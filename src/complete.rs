@@ -30,6 +30,8 @@ pub enum Kind {
     Priority,
     /// A queued task, in the order dispatch takes them.
     QueuedTask,
+    /// An account the head keeps a usage limit for.
+    Account,
 }
 
 /// The kind of name the argument `id` of the subcommand at `path` (canonical
@@ -39,6 +41,7 @@ pub fn kind_of(path: &[&str], id: &str) -> Option<Kind> {
         // A new flock's or machine's name is the user's to choose.
         ([_, "add"], "name") => None,
         (["queue", "move"], "task" | "before" | "after") => Some(Kind::QueuedTask),
+        (["limit", "clear"], "account") => Some(Kind::Account),
         (_, "flock") => Some(Kind::Flock),
         (_, "machine") | (["flock", "add"], "machines") => Some(Kind::Machine),
         (_, "task") | (["task", "close"], "tasks") => Some(Kind::Task),
@@ -222,6 +225,7 @@ pub fn names(paths: &Paths, kind: Kind) -> Vec<(String, Option<String>)> {
         }
         Kind::Task => tasks(paths),
         Kind::QueuedTask => queued_tasks(paths),
+        Kind::Account => accounts(paths),
         Kind::Priority => crate::task::Priority::ALL
             .iter()
             .map(|p| (p.to_string(), None))
@@ -293,6 +297,23 @@ fn queued_tasks(paths: &Paths) -> Vec<(String, Option<String>)> {
             )
         })
         .collect()
+}
+
+/// The accounts with a usage limit, each once, with what ran out.
+fn accounts(paths: &Paths) -> Vec<(String, Option<String>)> {
+    let Ok(store) = Store::open_read_only(&paths.db_file()) else {
+        return Vec::new();
+    };
+    let Ok(limits) = store.limits() else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, Option<String>)> = Vec::new();
+    for l in limits {
+        if !out.iter().any(|(a, _)| *a == l.account) {
+            out.push((l.account.clone(), Some(l.what())));
+        }
+    }
+    out
 }
 
 /// The entries of `dir`, sorted, hidden ones left out; with `ext`, only files

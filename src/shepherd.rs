@@ -411,6 +411,8 @@ impl Puller {
                 state: t.state,
                 pane: t.pane_id.clone(),
                 detail: t.error.clone(),
+                // Nothing here reads a limit from a pane yet.
+                limit: None,
             };
             let head_row = match (self.ask)(req).await {
                 Ok(IpcResponse::Task(row)) => row,

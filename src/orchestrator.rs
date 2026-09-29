@@ -1320,15 +1320,55 @@ impl Runner {
     /// week's, or next year's `resets Oct 6` once Oct 6 has passed. A reset
     /// resolved that way, but already behind `now` by the time this runs,
     /// means the quota is not held back at all.
+    ///
+    /// The limit also goes in the head's table (`Fleet::note_limit`), under
+    /// the account the agent names on its machine, so no task starts on
+    /// that account either; `orchestrator.quota` is as before.
     fn quota_until(&self, task: &Task, pane: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         let agents = self.fleet.agents();
         let kind = agents.kind(&task.spec.agent);
         let read_at = task.finished_at.unwrap_or(now);
-        [pane, task.error.as_deref().unwrap_or("")]
+        let limit = [pane, task.error.as_deref().unwrap_or("")]
             .iter()
-            .find_map(|said| crate::limit::limit_in(kind, said, read_at).filter(|limit| limit.hard))
-            .map(|limit| limit.retry_at(now))
-            .filter(|until| *until > now)
+            .find_map(|said| {
+                crate::limit::limit_in(kind, said, read_at).filter(|limit| limit.hard)
+            })?;
+        let until = limit.retry_at(now);
+        if until <= now {
+            return None;
+        }
+        if let Some(machine) = task.machine.as_deref()
+            && let Err(err) = self.fleet.note_limit(task, machine, &limit, read_at)
+        {
+            tracing::warn!(task = %task.display_id(), %err, "keep the usage limit");
+        }
+        Some(until)
+    }
+
+    /// When the account `orch`'s agent would run on is exhausted, hold it
+    /// as for a quota its own agent found: `quota_until` becomes the
+    /// account's `retry_at`, unless a later wait already holds it.
+    fn hold_for_account(&self, orch: &Orchestrator, state: &mut State, now: DateTime<Utc>) {
+        if state.quota_until.is_some_and(|u| u > now) {
+            return;
+        }
+        let flock = self.fleet.flock();
+        let Some(head) = flock.machines.iter().find(|m| m.local) else {
+            return;
+        };
+        let ask = AgentChoice {
+            model: orch.model.clone(),
+            ..Default::default()
+        };
+        let pick = self.fleet.defaults().resolve_agent(&ask, None);
+        let model = pick.model.as_ref().map(|(m, _)| m.as_str());
+        if let Some(row) = self
+            .fleet
+            .limit_holding(&head.name, &pick.agent, model, now)
+        {
+            tracing::info!(orchestrator = %orch.name, account = %row.account, until = %row.retry_at, "its agent's account is exhausted; no agent before the reset");
+            state.quota_until = Some(row.retry_at);
+        }
     }
 
     fn emit(&self, kind: &str, name: &str, task: Option<i64>, extra: serde_json::Value) {
@@ -1442,6 +1482,7 @@ impl Runner {
             return self.save_run(name, state, run);
         }
         run.lines = lines.clone();
+        self.hold_for_account(orch, &mut state, now);
         if let Some(until) = state.quota_until.filter(|u| *u > now) {
             run.outcome = RunOutcome::Held;
             run.detail = Some(format!(
@@ -1780,6 +1821,7 @@ impl Runner {
         state.stopped_until = None;
         state.held_since = None;
         state.last_run_at = Some(now);
+        self.hold_for_account(orch, state, now);
         if let Some(wait) = state.quota_until.filter(|u| *u > now) {
             state.record(RunRecord {
                 at: now,
@@ -2083,6 +2125,10 @@ impl Runner {
                         );
                         return;
                     }
+                }
+                self.hold_for_account(orch, state, now);
+                if state.quota_until.is_some_and(|u| u > now) {
+                    return;
                 }
             }
         }
@@ -2891,6 +2937,67 @@ prompt = "You are the night orchestrator."
         assert_eq!(head.kinds(), ["orchestrator.held"]);
         let st = head.runner.statuses(Utc::now());
         assert_eq!(st[0].state, "waiting for quota");
+    }
+
+    /// A quota its agent stopped on also goes in the head's table, under
+    /// the account of the agent on the machine it ran on.
+    #[tokio::test]
+    async fn a_quota_its_agent_found_is_kept_for_the_account() {
+        let mut head = Head::new(&scheduled(), "echo 'PR #31'", "");
+        let id = head.run().await.task.unwrap();
+        head.store
+            .note_pane_tail(id, "working...\nClaude AI usage limit reached|4102444800\n");
+        let mut t = head.store.get_task(id).unwrap().unwrap();
+        t.machine = Some("head".into());
+        t.state = TaskState::Done;
+        head.store.update_task(&mut t).unwrap();
+        head.runner.finish_now(&head.orch()).await;
+        assert_eq!(head.kinds(), ["orchestrator.started", "orchestrator.quota"]);
+        let rows = head.store.limits().unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].account, "head/claude");
+        assert_eq!(rows[0].task_id, Some(id));
+        assert_eq!(
+            rows[0].retry_at,
+            Utc.timestamp_opt(4_102_444_800, 0).single().unwrap()
+        );
+    }
+
+    /// An orchestrator whose agent's account is exhausted on the head's
+    /// machine starts no agent before the account's reset.
+    #[tokio::test]
+    async fn an_exhausted_account_holds_the_orchestrator() {
+        let mut head = Head::new(&scheduled(), "echo 'PR #31'", "");
+        let now = Utc::now();
+        let reset = now + chrono::Duration::hours(2);
+        head.store
+            .record_limit(&crate::limit::AccountLimit {
+                account: "head/claude".into(),
+                model: None,
+                hard: true,
+                no_credit: false,
+                until: Some(reset),
+                retry_at: reset,
+                line: "You've hit your limit".into(),
+                task_id: None,
+                machine: Some("head".into()),
+                agent: Some("claude".into()),
+                seen_at: now,
+            })
+            .unwrap();
+        let run = head.run().await;
+        assert_eq!(run.outcome, RunOutcome::Held, "{run:?}");
+        assert!(head.tasks().is_empty());
+        assert_eq!(head.kinds(), ["orchestrator.held"]);
+        assert_eq!(head.state().quota_until, Some(reset));
+        let st = head.runner.statuses(Utc::now());
+        assert_eq!(st[0].state, "waiting for quota");
+        // Cleared, it holds nothing.
+        head.runner.fleet.clear_limits("head/claude", None).unwrap();
+        let mut state = head.state();
+        state.quota_until = None;
+        save_state(&head.paths, "merge", &state);
+        assert_eq!(head.run().await.outcome, RunOutcome::Started);
     }
 
     /// A scheduled orchestrator whose agent, run by `agent`, ended with

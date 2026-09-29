@@ -1963,6 +1963,7 @@ mod tests {
                 model_from: None,
                 fallback: vec![],
                 fallback_from: None,
+                fallback_use: None,
                 profile: profile.map(str::to_string),
                 profile_from: Some("defaults".into()),
                 timeout_from: None,

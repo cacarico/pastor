@@ -1130,6 +1130,12 @@ pub struct AgentDef {
     /// Like `allow_flag`, for `deny` (`--disallowedTools` for claude).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deny_flag: Option<String>,
+    /// The account the agent is logged in to, as a label: every machine
+    /// whose agent names the same account shares its usage limits
+    /// (`Agents::limit_key`). Unset, a limit holds only for this agent on
+    /// the machine it was seen on. pastor never reads it as a credential.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 }
 
 /// `[agents.<name>]`, by agent name (`claude`, `codex`).
@@ -1220,6 +1226,17 @@ fn is_permission_arg(arg: &str) -> bool {
 const CLAUDE_TOOL_FLAGS: (&str, &str) = ("--allowedTools", "--disallowedTools");
 
 impl Agents {
+    /// What a usage limit of `agent` on `machine` is kept under: its
+    /// `account`, which every machine naming it shares, else
+    /// `<machine>/<agent>`, which holds only there. An account never holds a
+    /// `/`, so the two never meet.
+    pub fn limit_key(&self, machine: &str, agent: &str) -> String {
+        match self.0.get(agent).and_then(|d| d.account.as_deref()) {
+            Some(account) => account.to_string(),
+            None => format!("{machine}/{agent}"),
+        }
+    }
+
     /// The herdr kind `agent` starts: its definition's `kind`, else its name.
     pub fn kind<'a>(&'a self, agent: &'a str) -> &'a str {
         self.0
@@ -1574,6 +1591,72 @@ pub struct PastorConfig {
     /// runs headless and the head has it as a pull machine.
     #[serde(skip_serializing_if = "ShepherdConfig::is_empty")]
     pub shepherd: ShepherdConfig,
+    /// `[limits]`: how the head treats an agent that ran out of usage.
+    #[serde(skip_serializing_if = "LimitsConfig::is_default")]
+    pub limits: LimitsConfig,
+}
+
+/// `[limits]` in pastor.toml: what the head does about usage limits. Every
+/// key is read here; the head acts on `unknown_reset_wait` and
+/// `retry_after_no_credit` when it records a limit, and the others shape how
+/// a limited task waits or moves on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LimitsConfig {
+    /// A limited task whose reset is closer than this waits for it; one
+    /// further off goes on under its next model. `0s` never waits.
+    pub wait_under: String,
+    /// How many times a task stopped on a 429 or 529 is sent on again
+    /// before it counts as limited.
+    pub rate_retries: u32,
+    /// How long to wait before the first of those tries; each next one
+    /// waits twice as long.
+    pub rate_backoff: String,
+    /// How long a limit whose message names no reset holds.
+    pub unknown_reset_wait: String,
+    /// How long a limit for no credit holds before the account is tried
+    /// again.
+    pub retry_after_no_credit: String,
+    /// How many of the pane's last lines a task that moves to another model
+    /// hands over to it.
+    pub handover_lines: u32,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        LimitsConfig {
+            wait_under: "1h".into(),
+            rate_retries: 3,
+            rate_backoff: "1m".into(),
+            unknown_reset_wait: "1h".into(),
+            retry_after_no_credit: "6h".into(),
+            handover_lines: 100,
+        }
+    }
+}
+
+impl LimitsConfig {
+    pub fn is_default(&self) -> bool {
+        self == &LimitsConfig::default()
+    }
+    pub fn wait_under_duration(&self) -> Duration {
+        duration_or_default(&self.wait_under, &LimitsConfig::default().wait_under)
+    }
+    pub fn rate_backoff_duration(&self) -> Duration {
+        duration_or_default(&self.rate_backoff, &LimitsConfig::default().rate_backoff)
+    }
+    pub fn unknown_reset_wait_duration(&self) -> Duration {
+        duration_or_default(
+            &self.unknown_reset_wait,
+            &LimitsConfig::default().unknown_reset_wait,
+        )
+    }
+    pub fn retry_after_no_credit_duration(&self) -> Duration {
+        duration_or_default(
+            &self.retry_after_no_credit,
+            &LimitsConfig::default().retry_after_no_credit,
+        )
+    }
 }
 
 /// The variable that makes a headless serve take flock work, as
@@ -1681,6 +1764,7 @@ impl Default for PastorConfig {
             profiles: profile::Profiles::default(),
             watch: WatchConfig::default(),
             shepherd: ShepherdConfig::default(),
+            limits: LimitsConfig::default(),
         }
     }
 }
@@ -1731,6 +1815,18 @@ impl PastorConfig {
             ("close_done_after", &cfg.close_done_after, false),
             ("close_failed_after", &cfg.close_failed_after, false),
             ("pull_lost_after", &cfg.pull_lost_after, false),
+            ("limits.wait_under", &cfg.limits.wait_under, true),
+            ("limits.rate_backoff", &cfg.limits.rate_backoff, true),
+            (
+                "limits.unknown_reset_wait",
+                &cfg.limits.unknown_reset_wait,
+                false,
+            ),
+            (
+                "limits.retry_after_no_credit",
+                &cfg.limits.retry_after_no_credit,
+                false,
+            ),
         ] {
             if name.starts_with("close_") && v == CLOSE_NEVER {
                 continue;
@@ -1785,6 +1881,14 @@ impl PastorConfig {
                 if flag.as_deref().is_some_and(|f| f.trim().is_empty()) {
                     anyhow::bail!("{}: agents.{name}.{key} must not be empty", path.display());
                 }
+            }
+            if let Some(account) = &def.account
+                && (account.trim().is_empty() || account.contains('/'))
+            {
+                anyhow::bail!(
+                    "{}: agents.{name}.account must not be empty or hold a /",
+                    path.display()
+                );
             }
             if def.trust_keys.iter().flatten().any(|k| k.trim().is_empty()) {
                 anyhow::bail!(
@@ -1961,6 +2065,73 @@ mod tests {
         assert!(!PastorConfig::default().agents_change_fleet);
         let cfg: PastorConfig = toml::from_str("agents_change_fleet = true").unwrap();
         assert!(cfg.agents_change_fleet);
+    }
+
+    /// `[limits]` takes every key, each checked as it loads; unset keys keep
+    /// their defaults.
+    #[test]
+    fn limits_parse_and_check_every_key() {
+        let path = Path::new("pastor.toml");
+        let cfg = PastorConfig::parse(
+            path,
+            "[limits]\nwait_under = \"30m\"\nrate_retries = 5\nrate_backoff = \"10s\"\nunknown_reset_wait = \"2h\"\nretry_after_no_credit = \"1d\"\nhandover_lines = 40\n",
+        )
+        .unwrap();
+        let l = &cfg.limits;
+        assert_eq!(l.wait_under_duration(), Duration::from_secs(1800));
+        assert_eq!(l.rate_retries, 5);
+        assert_eq!(l.rate_backoff_duration(), Duration::from_secs(10));
+        assert_eq!(l.unknown_reset_wait_duration(), Duration::from_secs(7200));
+        assert_eq!(
+            l.retry_after_no_credit_duration(),
+            Duration::from_secs(86400)
+        );
+        assert_eq!(l.handover_lines, 40);
+        let d = PastorConfig::parse(path, "[limits]\nrate_retries = 1\n").unwrap();
+        assert_eq!(d.limits.unknown_reset_wait, "1h");
+        assert_eq!(
+            PastorConfig::parse(path, "[limits]\nwait_under = \"0s\"\n")
+                .unwrap()
+                .limits
+                .wait_under_duration(),
+            Duration::ZERO
+        );
+        for (bad, key) in [
+            ("unknown_reset_wait = \"0s\"", "limits.unknown_reset_wait"),
+            (
+                "retry_after_no_credit = \"soon\"",
+                "limits.retry_after_no_credit",
+            ),
+            ("wait_under = \"5\"", "limits.wait_under"),
+            ("rate_backoff = \"1y\"", "limits.rate_backoff"),
+            ("handover = 3", "handover"),
+        ] {
+            let err = PastorConfig::parse(path, &format!("[limits]\n{bad}\n")).unwrap_err();
+            assert!(err.to_string().contains(key), "{bad}: {err}");
+        }
+    }
+
+    /// An agent's `account` names who shares its limits: every machine
+    /// whose agent names it gets one key, and with none the key is the
+    /// machine and the agent, so each machine keeps its own.
+    #[test]
+    fn a_limit_is_kept_under_the_account_else_the_machine_and_agent() {
+        let path = Path::new("pastor.toml");
+        let cfg = PastorConfig::parse(
+            path,
+            "[agents.claude-personal]\nkind = \"claude\"\naccount = \"me-at-home\"\n",
+        )
+        .unwrap();
+        let a = &cfg.agents;
+        assert_eq!(a.limit_key("pi-1", "claude-personal"), "me-at-home");
+        assert_eq!(a.limit_key("pi-2", "claude-personal"), "me-at-home");
+        assert_eq!(a.limit_key("pi-1", "claude"), "pi-1/claude");
+        assert_eq!(a.limit_key("pi-2", "claude"), "pi-2/claude");
+        for bad in ["\"\"", "\"a/b\""] {
+            let err =
+                PastorConfig::parse(path, &format!("[agents.x]\naccount = {bad}\n")).unwrap_err();
+            assert!(err.to_string().contains("agents.x.account"), "{bad}: {err}");
+        }
     }
 
     /// `head_address` is an ssh destination: optional, and when set a
@@ -3124,6 +3295,7 @@ mod tests {
                 model_from: None,
                 fallback: vec![],
                 fallback_from: None,
+                fallback_use: None,
                 profile: Some("develop".into()),
                 profile_from: Some("defaults".into()),
                 timeout_from: None,
@@ -3205,6 +3377,7 @@ mod tests {
             model_from: None,
             fallback: vec![],
             fallback_from: None,
+            fallback_use: None,
             profile: Some("develop".into()),
             profile_from: Some("defaults".into()),
             timeout_from: None,
@@ -4140,6 +4313,17 @@ mod tests {
                     .trim()
                     .starts_with(&format!("{key} ="))),
                 "the manual's [shepherd] table has no {key}"
+            );
+        }
+        let limits = &block[block.find("[limits]").expect("no [limits]")..];
+        let want = toml::Value::try_from(LimitsConfig::default()).unwrap();
+        for (key, value) in want.as_table().unwrap() {
+            let want = format!("{key} = {value}");
+            assert!(
+                limits.lines().any(|l| l
+                    .strip_prefix(&want)
+                    .is_some_and(|tail| tail.is_empty() || tail.starts_with(char::is_whitespace))),
+                "the manual's [limits] table has no `{want}`"
             );
         }
         assert!(text.contains("\npull = true"), "no pull machine example");

@@ -531,6 +531,10 @@ pub struct AgentSource {
     /// layer's list is `[]`, and `None` when no layer sets one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_from: Option<String>,
+    /// Set when `model` is one of `fallback`, taken because every model
+    /// before it was on an exhausted account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_use: Option<FallbackUse>,
     /// The permission profile the task runs under, whose lists are in the
     /// spec's `allow` and `deny`; `None` when no layer names one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -545,6 +549,24 @@ pub struct AgentSource {
     /// Where the spec's `place` came from, like `timeout_from`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub place_from: Option<String>,
+}
+
+/// Which of its fallback models a task started on, and why not on those
+/// before it: `fallback 2 of 2; claude-personal exhausted until 03:00`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FallbackUse {
+    /// Its place in the task's fallback list, from 1.
+    pub pos: usize,
+    /// How long that list is.
+    pub of: usize,
+    /// The exhausted accounts it went past.
+    pub why: String,
+}
+
+impl std::fmt::Display for FallbackUse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "fallback {} of {}; {}", self.pos, self.of, self.why)
+    }
 }
 
 /// A worktree herdr made for a task: its branch and where it is on disk.

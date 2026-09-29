@@ -8,6 +8,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::limit::AccountLimit;
 use crate::queue::QueueSpot;
 use crate::sync::Recover;
 use crate::task::{
@@ -15,7 +16,7 @@ use crate::task::{
     TaskSummary,
 };
 
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 
 /// The tables schema 2 added: created on a fresh database and by the v1
 /// migration.
@@ -66,6 +67,24 @@ const V13_TABLES: &str = "CREATE TABLE IF NOT EXISTS task_summaries (
         source TEXT NOT NULL,
         at TEXT NOT NULL,
         PRIMARY KEY (task_id, round)
+     );";
+
+/// Schema 15: the accounts (or one model of one) that ran out of usage
+/// (`AccountLimit`), one row per account and model, `''` for the whole
+/// account.
+const V15_TABLES: &str = "CREATE TABLE IF NOT EXISTS limits (
+        account TEXT NOT NULL,
+        model TEXT NOT NULL DEFAULT '',
+        hard INTEGER NOT NULL,
+        no_credit INTEGER NOT NULL DEFAULT 0,
+        until TEXT,
+        retry_at TEXT NOT NULL,
+        line TEXT NOT NULL,
+        task_id INTEGER,
+        machine TEXT,
+        agent TEXT,
+        seen_at TEXT NOT NULL,
+        PRIMARY KEY (account, model)
      );";
 
 /// A task row with its last round's summary as JSON (`summary_json`), which
@@ -382,6 +401,7 @@ impl Store {
                         paused_at TEXT,
                         paused_for INTEGER,
                         resumed_at TEXT,
+                        waiting_until TEXT,
                         created_at TEXT NOT NULL,
                         started_at TEXT,
                         finished_at TEXT,
@@ -394,6 +414,7 @@ impl Store {
                 tx.execute_batch(V5_TABLES)?;
                 tx.execute_batch(V8_TABLES)?;
                 tx.execute_batch(V13_TABLES)?;
+                tx.execute_batch(V15_TABLES)?;
                 tx.execute(
                     "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)",
                     params![SCHEMA_VERSION.to_string()],
@@ -406,6 +427,7 @@ impl Store {
                 tx.execute_batch(V5_TABLES)?;
                 tx.execute_batch(V8_TABLES)?;
                 tx.execute_batch(V13_TABLES)?;
+                tx.execute_batch(V15_TABLES)?;
             }
             Some(v) if v < SCHEMA_VERSION => {
                 // One `if v < N` block per migration. The job tables go in
@@ -501,6 +523,12 @@ impl Store {
                 if v < 14 {
                     add_column(&tx, "aged_from", "aged_from TEXT")?;
                     add_column(&tx, "aged_at", "aged_at TEXT")?;
+                }
+                // Usage limits, and when a limited task is due to go on
+                // (`waiting_until`). Nothing was limited before.
+                if v < 15 {
+                    tx.execute_batch(V15_TABLES)?;
+                    add_column(&tx, "waiting_until", "waiting_until TEXT")?;
                 }
                 tx.execute(
                     "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
@@ -1670,6 +1698,146 @@ impl Store {
         })
     }
 
+    /// Keep `limit`, replacing any row of the same account and model: a
+    /// later limit on the same key is the one that holds.
+    pub fn record_limit(&self, limit: &AccountLimit) -> anyhow::Result<()> {
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            conn.execute(
+                "INSERT OR REPLACE INTO limits
+                   (account, model, hard, no_credit, until, retry_at, line, task_id, machine, agent, seen_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    limit.account,
+                    limit.model.as_deref().unwrap_or(""),
+                    limit.hard,
+                    limit.no_credit,
+                    limit.until.map(|t| t.to_rfc3339()),
+                    limit.retry_at.to_rfc3339(),
+                    limit.line,
+                    limit.task_id,
+                    limit.machine,
+                    limit.agent,
+                    limit.seen_at.to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Every limit kept, live or past its `retry_at`, by account then model.
+    pub fn limits(&self) -> anyhow::Result<Vec<AccountLimit>> {
+        self.select_limits("SELECT * FROM limits ORDER BY account, model", [])
+    }
+
+    /// The limits whose `retry_at` is after `now`: those that stop a task.
+    pub fn live_limits(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<AccountLimit>> {
+        Ok(self
+            .limits()?
+            .into_iter()
+            .filter(|l| l.retry_at > now)
+            .collect())
+    }
+
+    /// Delete the limits whose `retry_at` is not after `now`, answering
+    /// them. The times are compared parsed, not as text: a row written in
+    /// another offset still sorts right. Each row is deleted by the
+    /// `retry_at` text it was read with, not one written again, so a row
+    /// kept as `Z` or `+02:00` goes too, while one replaced meanwhile by a
+    /// later limit stays.
+    pub fn expire_limits(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<AccountLimit>> {
+        let rows = self.select_limits_raw("SELECT * FROM limits ORDER BY account, model", [])?;
+        let gone: Vec<(AccountLimit, String)> = rows
+            .into_iter()
+            .filter(|(l, _)| l.retry_at <= now)
+            .collect();
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            for (l, retry_at) in &gone {
+                conn.execute(
+                    "DELETE FROM limits WHERE account = ?1 AND model = ?2 AND retry_at = ?3",
+                    params![l.account, l.model.as_deref().unwrap_or(""), retry_at],
+                )?;
+            }
+            anyhow::Ok(())
+        })?;
+        Ok(gone.into_iter().map(|(l, _)| l).collect())
+    }
+
+    /// Delete `account`'s limits, answering them: only `model`'s row when
+    /// given, else every row of the account, its models' included.
+    pub fn clear_limits(
+        &self,
+        account: &str,
+        model: Option<&str>,
+    ) -> anyhow::Result<Vec<AccountLimit>> {
+        let gone: Vec<AccountLimit> = self
+            .limits()?
+            .into_iter()
+            .filter(|l| l.account == account && model.is_none_or(|m| l.model.as_deref() == Some(m)))
+            .collect();
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            match model {
+                Some(m) => conn.execute(
+                    "DELETE FROM limits WHERE account = ?1 AND model = ?2",
+                    params![account, m],
+                )?,
+                None => conn.execute("DELETE FROM limits WHERE account = ?1", params![account])?,
+            };
+            anyhow::Ok(())
+        })?;
+        Ok(gone)
+    }
+
+    fn select_limits(
+        &self,
+        sql: &str,
+        args: impl rusqlite::Params,
+    ) -> anyhow::Result<Vec<AccountLimit>> {
+        Ok(self
+            .select_limits_raw(sql, args)?
+            .into_iter()
+            .map(|(l, _)| l)
+            .collect())
+    }
+
+    /// `select_limits`, each row with its `retry_at` as stored.
+    fn select_limits_raw(
+        &self,
+        sql: &str,
+        args: impl rusqlite::Params,
+    ) -> anyhow::Result<Vec<(AccountLimit, String)>> {
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let mut stmt = conn.prepare(sql)?;
+            let time = |s: String| {
+                DateTime::parse_from_rfc3339(&s)
+                    .map(|d| d.with_timezone(&Utc))
+                    .map_err(conversion_failure)
+            };
+            let rows = stmt.query_map(args, |r| {
+                let model: String = r.get("model")?;
+                let retry_at: String = r.get("retry_at")?;
+                let limit = AccountLimit {
+                    account: r.get("account")?,
+                    model: (!model.is_empty()).then_some(model),
+                    hard: r.get("hard")?,
+                    no_credit: r.get("no_credit")?,
+                    until: r.get::<_, Option<String>>("until")?.map(time).transpose()?,
+                    retry_at: time(retry_at.clone())?,
+                    line: r.get("line")?,
+                    task_id: r.get("task_id")?,
+                    machine: r.get("machine")?,
+                    agent: r.get("agent")?,
+                    seen_at: time(r.get("seen_at")?)?,
+                };
+                Ok((limit, retry_at))
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
     /// Forget a saved trust. Returns whether there was one.
     pub fn untrust(&self, machine: &str, repo: &str) -> anyhow::Result<bool> {
         blocking(|| {
@@ -2452,6 +2620,7 @@ mod tests {
             table_names(&path),
             vec![
                 "event_seq",
+                "limits",
                 "meta",
                 "task_summaries",
                 "tasks",
@@ -2464,6 +2633,7 @@ mod tests {
             vec![
                 "event_seq",
                 "job_state",
+                "limits",
                 "meta",
                 "seen",
                 "task_summaries",
@@ -2505,6 +2675,7 @@ mod tests {
             vec![
                 "event_seq",
                 "job_state",
+                "limits",
                 "meta",
                 "seen",
                 "task_summaries",
@@ -3058,6 +3229,7 @@ mod tests {
                         model_from: None,
                         fallback: vec![],
                         fallback_from: None,
+                        fallback_use: None,
                         profile: None,
                         profile_from: None,
                         timeout_from: None,
@@ -3966,12 +4138,14 @@ mod tests {
                  ALTER TABLE tasks DROP COLUMN resumed_at;
                  ALTER TABLE tasks DROP COLUMN aged_from;
                  ALTER TABLE tasks DROP COLUMN aged_at;
+                 ALTER TABLE tasks DROP COLUMN waiting_until;
                  DROP TABLE trusted_repos;
                  DROP TABLE event_seq;
                  DROP TABLE task_summaries;
+                 DROP TABLE limits;
                  UPDATE meta SET value = '1' WHERE key = 'schema_version';
                  CREATE TRIGGER no_bump BEFORE UPDATE ON meta
-                   WHEN NEW.value = '14' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+                   WHEN NEW.value = '15' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
             );
         }
         assert!(Store::open(&path).is_err());
@@ -4004,7 +4178,8 @@ mod tests {
                 || c == "description"
                 || c == "preempt"
                 || c == "aged_from"
-                || c == "paused_at"),
+                || c == "paused_at"
+                || c == "waiting_until"),
             "rolled back: {cols:?}"
         );
         drop(conn);
@@ -4012,9 +4187,173 @@ mod tests {
         assert!(
             !tables.contains(&"trusted_repos".to_string())
                 && !tables.contains(&"event_seq".to_string())
-                && !tables.contains(&"task_summaries".to_string()),
+                && !tables.contains(&"task_summaries".to_string())
+                && !tables.contains(&"limits".to_string()),
             "rolled back: {tables:?}"
         );
+    }
+
+    /// Every table's columns, name, type, default and whether it is
+    /// required, by table: what a migration must end at, whatever order
+    /// its ALTERs left the columns in.
+    type Columns = Vec<(String, String, Option<String>, bool, i64)>;
+
+    fn shape(path: &Path) -> Vec<(String, Columns)> {
+        let conn = Connection::open(path).unwrap();
+        table_names(path)
+            .into_iter()
+            .map(|t| {
+                let mut cols: Vec<_> = conn
+                    .prepare(&format!("SELECT name, type, dflt_value, \"notnull\", pk FROM pragma_table_info('{t}')"))
+                    .unwrap()
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                cols.sort();
+                (t, cols)
+            })
+            .collect()
+    }
+
+    /// A schema 13 store, from before usage limits, migrates to the shape
+    /// a fresh store has: the limits table and `tasks.waiting_until`.
+    #[test]
+    fn a_v13_database_migrates_to_the_shape_of_a_fresh_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fresh = tmp.path().join("fresh.db");
+        drop(Store::open(&fresh).unwrap());
+        let old = tmp.path().join("old.db");
+        {
+            let s = Store::open(&old).unwrap();
+            s.insert_task(new_task("run")).unwrap();
+            s.execute_raw(
+                "ALTER TABLE tasks DROP COLUMN waiting_until;
+                 DROP TABLE limits;
+                 UPDATE meta SET value = '13' WHERE key = 'schema_version'",
+            );
+        }
+        assert!(!table_names(&old).contains(&"limits".to_string()));
+        let s = Store::open(&old).unwrap();
+        assert_eq!(
+            s.meta("schema_version").unwrap().unwrap(),
+            SCHEMA_VERSION.to_string()
+        );
+        assert!(s.get_task(1).unwrap().is_some());
+        drop(s);
+        assert_eq!(shape(&old), shape(&fresh));
+    }
+
+    fn limit_row(account: &str, model: Option<&str>, retry_in_mins: i64) -> AccountLimit {
+        let now = Utc::now();
+        AccountLimit {
+            account: account.into(),
+            model: model.map(str::to_string),
+            hard: true,
+            no_credit: false,
+            until: Some(now + chrono::Duration::minutes(retry_in_mins)),
+            retry_at: now + chrono::Duration::minutes(retry_in_mins),
+            line: "You've hit your limit".into(),
+            task_id: Some(7),
+            machine: Some("pi-1".into()),
+            agent: Some("claude".into()),
+            seen_at: now,
+        }
+    }
+
+    /// One row per account and model: a later limit on the same key
+    /// replaces the row, one of another model sits beside it.
+    #[test]
+    fn a_later_limit_on_the_same_key_replaces_the_row() {
+        let s = Store::open_in_memory().unwrap();
+        s.record_limit(&limit_row("me", None, 60)).unwrap();
+        let later = limit_row("me", None, 120);
+        s.record_limit(&later).unwrap();
+        s.record_limit(&limit_row("me", Some("opus"), 30)).unwrap();
+        let rows = s.limits().unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0], later);
+        assert_eq!(rows[1].model.as_deref(), Some("opus"));
+    }
+
+    /// Only a row whose retry is still ahead is live; expiring deletes the
+    /// others and answers them.
+    #[test]
+    fn a_limit_past_its_retry_expires() {
+        let s = Store::open_in_memory().unwrap();
+        s.record_limit(&limit_row("gone", None, -1)).unwrap();
+        s.record_limit(&limit_row("held", None, 60)).unwrap();
+        let now = Utc::now();
+        let live: Vec<String> = s
+            .live_limits(now)
+            .unwrap()
+            .into_iter()
+            .map(|l| l.account)
+            .collect();
+        assert_eq!(live, ["held"]);
+        let gone: Vec<String> = s
+            .expire_limits(now)
+            .unwrap()
+            .into_iter()
+            .map(|l| l.account)
+            .collect();
+        assert_eq!(gone, ["gone"]);
+        assert_eq!(s.limits().unwrap().len(), 1);
+        assert!(s.expire_limits(now).unwrap().is_empty());
+    }
+
+    /// A row whose `retry_at` was kept in another form than `+00:00` still
+    /// expires: it is deleted by the text it was read with.
+    #[test]
+    fn a_limit_kept_in_another_offset_expires() {
+        let s = Store::open_in_memory().unwrap();
+        for (account, retry_at) in [
+            ("zulu", "2026-09-29T10:00:00Z"),
+            ("plus-two", "2026-09-29T12:00:00+02:00"),
+            ("held", "2099-01-01T00:00:00Z"),
+        ] {
+            let conn = s.conn.lock().recover();
+            conn.execute(
+                "INSERT INTO limits (account, hard, retry_at, line, seen_at)
+                 VALUES (?1, 1, ?2, 'You''ve hit your limit', ?2)",
+                params![account, retry_at],
+            )
+            .unwrap();
+        }
+        let now = DateTime::parse_from_rfc3339("2026-09-29T11:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut gone: Vec<String> = s
+            .expire_limits(now)
+            .unwrap()
+            .into_iter()
+            .map(|l| l.account)
+            .collect();
+        gone.sort();
+        assert_eq!(gone, ["plus-two", "zulu"]);
+        let left: Vec<String> = s.limits().unwrap().into_iter().map(|l| l.account).collect();
+        assert_eq!(
+            left,
+            ["held"],
+            "the expired rows are deleted, not only answered"
+        );
+    }
+
+    /// Clearing an account takes all its rows; with a model, only that
+    /// model's.
+    #[test]
+    fn clearing_takes_the_account_or_one_model() {
+        let s = Store::open_in_memory().unwrap();
+        s.record_limit(&limit_row("me", None, 60)).unwrap();
+        s.record_limit(&limit_row("me", Some("opus"), 60)).unwrap();
+        s.record_limit(&limit_row("you", None, 60)).unwrap();
+        let one = s.clear_limits("me", Some("opus")).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].model.as_deref(), Some("opus"));
+        assert_eq!(s.clear_limits("me", None).unwrap().len(), 1);
+        assert!(s.clear_limits("me", None).unwrap().is_empty());
+        let left: Vec<String> = s.limits().unwrap().into_iter().map(|l| l.account).collect();
+        assert_eq!(left, ["you"]);
     }
 
     /// `tasks.id` has no AUTOINCREMENT, so SQLite hands out MAX(id) + 1:

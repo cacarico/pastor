@@ -112,6 +112,11 @@ enum Command {
         #[command(subcommand)]
         cmd: pastor::profile_cli::ProfileCmd,
     },
+    /// The accounts that ran out of usage, which no new task starts on until they reset
+    Limit {
+        #[command(subcommand)]
+        cmd: pastor::limit_cli::LimitCmd,
+    },
     /// The repos whose folder-trust prompt pastor answers on each machine
     Trust {
         #[command(subcommand)]
@@ -764,6 +769,7 @@ fn main() {
             Command::Connector { cmd } => pastor::connector::cli::run(&paths, cmd, head).await,
             Command::Profile { cmd } => pastor::profile_cli::run(&head_config(&paths).await?, cmd),
             Command::Trust { cmd } => pastor::trust_cli::run(&paths, cmd, head).await,
+            Command::Limit { cmd } => pastor::limit_cli::run(&paths, cmd, head).await,
             Command::Queue(args) => pastor::queue_cli::run(&paths, args, head).await,
             Command::Bridge(_) => unreachable!("handled before the runtime"),
             Command::Head { cmd } => pastor::head::run(&paths, cmd, remote.as_ref()).await,
@@ -1036,7 +1042,7 @@ fn head_use(command: &Command) -> Option<bool> {
         },
         Command::Tick(_) | Command::Job { .. } | Command::Config { .. } => Some(false),
         Command::Orchestrator { .. } => Some(false),
-        Command::Trust { .. } => Some(false),
+        Command::Trust { .. } | Command::Limit { .. } => Some(false),
         Command::Queue(a) => Some(a.flock.is_some()),
         Command::Connector { cmd } => {
             (!matches!(cmd, ConnectorCmd::List { .. } | ConnectorCmd::Try { .. })).then_some(false)
@@ -1089,6 +1095,7 @@ fn remote_route(command: &Command) -> RemoteRoute {
         | Command::Machine { .. }
         | Command::Flock { .. }
         | Command::Trust { .. }
+        | Command::Limit { .. }
         | Command::Profile { .. }
         | Command::Config { .. }
         | Command::Events(_)
@@ -1218,6 +1225,7 @@ fn changes_fleet(command: &Command) -> bool {
         }) => false,
         Command::Serve(_) | Command::Setup { .. } => true,
         Command::Trust { cmd } => pastor::trust_cli::changes_fleet(cmd),
+        Command::Limit { cmd } => pastor::limit_cli::changes_fleet(cmd),
         Command::Queue(a) => pastor::queue_cli::changes_fleet(a),
         _ => false,
     }

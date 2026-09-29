@@ -38,8 +38,9 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 /// (`AgentChoice::fallback`, a job's `[dispatch] fallback`). 28: `task run
 /// --now` (`Run::now`, `MachineStatus::now`). 29: keeping a task's pane
 /// (`DispatchSpec::keep_pane`, a job's `[dispatch] keep_pane`,
-/// `FlockEntry::keep_pane`).
-pub const IPC_PROTOCOL: u32 = 29;
+/// `FlockEntry::keep_pane`). 30: usage limits (`LimitList`, `LimitClear`,
+/// `TaskReport::limit`).
+pub const IPC_PROTOCOL: u32 = 30;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -178,6 +179,11 @@ pub const MODEL_PROTOCOL: u32 = 8;
 /// drop them without a word.
 pub const FALLBACK_PROTOCOL: u32 = 27;
 
+/// The first protocol whose head keeps usage limits: it answers
+/// `LimitList` and `LimitClear`, and records `TaskReport::limit`. An older
+/// one refuses the first two as unreadable and drops the third.
+pub const LIMIT_PROTOCOL: u32 = 30;
+
 /// The first protocol whose head honours `Run::priority` and knows
 /// `TaskPriority`. An older one would queue the task at its own level
 /// without a word, or refuse the request as unreadable.
@@ -293,6 +299,8 @@ const JOB_KEEP_PANE: &str = "predates a job with keep_pane, and would refuse its
 const PULL: &str = "predates pull machines, and would refuse the claim or report";
 const ORCHESTRATOR: &str = "predates orchestrator files, and would refuse the request";
 const SESSION: &str = "predates session orchestrators, and would refuse the request";
+const LIMITS: &str = "predates usage limits, and would refuse the request";
+const REPORT_LIMIT: &str = "predates usage limits, and would drop the limit the report carries";
 
 /// How long a head's `Pong` settles the protocol check before it is asked
 /// again: a long-lived sender (a headless serve) sees a restarted head
@@ -686,6 +694,20 @@ pub enum IpcRequest {
         pane: Option<String>,
         #[serde(default)]
         detail: Option<String>,
+        /// The usage limit the task's agent stopped on, as the pull machine
+        /// read it; the head keeps it under the account the task's agent
+        /// names on that machine (`Fleet::report`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<crate::limit::Limit>,
+    },
+    /// Every usage limit the head keeps. Answers `Limits`.
+    LimitList,
+    /// Forget `account`'s limits, only `model`'s when given. Answers
+    /// `Limits`, those cleared.
+    LimitClear {
+        account: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     /// Every orchestrator file the head reads. Answers `Orchestrators`.
     OrchestratorList,
@@ -925,7 +947,14 @@ impl IpcRequest {
             | R::TrustRemove { .. }
             | R::FlockDescribe { .. }
             | R::MachineDescribe { .. } => need.at(HEAD_READS_PROTOCOL, HEAD_READS),
-            R::TaskClaim { .. } | R::TaskReport { .. } => need.at(PULL_PROTOCOL, PULL),
+            R::TaskClaim { .. } => need.at(PULL_PROTOCOL, PULL),
+            R::TaskReport { limit, .. } => {
+                need.at(PULL_PROTOCOL, PULL);
+                if limit.is_some() {
+                    need.at(LIMIT_PROTOCOL, REPORT_LIMIT);
+                }
+            }
+            R::LimitList | R::LimitClear { .. } => need.at(LIMIT_PROTOCOL, LIMITS),
             R::OrchestratorStart { .. } | R::OrchestratorStop { .. } => {
                 need.at(SESSION_PROTOCOL, SESSION);
             }
@@ -957,6 +986,7 @@ impl IpcRequest {
             | IpcRequest::MachineDescribe { .. }
             | IpcRequest::OrchestratorList
             | IpcRequest::OrchestratorDescribe { .. }
+            | IpcRequest::LimitList
             | IpcRequest::Queue { .. } => false,
             IpcRequest::FileGet { .. } | IpcRequest::JobDescribe { .. } => false,
             IpcRequest::Reload
@@ -986,6 +1016,7 @@ impl IpcRequest {
             | IpcRequest::TrustRemove { .. }
             | IpcRequest::TaskClaim { .. }
             | IpcRequest::TaskReport { .. }
+            | IpcRequest::LimitClear { .. }
             | IpcRequest::OrchestratorRun { .. }
             | IpcRequest::OrchestratorStart { .. }
             | IpcRequest::OrchestratorStop { .. }
@@ -1159,6 +1190,7 @@ pub enum IpcResponse {
     Summaries(Vec<crate::task::TaskSummary>),
     Orchestrators(Vec<crate::orchestrator::OrchestratorStatus>),
     Orchestrator(crate::orchestrator::OrchestratorDescription),
+    Limits(Vec<crate::limit::AccountLimit>),
 }
 
 /// One of the head's config files as `FileGet` found it.
@@ -1710,6 +1742,7 @@ mod tests {
                 state: crate::task::TaskState::Blocked,
                 pane: Some("p1".into()),
                 detail: Some("agent asked: go on?".into()),
+                limit: None,
             },
         ] {
             let json = serde_json::to_string(&req).unwrap();
@@ -1758,6 +1791,7 @@ mod tests {
             },
             IpcRequest::OrchestratorList,
             IpcRequest::OrchestratorDescribe { name: "o".into() },
+            IpcRequest::LimitList,
         ];
         for req in reads {
             assert!(!req.changes_fleet(), "{req:?}");
@@ -1885,6 +1919,10 @@ mod tests {
             IpcRequest::TrustRemove {
                 machine: "m".into(),
                 repo: "/r".into(),
+            },
+            IpcRequest::LimitClear {
+                account: "me".into(),
+                model: None,
             },
             IpcRequest::OrchestratorRun { name: "o".into() },
             IpcRequest::OrchestratorStart { name: "o".into() },

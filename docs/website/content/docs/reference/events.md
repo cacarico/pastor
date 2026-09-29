@@ -64,6 +64,8 @@ A task's state change is `task.` and the new state.
 | `connector.finish_failed` | a connector's finish command failed | `connector`, `reason` |
 | `machine.lost` | a machine stopped answering; once per outage | |
 | `machine.connected` | a lost machine answers again | |
+| `agent.exhausted` | the head recorded an account (or one model of it) as out of usage | `account`, `model`, `agent`, `until`, `retry_at`, `hard`, `no_credit`, `what`, `line` |
+| `agent.reset` | an exhausted account can be used again | `account`, `model`, `agent`, `retry_at`, `by` (`time` or `hand`) |
 
 Orchestrator events all carry `orchestrator`, its name, in `detail`. See
 [orchestrators](../../concepts/orchestrators/).

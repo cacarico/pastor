@@ -11,7 +11,7 @@ use crate::config::flock::{
 };
 use crate::config::{
     AGENT_KIND_MISSING, AgentChoice, AgentPick, AgentRefusal, Agents, Defaults, Layer,
-    MODEL_KIND_MISMATCH, Models, PastorConfig, Paths, profile::PROFILE_NOT_ALLOWED,
+    LimitsConfig, MODEL_KIND_MISMATCH, Models, PastorConfig, Paths, profile::PROFILE_NOT_ALLOWED,
 };
 use crate::dispatch::{
     Claim, FlockSeat, MachineView, flock_held, mark_waiting_under_share, now_machine, pick_machine,
@@ -19,6 +19,7 @@ use crate::dispatch::{
 };
 use crate::herdr::{Connector, Endpoint};
 use crate::ipc::{HeadPing, IpcRequest, IpcResponse};
+use crate::limit::AccountLimit;
 use crate::machine::{
     ActorStopped, MachineHandle, MachineSettings, OrphanClosed, PastorEvent, SendInput,
     SendRefused, ShutdownOutcome, spawn_machine,
@@ -397,6 +398,14 @@ pub struct Fleet {
     agents_change_fleet: std::sync::atomic::AtomicBool,
     /// `max_orchestrators` as last applied.
     max_orchestrators: std::sync::atomic::AtomicU32,
+    /// `[limits]` as last applied: how long a limit holds.
+    limits: RwLock<LimitsConfig>,
+    /// The limits table as last read (`live_limits`): a pass settles each
+    /// queued task against each machine, and the later tasks again for
+    /// each one, so reading the store every time adds up. Dropped whenever
+    /// this fleet writes the table; a row another process writes (the CLI
+    /// with no head) shows within `LIMITS_FRESH`.
+    limits_seen: std::sync::Mutex<Option<(std::time::Instant, Vec<AccountLimit>)>>,
     store: Arc<Store>,
     /// `None` for a fixed fleet (`Fleet::new`): tests and the daemon-less CLI.
     spawner: Option<Spawner>,
@@ -436,6 +445,8 @@ impl Fleet {
             profiles: RwLock::default(),
             agents_change_fleet: Default::default(),
             max_orchestrators: std::sync::atomic::AtomicU32::new(1),
+            limits: RwLock::default(),
+            limits_seen: Default::default(),
             store,
             spawner: None,
             forward: None,
@@ -480,6 +491,8 @@ impl Fleet {
             profiles: RwLock::default(),
             agents_change_fleet: Default::default(),
             max_orchestrators: std::sync::atomic::AtomicU32::new(1),
+            limits: RwLock::default(),
+            limits_seen: Default::default(),
             store,
             spawner: Some(Spawner { connect, events }),
             forward: None,
@@ -567,6 +580,7 @@ impl Fleet {
         *self.agents.write().recover() = config.agents.clone();
         *self.models.write().recover() = config.models.clone();
         *self.profiles.write().recover() = config.profiles.clone();
+        *self.limits.write().recover() = config.limits.clone();
         self.agents_change_fleet.store(
             config.agents_change_fleet,
             std::sync::atomic::Ordering::Relaxed,
@@ -722,6 +736,7 @@ impl Fleet {
             model_from: pick.model.as_ref().map(|&(_, layer)| label(layer)),
             fallback: models.fallback(&pick)?,
             fallback_from: pick.fallback.as_ref().map(|&(_, layer)| label(layer)),
+            fallback_use: None,
             profile: pick.profile.as_ref().map(|(name, _)| name.clone()),
             profile_from: pick.profile.as_ref().map(|&(_, layer)| label(layer)),
             timeout_from,
@@ -1648,19 +1663,9 @@ impl Fleet {
         // Same model/agent compatibility check `dispatch_queued` applies: a
         // machine whose agent cannot run the task's model does not take it.
         let accepts = |task: &Task, machine: &str| {
-            let Some(source) = task.spec.agent_source.as_ref() else {
-                return true;
-            };
             let target = task.flock.as_deref().unwrap_or(wanted.default_flock());
-            let mut spec = task.spec.clone();
-            self.settle(
-                &mut spec,
-                &source.ask,
-                target,
-                Some(machine),
-                &asked_by(task),
-            )
-            .is_ok()
+            self.settled_on(task, target, machine)
+                .is_none_or(|r| r.is_ok())
         };
         let mut entries =
             crate::queue::entries(queued, &self.views(), wanted.default_flock(), &accepts);
@@ -1680,14 +1685,238 @@ impl Fleet {
         flock: &str,
         machine: &str,
     ) -> Option<Result<crate::task::DispatchSpec, AgentRefusal>> {
-        let source = task.spec.agent_source.as_ref()?;
+        let now = chrono::Utc::now();
+        let live = self.live_limits(now);
+        let Some(source) = task.spec.agent_source.as_ref() else {
+            // It keeps its agent, so only that agent's limit can stop it.
+            let held = self.limits_holding(&live, machine, &task.spec);
+            return (!held.is_empty()).then(|| Err(exhausted(&held, now)));
+        };
         let mut ask = source.ask.clone();
         if ask.profile.is_none() {
             ask.profile = source.profile.clone();
         }
+        let by = asked_by(task);
         let mut spec = task.spec.clone();
-        let r = self.settle(&mut spec, &ask, flock, Some(machine), &asked_by(task));
-        Some(r.map(|()| spec))
+        if let Err(e) = self.settle(&mut spec, &ask, flock, Some(machine), &by) {
+            return Some(Err(e));
+        }
+        let mut held = self.limits_holding(&live, machine, &spec);
+        if held.is_empty() {
+            return Some(Ok(spec));
+        }
+        // Its own model's account is exhausted here: the first model of its
+        // fallback list whose account is not, as that model settles here.
+        let primary = spec.agent_source.clone().expect("settled");
+        for (i, name) in primary.fallback.iter().enumerate() {
+            let mut then = ask.clone();
+            then.model = Some(name.clone());
+            let mut fb = task.spec.clone();
+            if self
+                .settle(&mut fb, &then, flock, Some(machine), &by)
+                .is_err()
+            {
+                continue;
+            }
+            let more = self.limits_holding(&live, machine, &fb);
+            if !more.is_empty() {
+                for l in more {
+                    if !held
+                        .iter()
+                        .any(|h| h.account == l.account && h.model == l.model)
+                    {
+                        held.push(l);
+                    }
+                }
+                continue;
+            }
+            if let Some(src) = fb.agent_source.as_mut() {
+                src.model_from = primary.fallback_from.clone();
+                src.fallback = primary.fallback.clone();
+                src.fallback_from = primary.fallback_from.clone();
+                src.fallback_use = Some(crate::task::FallbackUse {
+                    pos: i + 1,
+                    of: primary.fallback.len(),
+                    why: held
+                        .iter()
+                        .map(|l| l.short_note(now))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                });
+            }
+            return Some(Ok(fb));
+        }
+        Some(Err(exhausted(&held, now)))
+    }
+
+    /// The live limits, as the store has them at `now`; none when it cannot
+    /// be read, so a store error never holds work back.
+    fn live_limits(&self, now: chrono::DateTime<chrono::Utc>) -> Vec<AccountLimit> {
+        let mut seen = self.limits_seen.lock().recover();
+        let rows = match &*seen {
+            Some((at, rows)) if at.elapsed() < LIMITS_FRESH => rows.clone(),
+            _ => match self.store.limits() {
+                Ok(rows) => {
+                    *seen = Some((std::time::Instant::now(), rows.clone()));
+                    rows
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "read the usage limits");
+                    Vec::new()
+                }
+            },
+        };
+        rows.into_iter().filter(|l| l.retry_at > now).collect()
+    }
+
+    /// Forget the limits as last read: the table changed.
+    fn limits_changed(&self) {
+        *self.limits_seen.lock().recover() = None;
+    }
+
+    /// Of `live`, the limits that stop `spec`'s agent and model on
+    /// `machine`: those of its account (`Agents::limit_key`) for the whole
+    /// account or for its model.
+    fn limits_holding(
+        &self,
+        live: &[AccountLimit],
+        machine: &str,
+        spec: &crate::task::DispatchSpec,
+    ) -> Vec<AccountLimit> {
+        let key = self.agents.read().recover().limit_key(machine, &spec.agent);
+        let model = spec.agent_source.as_ref().and_then(|s| s.model.as_deref());
+        live.iter()
+            .filter(|l| l.account == key && l.stops(model))
+            .cloned()
+            .collect()
+    }
+
+    /// Keep `limit` and say so (`agent.exhausted`). A headless serve keeps
+    /// none: the head owns the table.
+    pub fn record_limit(&self, limit: &AccountLimit) -> anyhow::Result<()> {
+        self.store.record_limit(limit)?;
+        self.limits_changed();
+        tracing::warn!(account = %limit.account, model = ?limit.model, retry_at = %limit.retry_at, "account exhausted");
+        self.emit_limit("agent.exhausted", limit, None);
+        Ok(())
+    }
+
+    /// The live limit that stops `agent` running `model` on `machine` at
+    /// `now`, if one does.
+    pub fn limit_holding(
+        &self,
+        machine: &str,
+        agent: &str,
+        model: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<AccountLimit> {
+        let key = self.agents.read().recover().limit_key(machine, agent);
+        self.live_limits(now)
+            .into_iter()
+            .find(|l| l.account == key && l.stops(model))
+    }
+
+    /// `[limits]` as last applied.
+    pub fn limits_config(&self) -> LimitsConfig {
+        self.limits.read().recover().clone()
+    }
+
+    /// Keep `limit`, which `task`'s agent stopped on at `now` on `machine`,
+    /// under the account that agent names there (`Agents::limit_key`); a
+    /// limit that is one model's is kept for the task's model.
+    pub fn note_limit(
+        &self,
+        task: &Task,
+        machine: &str,
+        limit: &crate::limit::Limit,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<AccountLimit> {
+        let key = self
+            .agents
+            .read()
+            .recover()
+            .limit_key(machine, &task.spec.agent);
+        let row = AccountLimit::of(
+            &key,
+            task.model(),
+            limit,
+            Some(task.id),
+            Some(machine),
+            Some(&task.spec.agent),
+            now,
+            &self.limits_config(),
+        );
+        self.record_limit(&row)?;
+        Ok(row)
+    }
+
+    /// Drop the limits past their `retry_at`, each with `agent.reset`
+    /// (`by: time`).
+    pub fn expire_limits(&self) {
+        match self.store.expire_limits(chrono::Utc::now()) {
+            Ok(gone) => {
+                if !gone.is_empty() {
+                    self.limits_changed();
+                }
+                for l in gone {
+                    tracing::info!(account = %l.account, model = ?l.model, "usage limit reset");
+                    self.emit_limit("agent.reset", &l, Some("time"));
+                }
+            }
+            Err(err) => tracing::warn!(%err, "expire the usage limits"),
+        }
+    }
+
+    /// Clear `account`'s limits by hand (`limit clear`), each with
+    /// `agent.reset` (`by: hand`), then dispatch what they held.
+    pub fn clear_limits(
+        &self,
+        account: &str,
+        model: Option<&str>,
+    ) -> anyhow::Result<Vec<AccountLimit>> {
+        let gone = self.store.clear_limits(account, model)?;
+        self.limits_changed();
+        for l in &gone {
+            tracing::info!(account = %l.account, model = ?l.model, "usage limit cleared by hand");
+            self.emit_limit("agent.reset", l, Some("hand"));
+        }
+        Ok(gone)
+    }
+
+    /// `agent.exhausted` or `agent.reset` about `limit`, with `by` for a
+    /// reset.
+    fn emit_limit(&self, kind: &str, limit: &AccountLimit, by: Option<&str>) {
+        let Some(spawner) = &self.spawner else {
+            return;
+        };
+        let mut detail = serde_json::json!({
+            "account": limit.account,
+            "model": limit.model,
+            "agent": limit.agent,
+            "retry_at": limit.retry_at,
+        });
+        if let Some(obj) = detail.as_object_mut() {
+            match by {
+                Some(by) => {
+                    obj.insert("by".into(), by.into());
+                }
+                None => {
+                    obj.insert("until".into(), serde_json::json!(limit.until));
+                    obj.insert("hard".into(), limit.hard.into());
+                    obj.insert("no_credit".into(), limit.no_credit.into());
+                    obj.insert("what".into(), limit.what().into());
+                    obj.insert("line".into(), limit.line.clone().into());
+                }
+            }
+        }
+        let _ = spawner.events.send(PastorEvent {
+            kind: kind.into(),
+            task_id: limit.task_id,
+            machine: limit.machine.clone(),
+            job: None,
+            detail: Some(detail),
+            summary: None,
+        });
     }
 
     /// Is `name` a pull machine (`MachineConfig::pull`) of the fleet?
@@ -1853,11 +2082,7 @@ impl Fleet {
             if let Some(Ok(spec)) = settled {
                 on.spec = spec;
             }
-            if on
-                .error
-                .as_deref()
-                .is_some_and(|e| e.starts_with(WAITING_FOR_MODEL))
-            {
+            if on.error.as_deref().is_some_and(is_waiting_note) {
                 on.error = None;
             }
             if (on.spec != task.spec || on.error != task.error)
@@ -1890,9 +2115,18 @@ impl Fleet {
         state: TaskState,
         pane: Option<String>,
         detail: Option<String>,
+        limit: Option<crate::limit::Limit>,
     ) -> anyhow::Result<Task> {
         let handle = self.pull_handle(machine)?;
         self.heard(&handle);
+        // The head owns the limits: one a pull machine read goes in the
+        // table as one this head read would, keyed by the machine it ran on.
+        if let Some(limit) = &limit
+            && let Some(task) = self.store.get_task(id)?
+            && task.machine.as_deref() == Some(machine)
+        {
+            self.note_limit(&task, machine, limit, chrono::Utc::now())?;
+        }
         if matches!(state, TaskState::Queued | TaskState::Paused) {
             return Err(crate::cli::CliError::err(
                 "invalid_report",
@@ -2170,6 +2404,7 @@ impl Fleet {
     /// placed is reserved on its machine before the next one is looked at.
     async fn place_queued(&self) -> Vec<Placement> {
         let _pass = self.dispatch_lock.lock().await;
+        self.expire_limits();
         let mut placed = Vec::new();
         self.age_queued(chrono::Utc::now());
         let queued = match self.store.queued_tasks() {
@@ -2291,17 +2526,22 @@ impl Fleet {
                         })
                         .find_map(|v| flock_held(v, target))
                 };
+                // Or every model it may run there is on an exhausted
+                // account, which gets a note of its own.
                 let why = none_has()
+                    .map(|why| format!("{WAITING_FOR_MODEL}: {why}"))
                     .or_else(|| {
                         let m = pick_machine(&views, target, &task.spec, claim)?;
-                        Some(settled_on(&m)?.err()?.to_string())
+                        let refused = settled_on(&m)?.err()?;
+                        Some(if refused.code == ACCOUNT_EXHAUSTED {
+                            format!("{WAITING_FOR_ACCOUNT}: {}", refused.message)
+                        } else {
+                            format!("{WAITING_FOR_MODEL}: {refused}")
+                        })
                     })
-                    .or_else(flock_full);
-                let note = why.map(|why| format!("{WAITING_FOR_MODEL}: {why}"));
-                let stale = task
-                    .error
-                    .as_deref()
-                    .is_some_and(|e| e.starts_with(WAITING_FOR_MODEL));
+                    .or_else(|| flock_full().map(|why| format!("{WAITING_FOR_MODEL}: {why}")));
+                let note = why;
+                let stale = task.error.as_deref().is_some_and(is_waiting_note);
                 if note.is_some() && task.error != note || note.is_none() && stale {
                     let mut t = task.clone();
                     t.error = note;
@@ -2318,11 +2558,7 @@ impl Fleet {
             if let Some(Ok(spec)) = settled_on(&name) {
                 on.spec = spec;
             }
-            if on
-                .error
-                .as_deref()
-                .is_some_and(|e| e.starts_with(WAITING_FOR_MODEL))
-            {
+            if on.error.as_deref().is_some_and(is_waiting_note) {
                 on.error = None;
             }
             if (on.spec != task.spec || on.error != task.error)
@@ -2549,7 +2785,26 @@ fn layer_label(layer: Layer, asked_by: &str, flock: &str, machine: Option<&str>)
     }
 }
 
-use crate::queue::{WAITING_FOR_MODEL, asked_by};
+use crate::queue::{WAITING_FOR_ACCOUNT, WAITING_FOR_MODEL, asked_by, is_waiting_note};
+
+/// How long `Fleet::live_limits` trusts the table as last read.
+const LIMITS_FRESH: Duration = Duration::from_secs(1);
+
+/// The code of a task every model of which is on an exhausted account
+/// where it would run.
+pub const ACCOUNT_EXHAUSTED: &str = "account_exhausted";
+
+/// The refusal for a task that `held` stops, as its waiting note says it.
+fn exhausted(held: &[AccountLimit], now: chrono::DateTime<chrono::Utc>) -> AgentRefusal {
+    AgentRefusal {
+        code: ACCOUNT_EXHAUSTED,
+        message: held
+            .iter()
+            .map(|l| l.note(now))
+            .collect::<Vec<_>>()
+            .join("; "),
+    }
+}
 
 /// An error from code the CLI shares with the head, as a reply: its
 /// `CliError` code when it has one, else `runtime_error`.
@@ -3585,6 +3840,20 @@ impl Daemon {
                     )),
                 }
             }
+            IpcRequest::LimitList => match self.store.limits() {
+                Ok(list) => IpcResponse::Limits(list),
+                Err(err) => IpcResponse::error("store_error", err),
+            },
+            IpcRequest::LimitClear { account, model } => {
+                match self.fleet.clear_limits(&account, model.as_deref()) {
+                    Ok(gone) if gone.is_empty() => IpcResponse::error(
+                        crate::limit_cli::NOT_EXHAUSTED,
+                        crate::limit_cli::not_exhausted(&account, model.as_deref()),
+                    ),
+                    Ok(gone) => IpcResponse::Limits(gone),
+                    Err(err) => IpcResponse::error("store_error", err),
+                }
+            }
             IpcRequest::TrustList => match self.store.trusted_repos() {
                 Ok(list) => IpcResponse::Trusted(list),
                 Err(err) => IpcResponse::error("store_error", err),
@@ -3626,7 +3895,12 @@ impl Daemon {
                 state,
                 pane,
                 detail,
-            } => match self.fleet.report(&machine, id, state, pane, detail).await {
+                limit,
+            } => match self
+                .fleet
+                .report(&machine, id, state, pane, detail, limit)
+                .await
+            {
                 Ok(task) => IpcResponse::Task(task),
                 Err(err) => cli_error(err),
             },
@@ -4823,6 +5097,7 @@ mod tests {
             state,
             pane: Some("p-9".into()),
             detail: detail.map(str::to_string),
+            limit: None,
         }
     }
 
@@ -6897,6 +7172,224 @@ mod tests {
                 Some("flock personal".into())
             )
         );
+    }
+
+    /// `models_daemon` over `pi` and `pi-2`, whose flock runs
+    /// `claude-personal`, logged in to the account `me` when `account`; and
+    /// `desk`, whose codex agent runs `gpt`, with room for one each.
+    async fn limits_daemon(account: bool) -> (Daemon, tempfile::TempDir) {
+        let desk = MachineConfig {
+            agents: [("codex".to_string(), "codex".to_string())].into(),
+            ..machine("desk", 1)
+        };
+        let (d, tmp) = models_daemon(
+            None,
+            vec![machine("pi", 1), machine("pi-2", 1), desk],
+            &[
+                ("pi", 1, FakeHerdr::new()),
+                ("pi-2", 1, FakeHerdr::new()),
+                ("desk", 1, FakeHerdr::new()),
+            ],
+        )
+        .await;
+        let mut config = models_config();
+        if account {
+            config.agents.0.get_mut("claude-personal").unwrap().account = Some("me".into());
+        }
+        std::fs::write(d.paths.config_file(), toml::to_string(&config).unwrap()).unwrap();
+        d.fleet().set_config(&config);
+        (d, tmp)
+    }
+
+    /// A limit read on `machine`'s `claude-personal` by task 9, under the
+    /// key its config gives, for `model` alone when set; it resets in an
+    /// hour.
+    fn seen_limit(d: &Daemon, machine: &str, model: Option<&str>) -> AccountLimit {
+        let now = chrono::Utc::now();
+        let limit = crate::limit::Limit {
+            hard: true,
+            until: Some(now + chrono::Duration::hours(1)),
+            model_scoped: model.is_some(),
+            no_credit: false,
+            line: "You've hit your session limit".into(),
+        };
+        let key = d.fleet().agents().limit_key(machine, "claude-personal");
+        AccountLimit::of(
+            &key,
+            model,
+            &limit,
+            Some(9),
+            Some(machine),
+            Some("claude-personal"),
+            now,
+            &Default::default(),
+        )
+    }
+
+    /// Two machines whose agent names one account share its limit: one
+    /// row, seen on pi, keeps a new task off pi-2 too, and the task says why.
+    #[tokio::test]
+    async fn machines_whose_agent_names_one_account_share_its_limit() {
+        let (d, _tmp) = limits_daemon(true).await;
+        let mut events = d.subscribe();
+        d.fleet().record_limit(&seen_limit(&d, "pi", None)).unwrap();
+        d.fleet()
+            .record_limit(&seen_limit(&d, "pi-2", None))
+            .unwrap();
+        let rows = d.store.limits().unwrap();
+        assert_eq!(rows.len(), 1, "one account, one row: {rows:?}");
+        assert_eq!(rows[0].account, "me");
+        let ev = events.recv().await.unwrap();
+        assert_eq!(ev.kind, "agent.exhausted");
+        assert_eq!(ev.detail.as_ref().unwrap()["account"], "me");
+        let IpcResponse::Task(t) = d
+            .handle(run_fallback(Some("sonnet"), Some(&[]), None))
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(t.state, TaskState::Queued);
+        let err = t.error.clone().unwrap_or_default();
+        assert!(err.starts_with("waiting: me exhausted until "), "{err}");
+        assert!(err.ends_with("(session limit, seen by t-9)"), "{err}");
+        let IpcResponse::Queue(q) = d
+            .handle(IpcRequest::Queue {
+                flock: None,
+                machine: None,
+            })
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(q[0].why, err);
+    }
+
+    /// With no account, a limit holds only for the machine it was seen on:
+    /// two machines give two rows, and a task still starts on a third.
+    #[tokio::test]
+    async fn an_agent_with_no_account_keeps_a_limit_per_machine() {
+        let (d, _tmp) = limits_daemon(false).await;
+        d.fleet().record_limit(&seen_limit(&d, "pi", None)).unwrap();
+        let IpcResponse::Task(t) = d
+            .handle(run_fallback(Some("sonnet"), Some(&[]), None))
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(t.machine.as_deref(), Some("pi-2"), "{:?}", t.error);
+        d.fleet()
+            .record_limit(&seen_limit(&d, "pi-2", None))
+            .unwrap();
+        let keys: Vec<String> = d
+            .store
+            .limits()
+            .unwrap()
+            .into_iter()
+            .map(|l| l.account)
+            .collect();
+        assert_eq!(keys, ["pi-2/claude-personal", "pi/claude-personal"]);
+    }
+
+    /// Every model of the account exhausted: the task starts on the first
+    /// free model of its fallback list, and describe says which and why.
+    #[tokio::test]
+    async fn a_task_starts_on_its_first_free_fallback() {
+        let (d, _tmp) = limits_daemon(true).await;
+        d.fleet().record_limit(&seen_limit(&d, "pi", None)).unwrap();
+        let IpcResponse::Task(t) = d
+            .handle(run_fallback(Some("sonnet"), Some(&["opus", "gpt"]), None))
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (t.machine.as_deref(), t.spec.agent.as_str(), t.model()),
+            (Some("desk"), "codex", Some("gpt")),
+            "{:?}",
+            t.error
+        );
+        assert_eq!(t.error, None);
+        assert_eq!(t.fallback(), ["opus", "gpt"]);
+        let used = t
+            .spec
+            .agent_source
+            .as_ref()
+            .unwrap()
+            .fallback_use
+            .clone()
+            .unwrap();
+        assert_eq!((used.pos, used.of), (2, 2));
+        let text = crate::cli::task_detail(&t);
+        assert!(
+            text.contains("model:      gpt (fallback 2 of 2; me exhausted until "),
+            "{text}"
+        );
+        assert_eq!(used.why.matches("me exhausted").count(), 1, "{}", used.why);
+    }
+
+    /// A limit that is one model's stops only that model: the task goes on
+    /// under the next one, on the same account and machine.
+    #[tokio::test]
+    async fn a_model_scoped_limit_stops_only_that_model() {
+        let (d, _tmp) = limits_daemon(true).await;
+        d.fleet()
+            .record_limit(&seen_limit(&d, "pi", Some("sonnet")))
+            .unwrap();
+        let IpcResponse::Task(t) = d
+            .handle(run_fallback(Some("sonnet"), Some(&["opus"]), None))
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (t.spec.agent.as_str(), t.model()),
+            ("claude-personal", Some("opus"))
+        );
+        assert_eq!(t.spec.agent_args[..2], ["--model", "claude-opus-5-5"]);
+        let IpcResponse::Task(t) = d.handle(run_fallback(Some("opus"), Some(&[]), None)).await
+        else {
+            panic!()
+        };
+        assert_eq!(t.model(), Some("opus"), "opus is free");
+        assert!(t.machine.is_some(), "{:?}", t.error);
+    }
+
+    /// Clearing the account lets the task it held start on the next pass,
+    /// with `agent.reset` by hand; a row past its retry goes on its own,
+    /// with `agent.reset` by time.
+    #[tokio::test]
+    async fn a_cleared_or_expired_limit_lets_the_task_start() {
+        let (d, _tmp) = limits_daemon(true).await;
+        d.fleet().record_limit(&seen_limit(&d, "pi", None)).unwrap();
+        let IpcResponse::Task(t) = d
+            .handle(run_fallback(Some("sonnet"), Some(&[]), None))
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(t.state, TaskState::Queued);
+        let mut events = d.subscribe();
+        assert_eq!(d.fleet().clear_limits("me", None).unwrap().len(), 1);
+        let ev = events.recv().await.unwrap();
+        assert_eq!(ev.kind, "agent.reset");
+        assert_eq!(ev.detail.as_ref().unwrap()["by"], "hand");
+        d.fleet().dispatch_queued().await;
+        let t = d.store.get_task(t.id).unwrap().unwrap();
+        assert_ne!(t.state, TaskState::Queued);
+        assert_eq!(t.error, None);
+
+        let mut past = seen_limit(&d, "pi", None);
+        past.retry_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        d.store.record_limit(&past).unwrap();
+        d.fleet().dispatch_queued().await;
+        assert!(d.store.limits().unwrap().is_empty());
+        let ev = loop {
+            let ev = events.recv().await.unwrap();
+            if ev.kind == "agent.reset" {
+                break ev;
+            }
+        };
+        assert_eq!(ev.detail.as_ref().unwrap()["by"], "time");
     }
 
     /// A fallback name `[models]` lacks is refused by `task run`, and by a
