@@ -6964,15 +6964,25 @@ fn spare_flock(tmp: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf
 /// Returns once process `pid` has `fleet.lock` in `state` open: an offline
 /// edit opens it only after its ping found no head, just before it waits on
 /// the lock. Linux only, from `/proc`, like CI.
+///
+/// Until it execs, the child is a fork of this test and still holds the
+/// test's own lock descriptor, so the fd alone can show up before the ping;
+/// under load that let the test listen first and the ping found a head that
+/// never answers. Only the fds of the pastor binary count.
 fn wait_for_fleet_lock_open(pid: u32, state: &std::path::Path) {
     let lock = state.canonicalize().unwrap().join("fleet.lock");
+    let bin = std::path::Path::new(env!("CARGO_BIN_EXE_pastor"))
+        .canonicalize()
+        .unwrap();
     let deadline = Instant::now() + WAIT;
     loop {
-        let open = std::fs::read_dir(format!("/proc/{pid}/fd"))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|p| p == lock));
+        let exec = std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|p| p == bin);
+        let open = exec
+            && std::fs::read_dir(format!("/proc/{pid}/fd"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|p| p == lock));
         if open {
             return;
         }
