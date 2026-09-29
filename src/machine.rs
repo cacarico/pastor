@@ -437,6 +437,15 @@ pub enum MachineCommand {
     },
 }
 
+/// A `task run --now` dispatch, sent on the actor's urgent channel
+/// (`MachineHandle::dispatch_now`) rather than behind the other commands:
+/// the actor takes it even while it is starting another task
+/// (`Actor::run_dispatch`), so that task's startup never holds it up.
+pub struct NowDispatch {
+    pub task_id: i64,
+    pub reply: oneshot::Sender<anyhow::Result<Task>>,
+}
+
 /// Why `Pause` left a task alone.
 #[derive(Debug, thiserror::Error)]
 #[error("{task} cannot be paused: {why}")]
@@ -527,6 +536,8 @@ pub struct MachineHandle {
     pub burst: u32,
     pub tags: Vec<String>,
     pub tx: mpsc::Sender<MachineCommand>,
+    /// The urgent channel, for `dispatch_now` only.
+    pub now_tx: mpsc::Sender<NowDispatch>,
     pub status: Arc<RwLock<MachineStatus>>,
     /// The actor task, for `shutdown`. `None` only for handles built by hand
     /// in tests, which have no actor.
@@ -636,6 +647,14 @@ impl MachineHandle {
             .await
     }
 
+    /// `dispatch` for a `--now` task: the actor takes it at once, even while
+    /// it is starting an earlier task.
+    pub async fn dispatch_now(&self, task_id: i64) -> anyhow::Result<Task> {
+        let (reply, rx) = oneshot::channel();
+        self.request_on(&self.now_tx, NowDispatch { task_id, reply }, rx)
+            .await
+    }
+
     pub async fn close(&self, task_id: i64, remove_worktree: bool) -> anyhow::Result<Task> {
         let (reply, rx) = oneshot::channel();
         let cmd = MachineCommand::Close {
@@ -718,9 +737,18 @@ impl MachineHandle {
         cmd: MachineCommand,
         rx: oneshot::Receiver<anyhow::Result<T>>,
     ) -> anyhow::Result<T> {
+        self.request_on(&self.tx, cmd, rx).await
+    }
+
+    /// `request` on channel `tx`.
+    async fn request_on<C, T>(
+        &self,
+        tx: &mpsc::Sender<C>,
+        cmd: C,
+        rx: oneshot::Receiver<anyhow::Result<T>>,
+    ) -> anyhow::Result<T> {
         let exchange = async {
-            self.tx
-                .send(cmd)
+            tx.send(cmd)
                 .await
                 .map_err(|_| anyhow::anyhow!("machine {} is gone", self.name))?;
             rx.await
@@ -768,6 +796,7 @@ pub const PULL_ENDPOINT: &str = "pull: its own pastor serve asks the head for ta
 /// its first claim.
 pub fn pull_machine(name: String, max_agents: u32, tags: Vec<String>) -> MachineHandle {
     let (tx, _) = mpsc::channel(1);
+    let (now_tx, _) = mpsc::channel(1);
     let status = Arc::new(RwLock::new(MachineStatus {
         now: Vec::new(),
         description: None,
@@ -799,6 +828,7 @@ pub fn pull_machine(name: String, max_agents: u32, tags: Vec<String>) -> Machine
         burst: 0,
         tags,
         tx,
+        now_tx,
         status,
         task: None,
     }
@@ -814,6 +844,7 @@ pub fn spawn_machine(
     events: broadcast::Sender<PastorEvent>,
 ) -> MachineHandle {
     let (tx, rx) = mpsc::channel(32);
+    let (now_tx, now_rx) = mpsc::channel(8);
     let status = Arc::new(RwLock::new(MachineStatus {
         now: Vec::new(),
         description: None,
@@ -846,6 +877,7 @@ pub fn spawn_machine(
         events,
         status: status.clone(),
         rx,
+        now_rx: Some(now_rx),
         pending_done: HashMap::new(),
         trust_answered: HashMap::new(),
         unseen_prompt: HashMap::new(),
@@ -865,6 +897,7 @@ pub fn spawn_machine(
         burst: 0,
         tags,
         tx,
+        now_tx,
         status,
         task: Some(Arc::new(ActorTask {
             abort: task.abort_handle(),
@@ -872,6 +905,47 @@ pub fn spawn_machine(
             join: tokio::sync::Mutex::new(Some(task)),
         })),
     }
+}
+
+/// The actor's next command, a `--now` dispatch (`NowDispatch`) ahead of
+/// the rest. `None` once the command channel is closed.
+async fn next_command(
+    rx: &mut mpsc::Receiver<MachineCommand>,
+    now_rx: &mut Option<mpsc::Receiver<NowDispatch>>,
+) -> Option<MachineCommand> {
+    tokio::select! {
+        biased;
+        Some(now) = recv_now(now_rx) => Some(MachineCommand::Dispatch {
+            task_id: now.task_id,
+            reply: now.reply,
+        }),
+        cmd = rx.recv() => cmd,
+    }
+}
+
+/// The next `--now` dispatch; never, while `run_dispatch` holds the channel.
+async fn recv_now(now_rx: &mut Option<mpsc::Receiver<NowDispatch>>) -> Option<NowDispatch> {
+    match now_rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The first of `starting` to finish, taken out of it. Pending while it is
+/// empty.
+async fn next_started<T>(
+    starting: &mut Vec<std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + '_>>>,
+) -> T {
+    std::future::poll_fn(|cx| {
+        for i in 0..starting.len() {
+            if let std::task::Poll::Ready(v) = starting[i].as_mut().poll(cx) {
+                drop(starting.swap_remove(i));
+                return std::task::Poll::Ready(v);
+            }
+        }
+        std::task::Poll::Pending
+    })
+    .await
 }
 
 struct Actor {
@@ -882,6 +956,9 @@ struct Actor {
     events: broadcast::Sender<PastorEvent>,
     status: Arc<RwLock<MachineStatus>>,
     rx: mpsc::Receiver<MachineCommand>,
+    /// The urgent channel (`NowDispatch`). `None` only while `run_dispatch`
+    /// holds it to take `--now` dispatches during another task's startup.
+    now_rx: Option<mpsc::Receiver<NowDispatch>>,
     /// task id -> (the agent's `state_change_seq` when it was seen idle, if the
     /// observation carried one; when). Confirmed as Done after `settle` if the
     /// agent is still idle at that same sequence; with no sequence, the first
@@ -1237,7 +1314,7 @@ impl Actor {
             let mut reconciled = true;
             loop {
                 tokio::select! {
-                    cmd = self.rx.recv() => {
+                    cmd = next_command(&mut self.rx, &mut self.now_rx) => {
                         let Some(cmd) = cmd else { return };
                         match self.handle_command(cmd).await {
                             CommandOutcome::Nothing => {}
@@ -1407,7 +1484,7 @@ impl Actor {
         loop {
             tokio::select! {
                 _ = &mut deadline => return,
-                cmd = self.rx.recv() => match cmd {
+                cmd = next_command(&mut self.rx, &mut self.now_rx) => match cmd {
                     None => return,
                     Some(MachineCommand::Dispatch { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
                     Some(MachineCommand::Read { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
@@ -1563,7 +1640,7 @@ impl Actor {
 
         loop {
             tokio::select! {
-                cmd = self.rx.recv() => {
+                cmd = next_command(&mut self.rx, &mut self.now_rx) => {
                     let Some(cmd) = cmd else { return PollExit::Shutdown };
                     match self.handle_command(cmd).await {
                         CommandOutcome::Nothing => {}
@@ -1656,14 +1733,15 @@ impl Actor {
     async fn handle_command(&mut self, cmd: MachineCommand) -> CommandOutcome {
         match cmd {
             MachineCommand::Dispatch { task_id, reply } => {
-                let (result, mut dead) = self.run_dispatch(task_id, false).await;
-                if matches!(&result, Ok(t) if t.state == TaskState::Blocked)
+                let (result, mut dead, nows) = self.run_dispatch(task_id, false).await;
+                dead |= nows.dead;
+                if (matches!(&result, Ok(t) if t.state == TaskState::Blocked) || nows.blocked)
                     && let Err(err) = self.auto_trust().await
                 {
                     tracing::warn!(machine = %self.name, "auto trust after dispatch: {err:#}");
                     dead |= is_outage(&err);
                 }
-                let changed = result.is_ok();
+                let changed = result.is_ok() || nows.changed;
                 self.refresh_live();
                 let _ = reply.send(result);
                 match (dead, changed) {
@@ -1725,8 +1803,15 @@ impl Actor {
                 }
             }
             MachineCommand::Resume { task_id, reply } => {
-                let (result, dead) = self.run_dispatch(task_id, true).await;
-                let changed = result.is_ok();
+                let (result, mut dead, nows) = self.run_dispatch(task_id, true).await;
+                dead |= nows.dead;
+                if nows.blocked
+                    && let Err(err) = self.auto_trust().await
+                {
+                    tracing::warn!(machine = %self.name, "auto trust after dispatch: {err:#}");
+                    dead |= is_outage(&err);
+                }
+                let changed = result.is_ok() || nows.changed;
                 self.refresh_live();
                 let _ = reply.send(result);
                 match (dead, changed) {
@@ -3000,7 +3085,73 @@ impl Actor {
         Ok(paused)
     }
 
-    async fn run_dispatch(&mut self, task_id: i64, resume: bool) -> (anyhow::Result<Task>, bool) {
+    /// Start task `task_id` (a paused one with `resume`), taking any
+    /// `--now` dispatch that comes in meanwhile (`NowDispatch`) at once,
+    /// beside it: a `--now` task never waits on another task's startup,
+    /// which can run to `agent_ready_timeout`. Each of those is answered as
+    /// soon as it has started; what they left (`NowsStarted`) is for the
+    /// caller, like `task_id`'s own result.
+    async fn run_dispatch(
+        &mut self,
+        task_id: i64,
+        resume: bool,
+    ) -> (anyhow::Result<Task>, bool, NowsStarted) {
+        let mut now_rx = self.now_rx.take();
+        let mut nows = NowsStarted::default();
+        let (result, dead) = {
+            let this = &*self;
+            let main = this.start_task(task_id, resume);
+            tokio::pin!(main);
+            type Started<'a> = std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = (
+                                (anyhow::Result<Task>, bool),
+                                oneshot::Sender<anyhow::Result<Task>>,
+                            ),
+                        > + Send
+                        + 'a,
+                >,
+            >;
+            let mut starting: Vec<Started<'_>> = Vec::new();
+            let mut answer = |((result, dead), reply): (
+                (anyhow::Result<Task>, bool),
+                oneshot::Sender<anyhow::Result<Task>>,
+            )| {
+                nows.note(&result, dead);
+                this.refresh_live();
+                let _ = reply.send(result);
+            };
+            let out = loop {
+                tokio::select! {
+                    out = &mut main => break out,
+                    Some(now) = recv_now(&mut now_rx) => {
+                        starting.push(Box::pin(async move {
+                            (this.start_task(now.task_id, false).await, now.reply)
+                        }));
+                    }
+                    started = next_started(&mut starting), if !starting.is_empty() => answer(started),
+                }
+            };
+            while !starting.is_empty() {
+                answer(next_started(&mut starting).await);
+            }
+            out
+        };
+        self.now_rx = now_rx;
+        for id in std::mem::take(&mut nows.uptake) {
+            self.expect_uptake(id);
+        }
+        if let Ok(t) = &result
+            && needs_uptake(t)
+        {
+            self.expect_uptake(t.id);
+        }
+        (result, dead, nows)
+    }
+
+    /// `run_dispatch` for one task, from the claim to its row and event.
+    async fn start_task(&self, task_id: i64, resume: bool) -> (anyhow::Result<Task>, bool) {
         // The claim is the `Queued -> Starting` transition done as a conditional
         // UPDATE: a task another pass already took, or that finished meanwhile,
         // is simply not claimable. It also persists `machine` and `agent_name`
@@ -3064,10 +3215,6 @@ impl Actor {
         }
         match outcome {
             Ok(_) => {
-                // A resume's prompt can be lost as a dispatch's can.
-                if task.state == TaskState::Running && !task.activity_seen {
-                    self.expect_uptake(task.id);
-                }
                 self.emit(&format!("task.{}", task.state), Some(task.id));
                 (Ok(task), dead)
             }
@@ -3080,7 +3227,42 @@ impl Actor {
             }
         }
     }
+}
 
+/// Should the actor watch that `task`'s agent takes its prompt
+/// (`Actor::expect_uptake`)? A resume's prompt can be lost as a dispatch's can.
+fn needs_uptake(task: &Task) -> bool {
+    task.state == TaskState::Running && !task.activity_seen
+}
+
+/// What the `--now` dispatches `Actor::run_dispatch` took beside its own
+/// task left for its caller.
+#[derive(Default)]
+struct NowsStarted {
+    /// Tasks to watch take their prompt (`needs_uptake`).
+    uptake: Vec<i64>,
+    /// One started and is `blocked`: run `auto_trust`.
+    blocked: bool,
+    /// One started: its pane joins the subscription.
+    changed: bool,
+    /// One failed below the API.
+    dead: bool,
+}
+
+impl NowsStarted {
+    fn note(&mut self, result: &anyhow::Result<Task>, dead: bool) {
+        if let Ok(t) = result {
+            self.changed = true;
+            self.blocked |= t.state == TaskState::Blocked;
+            if needs_uptake(t) {
+                self.uptake.push(t.id);
+            }
+        }
+        self.dead |= dead;
+    }
+}
+
+impl Actor {
     async fn handle_event(&mut self, ev: &crate::herdr::Event) -> anyhow::Result<()> {
         let Some(pane_id) = ev.pane_id() else {
             return Ok(());

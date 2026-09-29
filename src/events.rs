@@ -786,6 +786,7 @@ mod tests {
 
     fn handle(name: &str, channel: ChannelState) -> MachineHandle {
         let (tx, _rx) = mpsc::channel(1);
+        let (now_tx, _now_rx) = mpsc::channel(1);
         MachineHandle {
             name: name.into(),
             max_agents: 2,
@@ -793,6 +794,7 @@ mod tests {
             burst: 0,
             tags: vec![],
             tx,
+            now_tx,
             status: Arc::new(RwLock::new(MachineStatus {
                 now: Vec::new(),
                 description: None,

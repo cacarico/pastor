@@ -285,6 +285,10 @@ impl Drop for Reservation {
 /// What a dispatch pass sends for one placed task, once the lock is let go.
 enum Outbound {
     Dispatch,
+    /// A `--now` task: dispatch it on the actor's urgent channel
+    /// (`MachineHandle::dispatch_now`), so it starts even while the actor
+    /// is still starting an earlier task.
+    Now,
     /// Pause this task on the machine first (`preempt`), then dispatch.
     PauseFor(i64),
     Resume,
@@ -2097,7 +2101,9 @@ impl Fleet {
         // A `--now` placement is urgent: send it ahead of this pass's other
         // placements for the same machine, so an earlier queued task's
         // dispatch (up to `reply_wait`) never makes it wait. `sort_by_key`
-        // is stable, so it does not reorder within either group.
+        // is stable, so it does not reorder within either group. One sent
+        // by an earlier pass that the actor is still starting does not hold
+        // it up either: it goes on the actor's urgent channel (`Outbound::Now`).
         for (_, sends) in &mut by_machine {
             sends.sort_by_key(|p| !p.task.spec.now);
         }
@@ -2204,7 +2210,7 @@ impl Fleet {
                         continue;
                     }
                 }
-                placed.push(self.reserve(task, handle, Outbound::Dispatch));
+                placed.push(self.reserve(task, handle, Outbound::Now));
                 continue;
             }
             let mut picked = pick_machine_where(&views, target, &task.spec, claim, &accepts);
@@ -2499,6 +2505,7 @@ async fn run_placement(p: Placement) {
             (handle.dispatch(task.id).await, "dispatch")
         }
         Outbound::Dispatch => (handle.dispatch(task.id).await, "dispatch"),
+        Outbound::Now => (handle.dispatch_now(task.id).await, "dispatch"),
     };
     match res {
         Ok(t) if what == "resume" => {
@@ -11001,6 +11008,52 @@ mod tests {
         pass.await.unwrap();
         assert_eq!(state_of(&d, &urgent), TaskState::Running);
         assert_eq!(state_of(&d, &first), TaskState::Running);
+    }
+
+    /// A `--now` task sent while an earlier pass's task is still starting on
+    /// the same machine starts beside it, on the actor's urgent channel,
+    /// instead of waiting in the actor's queue behind that startup (GPT
+    /// review on #103, second round).
+    #[tokio::test]
+    async fn now_starts_while_an_earlier_task_is_starting_on_its_machine() {
+        let slow = FakeHerdr::new();
+        slow.set_ready_after(Duration::from_secs(3));
+        let (d, _tmp) = daemon(&[("a", 1, slow.clone())]).await;
+        let first = queue_on(&d.store(), "slow", Some("a"));
+        let fleet = d.fleet();
+        let pass = tokio::spawn({
+            let fleet = fleet.clone();
+            async move { fleet.dispatch_queued().await }
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while state_of(&d, &first) != TaskState::Starting {
+            assert!(Instant::now() < deadline, "a never claimed its task");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let urgent = queue_now_on(&d.store(), "urgent", "a");
+        let now_pass = tokio::spawn({
+            let fleet = fleet.clone();
+            async move { fleet.dispatch_queued().await }
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while state_of(&d, &urgent) != TaskState::Starting {
+            assert!(
+                Instant::now() < deadline,
+                "the --now task waited behind the earlier task's startup"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(state_of(&d, &first), TaskState::Starting);
+        assert!(!pass.is_finished(), "the earlier task is still starting");
+        slow.set_ready_after(Duration::ZERO);
+        tokio::time::timeout(Duration::from_secs(2), now_pass)
+            .await
+            .expect("the --now pass ends once its agent is up")
+            .unwrap();
+        pass.await.unwrap();
+        assert_eq!(state_of(&d, &urgent), TaskState::Running);
+        assert_eq!(state_of(&d, &first), TaskState::Running);
+        assert_eq!(slow.agents().len(), 2);
     }
 
     /// A pass sends outside the dispatch lock: while `a` is still starting

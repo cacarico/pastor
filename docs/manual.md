@@ -1519,7 +1519,8 @@ refuses it up front without `--machine` (`now_needs_machine`) or when that
 machine is not connected (`machine_not_connected`, and a pull machine never
 is), and if the machine still does not take it (it went away meanwhile, or
 its agent cannot run the task's model), the task is closed and the request
-answers `now_not_started`. It needs the machine's tags like any pinned task,
+answers `now_not_started`. It does not wait for the machine to finish
+starting another task either: the two start side by side. It needs the machine's tags like any pinned task,
 and it does not go with `--preempt` (clap refuses the two together): it
 pauses nothing.
 
