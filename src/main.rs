@@ -271,7 +271,8 @@ struct RunArgs {
     preempt: bool,
     /// Start at once on --machine (which it needs), skipping the queue and
     /// running past that machine's max_agents, job slots, burst and flock
-    /// number; for a person at the CLI, never a task or an orchestrator
+    /// number; meant for a person at the CLI, and refused from a task or an
+    /// orchestrator as a guard against mistakes, not a boundary
     #[arg(long, conflicts_with = "preempt")]
     now: bool,
     /// Run under this permission profile, built in or from `[profiles]` in
