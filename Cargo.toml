@@ -56,6 +56,10 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
+# Only for `#[cfg_attr(test, mutants::skip)]` on an equivalent mutant (see
+# .cargo/mutants.toml): the attribute exists in test builds alone, so the
+# shipped binary never links it.
+mutants = "0.0.4"
 proptest = "1.11.0"
 tempfile = "3.27.0"
 

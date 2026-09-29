@@ -44,7 +44,7 @@ env = { CLAUDE_CONFIG_DIR = "~/.claude-sandbox" }  # ~ is the task's machine's h
 ```
 
 ```toml
-# ~/.config/pastor/flock.toml
+# fragment of ~/.config/pastor/flock.toml
 [[flock]]
 name = "sandbox"
 machines = { sandbox-1 = 1 }

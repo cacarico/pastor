@@ -70,7 +70,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_
 complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list describe read attach retry priority close prune send done help" -f -a "attach" -d 'Attach to a task\'s agent terminal (ctrl+b q detaches); a closed Claude task\'s session reopens in a new pane'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list describe read attach retry priority close prune send done help" -f -a "retry" -d 'Re-dispatch a failed or stale task as a new task (retry_of points back)'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list describe read attach retry priority close prune send done help" -f -a "priority" -d 'Put a queued task at another level: low, normal, high or critical'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list describe read attach retry priority close prune send done help" -f -a "close" -d 'Close a task\'s pane (and with --remove-worktree its worktree), or an orphaned agent'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list describe read attach retry priority close prune send done help" -f -a "close" -d 'Close tasks\' panes (and with --remove-worktree their worktrees), or orphaned agents'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list describe read attach retry priority close prune send done help" -f -a "prune" -d 'Delete old finished tasks; their items stay seen'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list describe read attach retry priority close prune send done help" -f -a "send" -d 'Type text or press keys in a live task\'s agent, to answer what it is waiting on'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list describe read attach retry priority close prune send done help" -f -a "done" -d 'Mark a task done, its pane to close after close_done_after; an agent may end its own'
@@ -128,8 +128,8 @@ complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from priority" -l json -d 'Print as a JSON object'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from priority" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from close" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
-complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from close" -l remove-worktree -d 'Remove the task\'s worktree too (refused if it has uncommitted changes)'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from close" -l json -d 'Print as a JSON object'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from close" -l remove-worktree -d 'Remove each task\'s worktree too (refused if it has uncommitted changes)'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from close" -l json -d 'Print as a JSON object, or an array of them for several tasks'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from close" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from prune" -l older-than -d 'Only tasks that finished longer ago than this (30m, 12h, 3d)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from prune" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
@@ -156,7 +156,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "attach" -d 'Attach to a task\'s agent terminal (ctrl+b q detaches); a closed Claude task\'s session reopens in a new pane'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "retry" -d 'Re-dispatch a failed or stale task as a new task (retry_of points back)'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "priority" -d 'Put a queued task at another level: low, normal, high or critical'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "close" -d 'Close a task\'s pane (and with --remove-worktree its worktree), or an orphaned agent'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "close" -d 'Close tasks\' panes (and with --remove-worktree their worktrees), or orphaned agents'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "prune" -d 'Delete old finished tasks; their items stay seen'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "send" -d 'Type text or press keys in a live task\'s agent, to answer what it is waiting on'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "done" -d 'Mark a task done, its pane to close after close_done_after; an agent may end its own'
@@ -520,7 +520,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "attach" -d 'Attach to a task\'s agent terminal (ctrl+b q detaches); a closed Claude task\'s session reopens in a new pane'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "retry" -d 'Re-dispatch a failed or stale task as a new task (retry_of points back)'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "priority" -d 'Put a queued task at another level: low, normal, high or critical'
-complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "close" -d 'Close a task\'s pane (and with --remove-worktree its worktree), or an orphaned agent'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "close" -d 'Close tasks\' panes (and with --remove-worktree their worktrees), or orphaned agents'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "prune" -d 'Delete old finished tasks; their items stay seen'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "send" -d 'Type text or press keys in a live task\'s agent, to answer what it is waiting on'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "done" -d 'Mark a task done, its pane to close after close_done_after; an agent may end its own'

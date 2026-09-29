@@ -1,0 +1,36 @@
+# cargo-mutants (https://mutants.rs): `make mutants` and `make mutants-diff`.
+# Coverage says a line ran; a mutant that survives says no test would notice
+# that line being wrong. These are the modules where a silent break reaches
+# users: the transport, the head, dispatch and config. machine.rs and
+# daemon.rs stay out for now: big, timing-bound, and `make test-machine`
+# already hammers the actor.
+examine_globs = [
+    "src/herdr/transport.rs",
+    "src/ssh.rs",
+    "src/head.rs",
+    "src/bridge.rs",
+    "src/dispatch.rs",
+    "src/config/**/*.rs",
+]
+
+# Matched against the mutant's name, e.g.
+# `src/config/flock.rs:167:9: replace <impl Display for FlockNumber>::fmt ...`.
+# Debug and Display output is for people, not for callers, so a test pinning
+# it would only pin wording. Log lines need no rule: cargo-mutants does not
+# mutate inside macro calls, so `tracing::warn!(...)` is never touched.
+#
+# An equivalent mutant (one no test can tell apart from the original) is
+# skipped where it stands with `#[cfg_attr(test, mutants::skip)]` and a
+# comment saying why, not with a line here: a regex on a function name or a
+# line number drifts from the code it means.
+exclude_re = [
+    "<impl (std::)?(fmt::)?(Debug|Display) for ",
+    "::fmt -> ",
+]
+
+# The whole suite takes about a minute, most of it tests/cli.rs and
+# tests/watch.rs, which drive real pastor and fake-herdr processes and wait
+# on them. A mutant that makes the daemon hang would otherwise hold a job
+# for the default five baselines; three still leaves room for a loaded host
+# running several jobs at once.
+timeout_multiplier = 3.0

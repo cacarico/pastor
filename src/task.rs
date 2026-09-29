@@ -217,6 +217,15 @@ pub struct DispatchSpec {
     /// is `ask`, so a spec from before it reads as `ask`.
     #[serde(default, skip_serializing_if = "SummaryMode::is_ask")]
     pub summary: SummaryMode,
+    /// The directory dispatch started a repo-less task in
+    /// (`dispatch::no_repo_dir`): `~/pastor-tasks`, or the machine's home if
+    /// that folder could not be made. Recorded so `pastor task attach` and a
+    /// paused task's resume both go back to the same place rather than
+    /// asking again, which can answer differently once the folder is fixed.
+    /// `None` for a task with a `repo`, and on a task from before this field
+    /// existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 /// The label template a task's own workspace gets when no layer sets one.
@@ -1192,7 +1201,7 @@ pub fn next_state(task: &Task, observed: &Observed) -> Option<TaskState> {
                     // `agent.start`; treat it as running, the same target a
                     // successful dispatch would have recorded, rather than leaving
                     // it stuck as `Starting` forever (stale only covers
-                    // Running/Blocked).
+                    // Running).
                     Running
                 } else {
                     return None;
@@ -1351,6 +1360,7 @@ pub(crate) mod tests {
                 session_id: None,
                 label: Default::default(),
                 summary: Default::default(),
+                cwd: None,
             },
             machine: Some("pi-1".into()),
             workspace_id: Some("w1".into()),

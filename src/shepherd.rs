@@ -26,7 +26,9 @@ use crate::daemon::{Answer, Daemon, Fleet, answer_on, jobs_answer};
 use crate::events::{EventRecord, EventsPage};
 use crate::head::RemoteHead;
 use crate::herdr::{Connector, Endpoint};
-use crate::ipc::{IPC_PROTOCOL, IpcRequest, IpcResponse, SHEPHERD_ROLE, request_line};
+use crate::ipc::{
+    IPC_PROTOCOL, IpcRequest, IpcResponse, ProtocolGate, SHEPHERD_ROLE, request_line,
+};
 use crate::machine::{MachineHandle, MachineSettings, PastorEvent};
 use crate::scheduler::{ConfigFingerprint, Scheduler, SchedulerHandle};
 use crate::store::Store;
@@ -54,10 +56,10 @@ pub type Ask = Arc<
         + Sync,
 >;
 
-/// `Ask` over ssh to `head`, through `pastor bridge` there.
+/// `Ask` over ssh to `head`, through `pastor bridge` there, `gated`.
 pub fn ask_remote(head: RemoteHead) -> Ask {
     let head = Arc::new(head);
-    Arc::new(move |req| {
+    gated(Arc::new(move |req| {
         let head = head.clone();
         Box::pin(async move {
             let line = request_line(&req, None)?;
@@ -66,6 +68,21 @@ pub fn ask_remote(head: RemoteHead) -> Ask {
                 Ok(resp) => Ok(resp),
                 Err(err) => Err(crate::head::failure(&err)),
             }
+        })
+    }))
+}
+
+/// `ask` that refuses a request the head is too old for, `head_too_old`,
+/// before it is sent: the job submits, claims, reports and event reads a
+/// headless serve sends get the check the CLI's requests get
+/// (`ipc::ProtocolGate`), with one ping per `PONG_FRESH` at most.
+pub fn gated(ask: Ask) -> Ask {
+    let gate = Arc::new(ProtocolGate::default());
+    Arc::new(move |req| {
+        let (ask, gate) = (ask.clone(), gate.clone());
+        Box::pin(async move {
+            gate.check(&req, ask(IpcRequest::Ping)).await?;
+            ask(req).await
         })
     })
 }
@@ -866,6 +883,7 @@ mod tests {
                 session_id: None,
                 label: Default::default(),
                 summary: Default::default(),
+                cwd: None,
             },
             flock: None,
             agent: None,
@@ -1066,7 +1084,7 @@ mod tests {
             })
         });
         let store = Arc::new(Store::open_in_memory().unwrap());
-        let fleet = Fleet::headless(store, old_head);
+        let fleet = Fleet::headless(store, gated(old_head));
         let job = crate::config::job::Job::parse(
             "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprofile = \"ci\"\nprompt = \"p\"\n",
             "x",
@@ -1102,7 +1120,7 @@ mod tests {
             })
         });
         let store = Arc::new(Store::open_in_memory().unwrap());
-        let fleet = Fleet::headless(store, old_head);
+        let fleet = Fleet::headless(store, gated(old_head));
         let job = crate::config::job::Job::parse(
             "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\npreempt = true\nprompt = \"p\"\n",
             "x",
@@ -1137,7 +1155,7 @@ mod tests {
             })
         });
         let store = Arc::new(Store::open_in_memory().unwrap());
-        let fleet = Fleet::headless(store, old_head);
+        let fleet = Fleet::headless(store, gated(old_head));
         let job = crate::config::job::Job::parse(
             "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nlabel = \"{{ item.key }}\"\nprompt = \"p\"\n",
             "x",
@@ -1154,5 +1172,68 @@ mod tests {
             Some("head_too_old"),
             "{err}"
         );
+    }
+
+    /// A head at `protocol` that records each request's op and answers every
+    /// one with its pong.
+    fn pong_head(protocol: u32) -> (Ask, Arc<std::sync::Mutex<Vec<String>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let ask: Ask = Arc::new(move |req| {
+            let log = log.clone();
+            Box::pin(async move {
+                let op = serde_json::to_value(&req).unwrap()["op"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                log.lock().unwrap().push(op);
+                Ok(IpcResponse::Pong {
+                    version: "0.5.0".into(),
+                    protocol,
+                    role: None,
+                })
+            })
+        });
+        (ask, seen)
+    }
+
+    /// The claim a pull machine sends each tick is checked like any CLI
+    /// request: a head from before pull machines gets only the ping, and
+    /// the claim is refused `head_too_old` naming them.
+    #[tokio::test]
+    async fn a_claim_refuses_a_head_that_predates_pull_machines() {
+        let (head, seen) = pong_head(crate::ipc::PULL_PROTOCOL - 1);
+        let err = gated(head)(IpcRequest::TaskClaim {
+            machine: "m".into(),
+            free_slots: 1,
+            flock_work: false,
+        })
+        .await
+        .unwrap_err();
+        let err = err.downcast_ref::<CliError>().unwrap();
+        assert_eq!(err.code, "head_too_old");
+        assert!(err.message.contains("pull machines"), "{}", err.message);
+        assert_eq!(*seen.lock().unwrap(), ["ping"]);
+    }
+
+    /// A job naming a model, a profile and a label is checked with one
+    /// ping, and a head new enough for all three gets the submit.
+    #[tokio::test]
+    async fn submit_to_head_pings_once() {
+        let (head, seen) = pong_head(crate::ipc::IPC_PROTOCOL);
+        let fleet = Fleet::headless(Arc::new(Store::open_in_memory().unwrap()), gated(head));
+        let job = crate::config::job::Job::parse(
+            "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprofile = \"ci\"\nlabel = \"x\"\npreempt = true\nprompt = \"p\"\n",
+            "x",
+            &crate::config::Defaults::default(),
+            &crate::connector::Builtins,
+        )
+        .unwrap();
+        // The fake head answers the submit with a pong, which is not what a
+        // submit gets back: only what was sent matters here.
+        let _ = fleet
+            .submit_to_head(&job, vec![serde_json::json!({})])
+            .await;
+        assert_eq!(*seen.lock().unwrap(), ["ping", "job_submit"]);
     }
 }

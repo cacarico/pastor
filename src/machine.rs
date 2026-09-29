@@ -1901,6 +1901,7 @@ impl Actor {
     /// A done task that was just given more to do runs again. The baseline
     /// stays at the idle it was done at and `activity_seen` stays clear, as
     /// `apply` left them, so the agent's next turn is what marks it done.
+    /// Its timeout counts from now, as a resume's does.
     /// A row that moved on meanwhile (closed, or picked up by an event) is
     /// left as it is.
     fn reopen(&mut self, task: Task) -> anyhow::Result<Task> {
@@ -1910,6 +1911,7 @@ impl Actor {
                 return false;
             }
             t.state = TaskState::Running;
+            t.started_at = Some(Utc::now());
             t.finished_at = None;
             // The agent said it was finished; it has more to do now. An
             // ended task may have seen work after `task done` (the rest of
@@ -2854,6 +2856,12 @@ impl Actor {
                     if !still_pending(t) {
                         return false;
                     }
+                    if t.state == TaskState::Blocked {
+                        // Same as `apply`: a startup block cleared past the
+                        // old deadline gets a fresh timeout, not one already
+                        // spent waiting for a person.
+                        t.started_at = Some(Utc::now());
+                    }
                     t.prompt_pending = false;
                     t.state = TaskState::Running;
                     t.error = None;
@@ -3255,6 +3263,12 @@ impl Actor {
             // a state the task has left; it is not an error on a running task.
             task.error = None;
         }
+        if from == TaskState::Blocked && to == TaskState::Running {
+            // The timeout counts the agent's own time, not a person's: a
+            // block cleared past the old deadline must not read as already
+            // timed out the moment it starts working again.
+            task.started_at = Some(Utc::now());
+        }
         if to == TaskState::Failed && task.error.is_none() {
             task.error = Some("agent process exited".into());
         }
@@ -3399,17 +3413,25 @@ impl Actor {
                     {
                         continue;
                     }
+                    // Only a running task times out, counted from its latest
+                    // start (dispatch, resume or reopen): a blocked one waits for
+                    // a person, not for its agent. That includes one this list is
+                    // the first to show blocked (a missed event): `apply` below
+                    // marks it so.
                     let timed_out = task
                         .started_at
                         .map(|s| (Utc::now() - s).num_seconds() as u64 > task.spec.timeout_secs)
                         .unwrap_or(false);
-                    if timed_out && matches!(task.state, TaskState::Running | TaskState::Blocked) {
+                    if timed_out
+                        && task.state == TaskState::Running
+                        && agent.agent_status != crate::herdr::AgentStatus::Blocked
+                    {
                         let written = write_task(&self.store, task, |t| {
-                            let open = matches!(t.state, TaskState::Running | TaskState::Blocked);
-                            if open {
+                            let running = t.state == TaskState::Running;
+                            if running {
                                 t.state = TaskState::Stale;
                             }
-                            open
+                            running
                         });
                         match written {
                             Ok(Some(t)) => self.emit("task.stale", Some(t.id)),
@@ -3657,6 +3679,7 @@ mod tests {
             session_id: None,
             label: Default::default(),
             summary: Default::default(),
+            cwd: None,
         }
     }
 
@@ -4271,6 +4294,44 @@ mod tests {
             format!("hi\n\n{}", crate::task::SUMMARY_ASK),
             "our prompt, not a stray one, asking for a summary"
         );
+    }
+
+    /// A startup block cleared past the old deadline gets a fresh timeout
+    /// too: `deliver_pending_prompt` takes the same branch `apply` does for
+    /// a later block, not the time spent waiting for a person at launch.
+    #[tokio::test]
+    async fn a_startup_block_cleared_past_its_timeout_gets_fresh_time() {
+        let fake = FakeHerdr::new();
+        fake.set_ready_after(Duration::from_secs(2));
+        let watcher = fake.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Some(a) = watcher.agents().first() {
+                    watcher.set_status(&a.pane_id, AgentStatus::Blocked);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task_timing_out(&store).id).await.unwrap();
+        assert_eq!(t.state, TaskState::Blocked);
+        assert!(t.prompt_pending);
+        start_an_hour_ago(&store, t.id);
+        fake.set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Idle);
+        wait_for("running with the prompt sent", || {
+            let t = store.get_task(t.id).unwrap().unwrap();
+            t.state == TaskState::Running && !t.prompt_pending
+        })
+        .await;
+        // Some reconciles later, within the new timeout, not the old one.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
     }
 
     /// A store error in reconcile is pastor's problem, not the machine's: the
@@ -8175,6 +8236,180 @@ mod tests {
         assert_eq!(t.state, TaskState::Running);
         wait_for("stale", || state_of(&store, t.id) == TaskState::Stale).await;
         assert_eq!(fake.agents().len(), 1, "nothing was killed");
+    }
+
+    /// A task with a one-second timeout, as `stale_after_timeout` makes.
+    fn new_task_timing_out(store: &Store) -> Task {
+        store
+            .insert_task(NewTask {
+                description: None,
+                job: "run".into(),
+                item: serde_json::Value::Null,
+                prompt: "hi".into(),
+                spec: DispatchSpec {
+                    timeout_secs: 1,
+                    ..spec()
+                },
+                flock: "default".into(),
+            })
+            .unwrap()
+    }
+
+    /// Moves a task's start an hour back, well past its timeout, retrying
+    /// when the actor wrote the row in between.
+    fn start_an_hour_ago(store: &Store, id: i64) {
+        loop {
+            let mut t = store.get_task(id).unwrap().unwrap();
+            t.started_at = Some(Utc::now() - chrono::Duration::hours(1));
+            match store.update_task(&mut t) {
+                Ok(()) => return,
+                Err(err) if err.downcast_ref::<crate::store::Conflict>().is_some() => {}
+                Err(err) => panic!("{err:#}"),
+            }
+        }
+    }
+
+    /// The timeout counts from the latest start: a done task given more to
+    /// do after its timeout runs again, and is not stale on the next
+    /// reconcile.
+    #[tokio::test]
+    async fn a_done_task_sent_more_work_after_its_timeout_runs() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task_timing_out(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+        start_an_hour_ago(&store, t.id);
+        let before = Utc::now();
+        let sent = h
+            .send(
+                t.id,
+                SendInput {
+                    text: Some("one more thing".into()),
+                    enter: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(sent.state, TaskState::Running);
+        assert!(sent.started_at.unwrap() >= before, "the reopen restarts it");
+        fake.set_status(&pane, AgentStatus::Working);
+        // Some reconciles later, within the new timeout.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+    }
+
+    /// A paused task never goes stale, however long it waits, and a resumed
+    /// one counts its timeout from the resume.
+    #[tokio::test]
+    async fn a_paused_task_is_never_stale_and_a_resumed_one_counts_from_its_resume() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let mut t = new_task_timing_out(&store);
+        t.state = TaskState::Paused;
+        t.machine = Some("m".into());
+        t.spec.session_id = crate::task::new_session_id();
+        t.started_at = Some(Utc::now() - chrono::Duration::hours(1));
+        store.update_task(&mut t).unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Paused);
+        let before = Utc::now();
+        let t = h.resume(t.id).await.unwrap();
+        assert_eq!(t.state, TaskState::Running);
+        assert!(t.started_at.unwrap() >= before, "the resume restarts it");
+        fake.set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Working);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+        wait_for("stale", || state_of(&store, t.id) == TaskState::Stale).await;
+    }
+
+    /// A blocked task waits for a person, not for its agent: past its
+    /// timeout it stays blocked.
+    #[tokio::test]
+    async fn a_blocked_task_past_its_timeout_stays_blocked() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task_timing_out(&store).id).await.unwrap();
+        fake.set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Blocked);
+        wait_for("blocked", || state_of(&store, t.id) == TaskState::Blocked).await;
+        start_an_hour_ago(&store, t.id);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Blocked);
+    }
+
+    /// A block cleared past the old deadline gets a fresh timeout: the time
+    /// spent waiting for a person does not count against it.
+    #[tokio::test]
+    async fn a_block_cleared_past_its_timeout_gets_fresh_time() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task_timing_out(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Blocked);
+        wait_for("blocked", || state_of(&store, t.id) == TaskState::Blocked).await;
+        start_an_hour_ago(&store, t.id);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            state_of(&store, t.id),
+            TaskState::Blocked,
+            "still waiting on a person"
+        );
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+        // Some reconciles later, within the new timeout, not the old one.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+    }
+
+    /// A running task past its timeout that a reconcile is the first to see
+    /// blocked (its event was missed) is blocked, not stale.
+    #[tokio::test]
+    async fn a_task_first_listed_blocked_past_its_timeout_is_blocked() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task_timing_out(&store).id).await.unwrap();
+        // Blocked first: a reconcile between the two would see a running task
+        // past its timeout that is not blocked, which is stale.
+        fake.set_status_silently(t.pane_id.as_deref().unwrap(), AgentStatus::Blocked);
+        start_an_hour_ago(&store, t.id);
+        wait_for("blocked", || state_of(&store, t.id) != TaskState::Running).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Blocked);
+    }
+
+    /// A stale task whose agent finishes after all is done, through the
+    /// actor, and `task.stale` went out once, not on every reconcile.
+    #[tokio::test]
+    async fn a_stale_task_whose_agent_completes_is_done() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task_timing_out(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("stale", || state_of(&store, t.id) == TaskState::Stale).await;
+        // Some reconciles while stale.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Stale);
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+        let mut stale = 0;
+        loop {
+            match events.try_recv() {
+                Ok(ev) if ev.kind == "task.stale" => stale += 1,
+                Ok(_) => {}
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(err) => panic!("{err}"),
+            }
+        }
+        assert_eq!(stale, 1);
     }
 
     /// Every request is served by the fake except `events.subscribe`, which gets

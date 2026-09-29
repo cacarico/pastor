@@ -139,6 +139,11 @@ pub enum MoveError {
     NotFound(i64),
     #[error("t-{id} is {state}; only queued tasks have a place in the queue")]
     NotQueued { id: i64, state: TaskState },
+    /// A dispatch pass placed it and is sending it to a machine
+    /// (`Fleet::in_flight`): the row still says queued, but the move would
+    /// not change where it goes.
+    #[error("t-{0} is being sent to a machine; only queued tasks have a place in the queue")]
+    InFlight(i64),
     #[error(transparent)]
     Store(#[from] anyhow::Error),
 }
@@ -175,6 +180,10 @@ pub enum PriorityError {
     NotFound(i64),
     #[error("t-{id} is {state}; only a queued task's priority can change")]
     NotQueued { id: i64, state: TaskState },
+    /// As `MoveError::InFlight`: the pass already decided on the old level
+    /// and `preempt`, so the change would be reported but not applied.
+    #[error("t-{0} is being sent to a machine; only a queued task's priority can change")]
+    InFlight(i64),
     #[error(transparent)]
     Store(#[from] anyhow::Error),
 }
@@ -1170,8 +1179,17 @@ impl Store {
     /// positions they held between them in their new order, so the moved
     /// one sits between its neighbours and a new task, placed by its id,
     /// still queues last. Refused unless both it and the task it is moved
-    /// before or after are queued.
-    pub fn move_queued(&self, id: i64, spot: QueueSpot) -> Result<Moved, MoveError> {
+    /// before or after are queued. `exclude` (a dispatch pass's in-flight
+    /// task ids, `Fleet::in_flight`) drops those rows from the queue this
+    /// works out positions and levels from, and from being a valid `before`
+    /// or `after`: their row still says `queued`, but they are on their way
+    /// out of it, and `--to`'s position must not count them either.
+    pub fn move_queued(
+        &self,
+        id: i64,
+        spot: QueueSpot,
+        exclude: &[i64],
+    ) -> Result<Moved, MoveError> {
         let now = Utc::now().to_rfc3339();
         let mut conn = self.conn.lock().recover();
         let tx = conn.transaction()?;
@@ -1186,7 +1204,11 @@ impl Store {
             })?;
             rows.collect::<Result<_, _>>()?
         };
+        queue.retain(|(qid, ..)| !exclude.contains(qid));
         let refusal = |tx: &rusqlite::Transaction, id: i64| -> MoveError {
+            if exclude.contains(&id) {
+                return MoveError::InFlight(id);
+            }
             let state: rusqlite::Result<Option<String>> = tx
                 .query_row("SELECT state FROM tasks WHERE id = ?1", params![id], |r| {
                     r.get(0)
@@ -1764,6 +1786,7 @@ mod tests {
             session_id: None,
             label: Default::default(),
             summary: Default::default(),
+            cwd: None,
         }
     }
 
@@ -3129,20 +3152,20 @@ mod tests {
             .map(|_| s.insert_task(new_task("run")).unwrap().id)
             .collect();
         let [a, b, c, d] = ids[..] else { panic!() };
-        let m = s.move_queued(d, Before(b)).unwrap();
+        let m = s.move_queued(d, Before(b), &[]).unwrap();
         assert_eq!((m.pos, m.of, m.was), (2, 4, N));
         assert_eq!(m.task.priority, N);
         assert_eq!(m.task.priority_from, None, "the level did not change");
         assert_eq!(queue_of(&s), [(a, N), (d, N), (b, N), (c, N)]);
-        let m = s.move_queued(a, After(c)).unwrap();
+        let m = s.move_queued(a, After(c), &[]).unwrap();
         assert_eq!(m.pos, 4);
         assert_eq!(queue_of(&s), [(d, N), (b, N), (c, N), (a, N)]);
-        s.move_queued(c, To(1)).unwrap();
+        s.move_queued(c, To(1), &[]).unwrap();
         assert_eq!(queue_of(&s), [(c, N), (d, N), (b, N), (a, N)]);
-        let m = s.move_queued(c, To(99)).unwrap();
+        let m = s.move_queued(c, To(99), &[]).unwrap();
         assert_eq!(m.pos, 4, "past the end is last");
         assert_eq!(queue_of(&s), [(d, N), (b, N), (a, N), (c, N)]);
-        let m = s.move_queued(b, Before(b)).unwrap();
+        let m = s.move_queued(b, Before(b), &[]).unwrap();
         assert_eq!(m.pos, 2, "before itself stays put");
         assert_eq!(queue_of(&s), [(d, N), (b, N), (a, N), (c, N)]);
         let e = s.insert_task(new_task("run")).unwrap().id;
@@ -3175,20 +3198,20 @@ mod tests {
         let high = at(High);
         let normal = at(Normal);
         let low = at(Low);
-        let m = s.move_queued(normal, Before(high)).unwrap();
+        let m = s.move_queued(normal, Before(high), &[]).unwrap();
         assert_eq!((m.was, m.task.priority, m.pos), (Normal, High, 2));
         assert_eq!(m.task.priority_from.as_deref(), Some("queue move"));
         assert_eq!(
             queue_of(&s),
             [(crit, Critical), (normal, High), (high, High), (low, Low)]
         );
-        let m = s.move_queued(high, After(low)).unwrap();
+        let m = s.move_queued(high, After(low), &[]).unwrap();
         assert_eq!((m.was, m.task.priority, m.pos), (High, Low, 4));
         assert_eq!(
             queue_of(&s),
             [(crit, Critical), (normal, High), (low, Low), (high, Low)]
         );
-        let m = s.move_queued(low, Top).unwrap();
+        let m = s.move_queued(low, Top, &[]).unwrap();
         assert_eq!((m.was, m.task.priority, m.pos), (Low, Critical, 1));
         assert_eq!(
             queue_of(&s),
@@ -3199,11 +3222,11 @@ mod tests {
                 (high, Low)
             ]
         );
-        let m = s.move_queued(low, Top).unwrap();
+        let m = s.move_queued(low, Top, &[]).unwrap();
         assert_eq!((m.was, m.task.priority, m.pos), (Critical, Critical, 1));
         // Behind a lower task at the very end lowers too, but between two
         // of its own level it stays.
-        let m = s.move_queued(crit, To(4)).unwrap();
+        let m = s.move_queued(crit, To(4), &[]).unwrap();
         assert_eq!((m.was, m.task.priority), (Critical, Low));
         assert_eq!(
             queue_of(&s),
@@ -3225,7 +3248,7 @@ mod tests {
             })
             .unwrap()
             .id;
-        let m = s.move_queued(work, Before(home)).unwrap();
+        let m = s.move_queued(work, Before(home), &[]).unwrap();
         assert_eq!(m.pos, 1);
         assert_eq!(m.task.flock.as_deref(), Some("work"));
         assert_eq!(
@@ -3243,24 +3266,51 @@ mod tests {
         let taken = s.insert_task(new_task("run")).unwrap().id;
         let q = s.insert_task(new_task("run")).unwrap().id;
         s.claim_task(taken, "m").unwrap().unwrap();
-        match s.move_queued(taken, Top) {
+        match s.move_queued(taken, Top, &[]) {
             Err(MoveError::NotQueued { id, state }) => {
                 assert_eq!((id, state), (taken, TaskState::Starting))
             }
             other => panic!("{other:?}"),
         }
-        match s.move_queued(q, Before(taken)) {
+        match s.move_queued(q, Before(taken), &[]) {
             Err(MoveError::NotQueued { id, .. }) => assert_eq!(id, taken),
             other => panic!("{other:?}"),
         }
         assert!(matches!(
-            s.move_queued(99, Top),
+            s.move_queued(99, Top, &[]),
             Err(MoveError::NotFound(99))
         ));
         assert!(matches!(
-            s.move_queued(q, After(98)),
+            s.move_queued(q, After(98), &[]),
             Err(MoveError::NotFound(98))
         ));
+    }
+
+    /// `exclude` (a dispatch pass's in-flight ids) drops those rows from
+    /// the queue a move works out positions and levels from, even though
+    /// their row still says `queued`: naming one `--before` or `--after`
+    /// is refused as `InFlight`, as if it had already left the queue, and
+    /// `--to` does not count it toward a position.
+    #[test]
+    fn move_queued_excludes_in_flight_tasks() {
+        use crate::queue::QueueSpot::*;
+        let s = Store::open_in_memory().unwrap();
+        let a = s.insert_task(new_task("run")).unwrap().id;
+        let flighty = s.insert_task(new_task("run")).unwrap().id;
+        let c = s.insert_task(new_task("run")).unwrap().id;
+        assert!(matches!(
+            s.move_queued(a, Before(flighty), &[flighty]),
+            Err(MoveError::InFlight(id)) if id == flighty
+        ));
+        assert!(matches!(
+            s.move_queued(a, After(flighty), &[flighty]),
+            Err(MoveError::InFlight(id)) if id == flighty
+        ));
+        // With `flighty` excluded, the queue `--to` counts over is just
+        // [a, c]: position 2 is last, not `of` 3 with `flighty` still in it.
+        let m = s.move_queued(c, To(2), &[flighty]).unwrap();
+        assert_eq!(m.task.id, c);
+        assert_eq!((m.pos, m.of), (2, 2));
     }
 
     /// Only a queued task's level changes; the refusal names the state.

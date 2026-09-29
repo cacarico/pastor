@@ -129,7 +129,7 @@ pub struct Orchestrator {
     pub skill: Option<String>,
     pub prompt: String,
     /// The repo its agents work in, each in a worktree of its own; `None`
-    /// starts them in the home directory.
+    /// starts them in `~/pastor-tasks`, as any task with no repo.
     pub repo: Option<String>,
     /// The directory of its file: scripts' paths are relative to it, and an
     /// `.env` there is read into their environment.
@@ -1639,6 +1639,7 @@ impl Runner {
             session_id: None,
             label: Default::default(),
             summary: Default::default(),
+            cwd: None,
         };
         let task = self
             .fleet
@@ -2040,7 +2041,11 @@ impl Runner {
                 },
                 s if s.occupies_pane() => {
                     match t.machine.as_deref().and_then(|m| self.fleet.get(m)) {
-                        Some(h) => h.close(t.id, false).await.map(|_| ()),
+                        Some(h) => self
+                            .fleet
+                            .bounded(&h.name, h.close(t.id, false))
+                            .await
+                            .map(|_| ()),
                         None => self.store.close_task(t.id).map(|_| ()),
                     }
                 }
@@ -2942,6 +2947,7 @@ prompt = "You are the night orchestrator."
                         session_id: None,
                         label: Default::default(),
                         summary: Default::default(),
+                        cwd: None,
                     },
                     flock: "default".into(),
                 },

@@ -14,7 +14,7 @@ Plan work so that pastor can run it, one task after another, on machines where n
 
 ## Why this is different from a normal plan
 
-A pastor task gets its prompt and nothing else. Nobody answers its questions: a question leaves it `blocked` until someone happens to attach. `done` means the agent went idle, not that the work is good. After `close_done_after` pastor removes a clean worktree, so **the pushed branch is the only state that survives**. A task that has not pushed has not finished.
+A pastor task gets its prompt and nothing else. Nobody answers its questions: a question leaves it `blocked` until someone happens to attach. `done` means the agent went idle, not that the work is good. After `close_done_after` pastor removes a clean worktree and keeps one with unpushed work, but no later task sees it, so **the pushed branch is the only state that reaches the next task**. A task that has not pushed has not finished.
 
 So every task in the plan must:
 
@@ -43,7 +43,7 @@ Never run `pastor task run` from this skill. Planning has no side effects on the
 
 ## Model per task
 
-pastor passes the model to Claude with `--agent-arg --model --agent-arg <alias>`. Name it on every task; do not rely on defaults. The aliases below are the ones `claude --help` documents for `--model` (`fable`, `opus`, `sonnet`), each naming the latest model of its family. If the Claude Code on the flock is older and rejects an alias, use the full model id instead, such as `claude-fable-5-1`.
+Name the model on every task with `--model <name>`, a name from `[models]` in the head's `pastor.toml`; do not rely on defaults. Leave `--agent` out unless the task needs another kind of agent: `--agent claude` would replace the agent the flock picks, which may be a definition that runs Claude on another account, and `--agent-arg --model` would add a second `--model` to a flock's own model. The names below assume `[models]` has `fable`, `opus` and `sonnet`; if it names them otherwise, use its names and say so in the plan header. A name `[models]` lacks is refused with `unknown_model`.
 
 | Task shape | Model | Why |
 |---|---|---|
@@ -51,7 +51,7 @@ pastor passes the model to Claude with `--agent-arg --model --agent-arg <alias>`
 | Several files, integration, following existing patterns | `opus` | Judgment across files; a wrong guess costs a retry on a remote machine. |
 | Investigation, root cause, unknown scope | `fable` | Long unattended sessions that verify often; a wrong answer costs the most here. |
 
-`sonnet` is the floor. A cheaper model takes more turns, and with nobody watching an agent that stalls becomes a `stale` or `blocked` task and a human's time. If the user's flock runs a different agent, use that agent's own model flag and say so in the plan header.
+`sonnet` is the floor. A cheaper model takes more turns, and with nobody watching an agent that stalls becomes a `stale` or `blocked` task and a human's time. If the user's flock runs a different agent, use the `[models]` name for that agent's model and say so in the plan header.
 
 ## Timeouts
 
@@ -80,7 +80,7 @@ And for the plan as a whole:
 | Thought | Reality |
 |---|---|
 | "The agent can ask if it gets stuck." | Nobody is there. It goes `blocked` and waits for hours. |
-| "It will obviously push when done." | Say it. A task that did not push lost its work when the worktree was removed. |
+| "It will obviously push when done." | Say it. An unpushed worktree is kept, but no later task sees it. Only the pushed branch reaches the next task. |
 | "`haiku` is enough for this." | Extra turns unattended cost more than the tokens saved. `sonnet` is the floor. |
 | "Two tasks can share one branch name." | The previous task's worktree may still hold it. One `--branch` per task. |
 | "I'll run the first task to check it works." | This skill plans. The user starts the tasks. |
