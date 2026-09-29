@@ -1776,6 +1776,21 @@ impl Fleet {
         Ok(())
     }
 
+    /// The live limit that stops `agent` running `model` on `machine` at
+    /// `now`, if one does.
+    pub fn limit_holding(
+        &self,
+        machine: &str,
+        agent: &str,
+        model: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<AccountLimit> {
+        let key = self.agents.read().recover().limit_key(machine, agent);
+        self.live_limits(now)
+            .into_iter()
+            .find(|l| l.account == key && l.stops(model))
+    }
+
     /// `[limits]` as last applied.
     pub fn limits_config(&self) -> LimitsConfig {
         self.limits.read().recover().clone()
