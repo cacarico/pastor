@@ -27,6 +27,7 @@ pub mod setup;
 pub mod shepherd;
 pub mod ssh;
 pub mod store;
+pub mod sync;
 pub mod task;
 pub mod task_cli;
 pub mod template;
