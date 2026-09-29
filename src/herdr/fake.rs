@@ -80,6 +80,8 @@ struct State {
     home: Option<String>,
     /// Paths `Connector::dir_exists` reports missing; every other path exists.
     missing_dirs: HashSet<String>,
+    /// Paths `Connector::file_exists` reports as files; no other path is.
+    files: HashSet<String>,
     /// Checkouts, by path, holding commits that are on no remote: what
     /// `Connector::unpushed_commits` reports.
     unpushed: HashSet<String>,
@@ -237,6 +239,10 @@ impl FakeHerdr {
             .unwrap()
             .missing_dirs
             .insert(path.to_string());
+    }
+    /// `Connector::file_exists` finds a file at `path`.
+    pub fn set_file(&self, path: &str) {
+        self.state.lock().unwrap().files.insert(path.to_string());
     }
     /// `Connector::restore_worktree` finds `branch` gone.
     pub fn set_gone_branch(&self, branch: &str) {
@@ -1225,6 +1231,10 @@ impl super::transport::Connector for FakeHerdr {
     }
     fn dir_exists(&self, path: &str) -> super::transport::DirFuture<'_> {
         let exists = !self.state.lock().unwrap().missing_dirs.contains(path);
+        Box::pin(async move { Ok(Some(exists)) })
+    }
+    fn file_exists(&self, path: &str) -> super::transport::DirFuture<'_> {
+        let exists = self.state.lock().unwrap().files.contains(path);
         Box::pin(async move { Ok(Some(exists)) })
     }
     /// Makes `path` unless it is unmakeable; it exists from then on.

@@ -325,6 +325,13 @@ pub trait Connector: Send + Sync {
     fn dir_exists(&self, _path: &str) -> DirFuture<'_> {
         Box::pin(async { Ok(None) })
     }
+    /// Whether `path` is a regular file on the machine: which of a repo's
+    /// instruction files a profiled opencode task gets back
+    /// (`config::opencode::instructions_content`). `None` when it cannot be
+    /// known.
+    fn file_exists(&self, _path: &str) -> DirFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
     /// Make the directory `path` on the machine, parents too, unless it is
     /// already there: where a task with no repo starts. `Some(true)` when it
     /// is there now, `Some(false)` when it could not be made, `None` when it
@@ -377,6 +384,10 @@ impl Connector for Endpoint {
     fn dir_exists(&self, path: &str) -> DirFuture<'_> {
         let path = path.to_string();
         Box::pin(async move { dir_exists(self, &path).await })
+    }
+    fn file_exists(&self, path: &str) -> DirFuture<'_> {
+        let path = path.to_string();
+        Box::pin(async move { file_exists(self, &path).await })
     }
     fn ensure_dir(&self, path: &str) -> DirFuture<'_> {
         let path = path.to_string();
@@ -435,6 +446,25 @@ async fn dir_exists(ep: &Endpoint, path: &str) -> Result<Option<bool>, ConnectEr
             // to this machine and start the master.
             ensure_control_dir(control_path.as_deref())?;
             let argv = ssh_argv_running(target, control_path.as_deref(), remote_dir_command(path));
+            let out = probe_output(&argv).await?;
+            remote_dir_answer(target, &out)
+        }
+        // An arbitrary bridge command says nothing about where it lands.
+        Endpoint::Command { .. } => Ok(None),
+    }
+}
+
+async fn file_exists(ep: &Endpoint, path: &str) -> Result<Option<bool>, ConnectError> {
+    match ep {
+        // The head and this herdr share a machine, and so a filesystem.
+        Endpoint::Local { .. } => Ok(Some(std::path::Path::new(path).is_file())),
+        Endpoint::Ssh {
+            target,
+            control_path,
+            ..
+        } => {
+            ensure_control_dir(control_path.as_deref())?;
+            let argv = ssh_argv_running(target, control_path.as_deref(), remote_file_command(path));
             let out = probe_output(&argv).await?;
             remote_dir_answer(target, &out)
         }
@@ -688,6 +718,14 @@ fn remote_pastor_version(
 fn remote_dir_command(path: &str) -> String {
     format!(
         "if test -d {}; then printf yes; else printf no; fi",
+        shell_quote(path)
+    )
+}
+
+/// `test -f` on the machine, answered like `remote_dir_command`.
+fn remote_file_command(path: &str) -> String {
+    format!(
+        "if test -f {}; then printf yes; else printf no; fi",
         shell_quote(path)
     )
 }
@@ -1044,6 +1082,32 @@ mod tests {
         assert_eq!(command.dir_exists("/").await.unwrap(), None);
     }
 
+    #[tokio::test]
+    async fn file_exists_per_endpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("AGENTS.md");
+        std::fs::write(&file, "x").unwrap();
+        let local = Endpoint::Local {
+            session: "s".into(),
+        };
+        assert_eq!(
+            local.file_exists(file.to_str().unwrap()).await.unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            local
+                .file_exists(tmp.path().to_str().unwrap())
+                .await
+                .unwrap(),
+            Some(false),
+            "a directory is not a file"
+        );
+        let command = Endpoint::Command {
+            argv: vec!["true".into()],
+        };
+        assert_eq!(command.file_exists("/").await.unwrap(), None);
+    }
+
     /// A local machine shares the head's pastor; a bridge command cannot know.
     /// The ssh command runs through `sh -c` so the PATH it adds is POSIX
     /// whatever the login shell is (fish, for one).
@@ -1163,6 +1227,14 @@ mod tests {
         assert_eq!(
             remote_dir_command("/srv/my app/it's"),
             "if test -d '/srv/my app/it'\\''s'; then printf yes; else printf no; fi"
+        );
+    }
+
+    #[test]
+    fn remote_file_command_quotes_the_path() {
+        assert_eq!(
+            remote_file_command("/srv/my app/AGENTS.md"),
+            "if test -f '/srv/my app/AGENTS.md'; then printf yes; else printf no; fi"
         );
     }
 

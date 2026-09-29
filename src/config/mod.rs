@@ -1193,7 +1193,7 @@ impl Agents {
     /// An opencode agent under a profile gets its lists in the env instead
     /// (`opencode::permission_json`), over its definition's, with the
     /// variables that would load another config emptied and the repo's
-    /// config turned off; dispatch gives it the repo's instructions back
+    /// config turned off; dispatch gives it the repo's instruction file back
     /// once it knows the checkout (`opencode::instructions_content`).
     pub fn launch(&self, spec: &crate::task::DispatchSpec) -> Result<Launch, AgentRefusal> {
         let mut env = self
