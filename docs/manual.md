@@ -89,11 +89,11 @@ instead.
 machines:
 
 ```text
-pastor 0.4.0 on desk (herdr 0.9.1), 2 machines, desk is the head of the flock
+pastor 0.8.0 on desk (herdr 0.9.1), 2 machines, desk is the head of the flock
 
 NAME  HOST       FLOCKS      PROFILE  CHANNEL    HERDR  PASTOR  AGENTS     ORPHANS  TAGS  ERROR
-desk  local      personal:2  -        connected  0.9.1  0.4.0   0/2+1j+1b  -        -
-pi-3  user@pi-3  work        develop  connected  0.9.1  0.4.0   1/2+1j+1b  -        fast
+desk  local      personal:2  -        connected  0.9.1  0.8.0   0/2+1j+1b  -        -
+pi-3  user@pi-3  work        develop  connected  0.9.1  0.8.0   1/2+1j+1b  -        fast
 ```
 
 The line names the head's pastor version, its hostname, the version of the

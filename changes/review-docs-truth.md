@@ -20,3 +20,14 @@
   keeps its flock's agent and account.
 - `make demo` stops its demo head again: it runs `pastor serve
   --foreground`, since a plain `pastor serve` forks and returns.
+- A Copilot pass over this docs review: the Tier 2 platform table no longer
+  claims every Tier 2 target goes untested, when Linux aarch64 and macOS
+  arm64 are smoke-run on release; the connector security model no longer
+  calls every connector's files and sockets the head user's, when a
+  headless serve's own connectors are the shepherd machine's; the manual's
+  refreshed `machine list` transcript no longer prints a stale pastor
+  version; the recommended setup no longer claims a permission profile
+  stops a task from ever blocking on a question, when it only silences
+  tool prompts; and the skill's remote-head section now names `task
+  attach`, `machine open` and `serve status`/`serve stop` among the
+  commands that stay local.

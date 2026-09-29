@@ -147,9 +147,11 @@ system asks before a command, the task sits `blocked` until someone answers.
   ```
 
 - **A profile** (`profile = "develop"` on a flock, or `--profile`) turns
-  Claude's prompts off and refuses whatever its lists don't allow, so a task
-  never parks on a question. Pick the narrowest: `review` for reading,
-  `develop` for changing a checkout. `pastor profile list` shows them.
+  Claude's permission prompts off and refuses whatever its lists don't
+  allow, so a task never blocks on one of those. It cannot stop the agent
+  itself from ending a turn with a question, which still parks the task
+  `blocked`. Pick the narrowest: `review` for reading, `develop` for
+  changing a checkout. `pastor profile list` shows them.
 - **opencode:** a `permission` block in `~/.config/opencode/opencode.json`
   with `"bash": {"*": "ask"}` stops every task at its first shell command.
   On a machine that runs opencode tasks, allow what those tasks run, or give

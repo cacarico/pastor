@@ -211,7 +211,7 @@ A watcher keeps a cursor under its `--name`, so one started again repeats nothin
 
 ## A head on another machine
 
-The CLI can drive a head on another machine over ssh. `pastor head set user@pi-1` saves it in `~/.config/pastor/client.toml`, `PASTOR_HEAD=<dest>` overrides that for one shell, and `--head <dest>` for one command. Every command then goes to that head, except `machine authorized-key` (`remote_head_unsupported`) and the ones that stay local on purpose: `completions`, `setup`, `head`, `bridge`, `connector` and `config edit --local`. `pastor serve` on such a machine runs headless: this machine's jobs and hooks, and the tasks the head hands it when it is a `pull = true` machine there.
+The CLI can drive a head on another machine over ssh. `pastor head set user@pi-1` saves it in `~/.config/pastor/client.toml`, `PASTOR_HEAD=<dest>` overrides that for one shell, and `--head <dest>` for one command. Most commands then go to that head, except `machine authorized-key` (`remote_head_unsupported`); the ones that stay local on purpose, `completions`, `setup`, `head`, `bridge`, `connector` and `config edit --local`; `task attach` and `machine open`, which still ask the head for the task or machine but then run here, against the machine itself; and `serve status`/`serve stop`, which always act on this machine's own serve, head or headless. `pastor serve` on such a machine runs headless: this machine's jobs and hooks, and the tasks the head hands it when it is a `pull = true` machine there.
 
 ## When pastor dispatched you
 

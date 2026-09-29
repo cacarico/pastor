@@ -29,12 +29,14 @@ It inherits the full environment of the pastor process that starts it, plus its
 own `.env` and the `PASTOR_*` variables. It is not limited to its `.env`:
 `SSH_AUTH_SOCK`, API tokens and cloud credentials in that environment reach
 every connector, and only the secrets its manifest declares are redacted from
-its run logs. It can read the head user's files, including other connectors'
-`.env` files, and `PASTOR_STATE_DIR` points it at `pastor.sock` and the ssh
-ControlMaster sockets. Hooks that do not set `only_own = true` hear every
-task's events, but get another connector's items, prompts and summaries
-blanked. Start `pastor serve` from a minimal environment, and
-review a connector as you would any program you run with your own account.
+its run logs. It can read that machine's user's files, including other
+connectors' `.env` files, and `PASTOR_STATE_DIR` points it at that machine's
+`pastor.sock`; on the head, that also means the ssh ControlMaster sockets,
+which a headless serve's shepherd does not hold. Hooks that do not set
+`only_own = true` hear every task's events, but get another connector's
+items, prompts and summaries blanked. Start `pastor serve` from a minimal
+environment, and review a connector as you would any program you run with
+your own account.
 
 Reports that need the head user's own access (writing its config, or running
 code as it) are in scope only where pastor makes that access easier to get

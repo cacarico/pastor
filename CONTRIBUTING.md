@@ -69,10 +69,11 @@ exit 1. Clap usage errors should stay plain text and exit 2.
   `head_too_old`; the connector protocol; and the minimum herdr version, which
   only rises in a minor bump, noted under Changed.
 - Platforms: the tiers follow the README's Platforms table. Tier 1 is built,
-  tested in CI and released (Linux x86_64). Tier 2 is built and released but
-  not tested (Linux aarch64, armv7, riscv64, macOS). Tier 3 is best effort:
-  compiled in CI, no binaries (FreeBSD). Moving a platform down a tier is a
-  breaking change.
+  tested in CI and released (Linux x86_64). Tier 2 is built and released;
+  Linux aarch64 and macOS arm64 are smoke-run on release too, armv7, riscv64
+  and macOS x86_64 are not tested at all. Tier 3 is best effort: compiled in
+  CI, no binaries (FreeBSD). Moving a platform down a tier is a breaking
+  change.
 - The minimum Rust version is `rust-version` in `Cargo.toml`. Raising it is
   a minor bump, never a patch.
 - Release when there is something worth shipping, not on a calendar. Cut an
