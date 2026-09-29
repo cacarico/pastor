@@ -369,6 +369,7 @@ key after the text, in order (`--key esc`, `--key Down --key Enter`; herdr's
 key names). It goes through the head to the task's machine; anything else
 answers `task_not_live`. Each send is a `task.input` event recording the key
 names and the length of the text, never the text, which may be a secret.
+`--json` prints the head's answer as `{"message": "..."}`.
 
 A done task that is sent input goes back to running (`task.running`), so an
 agent marked done with its work unfinished can be told to finish in the same
@@ -998,8 +999,8 @@ agent = "claude-personal"
 a job does the same for one task. herdr starts a `claude` (the `kind`; without
 one, the name itself), and `task describe` and `task list` keep the name
 `claude-personal`. Built-in settings follow the kind, not the name: the
-definition gets Claude's trust keys and its `--allowedTools` and
-`--disallowedTools` flags unless it sets `trust_keys`, `allow_flag` or
+definition gets Claude's trust keys and marker and its `--allowedTools` and
+`--disallowedTools` flags unless it sets `trust_keys`, `trust_marker`, `allow_flag` or
 `deny_flag` of its own. It does not inherit what `[agents.claude]` sets.
 
 `env` values are passed as written, except that a value of `~` or one that
@@ -1120,7 +1121,7 @@ itself, fails the file's load, as does a pattern that is empty or starts with
 `-`.
 
 ```bash
-pastor profile list               # NAME, SOURCE (built-in, pastor.toml), EXTENDS, DESCRIPTION; --json
+pastor profile list               # NAME, SOURCE (built-in, pastor.toml, or pastor.toml (overrides built-in)), EXTENDS, DESCRIPTION; --json (source: built_in, config, overrides)
 pastor profile describe ci        # the chain (ci -> develop) and the allow and deny it adds up to; --json
 ```
 
@@ -1561,7 +1562,10 @@ A record, which is also what connector event hooks get on stdin:
 - `machine`: on `machine.*` events, the machine's status as an entry of
   `machines` in `pastor machine list --json` shows it (`name`, `host`,
   `endpoint`, `channel`, `herdr_version`, `pastor_version`, `protocol`,
-  `error`, `live`, `max_agents`, `tags`, `flock`); `null` on other events.
+  `error`, `live`, `max_agents`, `tags`, `flock`, and the rest of what
+  `machine list --json` has: `flocks`, `job_slots`, `burst`, `live_jobs`,
+  `orphans`, `profile`, `description`, `shutting_down`); `null` on other
+  events.
   A task's machine is `task.machine`.
 - `detail`: only on events that carry more, and absent otherwise. On
   `task.input`, `keys` (the key names pressed, Enter included), `text_len`
@@ -1569,7 +1573,8 @@ A record, which is also what connector event hooks get on stdin:
   `task.trusted`, `keys`; on a `task.blocked` for an agent that ended its
   turn on a question, `question`; on `connector.finish_failed`, `connector`
   (its id) and `reason` (why: the exit status and stderr tail, or a timeout);
-  on `orchestrator.*`, `orchestrator` (its name) and: `lines` on a scheduled
+  on `orchestrator.*`, `orchestrator` (its name) and: `lines` (a count: how
+  many lines its pre script printed) on a scheduled
   run's `started` and `by` (`hours` or `hand`) and `until` on a session's
   (whose task is the record's `task`), `reason` on `skipped` (`busy` or
   `post_pending`) and `held` (`max_orchestrators`, with `max`; `quota`, with
@@ -1577,7 +1582,8 @@ A record, which is also what connector event hooks get on stdin:
   `quota`, `after` (the agent it replaces) and `restarts` (in the last hour)
   on `restarted`, `reason` (`hours` or `hand`) on `stopping` and `stopped`
   and `grace` on `stopping`, and `stage` (`pre`, `agent`, `post` or
-  `state`) and `error` on `failed`.
+  `state`) and `error` on `failed`, with `failures` (how many in a row) on a
+  `pre` failure.
 - `summary`: on `task.done` and `task.failed`, how the round that just ended
   ended (see Task summaries): `round`, `outcome` (`done`, `partial`,
   `blocked`, `nothing to do`, `unknown`, or `no summary`), `text`, `source`
@@ -1663,7 +1669,7 @@ name = "prs"                         # a connector id with a [watch] command
 
 `--json` prints one object per line: `kind` (`TASK`, `JOB`, `HEAD`,
 `CONNECTOR` or `OUTPUT` for a connector's line), the fields of the line
-(`task`, `state`, `machine`, `job`, `reason`, `connector`, `text`) and
+(`task`, `state`, `machine`, `job`, `outcome`, `reason`, `connector`, `text`) and
 `line`, the text form. With a head on another machine (`pastor head set`) the
 events, tasks and jobs are that head's, and the connectors run here. The
 watcher only reads, so an agent pastor started may run it; through a bridge
@@ -1731,7 +1737,7 @@ gh pr list --repo "$repo" --json number,mergeStateStatus,reviewDecision \
 while read -r pr state review; do
   if [ "$state" = CLEAN ] && [ "$review" = APPROVED ]; then
     echo "merging #$pr" >&2
-    gh pr merge "$pr" --repo "$repo" --squash >&2 || echo "PR #$pr merge refused"
+    gh pr merge "$pr" --repo "$repo" --merge >&2 || echo "PR #$pr merge refused"
   elif [ "$state" = BEHIND ] && [ ! -e "$PASTOR_ORCHESTRATOR_STATE_DIR/rebase-$pr" ]; then
     pastor task run "Rebase PR #$pr onto main and push." --repo '~/src/repo' --worktree >&2
     touch "$PASTOR_ORCHESTRATOR_STATE_DIR/rebase-$pr"
@@ -1821,8 +1827,8 @@ leave the name out, and may keep only their own orchestrator's note; a
 person names it with `--name`. `-` reads the note from stdin.
 
 **Quota.** When the agent ends on a quota error (its error or the last
-lines of its pane say `usage limit`, `limit reached`, `hit your limit` or
-`quota exceeded`), the head reads the reset time from the message
+lines of its pane say `usage limit`, `limit reached`, `hit your limit`,
+`quota exceeded` or `exceeded your current quota`, OpenAI's wording), the head reads the reset time from the message
 (`|<unix time>`, or `resets 3am` or `resets at 15:30`, the next such time in
 local time; Claude's messages, for now), or waits an hour when it finds none,
 emits `orchestrator.quota` with `until`, and starts no agent for that
@@ -1959,7 +1965,7 @@ repo = "~/work/api"
 prompt = "It is {{ item.key }}. Run the test suite and fix what broke. Task {{ task.id }}."
 EOF
 pastor job list                      # picked up at the next tick
-pastor tick --dry-run --job hourly   # what a run would create, without creating it
+pastor tick --dry-run --job hourly   # what a run would create, without creating it; --json: one entry per job run
 pastor job run hourly                # fire it now
 pastor task list --job hourly        # live tasks only
 pastor job disable hourly
@@ -2020,6 +2026,9 @@ that cannot report its home, herdr still decides.
 | `--tag` | only a machine with this tag takes it; repeat for more, and it needs them all |
 | `--timeout` | marks the task stale once it has run this long |
 | `--place` | where its pane goes (see [Where a task's pane goes](#where-a-tasks-pane-goes)) |
+| `--label` | the label of the workspace pastor makes for it (see [Workspace labels](#workspace-labels)) |
+| `--role` | what its agent may change through the head, `agent` or `orchestrator` (see [Trust model](#trust-model)) |
+| `--description` | one line on what it is about (see [Descriptions](#descriptions)) |
 | `--json` | JSON output |
 
 `--agent-arg` hands one argument to the agent; repeat it for more, in order.
@@ -2222,9 +2231,11 @@ and `stream` connectors, a `notify` hook).
 ~/.config/pastor/connectors/<id>/.env    secrets and settings, written by you
 ~/.local/state/pastor/connectors/<job>/  the job's scratch directory, owned by pastor
 ~/.local/state/pastor/runs/<job>/        run logs, one <ts>.log per run
+~/.local/state/pastor/runs/@<id>/        hook and finish runs, named the same way
 ```
 
-`PASTOR_DATA_DIR` overrides the first. The directory name is the connector's id
+`PASTOR_DATA_DIR` overrides the first. A second run in the same millisecond
+logs to `<ts>-1.log`. The directory name is the connector's id
 and must equal `id` in the manifest.
 
 ### The manifest
@@ -2500,8 +2511,8 @@ reading `connector.use` in the job's file; one-off `pastor task run` tasks
 belong to no connector, and an event about no job passes.
 
 A hook that hears about a task whose job another connector owns (or a one-off
-task, which no connector owns) gets the task with `item` set to `null` and
-`prompt` empty: those hold the text of the other connector's items, which a
+task, which no connector owns) gets the task with `item` set to `null`,
+`prompt` empty and the summary's `text` empty: those hold the text of the other connector's items, which a
 notifier has no need to see. Its `PASTOR_CONNECTOR_STATE_DIR` is then its own
 `@<id>` scratch dir, not the job's, which belongs to the job's connector;
 `PASTOR_JOB` still names the job.
@@ -2785,7 +2796,8 @@ no jobs
 ```
 
 `--json` stays one flat array, the head's jobs first, each with `where`:
-`head` or `shepherd`.
+`head` or `shepherd`. `--wide` is ignored here: the two tables have no
+DESCRIPTION column, and `--json` has each job's `description`.
 
 This machine's jobs come from its headless serve. With none running,
 `job list` reads the job files here and the last state in `shepherd.db`,
@@ -3038,8 +3050,8 @@ prompt's first line. A headless serve's jobs send `description` inside their
 `[dispatch]` like any other key, and the head renders it.
 
 The lists stay as narrow as they were unless asked. `-w, --wide` on `pastor
-task list`, `pastor job list`, `pastor machine list`, `pastor flock list`
-and `pastor connector list` adds a DESCRIPTION column, last:
+task list`, `pastor job list`, `pastor machine list`, `pastor flock list`,
+`pastor connector list` and `pastor orchestrator list` adds a DESCRIPTION column, last:
 
 ```text
 NAME             SCHEDULE   ENABLED  FLOCK  CONNECTOR  LAST RUN  NEXT    RESULT  DESCRIPTION
@@ -3221,13 +3233,15 @@ copies for bash and fish live in `contrib/completions/`.
 In bash and fish the script also offers the names a command takes: job names
 after `job describe`, `--job` and the like, flock and machine names after
 `--flock`, `--machine` and the flock and machine commands, task ids after the
-task commands, connector ids after `connector uninstall|unlink|try`, and
+task commands, connector ids after `connector describe|uninstall|unlink|try`
+and `watch --connector`, orchestrator names after the orchestrator commands, and
 the `[models]` names of pastor.toml after `--model`, profile names
-after `profile describe`, the levels after `--priority` and
+after `--profile` and `profile describe`, the levels after `--priority` and
 `task priority`, and the queued tasks, in queue order with their level,
 after `queue move` and its `--before` and `--after`. A
 static script cannot know them, so at TAB it runs `pastor __complete <shell>
--- <words>`, which reads the job files, `flock.toml`, the connectors
+-- <words>`, which reads the job files, `orchestrators/`, `flock.toml`,
+`pastor.toml`, the connectors
 directory and the task store directly, never the head, and prints nothing
 when it cannot read them. Task ids come live ones first, newest first, and
 fish shows each task's note beside it; beside a job, flock or machine it
@@ -3349,7 +3363,9 @@ a connection per request, and how it opens one follows the machine's kind: a
 `local` machine dials herdr's unix socket directly; a `command` machine
 spawns its configured bridge program; an `ssh` machine runs `herdr --session
 <s> remote-api-bridge` over ssh, which pipes herdr's socket protocol over
-stdio. A pull machine's own headless serve reaches its herdr the same way,
+stdio. `<s>` is the herdr session the machine's agents run in: `pastor
+machine add --session <s>`, or `session` in flock.toml, `default` when left
+out. A pull machine's own headless serve reaches its herdr the same way,
 as whichever of those three kinds it is in its own flock.toml; the head
 never opens a connection to it at all (see [Pull
 machines](#pull-machines)). Every command pastor runs over ssh (this one,
@@ -3476,7 +3492,7 @@ A head started from a pastor before flocks would ignore `--flock` and read
 `flock.toml` as one flock, so while flocks are in play every command that
 talks to or reloads the head asks its protocol first and refuses an old one.
 Flocks are in play when the command takes `--flock`, edits `flock.toml`
-(`flock add|join|leave|default|remove`, `machine add|remove|move`), or
+(`flock add|join|leave|remove|edit|default set`, `machine add|remove|move`), or
 `flock.toml` declares named flocks, since then no `--flock` means the
 default flock rather than every machine. A head that is listening but does
 not answer is refused whether flocks are in play or not

@@ -87,9 +87,9 @@ Create a one-off task and dispatch it
 | `--worktree` | A git worktree per task, branched from --repo (so it needs --repo) |  |
 | `--branch <BRANCH>` | Branch for the worktree (needs --worktree; a plain workspace has no branch) |  |
 | `--tag <TAGS>` | Only a machine with this tag takes the task; repeat for more, and it needs them all |  |
-| `--timeout <TIMEOUT>` | Mark the task stale once it has run this long (30m, 2h; default: `[defaults]` timeout) |  |
+| `--timeout <TIMEOUT>` | Mark the task stale once it has run this long (30m, 2h; default: the flock's, else `[defaults] timeout`) |  |
 | `--label <TEMPLATE>` | Label template of the workspace pastor makes for the task, with {{ task.id }}, {{ flock }}, {{ machine }}, {{ job }} and {{ item.key }} (default: the flock's `label`, else `[defaults] label`, else {{ flock }}/{{ task.id }}). The agent stays t-N |  |
-| `--place <PLACE>` | Where the agent's pane goes: repo (under the repo it works on), own (its own workspace), pastor (the `pastor` workspace) or pane:&lt;workspace&gt; (default: `[defaults] place`, else repo) |  |
+| `--place <PLACE>` | Where the agent's pane goes: repo (under the repo it works on), own (its own workspace), pastor (the `pastor` workspace) or pane:&lt;workspace&gt; (default: the flock's, else `[defaults] place`, else repo) |  |
 | `--role <ROLE>` | What the agent may change through the head: agent (read, and end its own task) or orchestrator (also run, retry, send to and close tasks and enable and disable jobs). Only a person may start an orchestrator, never a task (one of `agent`, `orchestrator`) | `agent` |
 | `--summary <MODE>` | Ask the agent for a summary when it finishes (ask), also fail the task if it stops without one (require), or neither (off) (default: the flock's `summary`, else `[defaults] summary`, else ask) (one of `ask`, `require`, `off`) |  |
 | `--description <TEXT>` | One line on what the task is about, for `task list --wide` and `describe` (default: the prompt's first line) |  |
@@ -107,7 +107,7 @@ List live tasks across the flock; --all adds finished ones
 | `--blocked` | Only blocked tasks, needing a human |  |
 | `--done` | Only done tasks |  |
 | `--all` | Every task, finished ones too (done, failed, stale, closed) |  |
-| `-w, --wide` | Add a DESCRIPTION column, cut to the terminal's width |  |
+| `-w, --wide` | Add RESULT and DESCRIPTION columns, the second cut to the terminal's width |  |
 | `--json` | Print as a JSON array of full task records |  |
 
 ### pastor task describe

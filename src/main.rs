@@ -269,7 +269,8 @@ struct RunArgs {
     /// Only a machine with this tag takes the task; repeat for more, and it needs them all
     #[arg(long = "tag")]
     tags: Vec<String>,
-    /// Mark the task stale once it has run this long (30m, 2h; default: `[defaults]` timeout)
+    /// Mark the task stale once it has run this long (30m, 2h; default:
+    /// the flock's, else `[defaults] timeout`)
     #[arg(long)]
     timeout: Option<String>,
     /// Label template of the workspace pastor makes for the task, with
@@ -280,7 +281,8 @@ struct RunArgs {
     label: Option<String>,
     /// Where the agent's pane goes: repo (under the repo it works on), own
     /// (its own workspace), pastor (the `pastor` workspace) or
-    /// pane:<workspace> (default: `[defaults] place`, else repo)
+    /// pane:<workspace> (default: the flock's, else `[defaults] place`,
+    /// else repo)
     #[arg(long, value_name = "PLACE")]
     place: Option<Place>,
     /// What the agent may change through the head: agent (read, and end
@@ -323,7 +325,7 @@ struct ListArgs {
     /// Every task, finished ones too (done, failed, stale, closed)
     #[arg(long, group = "list_filter")]
     all: bool,
-    /// Add a DESCRIPTION column, cut to the terminal's width
+    /// Add RESULT and DESCRIPTION columns, the second cut to the terminal's width
     #[arg(short, long)]
     wide: bool,
     /// Print as a JSON array of full task records
@@ -3946,6 +3948,45 @@ mod tests {
         for id in ["model", "profile", "priority"] {
             order(&help(id), "flock's", "machine's");
         }
+    }
+
+    /// `--timeout` and `--place` fall through the task's flock before
+    /// `[defaults]` (`flock.toml`'s `timeout` and `place`), and the help
+    /// says so.
+    #[test]
+    fn run_help_names_the_flock_for_timeout_and_place() {
+        use clap::CommandFactory;
+        let root = Cli::command();
+        let run = root
+            .find_subcommand("task")
+            .and_then(|t| t.find_subcommand("run"))
+            .unwrap();
+        for id in ["timeout", "place"] {
+            let arg = run.get_arguments().find(|a| a.get_id() == id).unwrap();
+            let help = arg.get_help().unwrap().to_string().replace('\n', " ");
+            let (flock, defaults) = (help.find("flock's"), help.find("[defaults]"));
+            assert!(
+                flock.is_some() && defaults.is_some() && flock < defaults,
+                "--{id} should name the flock's before [defaults]: {help:?}"
+            );
+        }
+    }
+
+    /// `task list --wide` adds two columns (`task_table`), not one.
+    #[test]
+    fn task_list_wide_help_names_both_columns() {
+        use clap::CommandFactory;
+        let root = Cli::command();
+        let list = root
+            .find_subcommand("task")
+            .and_then(|t| t.find_subcommand("list"))
+            .unwrap();
+        let arg = list.get_arguments().find(|a| a.get_id() == "wide").unwrap();
+        let help = arg.get_help().unwrap().to_string();
+        assert!(
+            help.contains("RESULT") && help.contains("DESCRIPTION"),
+            "{help:?}"
+        );
     }
 
     #[test]
