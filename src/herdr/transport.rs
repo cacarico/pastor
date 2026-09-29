@@ -797,6 +797,29 @@ mod tests {
         assert_eq!(Endpoint::Command { argv: vec![] }.host(), "-");
     }
 
+    /// `describe` names the target and session, unlike `host`'s short form.
+    #[test]
+    fn describe_names_the_target_and_session() {
+        let paths = Paths::new("/c", "/s");
+        assert_eq!(
+            Endpoint::from_machine(&ssh_machine("pi-3"), &paths).describe(),
+            "ssh fleet@host (session default)"
+        );
+        let local = MachineConfig {
+            local: true,
+            ssh: None,
+            ..ssh_machine("here")
+        };
+        assert_eq!(
+            Endpoint::from_machine(&local, &paths).describe(),
+            "local herdr session default"
+        );
+        let command = Endpoint::Command {
+            argv: vec!["fake-herdr".into(), "--connect".into(), "/h.sock".into()],
+        };
+        assert_eq!(command.describe(), "command fake-herdr --connect /h.sock");
+    }
+
     /// The machine name in the ControlPath is only there to be recognisable;
     /// `%C` is the identity. A name that would push the socket name past
     /// `sun_path` must be shortened, not cost every request a full handshake.
@@ -1335,6 +1358,10 @@ mod tests {
         assert!(err.message.contains("more than"), "{}", err.message);
         let err = probe_output(&argv("yes >&2")).await.unwrap_err();
         assert!(err.message.contains("more than"), "{}", err.message);
+        // Pinned against a literal, not the constant itself: every other
+        // assertion here uses `PROBE_OUTPUT_LIMIT` symbolically, so a wrong
+        // value for it would still pass them.
+        assert_eq!(PROBE_OUTPUT_LIMIT, 65536);
         // Exactly at the cap is fine.
         let out = probe_output(&argv(&format!("head -c {PROBE_OUTPUT_LIMIT} /dev/zero")))
             .await
