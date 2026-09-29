@@ -165,6 +165,18 @@ fn role_name(role: Option<&str>) -> &'static str {
 pub async fn start_background(paths: &Paths, head: Option<&str>) -> anyhow::Result<()> {
     paths.ensure()?;
     crate::daemon::refuse_live_socket(&paths.socket_file()).await?;
+    // Wait out an offline fleet edit here, before START_WAIT runs: the child
+    // takes the same lock with the same bound, so its `fleet_locked` would
+    // otherwise come after this command had already given up as serve_slow.
+    {
+        let paths = paths.clone();
+        drop(
+            tokio::task::spawn_blocking(move || {
+                crate::fleet_edit::lock_fleet(&paths, crate::fleet_edit::FLEET_LOCK_WAIT)
+            })
+            .await??,
+        );
+    }
     let log = paths.serve_log_file();
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -198,11 +210,17 @@ pub async fn start_background(paths: &Paths, head: Option<&str>) -> anyhow::Resu
     let deadline = Instant::now() + START_WAIT;
     loop {
         if let Some(status) = child.try_wait()? {
+            let (code, message) = last_error(&log, from);
+            // An edit that took the lock between the wait above and the
+            // child's own gives the child's code, which says to try again.
+            let code = match code.as_deref() {
+                Some("fleet_locked") => "fleet_locked",
+                _ => "serve_failed",
+            };
             return Err(CliError::err(
-                "serve_failed",
+                code,
                 format!(
-                    "pastor serve exited before it answered ({status}): {}; its log is {}",
-                    last_error(&log, from),
+                    "pastor serve exited before it answered ({status}): {message}; its log is {}",
                     log.display()
                 ),
             ));
@@ -233,9 +251,9 @@ pub async fn start_background(paths: &Paths, head: Option<&str>) -> anyhow::Resu
     }
 }
 
-/// Why a head that exited did: the message of the last error line it wrote
-/// to `log` after byte `from`, or its last line.
-fn last_error(log: &Path, from: u64) -> String {
+/// Why a head that exited did: the code and message of the last error line
+/// it wrote to `log` after byte `from`, or no code and its last line.
+fn last_error(log: &Path, from: u64) -> (Option<String>, String) {
     let mut text = String::new();
     if let Ok(mut f) = std::fs::File::open(log) {
         let len = f.metadata().map(|m| m.len()).unwrap_or(0);
@@ -249,11 +267,11 @@ fn last_error(log: &Path, from: u64) -> String {
         .rev()
         .find_map(|l| {
             let v: serde_json::Value = serde_json::from_str(l).ok()?;
-            v.get("code")?;
-            Some(v.get("message")?.as_str()?.to_string())
+            let code = v.get("code")?.as_str()?.to_string();
+            Some((Some(code), v.get("message")?.as_str()?.to_string()))
         })
-        .or_else(|| lines.last().map(|l| l.to_string()))
-        .unwrap_or_else(|| "it wrote nothing".into())
+        .or_else(|| lines.last().map(|l| (None, l.to_string())))
+        .unwrap_or_else(|| (None, "it wrote nothing".into()))
 }
 
 /// `pastor serve status`.
@@ -550,12 +568,18 @@ mod tests {
             "old run\n2026 INFO pastor: starting\n{\"code\":\"runtime_error\",\"message\":\"flock is empty\"}\n",
         )
         .unwrap();
-        assert_eq!(last_error(&path, 8), "flock is empty");
+        assert_eq!(
+            last_error(&path, 8),
+            (Some("runtime_error".into()), "flock is empty".into())
+        );
         std::fs::write(&path, "old run\nthread main panicked\n").unwrap();
-        assert_eq!(last_error(&path, 8), "thread main panicked");
-        assert_eq!(last_error(&path, 100), "thread main panicked");
+        assert_eq!(last_error(&path, 8), (None, "thread main panicked".into()));
+        assert_eq!(
+            last_error(&path, 100),
+            (None, "thread main panicked".into())
+        );
         std::fs::write(&path, "old run\n").unwrap();
-        assert_eq!(last_error(&path, 8), "it wrote nothing");
+        assert_eq!(last_error(&path, 8), (None, "it wrote nothing".into()));
     }
 
     #[test]
