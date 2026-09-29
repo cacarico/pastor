@@ -1855,6 +1855,7 @@ async fn list(paths: &Paths, a: ListArgs, head: Head) -> anyhow::Result<()> {
         eprintln!("pastor serve is not running; showing the last known state");
         open_store(paths)?.list_tasks(&filter)?
     };
+    let tasks = pastor::cli::waiting_first(tasks);
     if tasks.is_empty()
         && let Some(hint) = hint
     {
