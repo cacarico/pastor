@@ -2,7 +2,7 @@
 # private repo, so Pages deploy never applies here (it's guarded to
 # cacarico/pastor in the GitHub workflow, and Woodpecker never runs there
 # at all). Hugo and lychee are pinned releases checked against their
-# published checksums, same as the GitHub workflow, just the arm64 tarballs.
+# published checksums, same as the GitHub workflow, but the musl build of lychee for Alpine.
 when:
   - event: pull_request
     path:
@@ -25,16 +25,20 @@ when:
         - ".woodpecker/website.yaml"
   - event: manual
 
+# Heavy: runs on the x86_64 agent only; the arm64 one keeps light checks.
+labels:
+  platform: linux/amd64
+
 steps:
   - name: build
     image: alpine:3.20
     commands:
       - apk add --no-cache curl make
-      - curl -sSLo /tmp/hugo.tar.gz "https://github.com/gohugoio/hugo/releases/download/v0.166.0/hugo_0.166.0_linux-arm64.tar.gz"
-      - echo "0e15cbc595e799401698c11af39d2594b64292b39d9ec7a19665bd43e05fcb2c  /tmp/hugo.tar.gz" | sha256sum -c -
+      - curl -sSLo /tmp/hugo.tar.gz "https://github.com/gohugoio/hugo/releases/download/v0.166.0/hugo_0.166.0_linux-amd64.tar.gz"
+      - echo "45228f5a52eb118b0ca168068f01d7df0447314a24056f1d29667ed9fc368308  /tmp/hugo.tar.gz" | sha256sum -c -
       - tar -xzf /tmp/hugo.tar.gz -C /usr/local/bin hugo
-      - curl -sSLo /tmp/lychee.tar.gz "https://github.com/lycheeverse/lychee/releases/download/lychee-v0.24.2/lychee-aarch64-unknown-linux-musl.tar.gz"
-      - echo "5d0b0e3aeab240f41920c633a6eaf97599be6eedda034b36e858ede7dba5e535  /tmp/lychee.tar.gz" | sha256sum -c -
-      - tar -xzf /tmp/lychee.tar.gz -C /usr/local/bin --strip-components=1 lychee-aarch64-unknown-linux-musl/lychee
+      - curl -sSLo /tmp/lychee.tar.gz "https://github.com/lycheeverse/lychee/releases/download/lychee-v0.24.2/lychee-x86_64-unknown-linux-musl.tar.gz"
+      - echo "73657a111819a30c47c08352896796f23d64e4eb2b3ed39b6d32149241566fc5  /tmp/lychee.tar.gz" | sha256sum -c -
+      - tar -xzf /tmp/lychee.tar.gz -C /usr/local/bin --strip-components=1 lychee-x86_64-unknown-linux-musl/lychee
       - make site
       - make links

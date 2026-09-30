@@ -1,8 +1,9 @@
-# Mirrors .github/workflows/ci.yml's three jobs as three steps. No cargo
-# cache yet: the spec's shared cargo-cache PVC is a homelab chart change,
-# out of this repo's scope, so every run compiles from scratch. Steps run
-# one at a time (depends_on) so only one Rust build competes for the Pi's
-# 4 cores and 8GB at once, per the spec's caution for this phase.
+# Mirrors .github/workflows/ci.yml's three jobs as three steps. Runs on an
+# x86_64 agent with the Docker backend (`labels` below), not on the arm64
+# one: that took about ten minutes a run and held up every other check. The
+# agent mounts a shared cargo registry and git cache into /usr/local/cargo,
+# so crates download once. msrv and portability wait for check, then run
+# side by side.
 #
 # check runs as a non-root user, not the step's default root, and this is
 # not cosmetic: create_private_dir_refuses_an_unsafe_ancestor asserts that
@@ -32,7 +33,7 @@
 #
 # portability: needs zig and cargo-zigbuild, as .github/actions/zig
 # installs for GitHub Actions; the same pinned version and checksum,
-# aarch64 build (this cluster's only architecture). CARGO_ZIGBUILD_ZIG_PATH
+# x86_64 build to match the runner. CARGO_ZIGBUILD_ZIG_PATH
 # is set as a step-level environment variable, not a shell export, because
 # a plain shell variable set in one command of this list does not survive
 # to the next command (confirmed the hard way on the governance pipeline).
@@ -51,7 +52,9 @@
 #   (`cargo install --help` shows `[CRATE[@<VER>]]...`), not a parse error.
 # - the official rust image chmods CARGO_HOME and RUSTUP_HOME to a+w
 #   (verified: `docker run rust:1-slim stat -c %a /usr/local/cargo` -> 777),
-#   so `su builder` can write there despite root ownership.
+#   so `su builder` can write there despite root ownership. The agent's
+#   mounted cache is root-owned and holds files root steps wrote, so
+#   check hands CARGO_HOME to builder before building.
 when:
   - event: pull_request
     path:
@@ -96,6 +99,10 @@ when:
         - "changes/**"
   - event: manual
 
+# Heavy: runs on the x86_64 agent only; the arm64 one keeps light checks.
+labels:
+  platform: linux/amd64
+
 steps:
   - name: check
     image: rust:1-slim
@@ -107,7 +114,7 @@ steps:
       - rustup component add rustfmt clippy
       - useradd --create-home --shell /bin/bash builder
       - mkdir -p /run/sshd
-      - chown -R builder:builder /woodpecker
+      - chown -R builder:builder /woodpecker /usr/local/cargo
       - echo woodpecker-ci > /etc/hostname
       - su builder -c 'export HOME=/home/builder PATH=/usr/local/cargo/bin:/usr/local/rustup/bin:"$PATH"; unset HOSTNAME; cd /woodpecker/src/github.com/cacarico/pastor-private && make check'
       - su builder -c 'export HOME=/home/builder PATH=/usr/local/cargo/bin:/usr/local/rustup/bin:"$PATH"; unset HOSTNAME; cd /woodpecker/src/github.com/cacarico/pastor-private && make test-machine'
@@ -125,15 +132,15 @@ steps:
 
   - name: portability
     image: rust:1-slim
-    depends_on: [msrv]
+    depends_on: [check]
     environment:
       CARGO_TERM_COLOR: always
       CARGO_ZIGBUILD_ZIG_PATH: /opt/zig/zig
     commands:
       - apt-get update -qq
       - apt-get install -qq -y --no-install-recommends pkg-config libsqlite3-dev curl xz-utils make
-      - curl -sSfL -o /tmp/zig.tar.xz "https://ziglang.org/download/0.16.0/zig-aarch64-linux-0.16.0.tar.xz"
-      - echo "ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17  /tmp/zig.tar.xz" | sha256sum -c -
+      - curl -sSfL -o /tmp/zig.tar.xz "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz"
+      - echo "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  /tmp/zig.tar.xz" | sha256sum -c -
       - mkdir -p /opt/zig
       - tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
       - cargo install --locked cargo-zigbuild@0.23.4
