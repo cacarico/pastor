@@ -228,8 +228,12 @@ async fn the_daemon_writes_the_events_log() {
     let serve = tokio::spawn(daemon.run_with_listener(listener));
     let deadline = std::time::Instant::now() + WAIT;
     loop {
-        if let Ok(IpcResponse::Machines(ms)) =
-            pastor::ipc::request(&socket, &IpcRequest::FlockList).await
+        if let Ok(IpcResponse::Machines(ms)) = pastor::ipc::request(
+            &socket,
+            &IpcRequest::FlockList,
+            &pastor::ipc::Caller::default(),
+        )
+        .await
             && ms.iter().all(|m| m.channel.accepts_dispatch())
         {
             break;
@@ -294,6 +298,7 @@ async fn the_daemon_writes_the_events_log() {
             agent: None,
             priority: None,
         },
+        &pastor::ipc::Caller::default(),
     )
     .await
     .unwrap();
@@ -316,6 +321,7 @@ async fn the_daemon_writes_the_events_log() {
             limit: 1,
             task: Some(t.id),
         },
+        &pastor::ipc::Caller::default(),
     )
     .await
     .unwrap();

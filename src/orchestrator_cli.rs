@@ -10,7 +10,7 @@ use clap::Subcommand;
 
 use crate::cli::{CliError, request_error};
 use crate::config::Paths;
-use crate::ipc::{Head, IpcRequest, IpcResponse};
+use crate::ipc::{Client, Head, IpcRequest, IpcResponse};
 use crate::orchestrator::{OrchestratorDescription, OrchestratorStatus};
 use crate::store::Store;
 
@@ -83,7 +83,7 @@ pub fn orchestrator_may(cmd: &OrchestratorCmd) -> bool {
     matches!(cmd, OrchestratorCmd::Note { .. })
 }
 
-pub async fn run(paths: &Paths, cmd: OrchestratorCmd, head: Head) -> anyhow::Result<()> {
+pub async fn run(client: &Client, cmd: OrchestratorCmd, head: Head) -> anyhow::Result<()> {
     let cmd = match cmd {
         OrchestratorCmd::Note { text, name } if text == "-" => {
             let mut text = String::new();
@@ -93,8 +93,9 @@ pub async fn run(paths: &Paths, cmd: OrchestratorCmd, head: Head) -> anyhow::Res
         other => other,
     };
     if head.is_live() {
-        return on_head(paths, cmd).await;
+        return on_head(client, cmd).await;
     }
+    let paths = &client.paths;
     let store = Store::open_read_only(&paths.db_file()).ok();
     match cmd {
         OrchestratorCmd::List { wide, json } => {
@@ -122,9 +123,9 @@ pub async fn run(paths: &Paths, cmd: OrchestratorCmd, head: Head) -> anyhow::Res
         OrchestratorCmd::Disable { name } => toggle(paths, &name, false),
         OrchestratorCmd::Note { text, name } => {
             // Whose note an agent or a script keeps only the head knows.
-            let Some(name) = name.filter(|_| {
-                crate::ipc::caller_task().is_none() && crate::ipc::caller().orchestrator.is_none()
-            }) else {
+            let Some(name) = name
+                .filter(|_| client.caller.task.is_none() && client.caller.orchestrator.is_none())
+            else {
                 return Err(CliError::err(
                     "no_head",
                     "pastor serve is not running; with no head, a person names the orchestrator with --name",
@@ -145,7 +146,7 @@ fn toggle(paths: &Paths, name: &str, enabled: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn on_head(paths: &Paths, cmd: OrchestratorCmd) -> anyhow::Result<()> {
+async fn on_head(client: &Client, cmd: OrchestratorCmd) -> anyhow::Result<()> {
     let (req, wide, json) = match cmd {
         OrchestratorCmd::List { wide, json } => (IpcRequest::OrchestratorList, wide, json),
         OrchestratorCmd::Describe { name, json } => {
@@ -174,7 +175,7 @@ async fn on_head(paths: &Paths, cmd: OrchestratorCmd) -> anyhow::Result<()> {
             (IpcRequest::OrchestratorNote { name, text }, false, false)
         }
     };
-    match crate::ipc::request_head(paths, &req).await {
+    match crate::ipc::request_head(client, &req).await {
         Ok(IpcResponse::Orchestrators(list)) => print_list(&list, wide, json),
         Ok(IpcResponse::Orchestrator(d)) => print_description(&d, json),
         Ok(IpcResponse::Text(text)) => {

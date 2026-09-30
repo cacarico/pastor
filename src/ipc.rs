@@ -77,6 +77,36 @@ impl Caller {
             orchestrator: None,
         }
     }
+
+    /// Who this process's own requests come from: `TASK_ENV` when set, else
+    /// `orchestrator::ORCHESTRATOR_ENV` (a task always wins over an
+    /// orchestrator script), else a person.
+    pub fn from_env() -> Caller {
+        let task = task_from_env();
+        let orchestrator = task.is_none().then(orchestrator_from_env).flatten();
+        Caller { task, orchestrator }
+    }
+}
+
+/// The CLI's own identity and routing, resolved once at startup: the paths
+/// it reads config and state from, the head it talks to (a remote one over
+/// ssh, or this machine's own socket when `None`), and who its requests say
+/// they come from.
+#[derive(Debug, Clone)]
+pub struct Client {
+    pub paths: crate::config::Paths,
+    pub head: Option<crate::head::RemoteHead>,
+    pub caller: Caller,
+}
+
+impl Client {
+    pub fn new(paths: crate::config::Paths, head: Option<crate::head::RemoteHead>) -> Client {
+        Client {
+            paths,
+            head,
+            caller: Caller::from_env(),
+        }
+    }
 }
 
 /// The first protocol whose head honours `flock` in a request.
@@ -371,12 +401,12 @@ static HEAD_GATES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<ProtocolGate>>>,
 > = std::sync::LazyLock::new(Default::default);
 
-/// The gate of the head `request_head` reaches from `paths`: the remote
+/// The gate of the head `request_head` reaches from `client`: the remote
 /// head when one is set, else this machine's socket.
-pub fn head_gate(paths: &crate::config::Paths) -> std::sync::Arc<ProtocolGate> {
-    let key = match remote_head() {
+pub fn head_gate(client: &Client) -> std::sync::Arc<ProtocolGate> {
+    let key = match &client.head {
         Some(head) => format!("ssh {}", head.ssh),
-        None => paths.socket_file().display().to_string(),
+        None => client.paths.socket_file().display().to_string(),
     };
     HEAD_GATES
         .lock()
@@ -1091,28 +1121,14 @@ pub fn parse_request_line(line: &str) -> serde_json::Result<(IpcRequest, Caller)
     Ok((serde_json::from_value(v)?, caller))
 }
 
-static CALLER_TASK: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-
 /// The task `TASK_ENV` names: `None` outside a pane pastor started, or when
-/// the variable is empty.
+/// the variable is empty. The library never reads the variable itself
+/// beyond this: tests run from an agent's pane build their own `Caller`
+/// instead of picking it up here, so they don't send the mark and get
+/// their own requests refused.
 pub fn task_from_env() -> Option<String> {
     std::env::var(TASK_ENV).ok().filter(|t| !t.is_empty())
 }
-
-/// Sets the task this process's requests carry. Only the `pastor` binary
-/// calls it, from `task_from_env`: the library never reads the variable
-/// itself, so tests run from an agent's pane don't send the mark and get
-/// their own requests refused.
-pub fn set_caller_task(task: Option<String>) {
-    let _ = CALLER_TASK.set(task);
-}
-
-/// The task this process's requests carry, as `set_caller_task` left it.
-pub fn caller_task() -> Option<String> {
-    CALLER_TASK.get().cloned().flatten()
-}
-
-static CALLER_ORCHESTRATOR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
 /// The orchestrator `orchestrator::ORCHESTRATOR_ENV` names: `None` outside
 /// its pre and post scripts, or when the variable is empty.
@@ -1120,25 +1136,6 @@ pub fn orchestrator_from_env() -> Option<String> {
     std::env::var(crate::orchestrator::ORCHESTRATOR_ENV)
         .ok()
         .filter(|o| !o.is_empty())
-}
-
-/// Sets the orchestrator this process's requests carry when they carry no
-/// task (`PASTOR_TASK` wins). Only the `pastor` binary calls it, as for
-/// `set_caller_task`.
-pub fn set_caller_orchestrator(orchestrator: Option<String>) {
-    let _ = CALLER_ORCHESTRATOR.set(orchestrator);
-}
-
-/// Who this process's requests say they come from.
-pub fn caller() -> Caller {
-    let task = caller_task();
-    Caller {
-        orchestrator: task
-            .is_none()
-            .then(|| CALLER_ORCHESTRATOR.get().cloned().flatten())
-            .flatten(),
-        task,
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1260,61 +1257,51 @@ impl From<crate::cli::CliError> for RequestError {
     }
 }
 
-static REMOTE_HEAD: std::sync::OnceLock<Option<crate::head::RemoteHead>> =
-    std::sync::OnceLock::new();
-
-/// Sets the head this process's requests go to over ssh. Only the `pastor`
-/// binary calls it, once, from `--head`, `PASTOR_HEAD` or client.toml.
-pub fn set_remote_head(head: Option<crate::head::RemoteHead>) {
-    let _ = REMOTE_HEAD.set(head);
-}
-
-/// The remote head `set_remote_head` left, if any.
-pub fn remote_head() -> Option<&'static crate::head::RemoteHead> {
-    REMOTE_HEAD.get().and_then(Option::as_ref)
-}
-
 /// One request to the head, wherever it is: over ssh to a remote head when
-/// one is set, else to this machine's socket. Every CLI request goes through
-/// here, and none goes to a head too old for it (`ProtocolGate`).
-pub async fn request_head(
-    paths: &crate::config::Paths,
-    req: &IpcRequest,
-) -> Result<IpcResponse, RequestError> {
-    request_head_with_timeout(paths, req, DEFAULT_REQUEST_TIMEOUT).await
+/// `client` has one set, else to this machine's socket. Every CLI request
+/// goes through here, and none goes to a head too old for it
+/// (`ProtocolGate`).
+pub async fn request_head(client: &Client, req: &IpcRequest) -> Result<IpcResponse, RequestError> {
+    request_head_with_timeout(client, req, DEFAULT_REQUEST_TIMEOUT).await
 }
 
 /// `request_head` with its own bound on the round trip.
 pub async fn request_head_with_timeout(
-    paths: &crate::config::Paths,
+    client: &Client,
     req: &IpcRequest,
     timeout: Duration,
 ) -> Result<IpcResponse, RequestError> {
-    head_gate(paths)
-        .check(req, send_to_head(paths, &IpcRequest::Ping, timeout))
+    head_gate(client)
+        .check(req, send_to_head(client, &IpcRequest::Ping, timeout))
         .await?;
-    send_to_head(paths, req, timeout).await
+    send_to_head(client, req, timeout).await
 }
 
 /// `request_head_with_timeout` without the protocol check.
 async fn send_to_head(
-    paths: &crate::config::Paths,
+    client: &Client,
     req: &IpcRequest,
     timeout: Duration,
 ) -> Result<IpcResponse, RequestError> {
-    match remote_head() {
+    match &client.head {
         Some(head) => {
-            let line = request_line_as(req, &caller()).map_err(RequestError::Exchange)?;
+            let line = request_line_as(req, &client.caller).map_err(RequestError::Exchange)?;
             head.request(&line, timeout).await
         }
-        None => request_with_timeout(&paths.socket_file(), req, timeout).await,
+        None => {
+            request_with_timeout(&client.paths.socket_file(), req, &client.caller, timeout).await
+        }
     }
 }
 
 /// One request, one reply, then the connection closes. Bounded by
 /// `DEFAULT_REQUEST_TIMEOUT`; use `request_with_timeout` to choose a different bound.
-pub async fn request(socket: &Path, req: &IpcRequest) -> Result<IpcResponse, RequestError> {
-    request_with_timeout(socket, req, DEFAULT_REQUEST_TIMEOUT).await
+pub async fn request(
+    socket: &Path,
+    req: &IpcRequest,
+    caller: &Caller,
+) -> Result<IpcResponse, RequestError> {
+    request_with_timeout(socket, req, caller, DEFAULT_REQUEST_TIMEOUT).await
 }
 
 /// Like `request`, but bounds the whole round trip (connect + write + read) by
@@ -1324,13 +1311,14 @@ pub async fn request(socket: &Path, req: &IpcRequest) -> Result<IpcResponse, Req
 pub async fn request_with_timeout(
     socket: &Path,
     req: &IpcRequest,
+    caller: &Caller,
     timeout: Duration,
 ) -> Result<IpcResponse, RequestError> {
     let exchange = async {
         let stream = tokio::net::UnixStream::connect(socket)
             .await
             .map_err(RequestError::Connect)?;
-        round_trip(stream, req)
+        round_trip(stream, req, caller)
             .await
             .map_err(RequestError::Exchange)
     };
@@ -1379,9 +1367,10 @@ pub async fn relay_line(socket: &Path, line: &[u8]) -> Result<Vec<u8>, RequestEr
 async fn round_trip(
     stream: tokio::net::UnixStream,
     req: &IpcRequest,
+    caller: &Caller,
 ) -> anyhow::Result<IpcResponse> {
     let (r, mut w) = stream.into_split();
-    let line = request_line_as(req, &caller())?;
+    let line = request_line_as(req, caller)?;
     w.write_all(line.as_bytes()).await?;
     w.flush().await?;
     let mut reply = String::new();
@@ -1441,7 +1430,12 @@ pub async fn ping_head(socket: &Path) -> HeadPing {
         Err(err) if connect_error_means_no_daemon(&err) => return HeadPing::NotRunning,
         Err(_) => return HeadPing::Unresponsive,
     };
-    match tokio::time::timeout(PING_TIMEOUT, round_trip(stream, &IpcRequest::Ping)).await {
+    match tokio::time::timeout(
+        PING_TIMEOUT,
+        round_trip(stream, &IpcRequest::Ping, &Caller::default()),
+    )
+    .await
+    {
         Ok(Ok(IpcResponse::Pong {
             version,
             protocol,
@@ -1505,9 +1499,14 @@ mod tests {
         });
 
         let start = Instant::now();
-        let err = request_with_timeout(&socket, &IpcRequest::Ping, Duration::from_millis(100))
-            .await
-            .unwrap_err();
+        let err = request_with_timeout(
+            &socket,
+            &IpcRequest::Ping,
+            &Caller::default(),
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
         assert!(
             start.elapsed() < Duration::from_secs(2),
             "did not bound the round trip: took {:?}",
@@ -1523,6 +1522,7 @@ mod tests {
         let err = request_with_timeout(
             &tmp.path().join("absent.sock"),
             &IpcRequest::Ping,
+            &Caller::default(),
             Duration::from_millis(100),
         )
         .await
@@ -2419,7 +2419,8 @@ mod tests {
             flock: None,
             machine: None,
         };
-        match request_head(&paths, &queue).await {
+        let client = Client::new(paths, None);
+        match request_head(&client, &queue).await {
             Err(RequestError::Refused { code, message }) => {
                 assert_eq!(code, "head_too_old");
                 assert!(message.contains("pastor queue"), "{message}");

@@ -290,6 +290,19 @@ pub struct JobState {
     pub backoff_until: Option<DateTime<Utc>>,
 }
 
+/// `Store::insert_job_task_at`'s arguments, grouped.
+pub struct InsertJobTaskAt<'a, F> {
+    pub job: &'a str,
+    pub flock: &'a str,
+    pub item: &'a Value,
+    /// The task's level, and what set it (`Task::priority_from`).
+    pub level: (Priority, Option<&'a str>),
+    pub preempt: bool,
+    /// Already rendered; `None` reads as the prompt's first line.
+    pub description: Option<&'a str>,
+    pub render: F,
+}
+
 impl Store {
     /// How long one connection waits for another's lock before giving up.
     const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -1692,29 +1705,31 @@ impl Store {
         description: Option<&str>,
         render: impl FnOnce(i64) -> Result<(String, DispatchSpec), String>,
     ) -> anyhow::Result<Task> {
-        self.insert_job_task_at(
+        self.insert_job_task_at(InsertJobTaskAt {
             job,
             flock,
             item,
-            (Priority::Normal, None),
-            false,
+            level: (Priority::Normal, None),
+            preempt: false,
             description,
             render,
-        )
+        })
     }
 
     /// `insert_job_task` at a level, and what set it (`Task::priority_from`).
-    #[allow(clippy::too_many_arguments)]
     pub fn insert_job_task_at(
         &self,
-        job: &str,
-        flock: &str,
-        item: &Value,
-        (priority, from): (Priority, Option<&str>),
-        preempt: bool,
-        description: Option<&str>,
-        render: impl FnOnce(i64) -> Result<(String, DispatchSpec), String>,
+        ask: InsertJobTaskAt<'_, impl FnOnce(i64) -> Result<(String, DispatchSpec), String>>,
     ) -> anyhow::Result<Task> {
+        let InsertJobTaskAt {
+            job,
+            flock,
+            item,
+            level: (priority, from),
+            preempt,
+            description,
+            render,
+        } = ask;
         let key = item
             .get("key")
             .and_then(Value::as_str)
@@ -3810,15 +3825,15 @@ mod tests {
     fn job_tasks_and_retries_keep_their_level() {
         let s = Store::open_in_memory().unwrap();
         let t = s
-            .insert_job_task_at(
-                "j",
-                "default",
-                &serde_json::json!({"key": "k"}),
-                (Priority::High, Some("job j")),
-                false,
-                None,
-                |_| Ok(("p".into(), spec())),
-            )
+            .insert_job_task_at(InsertJobTaskAt {
+                job: "j",
+                flock: "default",
+                item: &serde_json::json!({"key": "k"}),
+                level: (Priority::High, Some("job j")),
+                preempt: false,
+                description: None,
+                render: |_| Ok(("p".into(), spec())),
+            })
             .unwrap();
         assert_eq!(t.priority, Priority::High);
         assert_eq!(t.priority_from.as_deref(), Some("job j"));

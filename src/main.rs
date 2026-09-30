@@ -661,10 +661,8 @@ fn main() {
             ),
         }
     }
-    pastor::ipc::set_remote_head(remote.clone());
-    pastor::ipc::set_caller_task(pastor::ipc::task_from_env());
-    pastor::ipc::set_caller_orchestrator(pastor::ipc::orchestrator_from_env());
-    if let Some(task) = pastor::ipc::caller_task() {
+    let client = pastor::ipc::Client::new(paths.clone(), remote.clone());
+    if let Some(task) = &client.caller.task {
         if makes_orchestrator(&command) {
             fail(
                 "role_refused",
@@ -675,16 +673,16 @@ fn main() {
         }
         if !head_decides(&paths, &command, remote.is_some())
             && changes_fleet(&command)
-            && !ends_own_task(&command, &task)
+            && !ends_own_task(&command, task)
             && !orchestrator_may(&command)
             && !agents_change_fleet(&paths)
         {
             fail(
                 "agent_refused",
-                &pastor::daemon::refusal(&task, local_caller_role(&paths, &task)),
+                &pastor::daemon::refusal(task, local_caller_role(&paths, task)),
             );
         }
-    } else if let Some(o) = pastor::ipc::caller().orchestrator {
+    } else if let Some(o) = &client.caller.orchestrator {
         // An orchestrator's pre or post script: the role's table, as the
         // head applies it (`Daemon::handle_as`), for what the CLI does
         // without it.
@@ -697,7 +695,7 @@ fn main() {
             );
         }
         if changes_fleet(&command) && !orchestrator_may(&command) && !agents_change_fleet(&paths) {
-            fail("agent_refused", &pastor::daemon::script_refusal(&o));
+            fail("agent_refused", &pastor::daemon::script_refusal(o));
         }
     }
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -724,7 +722,7 @@ fn main() {
             // here need of it.
             Some(flocky) => {
                 probe_head(
-                    &paths,
+                    &client,
                     // A remote head's flock.toml is not here to read.
                     flocky || remote.is_some() || flocks_declared(&paths),
                     // flock.toml uses a field an older head's `FlockEntry`
@@ -744,15 +742,17 @@ fn main() {
         };
         match command {
             Command::Serve(args) => serve(paths, args, remote.clone(), head_flag, serve_log).await,
-            Command::Task { cmd } => task(&paths, cmd, head).await,
-            Command::Machine { cmd } => machine(&paths, cmd, head).await,
-            Command::Flock { cmd } => flock(&paths, cmd, head).await,
-            Command::Tick(args) => tick(&paths, args, head).await,
-            Command::Job { cmd } => job(&paths, cmd, head).await,
-            Command::Orchestrator { cmd } => pastor::orchestrator_cli::run(&paths, cmd, head).await,
+            Command::Task { cmd } => task(&client, cmd, head).await,
+            Command::Machine { cmd } => machine(&client, cmd, head).await,
+            Command::Flock { cmd } => flock(&client, cmd, head).await,
+            Command::Tick(args) => tick(&client, args, head).await,
+            Command::Job { cmd } => job(&client, cmd, head).await,
+            Command::Orchestrator { cmd } => {
+                pastor::orchestrator_cli::run(&client, cmd, head).await
+            }
             Command::Config {
                 cmd: ConfigCmd::Edit { local },
-            } => config_edit(&paths, local, head).await,
+            } => config_edit(&client, local, head).await,
             Command::Completions { shell } => {
                 let mut cmd = completion_tree();
                 clap_complete::generate(shell, &mut cmd, "pastor", &mut std::io::stdout());
@@ -763,14 +763,14 @@ fn main() {
                 }
                 Ok(())
             }
-            Command::Events(args) => pastor::events::cli(&paths, args).await,
-            Command::Watch(args) => pastor::watch::cli(&paths, args).await,
+            Command::Events(args) => pastor::events::cli(&client, args).await,
+            Command::Watch(args) => pastor::watch::cli(&client, args).await,
             Command::Setup { cmd } => pastor::setup::cli(&paths, cmd),
             Command::Connector { cmd } => pastor::connector::cli::run(&paths, cmd, head).await,
-            Command::Profile { cmd } => pastor::profile_cli::run(&head_config(&paths).await?, cmd),
-            Command::Trust { cmd } => pastor::trust_cli::run(&paths, cmd, head).await,
-            Command::Limit { cmd } => pastor::limit_cli::run(&paths, cmd, head).await,
-            Command::Queue(args) => pastor::queue_cli::run(&paths, args, head).await,
+            Command::Profile { cmd } => pastor::profile_cli::run(&head_config(&client).await?, cmd),
+            Command::Trust { cmd } => pastor::trust_cli::run(&client, cmd, head).await,
+            Command::Limit { cmd } => pastor::limit_cli::run(&client, cmd, head).await,
+            Command::Queue(args) => pastor::queue_cli::run(&client, args, head).await,
             Command::Bridge(_) => unreachable!("handled before the runtime"),
             Command::Head { cmd } => pastor::head::run(&paths, cmd, remote.as_ref()).await,
         }
@@ -925,12 +925,12 @@ fn fail(code: &str, message: &str) -> ! {
 /// too. What each request needs is checked as it is sent
 /// (`IpcRequest::min_protocol`), against the pong kept here.
 async fn probe_head(
-    paths: &Paths,
+    client: &pastor::ipc::Client,
     flocks: bool,
     need: Option<(u32, &str)>,
 ) -> anyhow::Result<Head> {
-    let socket = paths.socket_file();
-    let ping = match pastor::ipc::remote_head() {
+    let socket = client.paths.socket_file();
+    let ping = match &client.head {
         // A remote head is never absent: the command must not fall back to
         // this machine's files, so no answer stops it.
         Some(remote) => {
@@ -960,7 +960,7 @@ async fn probe_head(
         version, protocol, ..
     } = &ping
     {
-        pastor::ipc::head_gate(paths).remember(version, *protocol);
+        pastor::ipc::head_gate(client).remember(version, *protocol);
     }
     match ping {
         HeadPing::NotRunning => Ok(Head::Absent),
@@ -968,7 +968,7 @@ async fn probe_head(
             role: Some(role), ..
         } if role == pastor::ipc::SHEPHERD_ROLE => Err(pastor::cli::CliError::err(
             "shepherd_running",
-            match pastor::ipc::remote_head() {
+            match &client.head {
                 Some(r) => format!(
                     "{} runs a headless pastor serve, not a head; point `pastor head set` at the head",
                     r.ssh
@@ -1401,7 +1401,8 @@ fn run_prompt(a: &RunArgs) -> anyhow::Result<String> {
     Ok(text.to_string())
 }
 
-async fn run(paths: &Paths, a: RunArgs) -> anyhow::Result<()> {
+async fn run(client: &pastor::ipc::Client, a: RunArgs) -> anyhow::Result<()> {
+    let paths = &client.paths;
     if let Some(m) = &a.model {
         pastor::config::check_model_name(m).map_err(|e| {
             CliError::err(
@@ -1434,14 +1435,14 @@ async fn run(paths: &Paths, a: RunArgs) -> anyhow::Result<()> {
     let prompt = run_prompt(&a)?;
     // With a remote head, pastor.toml is the head's and not here: the built-in
     // defaults fill the spec, and the head resolves the agent again with its own.
-    let config = if pastor::ipc::remote_head().is_some() {
+    let config = if client.head.is_some() {
         PastorConfig::default()
     } else {
         PastorConfig::load(&paths.config_file())?
     };
     let spec = run_spec(&a, &config)?;
     let resp = ask(
-        paths,
+        client,
         IpcRequest::Run {
             agent: Some(agent_choice(&a)),
             prompt,
@@ -1715,8 +1716,11 @@ fn head_row() -> pastor::cli::HeadRow {
 
 /// A remote head's row: its ssh destination for the host and the version
 /// it answers ping with. Its herdr is not asked, so it reads `-`.
-async fn remote_head_row(paths: &Paths, ssh: &str) -> anyhow::Result<pastor::cli::HeadRow> {
-    let resp = ask(paths, IpcRequest::Ping).await?;
+async fn remote_head_row(
+    client: &pastor::ipc::Client,
+    ssh: &str,
+) -> anyhow::Result<pastor::cli::HeadRow> {
+    let resp = ask(client, IpcRequest::Ping).await?;
     let IpcResponse::Pong { version, .. } = resp else {
         return Err(unexpected(resp));
     };
@@ -1730,17 +1734,18 @@ async fn remote_head_row(paths: &Paths, ssh: &str) -> anyhow::Result<pastor::cli
 /// everything worked, since a failure must leave exactly one JSON value on
 /// stderr.
 async fn machine_list(
-    paths: &Paths,
+    client: &pastor::ipc::Client,
     flock: Option<&str>,
     wide: bool,
     json: bool,
     head: Head,
 ) -> anyhow::Result<()> {
+    let paths = &client.paths;
     // A head that is up but busy never gets here (`probe_head`), so the
     // machines are probed directly only when nothing is listening.
     let (rows, note) = match head {
         Head::Live => {
-            let resp = ask(paths, IpcRequest::FlockList).await?;
+            let resp = ask(client, IpcRequest::FlockList).await?;
             let IpcResponse::Machines(ms) = resp else {
                 return Err(unexpected(resp));
             };
@@ -1775,8 +1780,8 @@ async fn machine_list(
         .filter(|m| flock.is_none_or(|n| m.in_flock(n)))
         .collect();
     pastor::cli::head_machine_first(&mut rows);
-    let head = match pastor::ipc::remote_head() {
-        Some(remote) => remote_head_row(paths, &remote.ssh).await?,
+    let head = match &client.head {
+        Some(remote) => remote_head_row(client, &remote.ssh).await?,
         None => head_row(),
     };
     if let Some(note) = note {
@@ -1836,7 +1841,8 @@ fn list_shows_orphans(a: &ListArgs) -> bool {
     !a.blocked && !a.done && a.job.is_none()
 }
 
-async fn list(paths: &Paths, a: ListArgs, head: Head) -> anyhow::Result<()> {
+async fn list(client: &pastor::ipc::Client, a: ListArgs, head: Head) -> anyhow::Result<()> {
+    let paths = &client.paths;
     let states = list_states(&a);
     let hint = list_empty_hint(&a);
     let show_orphans = list_shows_orphans(&a);
@@ -1847,7 +1853,7 @@ async fn list(paths: &Paths, a: ListArgs, head: Head) -> anyhow::Result<()> {
         flock: a.flock.clone(),
     };
     let tasks = if head.is_live() {
-        let resp = ask(paths, IpcRequest::List { filter }).await?;
+        let resp = ask(client, IpcRequest::List { filter }).await?;
         let IpcResponse::Tasks(ts) = resp else {
             return Err(unexpected(resp));
         };
@@ -1886,7 +1892,7 @@ async fn list(paths: &Paths, a: ListArgs, head: Head) -> anyhow::Result<()> {
             if group.is_empty() {
                 continue;
             }
-            let table = task_table(paths, group, a.wide).await?;
+            let table = task_table(client, group, a.wide).await?;
             tables.push(if titled {
                 format!("{title}:\n{table}")
             } else {
@@ -1899,7 +1905,7 @@ async fn list(paths: &Paths, a: ListArgs, head: Head) -> anyhow::Result<()> {
     // Only a running head knows them (its last reconcile); `--json` stays a
     // plain task array, and `machine list --json` carries them instead.
     if head.is_live() && !a.json && show_orphans {
-        let resp = ask(paths, IpcRequest::FlockList).await?;
+        let resp = ask(client, IpcRequest::FlockList).await?;
         let IpcResponse::Machines(ms) = resp else {
             return Err(unexpected(resp));
         };
@@ -1911,7 +1917,12 @@ async fn list(paths: &Paths, a: ListArgs, head: Head) -> anyhow::Result<()> {
 }
 
 /// `task list`'s table of `tasks`, with `--wide`'s RESULT and DESCRIPTION.
-async fn task_table(paths: &Paths, tasks: &[Task], wide: bool) -> anyhow::Result<String> {
+async fn task_table(
+    client: &pastor::ipc::Client,
+    tasks: &[Task],
+    wide: bool,
+) -> anyhow::Result<String> {
+    let paths = &client.paths;
     let mut rows = pastor::cli::task_rows(tasks);
     // The flock file is the truth for "removed" whether or not a head
     // runs (a running head re-reads it every tick). `load_existing`
@@ -1921,8 +1932,8 @@ async fn task_table(paths: &Paths, tasks: &[Task], wide: bool) -> anyhow::Result
     // 4103271200, 4103271289, 4103271156).
     // A remote head's flock.toml is not here: its machines are what it
     // reports.
-    if pastor::ipc::remote_head().is_some() {
-        let resp = ask(paths, IpcRequest::FlockList).await?;
+    if client.head.is_some() {
+        let resp = ask(client, IpcRequest::FlockList).await?;
         let IpcResponse::Machines(ms) = resp else {
             return Err(unexpected(resp));
         };
@@ -1960,10 +1971,11 @@ fn task_id(s: &str) -> i64 {
     parse_task_id(s).unwrap_or_else(|| fail("usage_error", &bad_task_id(s)))
 }
 
-async fn task(paths: &Paths, cmd: TaskCmd, head: Head) -> anyhow::Result<()> {
+async fn task(client: &pastor::ipc::Client, cmd: TaskCmd, head: Head) -> anyhow::Result<()> {
+    let paths = &client.paths;
     match cmd {
-        TaskCmd::Run(args) => run(paths, *args).await?,
-        TaskCmd::List(args) => list(paths, args, head).await?,
+        TaskCmd::Run(args) => run(client, *args).await?,
+        TaskCmd::List(args) => list(client, args, head).await?,
         TaskCmd::Describe {
             task,
             all_summaries,
@@ -1971,12 +1983,12 @@ async fn task(paths: &Paths, cmd: TaskCmd, head: Head) -> anyhow::Result<()> {
         } => {
             let id = task_id(&task);
             let (t, all) = if head.is_live() {
-                let resp = ask(paths, IpcRequest::TaskShow { id }).await?;
+                let resp = ask(client, IpcRequest::TaskShow { id }).await?;
                 let IpcResponse::Task(t) = resp else {
                     return Err(unexpected(resp));
                 };
                 let all = if all_summaries {
-                    let resp = ask(paths, IpcRequest::TaskSummaries { id }).await?;
+                    let resp = ask(client, IpcRequest::TaskSummaries { id }).await?;
                     let IpcResponse::Summaries(all) = resp else {
                         return Err(unexpected(resp));
                     };
@@ -2010,7 +2022,7 @@ async fn task(paths: &Paths, cmd: TaskCmd, head: Head) -> anyhow::Result<()> {
         }
         TaskCmd::Read { task, lines } => {
             let resp = ask(
-                paths,
+                client,
                 IpcRequest::TaskRead {
                     id: task_id(&task),
                     lines,
@@ -2022,18 +2034,19 @@ async fn task(paths: &Paths, cmd: TaskCmd, head: Head) -> anyhow::Result<()> {
             };
             print!("{}", pastor::cli::printable(&text));
         }
-        TaskCmd::Attach { task } => attach(paths, &task).await?,
-        TaskCmd::Retry(a) => pastor::task_cli::retry(paths, a).await?,
-        TaskCmd::Priority(a) => pastor::task_cli::priority(paths, a).await?,
-        TaskCmd::Close(a) => pastor::task_cli::close(paths, a).await?,
-        TaskCmd::Prune(a) => pastor::task_cli::prune(paths, a, head).await?,
-        TaskCmd::Send(a) => pastor::task_cli::send(paths, a).await?,
-        TaskCmd::Done(a) => pastor::task_cli::done(paths, a).await?,
+        TaskCmd::Attach { task } => attach(client, &task).await?,
+        TaskCmd::Retry(a) => pastor::task_cli::retry(client, a).await?,
+        TaskCmd::Priority(a) => pastor::task_cli::priority(client, a).await?,
+        TaskCmd::Close(a) => pastor::task_cli::close(client, a).await?,
+        TaskCmd::Prune(a) => pastor::task_cli::prune(client, a, head).await?,
+        TaskCmd::Send(a) => pastor::task_cli::send(client, a).await?,
+        TaskCmd::Done(a) => pastor::task_cli::done(client, a).await?,
     }
     Ok(())
 }
 
-async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<()> {
+async fn machine(client: &pastor::ipc::Client, cmd: MachineCmd, head: Head) -> anyhow::Result<()> {
+    let paths = &client.paths;
     let path = paths.flock_file();
     match cmd {
         MachineCmd::Add {
@@ -2076,7 +2089,7 @@ async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<(
             let reload = if head.is_live() {
                 println!(
                     "{}",
-                    ask_text(paths, IpcRequest::MachineAdd { machine: m.clone() }).await?
+                    ask_text(client, IpcRequest::MachineAdd { machine: m.clone() }).await?
                 );
                 None
             } else {
@@ -2115,7 +2128,7 @@ async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<(
             // Only for the herdr hint below, read before the machine goes,
             // from the head's file; a file that does not load gives no hint.
             let target = if herdr {
-                head_flock(paths)
+                head_flock(client)
                     .await
                     .ok()
                     .and_then(|f| f.get(&name).and_then(|m| m.ssh.clone()))
@@ -2125,7 +2138,7 @@ async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<(
             if head.is_live() {
                 println!(
                     "{}",
-                    ask_text(paths, IpcRequest::MachineRemove { name: name.clone() }).await?
+                    ask_text(client, IpcRequest::MachineRemove { name: name.clone() }).await?
                 );
             } else {
                 let _lock = offline_fleet_lock(paths)?;
@@ -2166,7 +2179,7 @@ async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<(
             if head.is_live() {
                 println!(
                     "{}",
-                    ask_text(paths, IpcRequest::MachineMove { name, flock }).await?
+                    ask_text(client, IpcRequest::MachineMove { name, flock }).await?
                 );
             } else {
                 let done = fleet_edit::move_machine(&path, &name, &flock).map_err(edit_error)?;
@@ -2174,10 +2187,10 @@ async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<(
             }
         }
         MachineCmd::List { flock, wide, json } => {
-            machine_list(paths, flock.as_deref(), wide, json, head).await?
+            machine_list(client, flock.as_deref(), wide, json, head).await?
         }
-        MachineCmd::Describe { name, json } => machine_describe(paths, &name, json, head).await?,
-        MachineCmd::Open { name } => open(paths, &name).await?,
+        MachineCmd::Describe { name, json } => machine_describe(client, &name, json, head).await?,
+        MachineCmd::Open { name } => open(client, &name).await?,
         MachineCmd::AuthorizedKey { name, key } => authorized_key(&path, &name, &key)?,
     }
     Ok(())
@@ -2210,15 +2223,16 @@ fn offline_fleet_lock(paths: &Paths) -> anyhow::Result<std::fs::File> {
 }
 
 /// `ask`, for a request the head answers with `Text`.
-async fn ask_text(paths: &Paths, req: IpcRequest) -> anyhow::Result<String> {
-    let resp = ask(paths, req).await?;
+async fn ask_text(client: &pastor::ipc::Client, req: IpcRequest) -> anyhow::Result<String> {
+    let resp = ask(client, req).await?;
     let IpcResponse::Text(text) = resp else {
         return Err(unexpected(resp));
     };
     Ok(text)
 }
 
-async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
+async fn flock(client: &pastor::ipc::Client, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
+    let paths = &client.paths;
     let path = paths.flock_file();
     let edit = |f: &dyn Fn(&mut FlockDoc) -> Result<(), EditError>| -> anyhow::Result<()> {
         let mut doc = FlockDoc::open(&path)?;
@@ -2226,11 +2240,11 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
         doc.save(&path)
     };
     let done = match cmd {
-        FlockCmd::List { wide, json } => return flock_list(paths, wide, json, head).await,
+        FlockCmd::List { wide, json } => return flock_list(client, wide, json, head).await,
         FlockCmd::Describe { name, json } => {
-            return flock_describe(paths, &name, json, head).await;
+            return flock_describe(client, &name, json, head).await;
         }
-        FlockCmd::Edit => return edit_file(paths, ConfigFile::Flock, head).await,
+        FlockCmd::Edit => return edit_file(client, ConfigFile::Flock, head).await,
         FlockCmd::Add {
             name,
             machines,
@@ -2241,7 +2255,7 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
                 println!(
                     "{}",
                     ask_text(
-                        paths,
+                        client,
                         IpcRequest::FlockAdd {
                             name,
                             default,
@@ -2284,7 +2298,7 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
                 println!(
                     "{}",
                     ask_text(
-                        paths,
+                        client,
                         IpcRequest::FlockJoin {
                             flock,
                             machine,
@@ -2302,7 +2316,7 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
             if head.is_live() {
                 println!(
                     "{}",
-                    ask_text(paths, IpcRequest::FlockLeave { flock, machine }).await?
+                    ask_text(client, IpcRequest::FlockLeave { flock, machine }).await?
                 );
                 return Ok(());
             }
@@ -2323,7 +2337,7 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
             // With a head, the head checks and edits under the lock `task
             // run` takes, so no task can be queued in the flock in between.
             if head.is_live() {
-                let resp = ask(paths, IpcRequest::FlockRemove { name }).await?;
+                let resp = ask(client, IpcRequest::FlockRemove { name }).await?;
                 let IpcResponse::Text(done) = resp else {
                     return Err(unexpected(resp));
                 };
@@ -2350,7 +2364,7 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
         FlockCmd::Default {
             cmd: FlockDefaultCmd::Show,
         } => {
-            println!("{}", head_flock(paths).await?.default_flock());
+            println!("{}", head_flock(client).await?.default_flock());
             return Ok(());
         }
         FlockCmd::Default {
@@ -2359,7 +2373,7 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
             if head.is_live() {
                 println!(
                     "{}",
-                    ask_text(paths, IpcRequest::FlockSetDefault { name }).await?
+                    ask_text(client, IpcRequest::FlockSetDefault { name }).await?
                 );
                 return Ok(());
             }
@@ -2372,10 +2386,15 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
 
 /// `flock list`: the flock file, the queued tasks, and with a head running
 /// the live agents on each flock's machines.
-async fn flock_list(paths: &Paths, wide: bool, json: bool, head: Head) -> anyhow::Result<()> {
-    let f = head_flock(paths).await?;
+async fn flock_list(
+    client: &pastor::ipc::Client,
+    wide: bool,
+    json: bool,
+    head: Head,
+) -> anyhow::Result<()> {
+    let f = head_flock(client).await?;
     let live = if head.is_live() {
-        let resp = ask(paths, IpcRequest::FlockList).await?;
+        let resp = ask(client, IpcRequest::FlockList).await?;
         let IpcResponse::Machines(ms) = resp else {
             return Err(unexpected(resp));
         };
@@ -2384,7 +2403,7 @@ async fn flock_list(paths: &Paths, wide: bool, json: bool, head: Head) -> anyhow
         eprintln!("pastor serve is not running; agents are unknown");
         None
     };
-    let queued = queued_tasks(paths, head).await?;
+    let queued = queued_tasks(client, head).await?;
     let rows = pastor::cli::flock_list(&f, live.as_deref(), &queued);
     if json {
         println!("{}", serde_json::to_string_pretty(&rows)?);
@@ -2408,14 +2427,14 @@ async fn flock_list(paths: &Paths, wide: bool, json: bool, head: Head) -> anyhow
 /// with `FileGet`, with the path it has there; `None` with the head here,
 /// whose files are this machine's.
 async fn head_file(
-    paths: &Paths,
+    client: &pastor::ipc::Client,
     file: ConfigFile,
 ) -> anyhow::Result<Option<(std::path::PathBuf, String)>> {
-    if pastor::ipc::remote_head().is_none() {
+    if client.head.is_none() {
         return Ok(None);
     }
     let resp = ask(
-        paths,
+        client,
         IpcRequest::FileGet {
             file: file.to_string(),
         },
@@ -2428,28 +2447,28 @@ async fn head_file(
 }
 
 /// flock.toml as the head reads it: the remote head's, else this machine's.
-async fn head_flock(paths: &Paths) -> anyhow::Result<Flock> {
-    match head_file(paths, ConfigFile::Flock).await? {
+async fn head_flock(client: &pastor::ipc::Client) -> anyhow::Result<Flock> {
+    match head_file(client, ConfigFile::Flock).await? {
         Some((path, text)) => Flock::parse(&path, &text),
-        None => Flock::load(&paths.flock_file()),
+        None => Flock::load(&client.paths.flock_file()),
     }
 }
 
 /// pastor.toml as the head reads it: the remote head's, else this
 /// machine's.
-async fn head_config(paths: &Paths) -> anyhow::Result<PastorConfig> {
-    match head_file(paths, ConfigFile::Config).await? {
+async fn head_config(client: &pastor::ipc::Client) -> anyhow::Result<PastorConfig> {
+    match head_file(client, ConfigFile::Config).await? {
         Some((path, text)) => PastorConfig::parse(&path, &text),
-        None => PastorConfig::load(&paths.config_file()),
+        None => PastorConfig::load(&client.paths.config_file()),
     }
 }
 
 /// `m` as this machine reaches it. The head's own machine (`local`) is,
 /// seen from a CLI with a remote head, the head's ssh destination.
-fn reach_from_here(m: &MachineConfig) -> MachineConfig {
+fn reach_from_here(m: &MachineConfig, head: Option<&pastor::head::RemoteHead>) -> MachineConfig {
     let mut m = m.clone();
     if m.local
-        && let Some(r) = pastor::ipc::remote_head()
+        && let Some(r) = head
     {
         m.local = false;
         m.ssh = Some(r.ssh.clone());
@@ -2458,12 +2477,12 @@ fn reach_from_here(m: &MachineConfig) -> MachineConfig {
 }
 
 /// The queued tasks, from the head when one runs, else from the store.
-async fn queued_tasks(paths: &Paths, head: Head) -> anyhow::Result<Vec<Task>> {
+async fn queued_tasks(client: &pastor::ipc::Client, head: Head) -> anyhow::Result<Vec<Task>> {
     let filter = TaskFilter {
         states: Some(vec![TaskState::Queued]),
         ..Default::default()
     };
-    tasks_matching(paths, head, filter).await
+    tasks_matching(client, head, filter).await
 }
 
 /// After `machine add|remove` rewrote flock.toml, a running head re-reads it
@@ -2473,7 +2492,13 @@ async fn queued_tasks(paths: &Paths, head: Head) -> anyhow::Result<Vec<Task>> {
 async fn reload_running_head(paths: &Paths, head: Head) -> &'static str {
     match head {
         Head::Absent => "start pastor serve to use it",
-        Head::Live => match request(&paths.socket_file(), &IpcRequest::Reload).await {
+        Head::Live => match request(
+            &paths.socket_file(),
+            &IpcRequest::Reload,
+            &pastor::ipc::Caller::from_env(),
+        )
+        .await
+        {
             Ok(IpcResponse::Jobs(_)) => "the running pastor serve picked it up",
             _ => "pastor serve did not take the reload; run `pastor job reload`",
         },
@@ -2578,12 +2603,13 @@ fn waiting_attach_refusal(t: &Task) -> Option<String> {
     })
 }
 
-async fn attach(paths: &Paths, task: &str) -> anyhow::Result<()> {
+async fn attach(client: &pastor::ipc::Client, task: &str) -> anyhow::Result<()> {
+    let paths = &client.paths;
     let id = task_id(task);
     // A remote head's task, its flock.toml and its pastor.toml; the pane
     // itself is reached from here.
-    let t = if pastor::ipc::remote_head().is_some() {
-        let resp = ask(paths, IpcRequest::TaskShow { id }).await?;
+    let t = if client.head.is_some() {
+        let resp = ask(client, IpcRequest::TaskShow { id }).await?;
         let IpcResponse::Task(t) = resp else {
             return Err(unexpected(resp));
         };
@@ -2602,16 +2628,17 @@ async fn attach(paths: &Paths, task: &str) -> anyhow::Result<()> {
     if let Some(why) = waiting_attach_refusal(&t) {
         fail(pastor::daemon::TASK_WAITING, &why);
     }
-    let f = head_flock(paths).await?;
+    let f = head_flock(client).await?;
     let m = reach_from_here(
         f.get(&machine)
             .unwrap_or_else(|| fail("unknown_machine", &machine)),
+        client.head.as_ref(),
     );
     let m = &m;
     // Its pane is gone: a Claude task's own session opens again in a new
     // pane, and the task stays as it is.
     if !t.state.occupies_pane() {
-        let agents = head_config(paths).await?.agents;
+        let agents = head_config(client).await?.agents;
         if let Some(why) = pastor::reopen::why_not(&t, &agents) {
             fail(
                 "no_agent",
@@ -2681,11 +2708,12 @@ fn authorized_key(flock: &std::path::Path, machine: &str, key: &str) -> anyhow::
     Ok(())
 }
 
-async fn open(paths: &Paths, machine: &str) -> anyhow::Result<()> {
-    let f = head_flock(paths).await?;
+async fn open(client: &pastor::ipc::Client, machine: &str) -> anyhow::Result<()> {
+    let f = head_flock(client).await?;
     let m = reach_from_here(
         f.get(machine)
             .unwrap_or_else(|| fail("unknown_machine", machine)),
+        client.head.as_ref(),
     );
     let err = if let Some(target) = &m.ssh {
         std::process::Command::new("herdr")
@@ -2744,10 +2772,11 @@ fn standalone(paths: &Paths) -> anyhow::Result<Scheduler> {
     Ok(Scheduler::standalone(paths.clone(), &config, store)?.with_connectors())
 }
 
-async fn tick(paths: &Paths, a: TickArgs, head: Head) -> anyhow::Result<()> {
+async fn tick(client: &pastor::ipc::Client, a: TickArgs, head: Head) -> anyhow::Result<()> {
+    let paths = &client.paths;
     let runs = if head.is_live() {
         let resp = ask(
-            paths,
+            client,
             IpcRequest::Tick {
                 job: a.job,
                 dry_run: a.dry_run,
@@ -2769,29 +2798,30 @@ async fn tick(paths: &Paths, a: TickArgs, head: Head) -> anyhow::Result<()> {
     print_runs(&runs, a.json)
 }
 
-async fn reload(paths: &Paths) -> anyhow::Result<()> {
-    let resp = ask(paths, IpcRequest::Reload).await?;
+async fn reload(client: &pastor::ipc::Client) -> anyhow::Result<()> {
+    let resp = ask(client, IpcRequest::Reload).await?;
     let IpcResponse::Jobs(jobs) = resp else {
         return Err(unexpected(resp));
     };
     print_jobs(&jobs, false, false)
 }
 
-async fn job(paths: &Paths, cmd: JobCmd, head: Head) -> anyhow::Result<()> {
+async fn job(client: &pastor::ipc::Client, cmd: JobCmd, head: Head) -> anyhow::Result<()> {
+    let paths = &client.paths;
     // With a head elsewhere, this machine's own jobs run in its headless
     // serve: the list shows both, and a job whose file is here is driven here.
-    if let Some(remote) = pastor::ipc::remote_head() {
+    if let Some(remote) = &client.head {
         if let JobCmd::List { json, .. } = cmd {
-            return shepherd_job_list(paths, &remote.ssh, json).await;
+            return shepherd_job_list(client, &remote.ssh, json).await;
         }
         if job_name(&cmd).is_some_and(|name| is_local_job(paths, name)) {
-            return local_job(paths, cmd).await;
+            return local_job(client, cmd).await;
         }
     }
     match cmd {
         JobCmd::List { wide, json } => {
             let jobs = if head.is_live() {
-                let resp = ask(paths, IpcRequest::JobList).await?;
+                let resp = ask(client, IpcRequest::JobList).await?;
                 let IpcResponse::Jobs(jobs) = resp else {
                     return Err(unexpected(resp));
                 };
@@ -2806,18 +2836,18 @@ async fn job(paths: &Paths, cmd: JobCmd, head: Head) -> anyhow::Result<()> {
             };
             print_jobs(&jobs, wide, json)?;
         }
-        JobCmd::Enable { name } => toggle(paths, &name, true, head).await?,
-        JobCmd::Disable { name } => toggle(paths, &name, false, head).await?,
+        JobCmd::Enable { name } => toggle(client, &name, true, head).await?,
+        JobCmd::Disable { name } => toggle(client, &name, false, head).await?,
         JobCmd::Run { name } => {
-            let resp = ask(paths, IpcRequest::JobRun { name }).await?;
+            let resp = ask(client, IpcRequest::JobRun { name }).await?;
             let IpcResponse::Text(msg) = resp else {
                 return Err(unexpected(resp));
             };
             println!("{msg}");
         }
-        JobCmd::Reload => reload(paths).await?,
-        JobCmd::Edit { name } => edit_file(paths, ConfigFile::Job(name), head).await?,
-        JobCmd::Describe { name, json } => job_describe(paths, &name, json, head).await?,
+        JobCmd::Reload => reload(client).await?,
+        JobCmd::Edit { name } => edit_file(client, ConfigFile::Job(name), head).await?,
+        JobCmd::Describe { name, json } => job_describe(client, &name, json, head).await?,
     }
     Ok(())
 }
@@ -2843,12 +2873,16 @@ fn is_local_job(paths: &Paths, name: &str) -> bool {
 }
 
 /// `job list` with a head elsewhere: the head's jobs, then this machine's.
-async fn shepherd_job_list(paths: &Paths, head: &str, json: bool) -> anyhow::Result<()> {
-    let resp = ask(paths, IpcRequest::JobList).await?;
+async fn shepherd_job_list(
+    client: &pastor::ipc::Client,
+    head: &str,
+    json: bool,
+) -> anyhow::Result<()> {
+    let resp = ask(client, IpcRequest::JobList).await?;
     let IpcResponse::Jobs(head_jobs) = resp else {
         return Err(unexpected(resp));
     };
-    let here = local_jobs(paths).await?;
+    let here = local_jobs(client).await?;
     if json {
         let jobs = pastor::cli::placed_jobs(&head_jobs, &here);
         println!("{}", serde_json::to_string_pretty(&jobs)?);
@@ -2861,9 +2895,10 @@ async fn shepherd_job_list(paths: &Paths, head: &str, json: bool) -> anyhow::Res
 
 /// This machine's jobs as its headless serve reports them, or with none
 /// running, the job files and the last state it saved.
-async fn local_jobs(paths: &Paths) -> anyhow::Result<Vec<JobStatus>> {
+async fn local_jobs(client: &pastor::ipc::Client) -> anyhow::Result<Vec<JobStatus>> {
+    let paths = &client.paths;
     if local_serve(paths).await? {
-        let resp = ask_here(paths, IpcRequest::JobList).await?;
+        let resp = ask_here(client, IpcRequest::JobList).await?;
         let IpcResponse::Jobs(jobs) = resp else {
             return Err(unexpected(resp));
         };
@@ -2908,16 +2943,17 @@ async fn local_serve(paths: &Paths) -> anyhow::Result<bool> {
 
 /// `ask` of this machine's own serve, never the head: for its own jobs
 /// while a head is set elsewhere.
-async fn ask_here(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
+async fn ask_here(client: &pastor::ipc::Client, req: IpcRequest) -> anyhow::Result<IpcResponse> {
     Ok(pastor::cli::reply(
-        request(&paths.socket_file(), &req).await,
+        request(&client.paths.socket_file(), &req, &client.caller).await,
     )?)
 }
 
 /// A job whose file is here, with a head elsewhere: this machine's serve
 /// runs it, so its file and state are here and only its tasks are the
 /// head's.
-async fn local_job(paths: &Paths, cmd: JobCmd) -> anyhow::Result<()> {
+async fn local_job(client: &pastor::ipc::Client, cmd: JobCmd) -> anyhow::Result<()> {
+    let paths = &client.paths;
     match cmd {
         JobCmd::Run { name } => {
             if !local_serve(paths).await? {
@@ -2926,14 +2962,14 @@ async fn local_job(paths: &Paths, cmd: JobCmd) -> anyhow::Result<()> {
                     "this machine's pastor serve is not running; start it to run a job here",
                 ));
             }
-            let resp = ask_here(paths, IpcRequest::JobRun { name }).await?;
+            let resp = ask_here(client, IpcRequest::JobRun { name }).await?;
             let IpcResponse::Text(msg) = resp else {
                 return Err(unexpected(resp));
             };
             println!("{msg}");
         }
-        JobCmd::Enable { name } => local_toggle(paths, &name, true).await?,
-        JobCmd::Disable { name } => local_toggle(paths, &name, false).await?,
+        JobCmd::Enable { name } => local_toggle(client, &name, true).await?,
+        JobCmd::Disable { name } => local_toggle(client, &name, false).await?,
         JobCmd::Edit { name } => {
             let file = ConfigFile::Job(name);
             let path = file.path(paths)?;
@@ -2942,19 +2978,19 @@ async fn local_job(paths: &Paths, cmd: JobCmd) -> anyhow::Result<()> {
             match pastor::edit::edit_here(&path, &editor, &check, &mut |_| ask_reopen()).await? {
                 Outcome::Unchanged => println!("no changes to {}", path.display()),
                 Outcome::Saved => {
-                    println!("saved {}; {}", path.display(), reload_here(paths).await?)
+                    println!("saved {}; {}", path.display(), reload_here(client).await?)
                 }
             }
         }
         JobCmd::Describe { name, json } => {
-            let statuses = local_jobs(paths).await?;
+            let statuses = local_jobs(client).await?;
             let store = Store::open(&paths.shepherd_db_file())?;
             let mut d = pastor::describe::job(paths, &name, statuses, &store)?;
             let filter = TaskFilter {
                 job: Some(name),
                 ..Default::default()
             };
-            let resp = ask(paths, IpcRequest::List { filter }).await?;
+            let resp = ask(client, IpcRequest::List { filter }).await?;
             let IpcResponse::Tasks(tasks) = resp else {
                 return Err(unexpected(resp));
             };
@@ -2970,8 +3006,13 @@ async fn local_job(paths: &Paths, cmd: JobCmd) -> anyhow::Result<()> {
 /// with no head to ask about the caller's role (the shepherd keeps no task
 /// store, `shepherd.rs`), so a task caller is refused unless
 /// `agents_change_fleet` is on, orchestrator or not.
-async fn local_toggle(paths: &Paths, name: &str, enabled: bool) -> anyhow::Result<()> {
-    if let Some(task) = pastor::ipc::caller_task()
+async fn local_toggle(
+    client: &pastor::ipc::Client,
+    name: &str,
+    enabled: bool,
+) -> anyhow::Result<()> {
+    let paths = &client.paths;
+    if let Some(task) = &client.caller.task
         && !agents_change_fleet(paths)
     {
         return Err(CliError::err(
@@ -2984,15 +3025,15 @@ async fn local_toggle(paths: &Paths, name: &str, enabled: bool) -> anyhow::Resul
     }
     set_enabled(&ConfigFile::Job(name.to_string()).path(paths)?, enabled)?;
     let verb = if enabled { "enabled" } else { "disabled" };
-    println!("{verb} {name}; {}", reload_here(paths).await?);
+    println!("{verb} {name}; {}", reload_here(client).await?);
     Ok(())
 }
 
 /// After a job file here changed: this machine's serve re-reads it now, or
 /// when it starts.
-async fn reload_here(paths: &Paths) -> anyhow::Result<&'static str> {
-    Ok(if local_serve(paths).await? {
-        ask_here(paths, IpcRequest::Reload).await?;
+async fn reload_here(client: &pastor::ipc::Client) -> anyhow::Result<&'static str> {
+    Ok(if local_serve(&client.paths).await? {
+        ask_here(client, IpcRequest::Reload).await?;
         "this machine's pastor serve picked it up"
     } else {
         "applies when this machine's pastor serve starts"
@@ -3005,7 +3046,12 @@ async fn reload_here(paths: &Paths) -> anyhow::Result<&'static str> {
 /// head; an invalid edit comes back with the head's error and reopens the
 /// editor. With no head the file is the local one, through the same
 /// `edit::put`.
-async fn edit_file(paths: &Paths, file: ConfigFile, head: Head) -> anyhow::Result<()> {
+async fn edit_file(
+    client: &pastor::ipc::Client,
+    file: ConfigFile,
+    head: Head,
+) -> anyhow::Result<()> {
+    let paths = &client.paths;
     let editor = pastor::edit::editor();
     if !head.is_live() {
         let path = file.path(paths)?;
@@ -3017,7 +3063,7 @@ async fn edit_file(paths: &Paths, file: ConfigFile, head: Head) -> anyhow::Resul
         return Ok(());
     }
     let resp = ask(
-        paths,
+        client,
         IpcRequest::FileGet {
             file: file.to_string(),
         },
@@ -3034,7 +3080,7 @@ async fn edit_file(paths: &Paths, file: ConfigFile, head: Head) -> anyhow::Resul
             text: text.to_string(),
             base_hash: got.hash.clone(),
         };
-        let resp = ask(paths, req).await?;
+        let resp = ask(client, req).await?;
         let IpcResponse::Text(msg) = resp else {
             return Err(unexpected(resp));
         };
@@ -3070,34 +3116,35 @@ fn ask_reopen() -> bool {
 /// `config edit`: the head's pastor.toml. With `--local` and a head on
 /// another machine, this machine's, which its headless serve reads; with the
 /// head here the two are the same file.
-async fn config_edit(paths: &Paths, local: bool, head: Head) -> anyhow::Result<()> {
-    if !(local && pastor::ipc::remote_head().is_some()) {
-        return edit_file(paths, ConfigFile::Config, head).await;
+async fn config_edit(client: &pastor::ipc::Client, local: bool, head: Head) -> anyhow::Result<()> {
+    let paths = &client.paths;
+    if !(local && client.head.is_some()) {
+        return edit_file(client, ConfigFile::Config, head).await;
     }
     let path = paths.config_file();
     let check = ConfigFile::Config.checker(paths)?;
     let editor = pastor::edit::editor();
     match pastor::edit::edit_here(&path, &editor, &check, &mut |_| ask_reopen()).await? {
         Outcome::Unchanged => println!("no changes to {}", path.display()),
-        Outcome::Saved => println!("saved {}; {}", path.display(), reload_here(paths).await?),
+        Outcome::Saved => println!("saved {}; {}", path.display(), reload_here(client).await?),
     }
     Ok(())
 }
 
 /// Tasks matching `filter`, from the head when one runs, else the store.
 async fn tasks_matching(
-    paths: &Paths,
+    client: &pastor::ipc::Client,
     head: Head,
     filter: TaskFilter,
 ) -> anyhow::Result<Vec<Task>> {
     if head.is_live() {
-        let resp = ask(paths, IpcRequest::List { filter }).await?;
+        let resp = ask(client, IpcRequest::List { filter }).await?;
         let IpcResponse::Tasks(ts) = resp else {
             return Err(unexpected(resp));
         };
         Ok(ts)
     } else {
-        Ok(open_store(paths)?.list_tasks(&filter)?)
+        Ok(open_store(&client.paths)?.list_tasks(&filter)?)
     }
 }
 
@@ -3120,10 +3167,16 @@ fn print_description<T: serde::Serialize>(
     Ok(())
 }
 
-async fn job_describe(paths: &Paths, name: &str, json: bool, head: Head) -> anyhow::Result<()> {
+async fn job_describe(
+    client: &pastor::ipc::Client,
+    name: &str,
+    json: bool,
+    head: Head,
+) -> anyhow::Result<()> {
+    let paths = &client.paths;
     let d = if head.is_live() {
         let resp = ask(
-            paths,
+            client,
             IpcRequest::JobDescribe {
                 name: name.to_string(),
             },
@@ -3147,12 +3200,18 @@ async fn job_describe(paths: &Paths, name: &str, json: bool, head: Head) -> anyh
 
 /// `machine describe`: the head's description when one runs, else one
 /// built from flock.toml, a probe and the store.
-async fn machine_describe(paths: &Paths, name: &str, json: bool, head: Head) -> anyhow::Result<()> {
+async fn machine_describe(
+    client: &pastor::ipc::Client,
+    name: &str,
+    json: bool,
+    head: Head,
+) -> anyhow::Result<()> {
+    let paths = &client.paths;
     if head.is_live() {
         let req = IpcRequest::MachineDescribe {
             name: name.to_string(),
         };
-        let resp = ask(paths, req).await?;
+        let resp = ask(client, req).await?;
         let IpcResponse::MachineDescription(d) = resp else {
             return Err(unexpected(resp));
         };
@@ -3184,12 +3243,18 @@ async fn machine_describe(paths: &Paths, name: &str, json: bool, head: Head) -> 
 
 /// `flock describe`: the head's description when one runs, else one built
 /// from flock.toml and the store.
-async fn flock_describe(paths: &Paths, name: &str, json: bool, head: Head) -> anyhow::Result<()> {
+async fn flock_describe(
+    client: &pastor::ipc::Client,
+    name: &str,
+    json: bool,
+    head: Head,
+) -> anyhow::Result<()> {
+    let paths = &client.paths;
     if head.is_live() {
         let req = IpcRequest::FlockDescribe {
             name: name.to_string(),
         };
-        let resp = ask(paths, req).await?;
+        let resp = ask(client, req).await?;
         let IpcResponse::FlockDescription(d) = resp else {
             return Err(unexpected(resp));
         };
@@ -3204,11 +3269,17 @@ async fn flock_describe(paths: &Paths, name: &str, json: bool, head: Head) -> an
     print_description(&d, json, pastor::describe::flock_text)
 }
 
-async fn toggle(paths: &Paths, name: &str, enabled: bool, head: Head) -> anyhow::Result<()> {
+async fn toggle(
+    client: &pastor::ipc::Client,
+    name: &str,
+    enabled: bool,
+    head: Head,
+) -> anyhow::Result<()> {
+    let paths = &client.paths;
     // Let through from a task's pane for an orchestrator
     // (`orchestrator_may`), whose role only the head knows.
     if !head.is_live()
-        && let Some(task) = pastor::ipc::caller_task()
+        && let Some(task) = &client.caller.task
         && !agents_change_fleet(paths)
     {
         return Err(CliError::err(
@@ -3224,7 +3295,7 @@ async fn toggle(paths: &Paths, name: &str, enabled: bool, head: Head) -> anyhow:
             name: name.to_string(),
             enabled,
         };
-        let resp = ask(paths, req).await?;
+        let resp = ask(client, req).await?;
         let IpcResponse::Text(done) = resp else {
             return Err(unexpected(resp));
         };

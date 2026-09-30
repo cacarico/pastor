@@ -7,8 +7,7 @@
 use clap::Subcommand;
 
 use crate::cli::{CliError, age, request_error, table};
-use crate::config::Paths;
-use crate::ipc::{Head, IpcRequest, IpcResponse};
+use crate::ipc::{Client, Head, IpcRequest, IpcResponse};
 use crate::limit::{AccountLimit, local_time};
 use crate::store::Store;
 
@@ -46,10 +45,11 @@ pub fn changes_fleet(cmd: &LimitCmd) -> bool {
     !matches!(cmd, LimitCmd::List { .. })
 }
 
-pub async fn run(paths: &Paths, cmd: LimitCmd, head: Head) -> anyhow::Result<()> {
+pub async fn run(client: &Client, cmd: LimitCmd, head: Head) -> anyhow::Result<()> {
     if head.is_live() {
-        return run_on_head(paths, cmd).await;
+        return run_on_head(client, cmd).await;
     }
+    let paths = &client.paths;
     paths.ensure()?;
     let store = Store::open(&paths.db_file())?;
     match cmd {
@@ -61,7 +61,7 @@ pub async fn run(paths: &Paths, cmd: LimitCmd, head: Head) -> anyhow::Result<()>
     }
 }
 
-async fn run_on_head(paths: &Paths, cmd: LimitCmd) -> anyhow::Result<()> {
+async fn run_on_head(client: &Client, cmd: LimitCmd) -> anyhow::Result<()> {
     let (req, json) = match &cmd {
         LimitCmd::List { json } => (IpcRequest::LimitList, *json),
         LimitCmd::Clear { account, model } => (
@@ -72,7 +72,7 @@ async fn run_on_head(paths: &Paths, cmd: LimitCmd) -> anyhow::Result<()> {
             false,
         ),
     };
-    match crate::ipc::request_head(paths, &req).await {
+    match crate::ipc::request_head(client, &req).await {
         Ok(IpcResponse::Limits(list)) => match cmd {
             LimitCmd::List { .. } => print_list(&list, json),
             LimitCmd::Clear { account, model } => print_cleared(&account, model.as_deref(), &list),

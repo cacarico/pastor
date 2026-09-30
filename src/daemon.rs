@@ -425,6 +425,37 @@ pub struct Fleet {
     reply_wait_ms: std::sync::atomic::AtomicU64,
 }
 
+/// `Fleet::queue_run_as`'s arguments, grouped: the `IpcRequest::Run` fields
+/// that reach it (`now` is settled into `spec` before this, so it carries
+/// none).
+pub struct RunAsk<'a> {
+    pub prompt: String,
+    pub spec: crate::task::DispatchSpec,
+    /// `None`: the flock of the pinned machine, or the default flock.
+    pub flock: Option<&'a str>,
+    /// What the run's flags said about the agent; `None` keeps the agent
+    /// `spec` already carries.
+    pub ask: Option<&'a AgentChoice>,
+    /// `--priority`; `None` lets the flock, the pinned machine or
+    /// `[defaults]` set the level.
+    pub priority: Option<Priority>,
+    pub role: TaskRole,
+    pub description: Option<String>,
+    pub preempt: bool,
+    pub summary: Option<crate::task::SummaryMode>,
+}
+
+/// `Fleet::pausable_for`'s arguments, grouped.
+struct PausableFor<'a> {
+    views: &'a [MachineView],
+    flock: &'a str,
+    task: &'a Task,
+    claim: Claim,
+    accepts: &'a dyn Fn(&str) -> bool,
+    later: &'a [Task],
+    takes: &'a dyn Fn(&Task, &str) -> bool,
+}
+
 impl Fleet {
     /// A fixed set of machines; `apply_flock` leaves it alone.
     pub fn new(machines: Vec<MachineHandle>, store: Arc<Store>) -> Fleet {
@@ -1266,35 +1297,34 @@ impl Fleet {
         ask: Option<&AgentChoice>,
         priority: Option<Priority>,
     ) -> Result<Task, QueueError> {
-        self.queue_run_as(
+        self.queue_run_as(RunAsk {
             prompt,
             spec,
             flock,
             ask,
             priority,
-            TaskRole::Agent,
-            None,
-            false,
-            None,
-        )
+            role: TaskRole::Agent,
+            description: None,
+            preempt: false,
+            summary: None,
+        })
         .await
     }
 
     /// `queue_run`, for a task of `role` (`task run --role`). `summary` is
     /// `task run --summary`; without it the flock or `[defaults]` decide.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn queue_run_as(
-        &self,
-        prompt: String,
-        mut spec: crate::task::DispatchSpec,
-        flock: Option<&str>,
-        ask: Option<&AgentChoice>,
-        priority: Option<Priority>,
-        role: TaskRole,
-        description: Option<String>,
-        preempt: bool,
-        summary: Option<crate::task::SummaryMode>,
-    ) -> Result<Task, QueueError> {
+    pub async fn queue_run_as(&self, run: RunAsk<'_>) -> Result<Task, QueueError> {
+        let RunAsk {
+            prompt,
+            mut spec,
+            flock,
+            ask,
+            priority,
+            role,
+            description,
+            preempt,
+            summary,
+        } = run;
         let _pass = self.dispatch_lock.lock().await;
         if let Some(m) = &spec.machine
             && !self.in_flock(m)
@@ -1408,31 +1438,32 @@ impl Fleet {
         let preempt = job.preempt && priority == Priority::Critical;
         let description = job.task_description_for(item);
         let summary = self.settle_summary(job.summary, &flock);
-        self.store.insert_job_task_at(
-            &job.name,
-            &flock,
-            item,
-            level,
-            preempt,
-            description.as_deref(),
-            |id| {
-                let (prompt, mut spec) = render(id)?;
-                spec.agent = settled.agent;
-                spec.agent_args = settled.agent_args;
-                spec.allow = settled.allow;
-                spec.deny = settled.deny;
-                spec.agent_source = settled.agent_source;
-                spec.timeout_secs = settled.timeout_secs;
-                spec.place = settled.place;
-                spec.label = settled.label;
-                spec.keep_pane = settled.keep_pane;
-                spec.keep_pane_from = settled.keep_pane_from;
-                spec.summary = summary;
-                // Only a person's `task run --now` skips the queue.
-                spec.now = false;
-                Ok((prompt, spec))
-            },
-        )
+        self.store
+            .insert_job_task_at(crate::store::InsertJobTaskAt {
+                job: &job.name,
+                flock: &flock,
+                item,
+                level,
+                preempt,
+                description: description.as_deref(),
+                render: |id| {
+                    let (prompt, mut spec) = render(id)?;
+                    spec.agent = settled.agent;
+                    spec.agent_args = settled.agent_args;
+                    spec.allow = settled.allow;
+                    spec.deny = settled.deny;
+                    spec.agent_source = settled.agent_source;
+                    spec.timeout_secs = settled.timeout_secs;
+                    spec.place = settled.place;
+                    spec.label = settled.label;
+                    spec.keep_pane = settled.keep_pane;
+                    spec.keep_pane_from = settled.keep_pane_from;
+                    spec.summary = summary;
+                    // Only a person's `task run --now` skips the queue.
+                    spec.now = false;
+                    Ok((prompt, spec))
+                },
+            })
     }
 
     /// Whether job runs send their items to a head (`Fleet::headless`)
@@ -2784,8 +2815,15 @@ impl Fleet {
             if picked.is_none()
                 && task.pause.preempt
                 && task.priority == Priority::Critical
-                && let Some((machine, victim)) =
-                    self.pausable_for(&views, target, task, claim, &accepts, later, &takes)
+                && let Some((machine, victim)) = self.pausable_for(PausableFor {
+                    views: &views,
+                    flock: target,
+                    task,
+                    claim,
+                    accepts: &accepts,
+                    later,
+                    takes: &takes,
+                })
             {
                 picked = Some(machine);
                 send = Outbound::PauseFor(victim);
@@ -2939,17 +2977,16 @@ impl Fleet {
     /// under its share there has a task in `later` waiting for it, the same
     /// rule dispatch applies, so a pause never frees a slot the task then
     /// may not take. Answers the machine and that task's id.
-    #[allow(clippy::too_many_arguments)]
-    fn pausable_for(
-        &self,
-        views: &[MachineView],
-        flock: &str,
-        task: &Task,
-        claim: Claim,
-        accepts: &dyn Fn(&str) -> bool,
-        later: &[Task],
-        takes: &dyn Fn(&Task, &str) -> bool,
-    ) -> Option<(String, i64)> {
+    fn pausable_for(&self, ask: PausableFor<'_>) -> Option<(String, i64)> {
+        let PausableFor {
+            views,
+            flock,
+            task,
+            claim,
+            accepts,
+            later,
+            takes,
+        } = ask;
         let agents = self.agents.read().recover().clone();
         let default = self.flock().default_flock().to_string();
         let now = chrono::Utc::now();
@@ -3779,17 +3816,17 @@ impl Daemon {
                 }
                 let task = match self
                     .fleet
-                    .queue_run_as(
+                    .queue_run_as(RunAsk {
                         prompt,
                         spec,
-                        flock.as_deref(),
-                        agent.as_ref(),
+                        flock: flock.as_deref(),
+                        ask: agent.as_ref(),
                         priority,
                         role,
-                        crate::config::clean_description(description.as_deref()),
+                        description: crate::config::clean_description(description.as_deref()),
                         preempt,
                         summary,
-                    )
+                    })
                     .await
                 {
                     Ok(t) => t,
@@ -9886,6 +9923,7 @@ mod tests {
                 agent: None,
                 priority: None,
             },
+            &crate::ipc::Caller::default(),
         )
         .await
         .unwrap();
