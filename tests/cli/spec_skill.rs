@@ -101,3 +101,92 @@ fn spec_example_prompts_rebase_before_the_ledger_and_retry_the_push() {
     }
     assert!(checked >= 2, "only {checked} prompt files checked");
 }
+
+/// next-task.sh is the mechanical part shared by both dispatch modes: it
+/// reads a plan and its ledger and prints exactly one of RUN, WAIT, CHECK,
+/// COMPLETE or BLOCKED. Run against the same worked example
+/// `spec_example_plan_runs_its_first_task` uses, since the plan format is
+/// the contract both share.
+#[test]
+fn next_task_reads_the_example_plan_and_its_ledger() {
+    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("skills/spec/example");
+    let plan_src = std::fs::read_dir(&example)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.extension().is_some_and(|e| e == "md") && !p.to_string_lossy().ends_with(".ledger.md")
+        })
+        .expect("an example plan");
+    let stem = plan_src.file_stem().unwrap().to_string_lossy().into_owned();
+    let ledger_src = example.join(format!("{stem}.ledger.md"));
+    let header = std::fs::read_to_string(&ledger_src).unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = tmp.path().join(plan_src.file_name().unwrap());
+    let ledger = tmp.path().join(ledger_src.file_name().unwrap());
+    std::fs::copy(&plan_src, &plan).unwrap();
+
+    let script =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("skills/dispatch/next-task.sh");
+    // A `pastor` stand-in for the PENDING branch: next-task.sh only ever
+    // calls `task describe t-<id> --json` and reads its "state" field.
+    let fake_pastor = tmp.path().join("fake-pastor");
+    let run = |ledger_text: &str, pastor_state: Option<&str>| -> String {
+        std::fs::write(&ledger, ledger_text).unwrap();
+        let mut cmd = Command::new("sh");
+        common::scrub(&mut cmd);
+        cmd.arg(&script).arg(&plan);
+        if let Some(state) = pastor_state {
+            std::fs::write(
+                &fake_pastor,
+                format!("#!/bin/sh\necho '{{\"state\": \"{state}\"}}'\n"),
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_pastor, std::fs::Permissions::from_mode(0o755)).unwrap();
+            cmd.env("PASTOR", &fake_pastor);
+        }
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim_end().to_string()
+    };
+
+    // Task 1 has never run.
+    assert_eq!(
+        run(&header, None),
+        format!("RUN 1 docs/superpowers/plans/{stem}/task-1.md")
+    );
+
+    // Its agent is still working.
+    let running = format!("{header}\nTask 1: ran as t-14 on pi-3\n");
+    assert_eq!(run(&running, Some("running")), "WAIT 1 t-14");
+
+    // It stopped and needs a decision.
+    assert_eq!(run(&running, Some("done")), "CHECK 1 t-14 done");
+
+    // Task 1 is complete: task 2 is next.
+    let task2 = format!(
+        "{header}\nTask 1: complete (a1b2c3d..e4f5a6b, make check: pass)\nTask 1: ran as t-14 on pi-3\n"
+    );
+    assert_eq!(
+        run(&task2, None),
+        format!("RUN 2 docs/superpowers/plans/{stem}/task-2.md")
+    );
+
+    // The ledger itself says task 2 is blocked.
+    let blocked = format!("{task2}Task 2: blocked: the manual has no troubleshooting section\n");
+    assert_eq!(
+        run(&blocked, None),
+        "BLOCKED 2 the manual has no troubleshooting section"
+    );
+
+    // Both tasks are complete.
+    let done = format!(
+        "{task2}Task 2: ran as t-15 on pi-3\nTask 2: complete (e4f5a6b..a1b2c3d, make check: pass)\n"
+    );
+    assert_eq!(run(&done, None), "COMPLETE");
+}
