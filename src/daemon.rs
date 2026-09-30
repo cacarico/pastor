@@ -12762,7 +12762,10 @@ mod tests {
     #[tokio::test]
     async fn now_starts_ahead_of_a_slower_placement_on_the_same_machine() {
         let slow = FakeHerdr::new();
-        slow.set_ready_after(Duration::from_millis(300));
+        // Wide next to the deadline below: a loaded runner (many `#[tokio::test]`s
+        // sharing the machine's cores) can leave this task's thread waiting well
+        // past a few hundred millis before it is next polled.
+        slow.set_ready_after(Duration::from_secs(1));
         let (d, _tmp) = daemon(&[("a", 1, slow.clone())]).await;
         let first = queue_on(&d.store(), "slow", Some("a"));
         let urgent = queue_now_on(&d.store(), "urgent", "a");
@@ -12771,7 +12774,7 @@ mod tests {
             let fleet = fleet.clone();
             async move { fleet.dispatch_queued().await }
         });
-        let deadline = Instant::now() + Duration::from_millis(150);
+        let deadline = Instant::now() + Duration::from_millis(700);
         while state_of(&d, &urgent) != TaskState::Starting {
             assert!(Instant::now() < deadline, "the --now task never started");
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -12781,7 +12784,10 @@ mod tests {
             TaskState::Queued,
             "a slower placement for the same machine must not go out ahead of --now"
         );
-        pass.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), pass)
+            .await
+            .expect("the pass ends once both agents are up")
+            .unwrap();
         assert_eq!(state_of(&d, &urgent), TaskState::Running);
         assert_eq!(state_of(&d, &first), TaskState::Running);
     }
@@ -12793,7 +12799,10 @@ mod tests {
     #[tokio::test]
     async fn now_starts_while_an_earlier_task_is_starting_on_its_machine() {
         let slow = FakeHerdr::new();
-        slow.set_ready_after(Duration::from_secs(3));
+        // Wide next to the deadlines below (their sum is 5s): on a runner busy
+        // with the rest of the suite, the two wait loops can themselves eat
+        // seconds of real time before either one notices its state changed.
+        slow.set_ready_after(Duration::from_secs(8));
         let (d, _tmp) = daemon(&[("a", 1, slow.clone())]).await;
         let first = queue_on(&d.store(), "slow", Some("a"));
         let fleet = d.fleet();
@@ -12801,7 +12810,7 @@ mod tests {
             let fleet = fleet.clone();
             async move { fleet.dispatch_queued().await }
         });
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(3);
         while state_of(&d, &first) != TaskState::Starting {
             assert!(Instant::now() < deadline, "a never claimed its task");
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -12811,7 +12820,7 @@ mod tests {
             let fleet = fleet.clone();
             async move { fleet.dispatch_queued().await }
         });
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + Duration::from_secs(2);
         while state_of(&d, &urgent) != TaskState::Starting {
             assert!(
                 Instant::now() < deadline,
@@ -12822,11 +12831,14 @@ mod tests {
         assert_eq!(state_of(&d, &first), TaskState::Starting);
         assert!(!pass.is_finished(), "the earlier task is still starting");
         slow.set_ready_after(Duration::ZERO);
-        tokio::time::timeout(Duration::from_secs(2), now_pass)
+        tokio::time::timeout(Duration::from_secs(10), now_pass)
             .await
             .expect("the --now pass ends once its agent is up")
             .unwrap();
-        pass.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), pass)
+            .await
+            .expect("the earlier pass ends once its agent is up")
+            .unwrap();
         assert_eq!(state_of(&d, &urgent), TaskState::Running);
         assert_eq!(state_of(&d, &first), TaskState::Running);
         assert_eq!(slow.agents().len(), 2);

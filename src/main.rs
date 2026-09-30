@@ -4276,6 +4276,55 @@ mod tests {
         assert!(check_commands(SKILL).0 > 20);
     }
 
+    /// `plan-format.md` documents waves alongside series: the `Order: waves`
+    /// header with its wave list, the Dispatch block's `wave: W` field, the
+    /// `pastor/<name>/task-<N>` branch a multi-task wave pushes instead of
+    /// the plan branch, and that task's own prompt template, which pushes
+    /// its branch with no rebase or retry since no sibling task can race it
+    /// there.
+    #[test]
+    fn plan_format_documents_waves() {
+        let path = skills_dir().join("spec/plan-format.md");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let at = |needle: &str| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("{} lacks {needle:?}", path.display()))
+        };
+        at("Order: waves");
+        at("Wave 1: Tasks 1, 2");
+        at("wave: W");
+        at("wave: 1");
+        at("pastor/<name>/task-<N>");
+        let wave_task = at("### A task in a multi-task wave");
+        let series_prompt_start = text.find("## Prompt file").unwrap();
+        assert!(
+            series_prompt_start < wave_task,
+            "the wave-task prompt must come after the series one"
+        );
+        let wave_prompt = &text[wave_task..];
+        assert!(
+            wave_prompt.contains("git reset --hard origin/pastor/<name>"),
+            "{wave_prompt}"
+        );
+        assert!(
+            wave_prompt.contains("git push origin HEAD:pastor/<name>/task-<N>"),
+            "{wave_prompt}"
+        );
+        assert!(
+            !wave_prompt.contains("git rebase"),
+            "a wave task pushes its own branch: nothing to rebase onto"
+        );
+        assert!(
+            !wave_prompt.contains("PUSH FAILED"),
+            "a wave task pushes its own branch: no retry, so no failure path"
+        );
+        assert!(
+            wave_prompt.contains("Task <N>: blocked: <why>"),
+            "{wave_prompt}"
+        );
+        assert!(wave_prompt.contains("Print DONE as your last line."));
+    }
+
     /// Every ```toml fence in the docs parses, and one that is a whole file
     /// loads with the loader of the file it shows, in a temp config dir, so a
     /// renamed key cannot leave an example that fails for whoever copies it.
