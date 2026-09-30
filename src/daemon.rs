@@ -11273,9 +11273,14 @@ mod tests {
         let (d, tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
         let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
         std::fs::create_dir_all(paths.jobs_dir()).unwrap();
+        // Disabled, so only the ticks below run it. Enabled, a new interval
+        // job is due at once and the scheduler's own pass may run it first;
+        // the clock item is keyed by the second, so a pass in the same second
+        // leaves the dry run nothing new to create. A forced tick and
+        // `JobRun` ignore `enabled`.
         std::fs::write(
             paths.jobs_dir().join("clock.toml"),
-            "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"tick {{ item.key }} {{ task.id }}\"\n",
+            "every = \"1h\"\nenabled = false\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"tick {{ item.key }} {{ task.id }}\"\n",
         )
         .unwrap();
         let IpcResponse::Jobs(jobs) = d.handle(IpcRequest::Reload).await else {
