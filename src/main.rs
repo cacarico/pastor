@@ -4278,7 +4278,7 @@ mod tests {
 
     /// `plan-format.md` documents waves alongside series: the `Order: waves`
     /// header with its wave list, the Dispatch block's `wave: W` field, the
-    /// `pastor/<name>/task-<N>` branch a multi-task wave pushes instead of
+    /// `pastor/<name>-task-<N>` branch a multi-task wave pushes instead of
     /// the plan branch, and that task's own prompt template, which pushes
     /// its branch with no rebase or retry since no sibling task can race it
     /// there.
@@ -4294,20 +4294,25 @@ mod tests {
         at("Wave 1: Tasks 1, 2");
         at("wave: W");
         at("wave: 1");
-        at("pastor/<name>/task-<N>");
+        at("pastor/<name>-task-<N>");
         let wave_task = at("### A task in a multi-task wave");
         let series_prompt_start = text.find("## Prompt file").unwrap();
         assert!(
             series_prompt_start < wave_task,
             "the wave-task prompt must come after the series one"
         );
+        // Up to the next heading: the merge-task template after it rebases
+        // and retries, which a wave task must not.
         let wave_prompt = &text[wave_task..];
+        let wave_prompt = &wave_prompt[..wave_prompt[3..]
+            .find("\n#")
+            .map_or(wave_prompt.len(), |i| i + 3)];
         assert!(
             wave_prompt.contains("git reset --hard origin/pastor/<name>"),
             "{wave_prompt}"
         );
         assert!(
-            wave_prompt.contains("git push origin HEAD:pastor/<name>/task-<N>"),
+            wave_prompt.contains("git push origin HEAD:pastor/<name>-task-<N>"),
             "{wave_prompt}"
         );
         assert!(
@@ -4323,6 +4328,101 @@ mod tests {
             "{wave_prompt}"
         );
         assert!(wave_prompt.contains("Print DONE as your last line."));
+    }
+
+    /// The merge task folds a multi-task wave's branches into the plan
+    /// branch. It is mechanical: it checks each task branch is there and
+    /// `complete` before merging, keeps both sides only of a ledger
+    /// conflict, runs the check on the merged result, and on anything else
+    /// writes `Wave <W>: blocked` and stops, so a person decides.
+    #[test]
+    fn plan_format_documents_the_wave_merge_task() {
+        let path = skills_dir().join("spec/plan-format.md");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let start = text
+            .find("### The merge task of a wave")
+            .unwrap_or_else(|| panic!("{} lacks the merge task", path.display()));
+        assert!(
+            text.find("### A task in a multi-task wave").unwrap() < start,
+            "the merge task must come after the wave task"
+        );
+        let merge = &text[start..];
+        let merge = &merge[..merge[3..].find("\n#").map_or(merge.len(), |i| i + 3)];
+        let at = |needle: &str| {
+            merge
+                .find(needle)
+                .unwrap_or_else(|| panic!("the merge task lacks {needle:?}:\n{merge}"))
+        };
+        let reset = at("git reset --hard origin/pastor/<name>");
+        let exists = at("origin/pastor/<name>-task-<N>` exists");
+        let not_complete = at("Wave <W>: blocked: Task <N>");
+        let merge_cmd = at("git merge --no-ff origin/pastor/<name>-task-<N>");
+        let abort = at("git merge --abort");
+        let conflict = at("Wave <W>: blocked: conflict in <paths> between Task <A> and Task <B>");
+        let check_fails = at("Wave <W>: blocked: <check> fails after merge");
+        let merged = at("Wave <W>: merged (Tasks <list>, <check>: pass)");
+        let rebase = at("git rebase origin/pastor/<name>");
+        let push = at("git push origin HEAD:pastor/<name>`");
+        assert!(reset < exists && exists < not_complete && not_complete < merge_cmd);
+        assert!(merge_cmd < abort && abort < conflict && conflict < check_fails);
+        assert!(check_fails < merged);
+        // A `blocked` stop records its line by rebasing onto the plan
+        // branch: nothing has been merged yet, or it just reset back to it,
+        // so there is nothing to lose. The template says that once, before
+        // the steps.
+        assert!(rebase < push && push < exists);
+        at("keep both sides' lines");
+        at("rejected as not a fast-forward");
+        at("PUSH FAILED");
+        at("Do not resolve");
+        // The `merged` line instead goes on top of the wave's `--no-ff`
+        // merge commits: rebasing there would drop them.
+        let merged_push = merge.rfind("git push origin HEAD:pastor/<name>`").unwrap();
+        assert!(
+            merged < merged_push,
+            "the merged line must push after recording it"
+        );
+        assert!(
+            merge[merged..].contains("Do not rebase here"),
+            "recording `Wave <W>: merged` must not rebase away the merge commits:\n{merge}"
+        );
+        assert!(
+            !merge.contains("git push origin HEAD:pastor/<name>-task-"),
+            "the merge task pushes the plan branch only"
+        );
+        assert!(
+            !merge.contains("git push origin HEAD:pastor/<name>-m"),
+            "the merge task pushes the plan branch only"
+        );
+        assert!(merge.contains("model: `sonnet`"), "{merge}");
+        assert!(merge.contains("timeout: `30m`"), "{merge}");
+        at("Print DONE as your last line.\n```");
+    }
+
+    /// The spec skill's self-review checks what the plan format asks of a
+    /// wave: siblings share no files, wave tasks push only their own branch,
+    /// and every multi-task wave ends with its merge task.
+    #[test]
+    fn spec_unattended_checks_cover_waves() {
+        let path = skills_dir().join("spec/SKILL.md");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let start = text.find("## Unattended checks").unwrap();
+        let checks = &text[start..];
+        let checks = &checks[..checks[3..].find("\n## ").map_or(checks.len(), |i| i + 3)];
+        for needle in [
+            "share no Files path",
+            "pastor/<name>-task-<N>",
+            "Only merge tasks and single-task waves push the plan branch",
+            "has a merge task after its tasks",
+            "Wave <W>: blocked",
+            "git merge --abort",
+            "fails after merge",
+        ] {
+            assert!(
+                checks.contains(needle),
+                "the Unattended checks lack {needle:?}"
+            );
+        }
     }
 
     /// Every ```toml fence in the docs parses, and one that is a whole file
