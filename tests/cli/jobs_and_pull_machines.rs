@@ -389,7 +389,12 @@ fn a_shepherd_runs_the_task_pinned_to_it_and_the_head_sees_it() {
     assert_eq!(running["machine"], "laptop", "{running}");
     assert!(running["pane_id"].is_string(), "{running}");
 
-    let out = ok(env.cmd(&["events", "--task", &id, "--json"]));
+    // `wait_pulled` above only waits for the task's row to read `done`; the
+    // event that says so is queued separately (`Actor::send_event`) and can
+    // still be in flight, so wait for it too instead of reading the log once.
+    let out = env.wait_for("task.done", &["events", "--task", &id, "--json"], |text| {
+        text.contains("\"task.done\"")
+    });
     let events: Vec<(String, String)> = out
         .lines()
         .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
