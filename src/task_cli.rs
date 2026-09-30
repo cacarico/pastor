@@ -3,8 +3,8 @@
 use clap::{ArgGroup, Args};
 
 use crate::cli::{CliError, ask, print_task, unexpected};
-use crate::config::{Paths, parse_duration};
-use crate::ipc::{Head, IpcRequest, IpcResponse};
+use crate::config::parse_duration;
+use crate::ipc::{Client, Head, IpcRequest, IpcResponse};
 use crate::machine::SendInput;
 use crate::store::{PruneOutcome, Store};
 use crate::task::{Priority, TaskState, UNKNOWN_PRIORITY, parse_task_id};
@@ -70,12 +70,6 @@ pub struct DoneArgs {
 }
 
 impl DoneArgs {
-    /// Whether a summary is given, which only a head of `SUMMARY_PROTOCOL`
-    /// keeps.
-    pub fn has_summary(&self) -> bool {
-        self.summary.is_some() || self.summary_file.is_some()
-    }
-
     /// The summary given: `--summary` as it is, or `--summary-file` read
     /// (`-` is stdin). A blank one is an error, not a round with none.
     pub fn summary_text(&self) -> anyhow::Result<Option<String>> {
@@ -171,21 +165,21 @@ fn task_id(s: &str) -> anyhow::Result<i64> {
 }
 
 /// `pastor task retry t-N`: a new task copying t-N, dispatched now.
-pub async fn retry(paths: &Paths, a: RetryArgs) -> anyhow::Result<()> {
+pub async fn retry(client: &Client, a: RetryArgs) -> anyhow::Result<()> {
     let id = task_id(&a.task)?;
     let req = IpcRequest::TaskRetry { id, place: a.place };
-    match ask(paths, req).await? {
+    match ask(client, req).await? {
         IpcResponse::Task(t) => print_task(&t, a.json),
         other => Err(unexpected(other)),
     }
 }
 
 /// `pastor task priority t-N LEVEL`: a queued task at another level.
-pub async fn priority(paths: &Paths, a: PriorityArgs) -> anyhow::Result<()> {
+pub async fn priority(client: &Client, a: PriorityArgs) -> anyhow::Result<()> {
     let id = task_id(&a.task)?;
     let priority = parse_priority(&a.level)?;
     match ask(
-        paths,
+        client,
         IpcRequest::TaskPriority {
             id,
             priority,
@@ -202,9 +196,9 @@ pub async fn priority(paths: &Paths, a: PriorityArgs) -> anyhow::Result<()> {
 /// `pastor task close t-N... [--remove-worktree]`. One task prints as it
 /// always has; several print one line (or JSON object) each, and any that
 /// failed make it `close_failed`.
-pub async fn close(paths: &Paths, a: CloseArgs) -> anyhow::Result<()> {
+pub async fn close(client: &Client, a: CloseArgs) -> anyhow::Result<()> {
     if let [task] = a.tasks.as_slice() {
-        return match close_one(paths, task, a.remove_worktree).await? {
+        return match close_one(client, task, a.remove_worktree).await? {
             IpcResponse::Task(t) => print_task(&t, a.json),
             // An orphaned agent with no row: there is no task to print.
             IpcResponse::Text(msg) if a.json => {
@@ -221,7 +215,7 @@ pub async fn close(paths: &Paths, a: CloseArgs) -> anyhow::Result<()> {
     let mut results = Vec::new();
     let mut failed = Vec::new();
     for task in &a.tasks {
-        let (line, json) = match close_one(paths, task, a.remove_worktree).await {
+        let (line, json) = match close_one(client, task, a.remove_worktree).await {
             Ok(IpcResponse::Task(t)) => (
                 format!("{} {}", t.display_id(), t.state),
                 serde_json::json!({"task": t.display_id(), "state": t.state}),
@@ -268,13 +262,13 @@ pub async fn close(paths: &Paths, a: CloseArgs) -> anyhow::Result<()> {
 }
 
 async fn close_one(
-    paths: &Paths,
+    client: &Client,
     task: &str,
     remove_worktree: bool,
 ) -> anyhow::Result<IpcResponse> {
     let id = task_id(task)?;
     Ok(ask(
-        paths,
+        client,
         IpcRequest::TaskClose {
             id,
             remove_worktree,
@@ -284,8 +278,8 @@ async fn close_one(
 }
 
 /// `pastor task done [t-N]`: the task given, or the one this pane runs.
-pub async fn done(paths: &Paths, a: DoneArgs) -> anyhow::Result<()> {
-    let task = match a.task.clone().or_else(crate::ipc::caller_task) {
+pub async fn done(client: &Client, a: DoneArgs) -> anyhow::Result<()> {
+    let task = match a.task.clone().or_else(|| client.caller.task.clone()) {
         Some(t) => t,
         None => {
             return Err(CliError::err(
@@ -299,14 +293,14 @@ pub async fn done(paths: &Paths, a: DoneArgs) -> anyhow::Result<()> {
     };
     let id = task_id(&task)?;
     let summary = a.summary_text()?;
-    match ask(paths, IpcRequest::TaskDone { id, summary }).await? {
+    match ask(client, IpcRequest::TaskDone { id, summary }).await? {
         IpcResponse::Task(t) => print_task(&t, a.json),
         other => Err(unexpected(other)),
     }
 }
 
 /// `pastor task send t-N [TEXT] [--key K]... [--no-enter] | --trust`.
-pub async fn send(paths: &Paths, a: SendArgs) -> anyhow::Result<()> {
+pub async fn send(client: &Client, a: SendArgs) -> anyhow::Result<()> {
     let id = task_id(&a.task)?;
     let input = SendInput {
         enter: a.text.is_some() && !a.no_enter,
@@ -314,7 +308,7 @@ pub async fn send(paths: &Paths, a: SendArgs) -> anyhow::Result<()> {
         keys: a.keys,
         trust: a.trust,
     };
-    match ask(paths, IpcRequest::TaskSend { id, input }).await? {
+    match ask(client, IpcRequest::TaskSend { id, input }).await? {
         IpcResponse::Text(msg) if a.json => {
             println!("{}", serde_json::json!({"message": msg}));
             Ok(())
@@ -346,7 +340,7 @@ impl PruneArgs {
 /// one probe found: a head that holds the socket but does not answer may be
 /// busy mid-request, with actors still writing tasks, so it stopped the
 /// command before this (`head_unresponsive`) rather than let prune race it.
-pub async fn prune(paths: &Paths, a: PruneArgs, head: Head) -> anyhow::Result<()> {
+pub async fn prune(client: &Client, a: PruneArgs, head: Head) -> anyhow::Result<()> {
     let older_than = parse_duration(&a.older_than).map_err(|e| CliError::err("usage_error", e))?;
     let states = a.states();
     let out = match head {
@@ -355,12 +349,13 @@ pub async fn prune(paths: &Paths, a: PruneArgs, head: Head) -> anyhow::Result<()
                 states,
                 older_than_secs: older_than.as_secs(),
             };
-            match ask(paths, req).await? {
+            match ask(client, req).await? {
                 IpcResponse::Pruned(out) => out,
                 other => return Err(unexpected(other)),
             }
         }
         Head::Absent => {
+            let paths = &client.paths;
             paths.ensure()?;
             Store::open(&paths.db_file())?.prune(&states, older_than)?
         }

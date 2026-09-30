@@ -53,12 +53,31 @@ pub const QUEUE_HEADER: [&str; 7] = [
 /// agent its model suits; cleared once one takes it.
 pub const WAITING_FOR_MODEL: &str = "waiting for a machine";
 
+/// How a queued task's error starts while every model it may run is on an
+/// exhausted account: `waiting: claude-personal exhausted until 03:00
+/// (5-hour limit, seen by t-412)`; cleared once it starts.
+pub const WAITING_FOR_ACCOUNT: &str = "waiting";
+
+/// Whether `error` is a note dispatch left on a queued task about why it
+/// waits (`WAITING_FOR_MODEL`, `WAITING_FOR_ACCOUNT`), not a real error.
+pub fn is_waiting_note(error: &str) -> bool {
+    error.starts_with(WAITING_FOR_MODEL) || error.starts_with(&format!("{WAITING_FOR_ACCOUNT}: "))
+}
+
 impl QueueEntry {
     /// The machine it is pinned to (or paused on), else its flock.
     pub fn place(&self) -> String {
         match self.task.pinned_machine() {
             Some(m) => format!("machine {m}"),
             None => format!("flock {}", self.flock),
+        }
+    }
+
+    /// Its level, and the one it had before it aged: `high (was low)`.
+    pub fn level(&self) -> String {
+        match self.task.aged_from {
+            Some(was) => format!("{} (was {was})", self.task.priority),
+            None => self.task.priority.to_string(),
         }
     }
 
@@ -82,6 +101,7 @@ impl QueueEntry {
             "pos": self.pos,
             "id": self.task.display_id(),
             "priority": self.task.priority,
+            "aged_from": self.task.aged_from,
             "where": self.place(),
             "flock": self.flock,
             "machine": self.task.pinned_machine(),
@@ -143,7 +163,7 @@ fn why_waiting(
     accepts: &dyn Fn(&Task, &str) -> bool,
 ) -> String {
     if let Some(note) = &task.error
-        && note.starts_with(WAITING_FOR_MODEL)
+        && is_waiting_note(note)
     {
         return note.clone();
     }
@@ -222,7 +242,7 @@ pub fn rows(entries: &[QueueEntry]) -> Vec<Vec<String>> {
             vec![
                 e.pos.to_string(),
                 e.task.display_id(),
-                e.task.priority.to_string(),
+                e.level(),
                 e.place(),
                 e.from(),
                 age(e.task.created_at),
@@ -266,7 +286,11 @@ mod tests {
             priority: Priority::Normal,
             priority_from: None,
             queue_pos: id,
+            aged_from: None,
+            aged_at: None,
             pause: Default::default(),
+            waiting_until: None,
+            usage: None,
             summary: None,
             created_at: now,
             started_at: None,
@@ -494,5 +518,20 @@ mod tests {
         assert_eq!(json["from"], "job nightly");
         assert!(json["waited_secs"].as_i64().unwrap() >= 90);
         assert_eq!(json["task"]["id"], 2);
+        assert_eq!(json["aged_from"], serde_json::Value::Null);
+    }
+
+    /// An aged task shows its level with the one it had before it aged.
+    #[test]
+    fn an_aged_task_shows_its_own_level() {
+        let mut t = task(1, None, None);
+        t.priority = Priority::High;
+        t.aged_from = Some(Priority::Low);
+        let e = entries(vec![t], &[], "default", &|_, _| true);
+        assert_eq!(rows(&e)[0][2], "high (was low)");
+        let json = e[0].to_json();
+        assert_eq!(json["priority"], "high");
+        assert_eq!(json["aged_from"], "low");
+        assert_eq!(json["task"]["aged_from"], "low");
     }
 }

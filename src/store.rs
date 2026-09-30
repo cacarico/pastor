@@ -8,6 +8,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::limit::AccountLimit;
 use crate::queue::QueueSpot;
 use crate::sync::Recover;
 use crate::task::{
@@ -15,7 +16,7 @@ use crate::task::{
     TaskSummary,
 };
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 16;
 
 /// The tables schema 2 added: created on a fresh database and by the v1
 /// migration.
@@ -68,13 +69,49 @@ const V13_TABLES: &str = "CREATE TABLE IF NOT EXISTS task_summaries (
         PRIMARY KEY (task_id, round)
      );";
 
-/// A task row with its last round's summary as JSON (`summary_json`), which
-/// `row_to_task` reads when the query has it.
+/// Schema 15: the accounts (or one model of one) that ran out of usage
+/// (`AccountLimit`), one row per account and model, `''` for the whole
+/// account.
+const V15_TABLES: &str = "CREATE TABLE IF NOT EXISTS limits (
+        account TEXT NOT NULL,
+        model TEXT NOT NULL DEFAULT '',
+        hard INTEGER NOT NULL,
+        no_credit INTEGER NOT NULL DEFAULT 0,
+        until TEXT,
+        retry_at TEXT NOT NULL,
+        line TEXT NOT NULL,
+        task_id INTEGER,
+        machine TEXT,
+        agent TEXT,
+        seen_at TEXT NOT NULL,
+        PRIMARY KEY (account, model)
+     );";
+
+/// Schema 16: what each Claude task's session used (`TaskUsage`), one row
+/// per task, replaced each time pastor reads the session again.
+const V16_TABLES: &str = "CREATE TABLE IF NOT EXISTS task_usage (
+        task_id INTEGER PRIMARY KEY,
+        model TEXT,
+        api_calls INTEGER NOT NULL,
+        input INTEGER NOT NULL,
+        cache_write INTEGER NOT NULL,
+        cache_read INTEGER NOT NULL,
+        output INTEGER NOT NULL,
+        read_at TEXT NOT NULL
+     );";
+
+/// A task row with its last round's summary as JSON (`summary_json`) and
+/// its usage (`usage_json`), which `row_to_task` reads when the query has
+/// them.
 const TASK_WITH_SUMMARY: &str = "SELECT tasks.*,
         (SELECT json_object('round', s.round, 'outcome', s.outcome, 'text', s.text,
                             'source', s.source, 'at', s.at)
            FROM task_summaries s WHERE s.task_id = tasks.id
-          ORDER BY s.round DESC LIMIT 1) AS summary_json
+          ORDER BY s.round DESC LIMIT 1) AS summary_json,
+        (SELECT json_object('model', u.model, 'api_calls', u.api_calls, 'input', u.input,
+                            'cache_write', u.cache_write, 'cache_read', u.cache_read,
+                            'output', u.output, 'read_at', u.read_at)
+           FROM task_usage u WHERE u.task_id = tasks.id) AS usage_json
      FROM tasks";
 
 /// One saved trust, as `pastor trust list` shows it.
@@ -83,6 +120,21 @@ pub struct TrustedRepo {
     pub machine: String,
     pub repo: String,
     pub trusted_at: DateTime<Utc>,
+}
+
+/// Runs a call that may wait on SQLite (the connection's lock, then up to
+/// `BUSY_TIMEOUT` for another connection's) without holding up the tokio
+/// worker it was made on: `block_in_place` hands the worker's other tasks to
+/// another thread first. Store methods are called straight from async code
+/// all over the head, so wrapping them here spares every call site a
+/// `spawn_blocking`. Outside a multi-thread runtime (a CLI, a
+/// `current_thread` test) the call runs as it is.
+fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == RuntimeFlavor::MultiThread => tokio::task::block_in_place(f),
+        _ => f(),
+    }
 }
 
 pub struct Store {
@@ -238,6 +290,19 @@ pub struct JobState {
     pub backoff_until: Option<DateTime<Utc>>,
 }
 
+/// `Store::insert_job_task_at`'s arguments, grouped.
+pub struct InsertJobTaskAt<'a, F> {
+    pub job: &'a str,
+    pub flock: &'a str,
+    pub item: &'a Value,
+    /// The task's level, and what set it (`Task::priority_from`).
+    pub level: (Priority, Option<&'a str>),
+    pub preempt: bool,
+    /// Already rendered; `None` reads as the prompt's first line.
+    pub description: Option<&'a str>,
+    pub render: F,
+}
+
 impl Store {
     /// How long one connection waits for another's lock before giving up.
     const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -359,12 +424,15 @@ impl Store {
                         priority TEXT NOT NULL DEFAULT 'normal',
                         priority_from TEXT,
                         queue_pos INTEGER,
+                        aged_from TEXT,
+                        aged_at TEXT,
                         role TEXT NOT NULL DEFAULT 'agent',
                         description TEXT,
                         preempt INTEGER NOT NULL DEFAULT 0,
                         paused_at TEXT,
                         paused_for INTEGER,
                         resumed_at TEXT,
+                        waiting_until TEXT,
                         created_at TEXT NOT NULL,
                         started_at TEXT,
                         finished_at TEXT,
@@ -377,6 +445,8 @@ impl Store {
                 tx.execute_batch(V5_TABLES)?;
                 tx.execute_batch(V8_TABLES)?;
                 tx.execute_batch(V13_TABLES)?;
+                tx.execute_batch(V15_TABLES)?;
+                tx.execute_batch(V16_TABLES)?;
                 tx.execute(
                     "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)",
                     params![SCHEMA_VERSION.to_string()],
@@ -389,6 +459,8 @@ impl Store {
                 tx.execute_batch(V5_TABLES)?;
                 tx.execute_batch(V8_TABLES)?;
                 tx.execute_batch(V13_TABLES)?;
+                tx.execute_batch(V15_TABLES)?;
+                tx.execute_batch(V16_TABLES)?;
             }
             Some(v) if v < SCHEMA_VERSION => {
                 // One `if v < N` block per migration. The job tables go in
@@ -479,6 +551,23 @@ impl Store {
                 if v < 13 {
                     tx.execute_batch(V13_TABLES)?;
                 }
+                // Queue ageing (`age_queued`): the level a task had before it
+                // aged, and when it last did. Older rows have not aged.
+                if v < 14 {
+                    add_column(&tx, "aged_from", "aged_from TEXT")?;
+                    add_column(&tx, "aged_at", "aged_at TEXT")?;
+                }
+                // Usage limits, and when a limited task is due to go on
+                // (`waiting_until`). Nothing was limited before.
+                if v < 15 {
+                    tx.execute_batch(V15_TABLES)?;
+                    add_column(&tx, "waiting_until", "waiting_until TEXT")?;
+                }
+                // What Claude tasks used (`Task::usage`). Nothing was read
+                // before.
+                if v < 16 {
+                    tx.execute_batch(V16_TABLES)?;
+                }
                 tx.execute(
                     "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
                     params![SCHEMA_VERSION.to_string()],
@@ -488,6 +577,12 @@ impl Store {
                 "database schema {v} is newer than this pastor ({SCHEMA_VERSION}); refusing to touch it"
             ),
         }
+        // Rows that still record a pane (`tasks_holding_panes`): a few, out
+        // of every task a machine ever ran. An index needs no schema bump,
+        // and an older pastor opening the file ignores it.
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS tasks_machine_pane ON tasks(machine) WHERE pane_id IS NOT NULL",
+        )?;
         tx.commit()?;
         Ok(Store {
             conn: Mutex::new(conn),
@@ -523,17 +618,19 @@ impl Store {
         preempt: bool,
     ) -> anyhow::Result<Task> {
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock().recover();
-        let tx = conn.transaction()?;
-        tx.execute(
+        blocking(|| {
+            let mut conn = self.conn.lock().recover();
+            let tx = conn.transaction()?;
+            tx.execute(
             "INSERT INTO tasks (job, item, prompt, spec, flock, state, priority, priority_from, role, description, preempt, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8, ?9, ?11, ?10, ?10)",
             params![t.job, serde_json::to_string(&t.item)?, t.prompt, serde_json::to_string(&t.spec)?, t.flock, priority.as_str(), from, role.as_str(), t.description, now, preempt],
         )?;
-        let id = tx.last_insert_rowid();
-        place_last(&tx, id)?;
-        tx.commit()?;
-        drop(conn);
-        self.get_task(id)?.context("task vanished after insert")
+            let id = tx.last_insert_rowid();
+            place_last(&tx, id)?;
+            tx.commit()?;
+            drop(conn);
+            self.get_task(id)?.context("task vanished after insert")
+        })
     }
 
     /// A task the head handed this machine (`IpcRequest::TaskClaim`), as a
@@ -543,29 +640,34 @@ impl Store {
     /// serve took before a restart) is left as it is and returned.
     pub fn adopt_claimed(&self, t: &Task) -> anyhow::Result<Task> {
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock().recover();
-        let tx = conn.transaction()?;
-        let n = tx.execute(
+        blocking(|| {
+            let mut conn = self.conn.lock().recover();
+            let tx = conn.transaction()?;
+            let n = tx.execute(
             "INSERT OR IGNORE INTO tasks (id, job, item, prompt, spec, flock, state, priority, priority_from, role, description, preempt, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
             params![t.id, t.job, serde_json::to_string(&t.item)?, t.prompt, serde_json::to_string(&t.spec)?, t.flock, t.priority.as_str(), t.priority_from, t.role.as_str(), t.description, t.pause.preempt, now],
         )?;
-        if n == 1 {
-            place_last(&tx, t.id)?;
-        }
-        tx.commit()?;
-        drop(conn);
-        self.get_task(t.id)?.context("task vanished after insert")
+            if n == 1 {
+                place_last(&tx, t.id)?;
+            }
+            tx.commit()?;
+            drop(conn);
+            self.get_task(t.id)?.context("task vanished after insert")
+        })
     }
 
     /// Delete task `id`'s row and its summaries: a claimed task whose end
     /// the head has heard of (`shepherd`), so the rows here do not pile up.
     pub fn forget_task(&self, id: i64) -> anyhow::Result<()> {
-        let mut conn = self.conn.lock().recover();
-        let tx = conn.transaction()?;
-        tx.execute("DELETE FROM task_summaries WHERE task_id = ?1", params![id])?;
-        tx.execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
-        tx.commit()?;
-        Ok(())
+        blocking(|| {
+            let mut conn = self.conn.lock().recover();
+            let tx = conn.transaction()?;
+            tx.execute("DELETE FROM task_summaries WHERE task_id = ?1", params![id])?;
+            tx.execute("DELETE FROM task_usage WHERE task_id = ?1", params![id])?;
+            tx.execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// End a round of task `id`: a new summary row, numbered one past its
@@ -592,38 +694,28 @@ impl Store {
         self.insert_round(id, row)
     }
 
+    /// `end_round` for a round that ended on a usage limit and handed the
+    /// task to another model: `no summary`, with `limit: <line>` for text.
+    pub fn end_round_on_limit(&self, id: i64, line: &str) -> anyhow::Result<TaskSummary> {
+        let row = TaskSummary {
+            round: 0,
+            outcome: Outcome::NoSummary,
+            text: format!("limit: {line}"),
+            source: SummarySource::Pane,
+            at: Utc::now(),
+        };
+        self.insert_round(id, row)
+    }
+
     /// Store `row` as task `id`'s next round.
     fn insert_round(&self, id: i64, row: TaskSummary) -> anyhow::Result<TaskSummary> {
-        let conn = self.conn.lock().recover();
-        let round: u32 = conn.query_row(
-            "INSERT INTO task_summaries (task_id, round, outcome, text, source, at)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let round: u32 = conn.query_row(
+                "INSERT INTO task_summaries (task_id, round, outcome, text, source, at)
              SELECT ?1, COALESCE(MAX(round), 0) + 1, ?2, ?3, ?4, ?5
                FROM task_summaries WHERE task_id = ?1
              RETURNING round",
-            params![
-                id,
-                row.outcome.as_str(),
-                row.text,
-                row.source.as_str(),
-                row.at.to_rfc3339()
-            ],
-            |r| r.get(0),
-        )?;
-        Ok(TaskSummary { round, ..row })
-    }
-
-    /// Put `summary` in place of task `id`'s last round's, for an agent
-    /// that says what it did after pastor already found the task done. A
-    /// task with no rounds yet gets its first.
-    pub fn replace_last_summary(&self, id: i64, summary: &str) -> anyhow::Result<TaskSummary> {
-        let row = self.summary_row(id, Some(summary));
-        let conn = self.conn.lock().recover();
-        let round: Option<u32> = conn
-            .query_row(
-                "UPDATE task_summaries SET outcome = ?2, text = ?3, source = ?4, at = ?5
-                  WHERE task_id = ?1
-                    AND round = (SELECT MAX(round) FROM task_summaries WHERE task_id = ?1)
-                 RETURNING round",
                 params![
                     id,
                     row.outcome.as_str(),
@@ -632,41 +724,97 @@ impl Store {
                     row.at.to_rfc3339()
                 ],
                 |r| r.get(0),
-            )
-            .optional()?;
-        drop(conn);
-        match round {
-            Some(round) => Ok(TaskSummary { round, ..row }),
-            None => self.end_round(id, Some(summary)),
-        }
+            )?;
+            Ok(TaskSummary { round, ..row })
+        })
+    }
+
+    /// Put `summary` in place of task `id`'s last round's, for an agent
+    /// that says what it did after pastor already found the task done. A
+    /// task with no rounds yet gets its first.
+    pub fn replace_last_summary(&self, id: i64, summary: &str) -> anyhow::Result<TaskSummary> {
+        let row = self.summary_row(id, Some(summary));
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let round: Option<u32> = conn
+                .query_row(
+                    "UPDATE task_summaries SET outcome = ?2, text = ?3, source = ?4, at = ?5
+                  WHERE task_id = ?1
+                    AND round = (SELECT MAX(round) FROM task_summaries WHERE task_id = ?1)
+                 RETURNING round",
+                    params![
+                        id,
+                        row.outcome.as_str(),
+                        row.text,
+                        row.source.as_str(),
+                        row.at.to_rfc3339()
+                    ],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            drop(conn);
+            match round {
+                Some(round) => Ok(TaskSummary { round, ..row }),
+                None => self.end_round(id, Some(summary)),
+            }
+        })
+    }
+
+    /// Keep `usage` as what task `id`'s session used, in place of what was
+    /// read before: the session file holds every round, so the last read
+    /// counts them all.
+    pub fn set_usage(&self, id: i64, usage: &crate::usage::TaskUsage) -> anyhow::Result<()> {
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            conn.execute(
+                "INSERT OR REPLACE INTO task_usage
+                   (task_id, model, api_calls, input, cache_write, cache_read, output, read_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    id,
+                    usage.model,
+                    to_sql_int(usage.api_calls)?,
+                    to_sql_int(usage.input)?,
+                    to_sql_int(usage.cache_write)?,
+                    to_sql_int(usage.cache_read)?,
+                    to_sql_int(usage.output)?,
+                    usage.read_at.to_rfc3339()
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     /// Every round's summary of task `id`, the first first.
     pub fn summaries(&self, id: i64) -> anyhow::Result<Vec<TaskSummary>> {
-        let conn = self.conn.lock().recover();
-        let mut stmt = conn.prepare(
-            "SELECT round, outcome, text, source, at FROM task_summaries
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let mut stmt = conn.prepare(
+                "SELECT round, outcome, text, source, at FROM task_summaries
               WHERE task_id = ?1 ORDER BY round",
-        )?;
-        let rows = stmt.query_map(params![id], |r| {
-            let outcome: String = r.get(1)?;
-            let source: String = r.get(3)?;
-            let at: String = r.get(4)?;
-            Ok(TaskSummary {
-                round: r.get(0)?,
-                outcome: outcome.parse().map_err(conversion_failure)?,
-                text: r.get(2)?,
-                source: match source.as_str() {
-                    "agent" => SummarySource::Agent,
-                    "pane" => SummarySource::Pane,
-                    other => return Err(conversion_failure(format!("unknown source {other:?}"))),
-                },
-                at: DateTime::parse_from_rfc3339(&at)
-                    .map(|d| d.with_timezone(&Utc))
-                    .map_err(conversion_failure)?,
-            })
-        })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            )?;
+            let rows = stmt.query_map(params![id], |r| {
+                let outcome: String = r.get(1)?;
+                let source: String = r.get(3)?;
+                let at: String = r.get(4)?;
+                Ok(TaskSummary {
+                    round: r.get(0)?,
+                    outcome: outcome.parse().map_err(conversion_failure)?,
+                    text: r.get(2)?,
+                    source: match source.as_str() {
+                        "agent" => SummarySource::Agent,
+                        "pane" => SummarySource::Pane,
+                        other => {
+                            return Err(conversion_failure(format!("unknown source {other:?}")));
+                        }
+                    },
+                    at: DateTime::parse_from_rfc3339(&at)
+                        .map(|d| d.with_timezone(&Utc))
+                        .map_err(conversion_failure)?,
+                })
+            })?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
     }
 
     /// The row `end_round` writes for task `id`, round not yet numbered.
@@ -734,32 +882,38 @@ impl Store {
     /// saved before it is returned, so no number is given twice, across
     /// restarts too. The first is 1.
     pub fn next_event_seq(&self) -> anyhow::Result<u64> {
-        let conn = self.conn.lock().recover();
-        let seq: i64 = conn.query_row(
-            "UPDATE event_seq SET last = last + 1 WHERE id = 1 RETURNING last",
-            [],
-            |r| r.get(0),
-        )?;
-        Ok(seq as u64)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let seq: i64 = conn.query_row(
+                "UPDATE event_seq SET last = last + 1 WHERE id = 1 RETURNING last",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok(seq as u64)
+        })
     }
 
     /// The last event sequence number given; 0 before the first.
     pub fn last_event_seq(&self) -> anyhow::Result<u64> {
-        let conn = self.conn.lock().recover();
-        let seq: i64 =
-            conn.query_row("SELECT last FROM event_seq WHERE id = 1", [], |r| r.get(0))?;
-        Ok(seq as u64)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let seq: i64 =
+                conn.query_row("SELECT last FROM event_seq WHERE id = 1", [], |r| r.get(0))?;
+            Ok(seq as u64)
+        })
     }
 
     pub fn get_task(&self, id: i64) -> anyhow::Result<Option<Task>> {
-        let conn = self.conn.lock().recover();
-        Ok(conn
-            .query_row(
-                &format!("{TASK_WITH_SUMMARY} WHERE id = ?1"),
-                params![id],
-                row_to_task,
-            )
-            .optional()?)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            Ok(conn
+                .query_row(
+                    &format!("{TASK_WITH_SUMMARY} WHERE id = ?1"),
+                    params![id],
+                    row_to_task,
+                )
+                .optional()?)
+        })
     }
 
     /// Optimistic: the write lands only if the row still carries `t.updated_at`.
@@ -771,12 +925,13 @@ impl Store {
         // clock tick still produce distinct stamps and the next check can tell
         // them apart.
         let now = Utc::now().max(t.updated_at + chrono::Duration::nanoseconds(1));
-        let conn = self.conn.lock().recover();
-        let n = conn.execute(
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let n = conn.execute(
             "UPDATE tasks SET machine = ?2, workspace_id = ?3, pane_id = ?4, agent_name = ?5, state = ?6, error = ?7,
                 last_completion_seq = ?8, started_at = ?9, finished_at = ?10, updated_at = ?11, prompt = ?12, spec = ?13,
                 prompt_pending = ?14, activity_seen = ?16, ended = ?17,
-                paused_at = ?18, paused_for = ?19, resumed_at = ?20
+                paused_at = ?18, paused_for = ?19, resumed_at = ?20, waiting_until = ?21
              WHERE id = ?1 AND updated_at = ?15",
             params![
                 t.id,
@@ -799,22 +954,24 @@ impl Store {
                 t.pause.paused_at.map(|d| d.to_rfc3339()),
                 t.pause.paused_for,
                 t.pause.resumed_at.map(|d| d.to_rfc3339()),
+                t.waiting_until.map(|d| d.to_rfc3339()),
             ],
         )?;
-        if n == 1 {
-            t.updated_at = now;
-            return Ok(());
-        }
-        let exists: bool = conn.query_row(
-            "SELECT COUNT(*) FROM tasks WHERE id = ?1",
-            params![t.id],
-            |r| r.get::<_, i64>(0),
-        )? > 0;
-        if exists {
-            Err(Conflict { id: t.id }.into())
-        } else {
-            anyhow::bail!("task {} not found", t.id)
-        }
+            if n == 1 {
+                t.updated_at = now;
+                return Ok(());
+            }
+            let exists: bool = conn.query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id = ?1",
+                params![t.id],
+                |r| r.get::<_, i64>(0),
+            )? > 0;
+            if exists {
+                Err(Conflict { id: t.id }.into())
+            } else {
+                anyhow::bail!("task {} not found", t.id)
+            }
+        })
     }
 
     /// The one transition dispatch is allowed to make on its own, done in SQL so
@@ -824,35 +981,42 @@ impl Store {
     /// as a conditional UPDATE; `task::next_state` keeps the rule readable.
     pub fn claim_task(&self, id: i64, machine: &str) -> anyhow::Result<Option<Task>> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().recover();
-        let n = conn.execute(
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let n = conn.execute(
             "UPDATE tasks SET state = 'starting', machine = ?2, agent_name = ?3, error = NULL, updated_at = ?4
              WHERE id = ?1 AND state = 'queued'",
             params![id, machine, Task::agent_name_for(id), now],
         )?;
-        drop(conn);
-        if n == 0 {
-            return Ok(None);
-        }
-        self.get_task(id)
+            drop(conn);
+            if n == 0 {
+                return Ok(None);
+            }
+            self.get_task(id)
+        })
     }
 
-    /// `claim_task` for a paused task: `paused` -> `starting` on the machine
-    /// it was paused on, and only there, stamping `resumed_at`. `None` means
-    /// it was not paused there any more (closed meanwhile, or unknown).
+    /// `claim_task` for a paused or waiting task: `paused` or `waiting` ->
+    /// `starting` on the machine it was paused or waiting on, and only there,
+    /// stamping `resumed_at`. A waiting task keeps `waiting_until` for the
+    /// start to tell it went on from a limit (`dispatch::resume`). `None`
+    /// means it was not paused or waiting there any more (closed meanwhile,
+    /// or unknown).
     pub fn claim_paused(&self, id: i64, machine: &str) -> anyhow::Result<Option<Task>> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().recover();
-        let n = conn.execute(
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let n = conn.execute(
             "UPDATE tasks SET state = 'starting', agent_name = ?3, error = NULL, resumed_at = ?4, updated_at = ?4
-             WHERE id = ?1 AND state = 'paused' AND machine = ?2",
+             WHERE id = ?1 AND state IN ('paused', 'waiting') AND machine = ?2",
             params![id, machine, Task::agent_name_for(id), now],
         )?;
-        drop(conn);
-        if n == 0 {
-            return Ok(None);
-        }
-        self.get_task(id)
+            drop(conn);
+            if n == 0 {
+                return Ok(None);
+            }
+            self.get_task(id)
+        })
     }
 
     /// Queue a fresh task that copies job, item, prompt, spec and flock from
@@ -885,13 +1049,16 @@ impl Store {
             None => serde_json::json!({}),
         }
         .to_string();
-        let mut conn = self.conn.lock().recover();
-        let tx = conn.transaction()?;
-        // Check and copy in one statement, so a task closed, pruned or
-        // finished by another writer in between is not retried. The copy
-        // keeps the level, its role, description and where it came from,
-        // but queues last in it.
-        let n = tx.execute(
+        blocking(|| {
+            let mut conn = self.conn.lock().recover();
+            let tx = conn.transaction()?;
+            // Check and copy in one statement, so a task closed, pruned or
+            // finished by another writer in between is not retried. The copy
+            // keeps the level (the one it had before it aged: the copy waits
+            // afresh), its role, description and where it came from,
+            // but queues last in it, and waits for a slot even when the task
+            // it copies ran with `--now`.
+            let n = tx.execute(
             "INSERT INTO tasks (job, item, prompt, spec, flock, role, description, state, retry_of, priority, priority_from, preempt, created_at, updated_at)
              SELECT job, item, prompt,
                     json_patch(json_remove(CASE WHEN COALESCE(json_extract(spec, '$.worktree'), 0) = 0
@@ -902,41 +1069,42 @@ impl Store {
                                                    'path', json_extract(spec, '$.checkout.path'),
                                                    'agent', COALESCE(agent_name, 't-' || id)))
                          ELSE json_remove(spec, '$.branch', '$.checkout', '$.reopen') END,
-                         '$.session_id', '$.label.name', '$.label.note'), ?3),
-                    flock, role, description, 'queued', id, priority, priority_from, preempt, ?2, ?2 FROM tasks
+                         '$.session_id', '$.label.name', '$.label.note', '$.now'), ?3),
+                    flock, role, description, 'queued', id, COALESCE(aged_from, priority), priority_from, preempt, ?2, ?2 FROM tasks
              WHERE id = ?1 AND state IN ('failed', 'stale')",
             params![of, now, patch],
         )?;
-        if n == 0 {
-            let state: Option<String> = tx
-                .query_row("SELECT state FROM tasks WHERE id = ?1", params![of], |r| {
-                    r.get(0)
-                })
-                .optional()?;
-            return Err(match state {
-                None => RetryError::NotFound(of),
-                Some(state) => RetryError::NotRetryable {
-                    id: of,
-                    state: state.parse().map_err(anyhow::Error::msg)?,
-                },
-            });
-        }
-        let id = tx.last_insert_rowid();
-        place_last(&tx, id)?;
-        if place.is_some() {
-            // `agent_source.place_from` is read by `task describe`: an
-            // overridden place explains itself as `task retry`, not as
-            // whatever placed the failed run. A task queued before
-            // `agent_source` existed has none to update.
-            tx.execute(
+            if n == 0 {
+                let state: Option<String> = tx
+                    .query_row("SELECT state FROM tasks WHERE id = ?1", params![of], |r| {
+                        r.get(0)
+                    })
+                    .optional()?;
+                return Err(match state {
+                    None => RetryError::NotFound(of),
+                    Some(state) => RetryError::NotRetryable {
+                        id: of,
+                        state: state.parse().map_err(anyhow::Error::msg)?,
+                    },
+                });
+            }
+            let id = tx.last_insert_rowid();
+            place_last(&tx, id)?;
+            if place.is_some() {
+                // `agent_source.place_from` is read by `task describe`: an
+                // overridden place explains itself as `task retry`, not as
+                // whatever placed the failed run. A task queued before
+                // `agent_source` existed has none to update.
+                tx.execute(
                 "UPDATE tasks SET spec = json_set(spec, '$.agent_source.place_from', 'task retry')
                  WHERE id = ?1 AND json_extract(spec, '$.agent_source') IS NOT NULL",
                 params![id],
             )?;
-        }
-        tx.commit()?;
-        drop(conn);
-        Ok(self.get_task(id)?.context("task vanished after insert")?)
+            }
+            tx.commit()?;
+            drop(conn);
+            Ok(self.get_task(id)?.context("task vanished after insert")?)
+        })
     }
 
     /// Mark task `id` closed, keeping the finish time of a task that already
@@ -964,17 +1132,19 @@ impl Store {
     /// go through that machine. The counterpart of `claim_task`.
     pub fn close_queued(&self, id: i64) -> anyhow::Result<Option<Task>> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().recover();
-        let n = conn.execute(
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let n = conn.execute(
             "UPDATE tasks SET state = 'closed', finished_at = COALESCE(finished_at, ?2), updated_at = ?2
-             WHERE id = ?1 AND state IN ('queued', 'paused')",
+             WHERE id = ?1 AND state IN ('queued', 'paused', 'waiting')",
             params![id, now],
         )?;
-        drop(conn);
-        if n == 0 {
-            return Ok(None);
-        }
-        self.get_task(id)
+            drop(conn);
+            if n == 0 {
+                return Ok(None);
+            }
+            self.get_task(id)
+        })
     }
 
     /// Delete tasks in `states` that finished more than `older_than` ago
@@ -1023,31 +1193,64 @@ impl Store {
              AND workspace_id IS NOT NULL";
         // List and delete under one lock and transaction, so the list
         // matches what the delete left behind.
-        let mut conn = self.conn.lock().recover();
-        let tx = conn.transaction()?;
-        let kept_worktrees = tx
-            .prepare(&format!(
-                "SELECT id FROM tasks WHERE {old} AND {on_disk} ORDER BY id"
-            ))?
-            .query_map(rusqlite::params_from_iter(args.iter()), |r| r.get(0))?
-            .collect::<Result<Vec<i64>, _>>()?;
-        let pruned = tx.execute(
-            &format!("DELETE FROM tasks WHERE {old} AND NOT ({on_disk})"),
-            rusqlite::params_from_iter(args.iter()),
-        )?;
-        tx.execute(
-            "DELETE FROM task_summaries WHERE task_id NOT IN (SELECT id FROM tasks)",
-            [],
-        )?;
-        tx.commit()?;
-        Ok(PruneOutcome {
-            pruned,
-            kept_worktrees,
+        blocking(|| {
+            let mut conn = self.conn.lock().recover();
+            let tx = conn.transaction()?;
+            let kept_worktrees = tx
+                .prepare(&format!(
+                    "SELECT id FROM tasks WHERE {old} AND {on_disk} ORDER BY id"
+                ))?
+                .query_map(rusqlite::params_from_iter(args.iter()), |r| r.get(0))?
+                .collect::<Result<Vec<i64>, _>>()?;
+            let pruned = tx.execute(
+                &format!("DELETE FROM tasks WHERE {old} AND NOT ({on_disk})"),
+                rusqlite::params_from_iter(args.iter()),
+            )?;
+            tx.execute(
+                "DELETE FROM task_summaries WHERE task_id NOT IN (SELECT id FROM tasks)",
+                [],
+            )?;
+            tx.execute(
+                "DELETE FROM task_usage WHERE task_id NOT IN (SELECT id FROM tasks)",
+                [],
+            )?;
+            tx.commit()?;
+            Ok(PruneOutcome {
+                pruned,
+                kept_worktrees,
+            })
         })
     }
 
     pub fn list_tasks(&self, f: &TaskFilter) -> anyhow::Result<Vec<Task>> {
+        self.list_tasks_where(f, false)
+    }
+
+    /// Tasks in `states` on `machine` that still record a pane, for
+    /// auto-close (`auto_close_stopped`): filtered in SQL, over the
+    /// `tasks_machine_pane` index, so a check every few seconds reads the
+    /// outstanding panes only, never the failed history that has none.
+    pub fn tasks_holding_panes(
+        &self,
+        machine: &str,
+        states: &[TaskState],
+    ) -> anyhow::Result<Vec<Task>> {
+        self.list_tasks_where(
+            &TaskFilter {
+                machine: Some(machine.into()),
+                states: Some(states.to_vec()),
+                ..Default::default()
+            },
+            true,
+        )
+    }
+
+    /// `list_tasks`, and with `pane_only` only rows with a pane id.
+    fn list_tasks_where(&self, f: &TaskFilter, pane_only: bool) -> anyhow::Result<Vec<Task>> {
         let mut sql = format!("{TASK_WITH_SUMMARY} WHERE 1=1");
+        if pane_only {
+            sql.push_str(" AND pane_id IS NOT NULL");
+        }
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(job) = &f.job {
             args.push(Box::new(job.clone()));
@@ -1072,13 +1275,15 @@ impl Store {
             sql.push_str(&format!(" AND state IN ({})", placeholders.join(",")));
         }
         sql.push_str(" ORDER BY id DESC");
-        let conn = self.conn.lock().recover();
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(
-            rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())),
-            row_to_task,
-        )?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())),
+                row_to_task,
+            )?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
     }
 
     /// Open tasks that hold a pane on this machine (for capacity and reconciliation).
@@ -1116,18 +1321,112 @@ impl Store {
     /// highest first, a paused task first in its level, then by position,
     /// then oldest first.
     pub fn queued_tasks(&self) -> anyhow::Result<Vec<Task>> {
-        let conn = self.conn.lock().recover();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT * FROM tasks WHERE state IN ('queued', 'paused') ORDER BY {QUEUE_ORDER}"
-        ))?;
-        let rows = stmt.query_map([], row_to_task)?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let mut stmt = conn.prepare(&format!(
+                "SELECT * FROM tasks WHERE state IN ('queued', 'paused') ORDER BY {QUEUE_ORDER}"
+            ))?;
+            let rows = stmt.query_map([], row_to_task)?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+    }
+
+    /// Bring waiting task `id`'s `waiting_until` forward to `now`, so the
+    /// next dispatch pass may resume it: its limit was cleared by hand.
+    /// False when it is not waiting any more.
+    pub fn wake_waiting(&self, id: i64, now: DateTime<Utc>) -> anyhow::Result<bool> {
+        let now = now.to_rfc3339();
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let n = conn.execute(
+                "UPDATE tasks SET waiting_until = ?2, updated_at = ?2
+                 WHERE id = ?1 AND state = 'waiting'",
+                params![id, now],
+            )?;
+            Ok(n == 1)
+        })
+    }
+
+    /// Waiting tasks (`TaskState::Waiting`), the soonest `waiting_until`
+    /// first, then oldest first.
+    pub fn waiting_tasks(&self) -> anyhow::Result<Vec<Task>> {
+        let mut tasks = self.list_tasks(&TaskFilter {
+            states: Some(vec![TaskState::Waiting]),
+            ..Default::default()
+        })?;
+        tasks.sort_by_key(|t| (t.waiting_until, t.id));
+        Ok(tasks)
+    }
+
+    /// Lift each queued task that has waited `age_after` a level
+    /// (`Priority::aged`): since it last aged, it was paused or it was
+    /// queued, whichever is latest. `age_after` gives a task's wait, `None`
+    /// when its flock does not age. One level a call, never past `high`. A
+    /// paused task ages too: it waits in the queue like any other, first
+    /// among its level, and a `low` one queued after it must not age past
+    /// it.
+    /// `exclude` (a dispatch pass's in-flight task ids, `Fleet::in_flight`)
+    /// is left alone: their row still says `queued`, but they were placed
+    /// and have left the queue, so the level they were placed at stays.
+    /// Returns the tasks lifted, as they are now.
+    pub fn age_queued(
+        &self,
+        now: DateTime<Utc>,
+        age_after: impl Fn(&Task) -> Option<std::time::Duration>,
+        exclude: &[i64],
+    ) -> anyhow::Result<Vec<Task>> {
+        let due: Vec<Task> = self
+            .queued_tasks()?
+            .into_iter()
+            .filter(|t| matches!(t.state, TaskState::Queued | TaskState::Paused))
+            .filter(|t| t.priority.aged().is_some())
+            .filter(|t| !exclude.contains(&t.id))
+            .filter(|t| {
+                let Some(wait) = age_after(t).and_then(|d| chrono::Duration::from_std(d).ok())
+                else {
+                    return false;
+                };
+                let since = [t.aged_at, t.pause.paused_at]
+                    .into_iter()
+                    .flatten()
+                    .fold(t.created_at, DateTime::max);
+                now - since >= wait
+            })
+            .collect();
+        let mut aged = Vec::new();
+        for t in due {
+            let to = t.priority.aged().expect("filtered");
+            let n = {
+                let conn = self.conn.lock().recover();
+                // Only while it is still in the state and at the level it was
+                // read at: a claim, a resume or a hand change in between wins.
+                conn.execute(
+                    "UPDATE tasks SET priority = ?3, aged_from = COALESCE(aged_from, ?2), aged_at = ?4
+                     WHERE id = ?1 AND state = ?5 AND priority = ?2",
+                    params![
+                        t.id,
+                        t.priority.as_str(),
+                        to.as_str(),
+                        now.to_rfc3339(),
+                        t.state.as_str()
+                    ],
+                )?
+            };
+            if n == 1
+                && let Some(t) = self.get_task(t.id)?
+            {
+                aged.push(t);
+            }
+        }
+        Ok(aged)
     }
 
     /// Put queued task `id` at `priority`, set by `from`. Refused unless the
     /// task is queued: one a machine took has left the queue. It keeps its
     /// position, so among its new level's tasks it goes by when it was
-    /// queued.
+    /// queued. It forgets what it aged from and resets the ageing clock, so
+    /// a dispatch pass right after does not immediately age it again off a
+    /// wait counted from before the hand change.
     pub fn set_priority(
         &self,
         id: i64,
@@ -1148,28 +1447,31 @@ impl Store {
         preempt: bool,
     ) -> Result<Task, PriorityError> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().recover();
-        let n = conn.execute(
-            "UPDATE tasks SET priority = ?2, priority_from = ?3, preempt = ?5, updated_at = ?4
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let n = conn.execute(
+                "UPDATE tasks SET priority = ?2, priority_from = ?3, preempt = ?5, updated_at = ?4,
+                    aged_from = NULL, aged_at = ?4
              WHERE id = ?1 AND state = 'queued'",
-            params![id, priority.as_str(), from, now, preempt],
-        )?;
-        if n == 0 {
-            let state: Option<String> = conn
-                .query_row("SELECT state FROM tasks WHERE id = ?1", params![id], |r| {
-                    r.get(0)
-                })
-                .optional()?;
-            return Err(match state {
-                None => PriorityError::NotFound(id),
-                Some(state) => PriorityError::NotQueued {
-                    id,
-                    state: state.parse().map_err(anyhow::Error::msg)?,
-                },
-            });
-        }
-        drop(conn);
-        Ok(self.get_task(id)?.context("task vanished after update")?)
+                params![id, priority.as_str(), from, now, preempt],
+            )?;
+            if n == 0 {
+                let state: Option<String> = conn
+                    .query_row("SELECT state FROM tasks WHERE id = ?1", params![id], |r| {
+                        r.get(0)
+                    })
+                    .optional()?;
+                return Err(match state {
+                    None => PriorityError::NotFound(id),
+                    Some(state) => PriorityError::NotQueued {
+                        id,
+                        state: state.parse().map_err(anyhow::Error::msg)?,
+                    },
+                });
+            }
+            drop(conn);
+            Ok(self.get_task(id)?.context("task vanished after update")?)
+        })
     }
 
     /// Move queued task `id` to `spot` (`pastor queue move`). It takes the
@@ -1179,10 +1481,12 @@ impl Store {
     /// positions they held between them in their new order, so the moved
     /// one sits between its neighbours and a new task, placed by its id,
     /// still queues last. Refused unless both it and the task it is moved
-    /// before or after are queued. `exclude` (a dispatch pass's in-flight
-    /// task ids, `Fleet::in_flight`) drops those rows from the queue this
-    /// works out positions and levels from, and from being a valid `before`
-    /// or `after`: their row still says `queued`, but they are on their way
+    /// before or after are queued. A move that changes its level forgets
+    /// what it aged from and resets the ageing clock, the same as a hand
+    /// priority change. `exclude` (a dispatch pass's in-flight task ids,
+    /// `Fleet::in_flight`) drops those rows from the queue this works out
+    /// positions and levels from, and from being a valid `before` or
+    /// `after`: their row still says `queued`, but they are on their way
     /// out of it, and `--to`'s position must not count them either.
     pub fn move_queued(
         &self,
@@ -1191,102 +1495,107 @@ impl Store {
         exclude: &[i64],
     ) -> Result<Moved, MoveError> {
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock().recover();
-        let tx = conn.transaction()?;
-        let mut queue: Vec<(i64, Priority, i64)> = {
-            let mut stmt = tx.prepare(&format!(
-                "SELECT id, priority, COALESCE(queue_pos, id) FROM tasks
+        blocking(|| {
+            let mut conn = self.conn.lock().recover();
+            let tx = conn.transaction()?;
+            let mut queue: Vec<(i64, Priority, i64)> = {
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT id, priority, COALESCE(queue_pos, id) FROM tasks
                  WHERE state = 'queued' ORDER BY {QUEUE_ORDER}"
-            ))?;
-            let rows = stmt.query_map([], |r| {
-                let p: String = r.get(1)?;
-                Ok((r.get(0)?, p.parse().unwrap_or_default(), r.get(2)?))
-            })?;
-            rows.collect::<Result<_, _>>()?
-        };
-        queue.retain(|(qid, ..)| !exclude.contains(qid));
-        let refusal = |tx: &rusqlite::Transaction, id: i64| -> MoveError {
-            if exclude.contains(&id) {
-                return MoveError::InFlight(id);
+                ))?;
+                let rows = stmt.query_map([], |r| {
+                    let p: String = r.get(1)?;
+                    Ok((r.get(0)?, p.parse().unwrap_or_default(), r.get(2)?))
+                })?;
+                rows.collect::<Result<_, _>>()?
+            };
+            queue.retain(|(qid, ..)| !exclude.contains(qid));
+            let refusal = |tx: &rusqlite::Transaction, id: i64| -> MoveError {
+                if exclude.contains(&id) {
+                    return MoveError::InFlight(id);
+                }
+                let state: rusqlite::Result<Option<String>> = tx
+                    .query_row("SELECT state FROM tasks WHERE id = ?1", params![id], |r| {
+                        r.get(0)
+                    })
+                    .optional();
+                match state {
+                    Err(err) => err.into(),
+                    Ok(None) => MoveError::NotFound(id),
+                    Ok(Some(state)) => match state.parse() {
+                        Ok(state) => MoveError::NotQueued { id, state },
+                        Err(err) => MoveError::Store(anyhow::anyhow!(err)),
+                    },
+                }
+            };
+            let index =
+                |queue: &[(i64, Priority, i64)], id: i64| queue.iter().position(|q| q.0 == id);
+            let Some(at) = index(&queue, id) else {
+                return Err(refusal(&tx, id));
+            };
+            if let QueueSpot::Before(other) | QueueSpot::After(other) = spot
+                && index(&queue, other).is_none()
+            {
+                return Err(refusal(&tx, other));
             }
-            let state: rusqlite::Result<Option<String>> = tx
-                .query_row("SELECT state FROM tasks WHERE id = ?1", params![id], |r| {
-                    r.get(0)
-                })
-                .optional();
-            match state {
-                Err(err) => err.into(),
-                Ok(None) => MoveError::NotFound(id),
-                Ok(Some(state)) => match state.parse() {
-                    Ok(state) => MoveError::NotQueued { id, state },
-                    Err(err) => MoveError::Store(anyhow::anyhow!(err)),
-                },
+            let (_, was, own) = queue.remove(at);
+            let i = match spot {
+                QueueSpot::Top => 0,
+                QueueSpot::To(n) => n.saturating_sub(1).min(queue.len()),
+                QueueSpot::Before(other) | QueueSpot::After(other) if other == id => at,
+                QueueSpot::Before(other) => index(&queue, other).expect("checked"),
+                QueueSpot::After(other) => index(&queue, other).expect("checked") + 1,
+            };
+            let mut level = was;
+            if let Some(behind) = queue.get(i)
+                && behind.1 > level
+            {
+                level = behind.1;
             }
-        };
-        let index = |queue: &[(i64, Priority, i64)], id: i64| queue.iter().position(|q| q.0 == id);
-        let Some(at) = index(&queue, id) else {
-            return Err(refusal(&tx, id));
-        };
-        if let QueueSpot::Before(other) | QueueSpot::After(other) = spot
-            && index(&queue, other).is_none()
-        {
-            return Err(refusal(&tx, other));
-        }
-        let (_, was, own) = queue.remove(at);
-        let i = match spot {
-            QueueSpot::Top => 0,
-            QueueSpot::To(n) => n.saturating_sub(1).min(queue.len()),
-            QueueSpot::Before(other) | QueueSpot::After(other) if other == id => at,
-            QueueSpot::Before(other) => index(&queue, other).expect("checked"),
-            QueueSpot::After(other) => index(&queue, other).expect("checked") + 1,
-        };
-        let mut level = was;
-        if let Some(behind) = queue.get(i)
-            && behind.1 > level
-        {
-            level = behind.1;
-        }
-        if i > 0 && queue[i - 1].1 < level {
-            level = queue[i - 1].1;
-        }
-        queue.insert(i, (id, level, own));
-        let mine: Vec<(i64, i64)> = queue
-            .iter()
-            .filter(|q| q.1 == level)
-            .map(|q| (q.0, q.2))
-            .collect();
-        let mut slots: Vec<i64> = mine.iter().map(|m| m.1).collect();
-        slots.sort_unstable();
-        // Ties (a hand edit) would leave the order to age: make them strict.
-        for k in 1..slots.len() {
-            slots[k] = slots[k].max(slots[k - 1] + 1);
-        }
-        for ((task, pos), slot) in mine.iter().zip(slots) {
-            if *pos != slot {
+            if i > 0 && queue[i - 1].1 < level {
+                level = queue[i - 1].1;
+            }
+            queue.insert(i, (id, level, own));
+            let mine: Vec<(i64, i64)> = queue
+                .iter()
+                .filter(|q| q.1 == level)
+                .map(|q| (q.0, q.2))
+                .collect();
+            let mut slots: Vec<i64> = mine.iter().map(|m| m.1).collect();
+            slots.sort_unstable();
+            // Ties (a hand edit) would leave the order to age: make them strict.
+            for k in 1..slots.len() {
+                slots[k] = slots[k].max(slots[k - 1] + 1);
+            }
+            for ((task, pos), slot) in mine.iter().zip(slots) {
+                if *pos != slot {
+                    tx.execute(
+                        "UPDATE tasks SET queue_pos = ?2 WHERE id = ?1",
+                        params![task, slot],
+                    )?;
+                }
+            }
+            if level != was {
                 tx.execute(
-                    "UPDATE tasks SET queue_pos = ?2 WHERE id = ?1",
-                    params![task, slot],
+                    "UPDATE tasks SET priority = ?2, priority_from = 'queue move',
+                        aged_from = NULL, aged_at = ?3
+                     WHERE id = ?1",
+                    params![id, level.as_str(), now],
                 )?;
             }
-        }
-        if level != was {
             tx.execute(
-                "UPDATE tasks SET priority = ?2, priority_from = 'queue move' WHERE id = ?1",
-                params![id, level.as_str()],
+                "UPDATE tasks SET updated_at = ?2 WHERE id = ?1",
+                params![id, now],
             )?;
-        }
-        tx.execute(
-            "UPDATE tasks SET updated_at = ?2 WHERE id = ?1",
-            params![id, now],
-        )?;
-        tx.commit()?;
-        drop(conn);
-        let task = self.get_task(id)?.context("task vanished after move")?;
-        Ok(Moved {
-            task,
-            was,
-            pos: i + 1,
-            of: queue.len(),
+            tx.commit()?;
+            drop(conn);
+            let task = self.get_task(id)?.context("task vanished after move")?;
+            Ok(Moved {
+                task,
+                was,
+                pos: i + 1,
+                of: queue.len(),
+            })
         })
     }
 
@@ -1296,11 +1605,13 @@ impl Store {
     /// such a row is only ever seen flockless between a migration and the
     /// first read of flock.toml. Returns how many rows it changed.
     pub fn adopt_default_flock(&self, default: &str) -> anyhow::Result<usize> {
-        let conn = self.conn.lock().recover();
-        Ok(conn.execute(
-            "UPDATE tasks SET flock = ?1 WHERE flock IS NULL",
-            params![default],
-        )?)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            Ok(conn.execute(
+                "UPDATE tasks SET flock = ?1 WHERE flock IS NULL",
+                params![default],
+            )?)
+        })
     }
 
     pub fn find_by_pane(&self, machine: &str, pane_id: &str) -> anyhow::Result<Option<Task>> {
@@ -1311,26 +1622,31 @@ impl Store {
     }
 
     pub fn job_state(&self, name: &str) -> anyhow::Result<Option<JobState>> {
-        let conn = self.conn.lock().recover();
-        Ok(conn
-            .query_row(
-                "SELECT * FROM job_state WHERE name = ?1",
-                params![name],
-                row_to_job_state,
-            )
-            .optional()?)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            Ok(conn
+                .query_row(
+                    "SELECT * FROM job_state WHERE name = ?1",
+                    params![name],
+                    row_to_job_state,
+                )
+                .optional()?)
+        })
     }
 
     pub fn job_states(&self) -> anyhow::Result<Vec<JobState>> {
-        let conn = self.conn.lock().recover();
-        let mut stmt = conn.prepare("SELECT * FROM job_state ORDER BY name")?;
-        let rows = stmt.query_map([], row_to_job_state)?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let mut stmt = conn.prepare("SELECT * FROM job_state ORDER BY name")?;
+            let rows = stmt.query_map([], row_to_job_state)?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
     }
 
     pub fn save_job_state(&self, s: &JobState) -> anyhow::Result<()> {
-        let conn = self.conn.lock().recover();
-        conn.execute(
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            conn.execute(
             "INSERT OR REPLACE INTO job_state (name, last_run_at, last_ok_at, last_result, last_error, cursor, failures, backoff_until)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
@@ -1344,30 +1660,35 @@ impl Store {
                 s.backoff_until.map(|d| d.to_rfc3339()),
             ],
         )?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// The task `(job, key)` was seen as: `None` when it is unseen,
     /// `Some(None)` when seen with no task id recorded.
     pub fn seen_task(&self, job: &str, key: &str) -> anyhow::Result<Option<Option<i64>>> {
-        let conn = self.conn.lock().recover();
-        Ok(conn
-            .query_row(
-                "SELECT task_id FROM seen WHERE job = ?1 AND key = ?2",
-                params![job, key],
-                |r| r.get(0),
-            )
-            .optional()?)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            Ok(conn
+                .query_row(
+                    "SELECT task_id FROM seen WHERE job = ?1 AND key = ?2",
+                    params![job, key],
+                    |r| r.get(0),
+                )
+                .optional()?)
+        })
     }
 
     pub fn is_seen(&self, job: &str, key: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().recover();
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM seen WHERE job = ?1 AND key = ?2",
-            params![job, key],
-            |r| r.get(0),
-        )?;
-        Ok(n > 0)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM seen WHERE job = ?1 AND key = ?2",
+                params![job, key],
+                |r| r.get(0),
+            )?;
+            Ok(n > 0)
+        })
     }
 
     /// Insert a queued task for `item`, render its prompt and spec with the id
@@ -1384,56 +1705,60 @@ impl Store {
         description: Option<&str>,
         render: impl FnOnce(i64) -> Result<(String, DispatchSpec), String>,
     ) -> anyhow::Result<Task> {
-        self.insert_job_task_at(
+        self.insert_job_task_at(InsertJobTaskAt {
             job,
             flock,
             item,
-            (Priority::Normal, None),
-            false,
+            level: (Priority::Normal, None),
+            preempt: false,
             description,
             render,
-        )
+        })
     }
 
     /// `insert_job_task` at a level, and what set it (`Task::priority_from`).
-    #[allow(clippy::too_many_arguments)]
     pub fn insert_job_task_at(
         &self,
-        job: &str,
-        flock: &str,
-        item: &Value,
-        (priority, from): (Priority, Option<&str>),
-        preempt: bool,
-        description: Option<&str>,
-        render: impl FnOnce(i64) -> Result<(String, DispatchSpec), String>,
+        ask: InsertJobTaskAt<'_, impl FnOnce(i64) -> Result<(String, DispatchSpec), String>>,
     ) -> anyhow::Result<Task> {
+        let InsertJobTaskAt {
+            job,
+            flock,
+            item,
+            level: (priority, from),
+            preempt,
+            description,
+            render,
+        } = ask;
         let key = item
             .get("key")
             .and_then(Value::as_str)
             .context("item has no string key")?
             .to_string();
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock().recover();
-        let tx = conn.transaction()?;
-        tx.execute(
+        blocking(|| {
+            let mut conn = self.conn.lock().recover();
+            let tx = conn.transaction()?;
+            tx.execute(
             "INSERT INTO tasks (job, item, prompt, spec, flock, description, state, priority, priority_from, preempt, created_at, updated_at) VALUES (?1, ?2, '', '{}', ?3, ?7, 'queued', ?5, ?6, ?8, ?4, ?4)",
             params![job, serde_json::to_string(item)?, flock, now, priority.as_str(), from, description, preempt],
         )?;
-        let id = tx.last_insert_rowid();
-        place_last(&tx, id)?;
-        let (prompt, spec) =
-            render(id).map_err(|e| anyhow::anyhow!("render task t-{id} for job {job}: {e}"))?;
-        tx.execute(
-            "UPDATE tasks SET prompt = ?2, spec = ?3 WHERE id = ?1",
-            params![id, prompt, serde_json::to_string(&spec)?],
-        )?;
-        tx.execute(
-            "INSERT INTO seen (job, key, task_id, seen_at) VALUES (?1, ?2, ?3, ?4)",
-            params![job, key, id, now],
-        )?;
-        tx.commit()?;
-        drop(conn);
-        self.get_task(id)?.context("task vanished after insert")
+            let id = tx.last_insert_rowid();
+            place_last(&tx, id)?;
+            let (prompt, spec) =
+                render(id).map_err(|e| anyhow::anyhow!("render task t-{id} for job {job}: {e}"))?;
+            tx.execute(
+                "UPDATE tasks SET prompt = ?2, spec = ?3 WHERE id = ?1",
+                params![id, prompt, serde_json::to_string(&spec)?],
+            )?;
+            tx.execute(
+                "INSERT INTO seen (job, key, task_id, seen_at) VALUES (?1, ?2, ?3, ?4)",
+                params![job, key, id, now],
+            )?;
+            tx.commit()?;
+            drop(conn);
+            self.get_task(id)?.context("task vanished after insert")
+        })
     }
 
     /// Test-only escape hatch to corrupt rows directly and check that reads
@@ -1445,75 +1770,227 @@ impl Store {
 
     /// Save `repo` on `machine` as trusted. Returns whether it was new.
     pub fn trust_repo(&self, machine: &str, repo: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().recover();
-        let n = conn.execute(
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let n = conn.execute(
             "INSERT OR IGNORE INTO trusted_repos (machine, repo, trusted_at) VALUES (?1, ?2, ?3)",
             params![machine, repo, Utc::now().to_rfc3339()],
         )?;
-        Ok(n == 1)
+            Ok(n == 1)
+        })
     }
 
     pub fn is_trusted(&self, machine: &str, repo: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().recover();
-        Ok(conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM trusted_repos WHERE machine = ?1 AND repo = ?2)",
-            params![machine, repo],
-            |r| r.get(0),
-        )?)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            Ok(conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM trusted_repos WHERE machine = ?1 AND repo = ?2)",
+                params![machine, repo],
+                |r| r.get(0),
+            )?)
+        })
     }
 
     /// Every saved trust, by machine then repo.
     pub fn trusted_repos(&self) -> anyhow::Result<Vec<TrustedRepo>> {
-        let conn = self.conn.lock().recover();
-        let mut stmt = conn.prepare(
-            "SELECT machine, repo, trusted_at FROM trusted_repos ORDER BY machine, repo",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            let at: String = r.get(2)?;
-            Ok(TrustedRepo {
-                machine: r.get(0)?,
-                repo: r.get(1)?,
-                trusted_at: DateTime::parse_from_rfc3339(&at)
-                    .map(|d| d.with_timezone(&Utc))
-                    .map_err(conversion_failure)?,
-            })
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let mut stmt = conn.prepare(
+                "SELECT machine, repo, trusted_at FROM trusted_repos ORDER BY machine, repo",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                let at: String = r.get(2)?;
+                Ok(TrustedRepo {
+                    machine: r.get(0)?,
+                    repo: r.get(1)?,
+                    trusted_at: DateTime::parse_from_rfc3339(&at)
+                        .map(|d| d.with_timezone(&Utc))
+                        .map_err(conversion_failure)?,
+                })
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
+    /// Keep `limit`, replacing any row of the same account and model: a
+    /// later limit on the same key is the one that holds.
+    pub fn record_limit(&self, limit: &AccountLimit) -> anyhow::Result<()> {
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            conn.execute(
+                "INSERT OR REPLACE INTO limits
+                   (account, model, hard, no_credit, until, retry_at, line, task_id, machine, agent, seen_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    limit.account,
+                    limit.model.as_deref().unwrap_or(""),
+                    limit.hard,
+                    limit.no_credit,
+                    limit.until.map(|t| t.to_rfc3339()),
+                    limit.retry_at.to_rfc3339(),
+                    limit.line,
+                    limit.task_id,
+                    limit.machine,
+                    limit.agent,
+                    limit.seen_at.to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Every limit kept, live or past its `retry_at`, by account then model.
+    pub fn limits(&self) -> anyhow::Result<Vec<AccountLimit>> {
+        self.select_limits("SELECT * FROM limits ORDER BY account, model", [])
+    }
+
+    /// The limits whose `retry_at` is after `now`: those that stop a task.
+    pub fn live_limits(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<AccountLimit>> {
+        Ok(self
+            .limits()?
+            .into_iter()
+            .filter(|l| l.retry_at > now)
+            .collect())
+    }
+
+    /// Delete the limits whose `retry_at` is not after `now`, answering
+    /// them. The times are compared parsed, not as text: a row written in
+    /// another offset still sorts right. Each row is deleted by the
+    /// `retry_at` text it was read with, not one written again, so a row
+    /// kept as `Z` or `+02:00` goes too, while one replaced meanwhile by a
+    /// later limit stays.
+    pub fn expire_limits(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<AccountLimit>> {
+        let rows = self.select_limits_raw("SELECT * FROM limits ORDER BY account, model", [])?;
+        let gone: Vec<(AccountLimit, String)> = rows
+            .into_iter()
+            .filter(|(l, _)| l.retry_at <= now)
+            .collect();
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            for (l, retry_at) in &gone {
+                conn.execute(
+                    "DELETE FROM limits WHERE account = ?1 AND model = ?2 AND retry_at = ?3",
+                    params![l.account, l.model.as_deref().unwrap_or(""), retry_at],
+                )?;
+            }
+            anyhow::Ok(())
         })?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        Ok(gone.into_iter().map(|(l, _)| l).collect())
+    }
+
+    /// Delete `account`'s limits, answering them: only `model`'s row when
+    /// given, else every row of the account, its models' included.
+    pub fn clear_limits(
+        &self,
+        account: &str,
+        model: Option<&str>,
+    ) -> anyhow::Result<Vec<AccountLimit>> {
+        let gone: Vec<AccountLimit> = self
+            .limits()?
+            .into_iter()
+            .filter(|l| l.account == account && model.is_none_or(|m| l.model.as_deref() == Some(m)))
+            .collect();
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            match model {
+                Some(m) => conn.execute(
+                    "DELETE FROM limits WHERE account = ?1 AND model = ?2",
+                    params![account, m],
+                )?,
+                None => conn.execute("DELETE FROM limits WHERE account = ?1", params![account])?,
+            };
+            anyhow::Ok(())
+        })?;
+        Ok(gone)
+    }
+
+    fn select_limits(
+        &self,
+        sql: &str,
+        args: impl rusqlite::Params,
+    ) -> anyhow::Result<Vec<AccountLimit>> {
+        Ok(self
+            .select_limits_raw(sql, args)?
+            .into_iter()
+            .map(|(l, _)| l)
+            .collect())
+    }
+
+    /// `select_limits`, each row with its `retry_at` as stored.
+    fn select_limits_raw(
+        &self,
+        sql: &str,
+        args: impl rusqlite::Params,
+    ) -> anyhow::Result<Vec<(AccountLimit, String)>> {
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let mut stmt = conn.prepare(sql)?;
+            let time = |s: String| {
+                DateTime::parse_from_rfc3339(&s)
+                    .map(|d| d.with_timezone(&Utc))
+                    .map_err(conversion_failure)
+            };
+            let rows = stmt.query_map(args, |r| {
+                let model: String = r.get("model")?;
+                let retry_at: String = r.get("retry_at")?;
+                let limit = AccountLimit {
+                    account: r.get("account")?,
+                    model: (!model.is_empty()).then_some(model),
+                    hard: r.get("hard")?,
+                    no_credit: r.get("no_credit")?,
+                    until: r.get::<_, Option<String>>("until")?.map(time).transpose()?,
+                    retry_at: time(retry_at.clone())?,
+                    line: r.get("line")?,
+                    task_id: r.get("task_id")?,
+                    machine: r.get("machine")?,
+                    agent: r.get("agent")?,
+                    seen_at: time(r.get("seen_at")?)?,
+                };
+                Ok((limit, retry_at))
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
     }
 
     /// Forget a saved trust. Returns whether there was one.
     pub fn untrust(&self, machine: &str, repo: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().recover();
-        let n = conn.execute(
-            "DELETE FROM trusted_repos WHERE machine = ?1 AND repo = ?2",
-            params![machine, repo],
-        )?;
-        Ok(n == 1)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let n = conn.execute(
+                "DELETE FROM trusted_repos WHERE machine = ?1 AND repo = ?2",
+                params![machine, repo],
+            )?;
+            Ok(n == 1)
+        })
     }
 
     /// Whether task `id` has had its trust keys sent. False for no such row.
     pub fn trust_sent(&self, id: i64) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().recover();
-        Ok(conn
-            .query_row(
-                "SELECT trust_sent FROM tasks WHERE id = ?1",
-                params![id],
-                |r| r.get::<_, bool>(0),
-            )
-            .optional()?
-            .unwrap_or(false))
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            Ok(conn
+                .query_row(
+                    "SELECT trust_sent FROM tasks WHERE id = ?1",
+                    params![id],
+                    |r| r.get::<_, bool>(0),
+                )
+                .optional()?
+                .unwrap_or(false))
+        })
     }
 
     /// Mark task `id` as having had its trust keys sent. True only for the
     /// call that set it, so the keys go to a task once, across restarts.
     /// `update_task` never writes the column, so no stale copy resets it.
     pub fn claim_trust_sent(&self, id: i64) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().recover();
-        let n = conn.execute(
-            "UPDATE tasks SET trust_sent = 1 WHERE id = ?1 AND trust_sent = 0",
-            params![id],
-        )?;
-        Ok(n == 1)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let n = conn.execute(
+                "UPDATE tasks SET trust_sent = 1 WHERE id = ?1 AND trust_sent = 0",
+                params![id],
+            )?;
+            Ok(n == 1)
+        })
     }
 
     /// Record `key` as seen for `job` without a task row here: a headless
@@ -1521,32 +1998,38 @@ impl Store {
     /// the row, or `None` when the head no longer has it. Seen already is
     /// not an error.
     pub fn mark_seen(&self, job: &str, key: &str, task_id: Option<i64>) -> anyhow::Result<()> {
-        let conn = self.conn.lock().recover();
-        conn.execute(
-            "INSERT OR IGNORE INTO seen (job, key, task_id, seen_at) VALUES (?1, ?2, ?3, ?4)",
-            params![job, key, task_id, Utc::now().to_rfc3339()],
-        )?;
-        Ok(())
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            conn.execute(
+                "INSERT OR IGNORE INTO seen (job, key, task_id, seen_at) VALUES (?1, ?2, ?3, ?4)",
+                params![job, key, task_id, Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })
     }
 
     /// Set `key` in the meta table, where the schema version lives too.
     pub fn set_meta(&self, key: &str, value: &str) -> anyhow::Result<()> {
         anyhow::ensure!(key != "schema_version", "schema_version is not a setting");
-        let conn = self.conn.lock().recover();
-        conn.execute(
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            conn.execute(
             "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = ?2",
             params![key, value],
         )?;
-        Ok(())
+            Ok(())
+        })
     }
 
     pub fn meta(&self, key: &str) -> anyhow::Result<Option<String>> {
-        let conn = self.conn.lock().recover();
-        Ok(conn
-            .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
-                r.get(0)
-            })
-            .optional()?)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            Ok(conn
+                .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
+                    r.get(0)
+                })
+                .optional()?)
+        })
     }
 }
 
@@ -1596,6 +2079,21 @@ fn summary_of(row: &Row<'_>, state: &str) -> rusqlite::Result<Option<TaskSummary
         .transpose()
 }
 
+/// A count as SQLite stores it, refused past `i64::MAX`.
+fn to_sql_int(n: u64) -> anyhow::Result<i64> {
+    i64::try_from(n).context("count too large to store")
+}
+
+/// The task's usage from `usage_json`; `None` from a query without the
+/// column, or for a task pastor has read none for.
+fn usage_of(row: &Row<'_>) -> rusqlite::Result<Option<crate::usage::TaskUsage>> {
+    let Ok(json) = row.get::<_, Option<String>>("usage_json") else {
+        return Ok(None);
+    };
+    json.map(|j| serde_json::from_str(&j).map_err(conversion_failure))
+        .transpose()
+}
+
 fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     let parse_dt = |s: &str| -> rusqlite::Result<DateTime<Utc>> {
         DateTime::parse_from_rfc3339(s)
@@ -1613,6 +2111,9 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     let role: String = row.get("role")?;
     let paused_at: Option<String> = row.get("paused_at")?;
     let resumed_at: Option<String> = row.get("resumed_at")?;
+    let waiting_until: Option<String> = row.get("waiting_until")?;
+    let aged_from: Option<String> = row.get("aged_from")?;
+    let aged_at: Option<String> = row.get("aged_at")?;
     Ok(Task {
         id: row.get("id")?,
         job: row.get("job")?,
@@ -1644,6 +2145,13 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         queue_pos: row
             .get::<_, Option<i64>>("queue_pos")?
             .unwrap_or(row.get("id")?),
+        aged_from: aged_from
+            .map(|p| {
+                p.parse()
+                    .map_err(|_| conversion_failure(format!("unknown task priority {p:?}")))
+            })
+            .transpose()?,
+        aged_at: aged_at.as_deref().map(parse_dt).transpose()?,
         role: role.parse().map_err(conversion_failure::<String>)?,
         description: row.get("description")?,
         pause: crate::task::Preemption {
@@ -1652,7 +2160,9 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
             paused_for: row.get("paused_for")?,
             resumed_at: resumed_at.as_deref().map(parse_dt).transpose()?,
         },
+        waiting_until: waiting_until.as_deref().map(parse_dt).transpose()?,
         summary: summary_of(row, &state)?,
+        usage: usage_of(row)?,
         created_at: parse_dt(&created_at)?,
         started_at: started_at.as_deref().map(parse_dt).transpose()?,
         finished_at: finished_at.as_deref().map(parse_dt).transpose()?,
@@ -1713,6 +2223,39 @@ mod tests {
         assert!(s.is_seen("j", "k").unwrap());
     }
 
+    /// A store call stuck on a busy database (here another connection's
+    /// write lock, which `busy_timeout` waits out for up to 5s) leaves the
+    /// tokio worker it was called on free for other tasks. With one worker,
+    /// an inline wait would hold back every other request until it ended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_slow_store_call_does_not_stall_other_tasks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        let s = std::sync::Arc::new(Store::open(&path).unwrap());
+        let other = Connection::open(&path).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let writer = {
+            let s = std::sync::Arc::clone(&s);
+            tokio::spawn(async move {
+                started_tx.send(()).unwrap();
+                s.trust_repo("a", "/r")
+            })
+        };
+        started_rx.await.unwrap();
+        // The wall clock, not tokio's: its timers stall with the worker.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let asked = std::time::Instant::now();
+        assert_eq!(tokio::spawn(async { 7 }).await.unwrap(), 7);
+        let waited = asked.elapsed();
+        other.execute_batch("COMMIT").unwrap();
+        assert!(
+            waited < std::time::Duration::from_secs(2),
+            "an unrelated task waited {waited:?} for the store"
+        );
+        assert!(writer.await.unwrap().unwrap());
+    }
+
     /// A headless serve keeps seen keys and its event cursor with no task
     /// rows of its own.
     #[test]
@@ -1769,6 +2312,7 @@ mod tests {
 
     fn spec() -> DispatchSpec {
         DispatchSpec {
+            now: false,
             agent: "claude".into(),
             agent_args: vec!["--model".into(), "x".into()],
             allow: vec![],
@@ -1787,6 +2331,9 @@ mod tests {
             label: Default::default(),
             summary: Default::default(),
             cwd: None,
+            keep_pane: None,
+            keep_pane_from: None,
+            rounds: Default::default(),
         }
     }
 
@@ -1921,6 +2468,53 @@ mod tests {
         );
     }
 
+    /// Auto-close asks every few seconds for the failed and stale tasks that
+    /// still record a pane: a machine's long failed history, which has none,
+    /// is filtered out in SQL, over its own index, never decoded.
+    #[test]
+    fn tasks_holding_panes_skips_the_paneless_history_in_sql() {
+        let s = Store::open_in_memory().unwrap();
+        for _ in 0..2_000 {
+            s.insert_task(new_task("run")).unwrap();
+        }
+        s.execute_raw("UPDATE tasks SET state = 'failed', machine = 'pi-3'");
+        // A read that decoded the history would trip on this.
+        s.execute_raw("UPDATE tasks SET spec = 'not json'");
+        let mut held = s.insert_task(new_task("run")).unwrap();
+        held.state = TaskState::Stale;
+        held.machine = Some("pi-3".into());
+        held.pane_id = Some("w2:p1".into());
+        s.update_task(&mut held).unwrap();
+        let mut elsewhere = s.insert_task(new_task("run")).unwrap();
+        elsewhere.state = TaskState::Failed;
+        elsewhere.machine = Some("pi-4".into());
+        elsewhere.pane_id = Some("w3:p1".into());
+        s.update_task(&mut elsewhere).unwrap();
+
+        let got = s
+            .tasks_holding_panes("pi-3", &[TaskState::Failed, TaskState::Stale])
+            .unwrap();
+        assert_eq!(got.iter().map(|t| t.id).collect::<Vec<_>>(), vec![held.id]);
+
+        let plan: Vec<String> = {
+            let conn = s.conn.lock().recover();
+            let mut stmt = conn
+                .prepare(
+                    "EXPLAIN QUERY PLAN SELECT * FROM tasks WHERE 1=1 AND pane_id IS NOT NULL \
+                     AND machine = 'pi-3' AND state IN ('failed','stale')",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>("detail"))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert!(
+            plan.iter().any(|d| d.contains("tasks_machine_pane")),
+            "{plan:?}"
+        );
+    }
+
     #[test]
     fn corrupt_rows_are_reported_not_reinterpreted() {
         let s = Store::open_in_memory().unwrap();
@@ -1988,7 +2582,10 @@ mod tests {
             );
         }
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.meta("schema_version").unwrap().unwrap(), "13");
+        assert_eq!(
+            s.meta("schema_version").unwrap().unwrap(),
+            SCHEMA_VERSION.to_string()
+        );
         assert_eq!(s.get_task(1).unwrap().unwrap().summary, None);
         assert_eq!(s.end_round(1, Some("done")).unwrap().round, 1);
     }
@@ -2022,6 +2619,62 @@ mod tests {
         t.state = TaskState::Running;
         s.update_task(&mut t).unwrap();
         assert_eq!(s.get_task(t.id).unwrap().unwrap().summary, None, "running");
+    }
+
+    /// A task's usage is read back with its row, in the list too, the last
+    /// read replacing the one before; forgetting the task drops it.
+    #[test]
+    fn a_tasks_usage_is_kept_and_replaced() {
+        let s = Store::open_in_memory().unwrap();
+        let t = s.insert_task(new_task("run")).unwrap();
+        assert_eq!(s.get_task(t.id).unwrap().unwrap().usage, None);
+        let at = DateTime::parse_from_rfc3339("2026-09-29T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut usage = crate::usage::TaskUsage {
+            model: None,
+            api_calls: 3,
+            input: 12,
+            cache_write: 3_400,
+            cache_read: 1_250_000,
+            output: 900,
+            read_at: at,
+        };
+        s.set_usage(t.id, &usage).unwrap();
+        assert_eq!(
+            s.get_task(t.id).unwrap().unwrap().usage,
+            Some(usage.clone())
+        );
+        usage.model = Some("claude-opus-4-5".into());
+        usage.api_calls = 5;
+        s.set_usage(t.id, &usage).unwrap();
+        let listed = s.list_tasks(&TaskFilter::default()).unwrap();
+        assert_eq!(listed[0].usage, Some(usage));
+        s.forget_task(t.id).unwrap();
+        let left: i64 = s
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM task_usage", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn a_v15_database_gains_the_usage_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.insert_task(new_task("run")).unwrap();
+            s.execute_raw(
+                "DROP TABLE task_usage;
+                 UPDATE meta SET value = '15' WHERE key = 'schema_version'",
+            );
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.meta("schema_version").unwrap().unwrap(), "16");
+        assert_eq!(s.get_task(1).unwrap().unwrap().usage, None);
     }
 
     /// A round that ends with no summary keeps the pane's last lines, and
@@ -2156,8 +2809,10 @@ mod tests {
             table_names(&path),
             vec![
                 "event_seq",
+                "limits",
                 "meta",
                 "task_summaries",
+                "task_usage",
                 "tasks",
                 "trusted_repos"
             ]
@@ -2168,9 +2823,11 @@ mod tests {
             vec![
                 "event_seq",
                 "job_state",
+                "limits",
                 "meta",
                 "seen",
                 "task_summaries",
+                "task_usage",
                 "tasks",
                 "trusted_repos"
             ]
@@ -2209,9 +2866,11 @@ mod tests {
             vec![
                 "event_seq",
                 "job_state",
+                "limits",
                 "meta",
                 "seen",
                 "task_summaries",
+                "task_usage",
                 "tasks",
                 "trusted_repos"
             ]
@@ -2655,6 +3314,44 @@ mod tests {
         );
     }
 
+    /// A waiting task keeps `waiting_until`, is no queued task, lists by
+    /// its reset, is claimed back only on its machine, and closes like a
+    /// queued one.
+    #[test]
+    fn a_waiting_task_lists_by_its_reset_and_is_claimed_on_its_machine() {
+        let s = Store::open_in_memory().unwrap();
+        let now = Utc::now();
+        let wait = |until: i64| {
+            let t = s.insert_task(new_task("run")).unwrap();
+            let mut t = s.claim_task(t.id, "a").unwrap().unwrap();
+            t.state = TaskState::Waiting;
+            t.waiting_until = Some(now + chrono::Duration::minutes(until));
+            s.update_task(&mut t).unwrap();
+            t
+        };
+        let later = wait(60);
+        let sooner = wait(5);
+        let closed = wait(1);
+        assert_eq!(
+            s.get_task(later.id).unwrap().unwrap().waiting_until,
+            later.waiting_until
+        );
+        assert!(s.queued_tasks().unwrap().is_empty());
+        let order: Vec<i64> = s.waiting_tasks().unwrap().iter().map(|t| t.id).collect();
+        assert_eq!(order, vec![closed.id, sooner.id, later.id]);
+        assert_eq!(
+            s.close_queued(closed.id).unwrap().unwrap().state,
+            TaskState::Closed
+        );
+        assert!(s.claim_paused(sooner.id, "b").unwrap().is_none());
+        let back = s.claim_paused(sooner.id, "a").unwrap().unwrap();
+        assert_eq!(back.state, TaskState::Starting);
+        assert_eq!(
+            back.waiting_until, sooner.waiting_until,
+            "kept for the start"
+        );
+    }
+
     /// A retry keeps `preempt` with the level it copies.
     #[test]
     fn a_retry_keeps_preempt() {
@@ -2670,6 +3367,19 @@ mod tests {
             .unwrap();
         set_state(&s, t.id, TaskState::Failed);
         assert!(s.insert_retry(t.id).unwrap().pause.preempt);
+    }
+
+    /// A retry of a `task run --now` task goes through the queue: only
+    /// the person's own run skips it.
+    #[test]
+    fn a_retry_drops_now() {
+        let s = Store::open_in_memory().unwrap();
+        let mut new = new_task("run");
+        new.spec.now = true;
+        let t = s.insert_task(new).unwrap();
+        assert!(t.spec.now);
+        set_state(&s, t.id, TaskState::Failed);
+        assert!(!s.insert_retry(t.id).unwrap().spec.now);
     }
 
     /// A v8 database has no description column: opening it adds one, and
@@ -2747,10 +3457,14 @@ mod tests {
                         agent_args: None,
                         model: None,
                         model_from: None,
+                        fallback: vec![],
+                        fallback_from: None,
+                        fallback_use: None,
                         profile: None,
                         profile_from: None,
                         timeout_from: None,
                         place_from: Some("flock default".into()),
+                        lists_unapplied: None,
                     })),
                     ..spec()
                 },
@@ -3111,15 +3825,15 @@ mod tests {
     fn job_tasks_and_retries_keep_their_level() {
         let s = Store::open_in_memory().unwrap();
         let t = s
-            .insert_job_task_at(
-                "j",
-                "default",
-                &serde_json::json!({"key": "k"}),
-                (Priority::High, Some("job j")),
-                false,
-                None,
-                |_| Ok(("p".into(), spec())),
-            )
+            .insert_job_task_at(InsertJobTaskAt {
+                job: "j",
+                flock: "default",
+                item: &serde_json::json!({"key": "k"}),
+                level: (Priority::High, Some("job j")),
+                preempt: false,
+                description: None,
+                render: |_| Ok(("p".into(), spec())),
+            })
             .unwrap();
         assert_eq!(t.priority, Priority::High);
         assert_eq!(t.priority_from.as_deref(), Some("job j"));
@@ -3313,6 +4027,221 @@ mod tests {
         assert_eq!((m.pos, m.of), (2, 2));
     }
 
+    /// A queued task that waited `age_after` goes up one level per wait,
+    /// counted from its last step, never past high; high, critical and a
+    /// task whose flock does not age stay where they are.
+    #[test]
+    fn age_queued_lifts_a_level_per_wait_up_to_high() {
+        let s = Store::open_in_memory().unwrap();
+        let at = |p: Priority| {
+            s.insert_task_at(new_task("run"), p, Some("defaults"), TaskRole::Agent)
+                .unwrap()
+        };
+        let low = at(Priority::Low);
+        let high = at(Priority::High);
+        let critical = at(Priority::Critical);
+        let never = at(Priority::Low);
+        let wait = std::time::Duration::from_secs(1800);
+        let after = |t: &Task| (t.id != never.id).then_some(wait);
+        let t0 = low.created_at;
+        let mins = |m: i64| t0 + chrono::Duration::minutes(m);
+        assert!(s.age_queued(mins(29), after, &[]).unwrap().is_empty());
+        let aged = s.age_queued(mins(30), after, &[]).unwrap();
+        assert_eq!(aged.len(), 1);
+        assert_eq!(aged[0].id, low.id);
+        assert_eq!(aged[0].priority, Priority::Normal);
+        assert_eq!(aged[0].aged_from, Some(Priority::Low));
+        assert_eq!(aged[0].aged_at, Some(mins(30)));
+        assert_eq!(aged[0].priority_from.as_deref(), Some("defaults"));
+        // The next step counts from the last one, not from the queue.
+        assert!(s.age_queued(mins(59), after, &[]).unwrap().is_empty());
+        let aged = s.age_queued(mins(60), after, &[]).unwrap();
+        assert_eq!(aged[0].priority, Priority::High);
+        assert_eq!(aged[0].aged_from, Some(Priority::Low));
+        assert!(s.age_queued(mins(600), after, &[]).unwrap().is_empty());
+        for (t, p) in [
+            (&high, Priority::High),
+            (&critical, Priority::Critical),
+            (&never, Priority::Low),
+        ] {
+            let t = s.get_task(t.id).unwrap().unwrap();
+            assert_eq!((t.priority, t.aged_from), (p, None));
+        }
+    }
+
+    /// A task a machine took, or one in flight (placed, its row still
+    /// `queued`), has left the queue's ageing.
+    #[test]
+    fn age_queued_passes_over_what_is_not_queued() {
+        let s = Store::open_in_memory().unwrap();
+        let t = s
+            .insert_task_at(new_task("run"), Priority::Low, None, TaskRole::Agent)
+            .unwrap();
+        let wait = |_: &Task| Some(std::time::Duration::from_secs(60));
+        let later = t.created_at + chrono::Duration::hours(1);
+        assert!(s.age_queued(later, wait, &[t.id]).unwrap().is_empty());
+        assert_eq!(s.get_task(t.id).unwrap().unwrap().priority, Priority::Low);
+        s.claim_task(t.id, "m").unwrap().unwrap();
+        assert!(s.age_queued(later, wait, &[]).unwrap().is_empty());
+        assert_eq!(s.get_task(t.id).unwrap().unwrap().priority, Priority::Low);
+    }
+
+    /// A task `--preempt` paused is back in the queue, first among `low`,
+    /// and ages like any queued task, its wait counted from when it was
+    /// paused: otherwise a `low` task queued after it would age past it
+    /// and a steady stream of `normal` work would keep it paused for good.
+    /// In flight (a resume on its way) it is left alone.
+    #[test]
+    fn a_paused_task_ages_from_when_it_was_paused() {
+        let s = Store::open_in_memory().unwrap();
+        let t = s
+            .insert_task_at(new_task("run"), Priority::Low, None, TaskRole::Agent)
+            .unwrap();
+        s.claim_task(t.id, "m").unwrap().unwrap();
+        let paused = t.created_at + chrono::Duration::hours(2);
+        let mut t = s.get_task(t.id).unwrap().unwrap();
+        t.state = TaskState::Paused;
+        t.pause.paused_at = Some(paused);
+        s.update_task(&mut t).unwrap();
+        let wait = |_: &Task| Some(std::time::Duration::from_secs(1800));
+        let mins = |m: i64| paused + chrono::Duration::minutes(m);
+        assert!(s.age_queued(mins(29), wait, &[]).unwrap().is_empty());
+        assert!(s.age_queued(mins(30), wait, &[t.id]).unwrap().is_empty());
+        let aged = s.age_queued(mins(30), wait, &[]).unwrap();
+        assert_eq!(aged.len(), 1);
+        assert_eq!(aged[0].state, TaskState::Paused);
+        assert_eq!(
+            (aged[0].priority, aged[0].aged_from, aged[0].aged_at),
+            (Priority::Normal, Some(Priority::Low), Some(mins(30)))
+        );
+    }
+
+    /// A level set by hand (`task priority`, a `queue move` that changes
+    /// it) is the task's own: it forgets what it aged from and resets the
+    /// ageing clock, so it ages on from the hand change, not from before it.
+    #[test]
+    fn a_level_set_by_hand_forgets_ageing() {
+        use crate::queue::QueueSpot::*;
+        let s = Store::open_in_memory().unwrap();
+        let at = |p: Priority| {
+            s.insert_task_at(new_task("run"), p, None, TaskRole::Agent)
+                .unwrap()
+        };
+        let a = at(Priority::Low);
+        let b = at(Priority::Low);
+        let high = at(Priority::High);
+        let wait = |_: &Task| Some(std::time::Duration::from_secs(60));
+        let later = a.created_at + chrono::Duration::minutes(5);
+        assert_eq!(s.age_queued(later, wait, &[]).unwrap().len(), 2);
+        let before_set = Utc::now();
+        let t = s
+            .set_priority(a.id, Priority::Low, "task priority")
+            .unwrap();
+        assert_eq!((t.priority, t.aged_from), (Priority::Low, None));
+        assert!(t.aged_at.is_some_and(|at| at >= before_set));
+        let m = s.move_queued(b.id, Top, &[]).unwrap();
+        assert_eq!(m.task.priority, Priority::High);
+        assert_eq!(m.task.aged_from, None);
+        assert!(m.task.aged_at.is_some_and(|at| at >= before_set));
+        let aged = s
+            .age_queued(later + chrono::Duration::minutes(1), wait, &[])
+            .unwrap();
+        assert_eq!(aged.len(), 1);
+        assert_eq!(aged[0].id, a.id);
+        assert_eq!(aged[0].aged_from, Some(Priority::Low));
+        let _ = high;
+    }
+
+    /// A dispatch pass run right after a hand priority change does not
+    /// immediately undo it: an overdue task's stale `aged_at` used to
+    /// survive the hand change, so the very next `age_queued` call could
+    /// lift it straight back up.
+    #[test]
+    fn a_dispatch_pass_right_after_lowering_does_not_immediately_re_age() {
+        let s = Store::open_in_memory().unwrap();
+        let t = s
+            .insert_task_at(new_task("run"), Priority::Low, None, TaskRole::Agent)
+            .unwrap();
+        // Queued two hours ago and aged half an hour later, so both its
+        // `created_at` and its `aged_at` are well past a 30 minute wait:
+        // only the hand change's reset keeps the next pass off it, with no
+        // timing in the test to race.
+        let queued = Utc::now() - chrono::Duration::hours(2);
+        s.execute_raw(&format!(
+            "UPDATE tasks SET created_at = '{}' WHERE id = {}",
+            queued.to_rfc3339(),
+            t.id
+        ));
+        let wait = std::time::Duration::from_secs(1800);
+        let after = |_: &Task| Some(wait);
+        let aged = s
+            .age_queued(queued + chrono::Duration::minutes(30), after, &[])
+            .unwrap();
+        assert_eq!(aged.len(), 1);
+        assert_eq!(aged[0].priority, Priority::Normal);
+        let lowered = s
+            .set_priority(t.id, Priority::Low, "task priority")
+            .unwrap();
+        assert_eq!(lowered.priority, Priority::Low);
+        assert!(
+            s.age_queued(Utc::now(), after, &[])
+                .unwrap()
+                .into_iter()
+                .all(|a| a.id != t.id)
+        );
+    }
+
+    /// A retry of an aged task queues at the level it had before it aged:
+    /// the copy waits afresh.
+    #[test]
+    fn a_retry_of_an_aged_task_starts_from_its_own_level() {
+        let s = Store::open_in_memory().unwrap();
+        let t = s
+            .insert_task_at(
+                new_task("run"),
+                Priority::Low,
+                Some("defaults"),
+                TaskRole::Agent,
+            )
+            .unwrap();
+        let later = t.created_at + chrono::Duration::hours(1);
+        s.age_queued(later, |_| Some(std::time::Duration::from_secs(60)), &[])
+            .unwrap();
+        s.claim_task(t.id, "m").unwrap().unwrap();
+        let mut t = s.get_task(t.id).unwrap().unwrap();
+        assert_eq!(t.priority, Priority::Normal);
+        t.state = TaskState::Failed;
+        s.update_task(&mut t).unwrap();
+        let r = s.insert_retry(t.id).unwrap();
+        assert_eq!(
+            (r.priority, r.aged_from, r.aged_at),
+            (Priority::Low, None, None)
+        );
+    }
+
+    /// A v13 database gains the ageing columns; its rows have not aged.
+    #[test]
+    fn a_v13_database_gains_ageing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.insert_task(new_task("run")).unwrap();
+            s.execute_raw(
+                "ALTER TABLE tasks DROP COLUMN aged_from;
+                 ALTER TABLE tasks DROP COLUMN aged_at;
+                 UPDATE meta SET value = '13' WHERE key = 'schema_version'",
+            );
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.meta("schema_version").unwrap().unwrap(),
+            SCHEMA_VERSION.to_string()
+        );
+        let t = &s.queued_tasks().unwrap()[0];
+        assert_eq!((t.aged_from, t.aged_at), (None, None));
+    }
+
     /// Only a queued task's level changes; the refusal names the state.
     #[test]
     fn set_priority_changes_only_a_queued_task() {
@@ -3438,12 +4367,17 @@ mod tests {
                  ALTER TABLE tasks DROP COLUMN paused_at;
                  ALTER TABLE tasks DROP COLUMN paused_for;
                  ALTER TABLE tasks DROP COLUMN resumed_at;
+                 ALTER TABLE tasks DROP COLUMN aged_from;
+                 ALTER TABLE tasks DROP COLUMN aged_at;
+                 ALTER TABLE tasks DROP COLUMN waiting_until;
                  DROP TABLE trusted_repos;
                  DROP TABLE event_seq;
                  DROP TABLE task_summaries;
+                 DROP TABLE limits;
+                 DROP TABLE task_usage;
                  UPDATE meta SET value = '1' WHERE key = 'schema_version';
                  CREATE TRIGGER no_bump BEFORE UPDATE ON meta
-                   WHEN NEW.value = '13' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+                   WHEN NEW.value = '16' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
             );
         }
         assert!(Store::open(&path).is_err());
@@ -3475,7 +4409,9 @@ mod tests {
                 || c == "role"
                 || c == "description"
                 || c == "preempt"
-                || c == "paused_at"),
+                || c == "aged_from"
+                || c == "paused_at"
+                || c == "waiting_until"),
             "rolled back: {cols:?}"
         );
         drop(conn);
@@ -3483,9 +4419,174 @@ mod tests {
         assert!(
             !tables.contains(&"trusted_repos".to_string())
                 && !tables.contains(&"event_seq".to_string())
-                && !tables.contains(&"task_summaries".to_string()),
+                && !tables.contains(&"task_summaries".to_string())
+                && !tables.contains(&"limits".to_string())
+                && !tables.contains(&"task_usage".to_string()),
             "rolled back: {tables:?}"
         );
+    }
+
+    /// Every table's columns, name, type, default and whether it is
+    /// required, by table: what a migration must end at, whatever order
+    /// its ALTERs left the columns in.
+    type Columns = Vec<(String, String, Option<String>, bool, i64)>;
+
+    fn shape(path: &Path) -> Vec<(String, Columns)> {
+        let conn = Connection::open(path).unwrap();
+        table_names(path)
+            .into_iter()
+            .map(|t| {
+                let mut cols: Vec<_> = conn
+                    .prepare(&format!("SELECT name, type, dflt_value, \"notnull\", pk FROM pragma_table_info('{t}')"))
+                    .unwrap()
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                cols.sort();
+                (t, cols)
+            })
+            .collect()
+    }
+
+    /// A schema 13 store, from before usage limits, migrates to the shape
+    /// a fresh store has: the limits table and `tasks.waiting_until`.
+    #[test]
+    fn a_v13_database_migrates_to_the_shape_of_a_fresh_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fresh = tmp.path().join("fresh.db");
+        drop(Store::open(&fresh).unwrap());
+        let old = tmp.path().join("old.db");
+        {
+            let s = Store::open(&old).unwrap();
+            s.insert_task(new_task("run")).unwrap();
+            s.execute_raw(
+                "ALTER TABLE tasks DROP COLUMN waiting_until;
+                 DROP TABLE limits;
+                 UPDATE meta SET value = '13' WHERE key = 'schema_version'",
+            );
+        }
+        assert!(!table_names(&old).contains(&"limits".to_string()));
+        let s = Store::open(&old).unwrap();
+        assert_eq!(
+            s.meta("schema_version").unwrap().unwrap(),
+            SCHEMA_VERSION.to_string()
+        );
+        assert!(s.get_task(1).unwrap().is_some());
+        drop(s);
+        assert_eq!(shape(&old), shape(&fresh));
+    }
+
+    fn limit_row(account: &str, model: Option<&str>, retry_in_mins: i64) -> AccountLimit {
+        let now = Utc::now();
+        AccountLimit {
+            account: account.into(),
+            model: model.map(str::to_string),
+            hard: true,
+            no_credit: false,
+            until: Some(now + chrono::Duration::minutes(retry_in_mins)),
+            retry_at: now + chrono::Duration::minutes(retry_in_mins),
+            line: "You've hit your limit".into(),
+            task_id: Some(7),
+            machine: Some("pi-1".into()),
+            agent: Some("claude".into()),
+            seen_at: now,
+        }
+    }
+
+    /// One row per account and model: a later limit on the same key
+    /// replaces the row, one of another model sits beside it.
+    #[test]
+    fn a_later_limit_on_the_same_key_replaces_the_row() {
+        let s = Store::open_in_memory().unwrap();
+        s.record_limit(&limit_row("me", None, 60)).unwrap();
+        let later = limit_row("me", None, 120);
+        s.record_limit(&later).unwrap();
+        s.record_limit(&limit_row("me", Some("opus"), 30)).unwrap();
+        let rows = s.limits().unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0], later);
+        assert_eq!(rows[1].model.as_deref(), Some("opus"));
+    }
+
+    /// Only a row whose retry is still ahead is live; expiring deletes the
+    /// others and answers them.
+    #[test]
+    fn a_limit_past_its_retry_expires() {
+        let s = Store::open_in_memory().unwrap();
+        s.record_limit(&limit_row("gone", None, -1)).unwrap();
+        s.record_limit(&limit_row("held", None, 60)).unwrap();
+        let now = Utc::now();
+        let live: Vec<String> = s
+            .live_limits(now)
+            .unwrap()
+            .into_iter()
+            .map(|l| l.account)
+            .collect();
+        assert_eq!(live, ["held"]);
+        let gone: Vec<String> = s
+            .expire_limits(now)
+            .unwrap()
+            .into_iter()
+            .map(|l| l.account)
+            .collect();
+        assert_eq!(gone, ["gone"]);
+        assert_eq!(s.limits().unwrap().len(), 1);
+        assert!(s.expire_limits(now).unwrap().is_empty());
+    }
+
+    /// A row whose `retry_at` was kept in another form than `+00:00` still
+    /// expires: it is deleted by the text it was read with.
+    #[test]
+    fn a_limit_kept_in_another_offset_expires() {
+        let s = Store::open_in_memory().unwrap();
+        for (account, retry_at) in [
+            ("zulu", "2026-09-29T10:00:00Z"),
+            ("plus-two", "2026-09-29T12:00:00+02:00"),
+            ("held", "2099-01-01T00:00:00Z"),
+        ] {
+            let conn = s.conn.lock().recover();
+            conn.execute(
+                "INSERT INTO limits (account, hard, retry_at, line, seen_at)
+                 VALUES (?1, 1, ?2, 'You''ve hit your limit', ?2)",
+                params![account, retry_at],
+            )
+            .unwrap();
+        }
+        let now = DateTime::parse_from_rfc3339("2026-09-29T11:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut gone: Vec<String> = s
+            .expire_limits(now)
+            .unwrap()
+            .into_iter()
+            .map(|l| l.account)
+            .collect();
+        gone.sort();
+        assert_eq!(gone, ["plus-two", "zulu"]);
+        let left: Vec<String> = s.limits().unwrap().into_iter().map(|l| l.account).collect();
+        assert_eq!(
+            left,
+            ["held"],
+            "the expired rows are deleted, not only answered"
+        );
+    }
+
+    /// Clearing an account takes all its rows; with a model, only that
+    /// model's.
+    #[test]
+    fn clearing_takes_the_account_or_one_model() {
+        let s = Store::open_in_memory().unwrap();
+        s.record_limit(&limit_row("me", None, 60)).unwrap();
+        s.record_limit(&limit_row("me", Some("opus"), 60)).unwrap();
+        s.record_limit(&limit_row("you", None, 60)).unwrap();
+        let one = s.clear_limits("me", Some("opus")).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].model.as_deref(), Some("opus"));
+        assert_eq!(s.clear_limits("me", None).unwrap().len(), 1);
+        assert!(s.clear_limits("me", None).unwrap().is_empty());
+        let left: Vec<String> = s.limits().unwrap().into_iter().map(|l| l.account).collect();
+        assert_eq!(left, ["you"]);
     }
 
     /// `tasks.id` has no AUTOINCREMENT, so SQLite hands out MAX(id) + 1:

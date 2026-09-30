@@ -31,6 +31,7 @@ fn task(id: i64) -> Task {
             item: serde_json::json!({"key": "k"}),
             prompt: "p".into(),
             spec: DispatchSpec {
+                now: false,
                 agent: "claude".into(),
                 agent_args: vec![],
                 allow: vec![],
@@ -49,6 +50,9 @@ fn task(id: i64) -> Task {
                 label: Default::default(),
                 summary: Default::default(),
                 cwd: None,
+                keep_pane: None,
+                keep_pane_from: None,
+                rounds: Default::default(),
             },
             flock: "default".into(),
         })
@@ -204,6 +208,7 @@ async fn the_daemon_writes_the_events_log() {
             agent: None,
             agent_args: None,
             model: None,
+            fallback: None,
             priority: None,
             agents: Default::default(),
             profile: None,
@@ -223,8 +228,12 @@ async fn the_daemon_writes_the_events_log() {
     let serve = tokio::spawn(daemon.run_with_listener(listener));
     let deadline = std::time::Instant::now() + WAIT;
     loop {
-        if let Ok(IpcResponse::Machines(ms)) =
-            pastor::ipc::request(&socket, &IpcRequest::FlockList).await
+        if let Ok(IpcResponse::Machines(ms)) = pastor::ipc::request(
+            &socket,
+            &IpcRequest::FlockList,
+            &pastor::ipc::Caller::default(),
+        )
+        .await
             && ms.iter().all(|m| m.channel.accepts_dispatch())
         {
             break;
@@ -255,12 +264,14 @@ async fn the_daemon_writes_the_events_log() {
     let resp = pastor::ipc::request(
         &socket,
         &IpcRequest::Run {
+            now: false,
             role: Default::default(),
             preempt: false,
             summary: None,
             description: None,
             prompt: "hi".into(),
             spec: DispatchSpec {
+                now: false,
                 agent: "claude".into(),
                 agent_args: vec![],
                 allow: vec![],
@@ -279,11 +290,15 @@ async fn the_daemon_writes_the_events_log() {
                 label: Default::default(),
                 summary: Default::default(),
                 cwd: None,
+                keep_pane: None,
+                keep_pane_from: None,
+                rounds: Default::default(),
             },
             flock: None,
             agent: None,
             priority: None,
         },
+        &pastor::ipc::Caller::default(),
     )
     .await
     .unwrap();
@@ -306,6 +321,7 @@ async fn the_daemon_writes_the_events_log() {
             limit: 1,
             task: Some(t.id),
         },
+        &pastor::ipc::Caller::default(),
     )
     .await
     .unwrap();

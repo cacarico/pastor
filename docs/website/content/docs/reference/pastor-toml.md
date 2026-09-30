@@ -48,6 +48,7 @@ load, and the error names the key.
 | `request_timeout` | `"60s"` | the bound on one herdr request, connect included; a machine that does not answer in time counts as lost |
 | `agent_ready_timeout` | `"30s"` | from starting an agent to a prompt herdr accepts; must be shorter than `request_timeout` |
 | `close_done_after` | `"5s"` | a done task's pane closes after this, so its machine slot frees; `"15m"` leaves time for `pastor task attach` to show its last screen; `"never"` keeps it |
+| `close_failed_after` | `"5s"` | a failed or stale task's pane, or an orphan's, closes after this once its agent has stopped; the task stays failed and retryable, its worktree kept; `"never"` keeps them |
 | `pull_lost_after` | `"10m"` | a pull machine that has not claimed or reported for this long counts as lost, and its starting and running tasks go stale |
 | `agents_change_fleet` | `false` | `true` lets agents pastor started run, retry, send to and close tasks, run jobs, and edit machines, flocks and jobs |
 | `max_orchestrators` | `1` | how many orchestrator agents run at once; each still takes a slot on the head's machine under its `max_agents` |
@@ -71,6 +72,7 @@ see the [`task run` flags](../cli/#task) and
 | `allow` | `[]` | tool patterns the agent may use without asking, like `"Bash(git:*)"` |
 | `deny` | `[]` | tool patterns it must never use; wins over `allow` |
 | `model` | unset | a `[models]` name; unset runs no model |
+| `fallback` | unset | `[models]` names tasks may fall back to, in order; unset or `[]` is none |
 | `priority` | unset | `low`, `normal`, `high` or `critical`; unset is `normal` |
 | `agents` | `{}` | the agent for a model of another kind than `agent`'s, by kind: `{ opencode = "opencode" }` |
 | `profile` | unset | a permission profile; unset runs none |
@@ -79,6 +81,7 @@ see the [`task run` flags](../cli/#task) and
 | `place` | `"repo"` | where a task's pane goes: `repo`, `own`, `pastor` or `pane:<workspace>` |
 | `label` | unset | the task's workspace name template; unset is `"{{ flock }}/{{ task.id }}"` |
 | `summary` | unset | `ask`, `require` or `off`; unset is `ask` |
+| `keep_pane` | unset | `true` keeps a task's pane once it ends, until `pastor task close`; unset is no |
 
 `allow` and `deny` add up across layers instead of replacing each other:
 `[defaults]`, then the flock, then the task or job. A pattern denied in any
@@ -98,6 +101,7 @@ with its own config dir. A task, job, flock or machine names it with
 | `trust_marker` | `"Yes, I trust this folder"` for Claude, else none | text only the trust prompt shows; saved trust presses the keys only while the pane shows it |
 | `allow_flag` | `"--allowedTools"` for Claude | the flag put before each `allow` pattern; an agent with none refuses tasks that carry an allow list |
 | `deny_flag` | `"--disallowedTools"` for Claude | the same, for `deny` |
+| `account` | none | a label for the login the agent uses: every machine whose agent names the same account shares its usage limits; unset, a limit holds only on the machine it was seen on |
 
 ## models
 
@@ -142,6 +146,21 @@ the list for one run.
 | key | default | does |
 |---|---|---|
 | `name` | required | the connector's id, as `pastor connector list` shows it |
+
+## limits
+
+`[limits]` says how the head treats an account that ran out of usage. See
+[usage limits](../../concepts/agents-and-models/#usage-limits); `pastor
+limit list` shows the accounts it holds back.
+
+| key | default | does |
+|---|---|---|
+| `wait_under` | `"30m"` | a limited task waits for a reset closer than this, and moves to its next model past it; `"0"` never waits when it can move |
+| `rate_retries` | `3` | a task stopped on a 429 or 529 is retried in its pane this many times before it counts as limited |
+| `rate_backoff` | `["1m", "5m", "15m"]` | the wait before each of those retries; the last one repeats |
+| `unknown_reset_wait` | `"1h"` | how long a limit whose message names no reset holds |
+| `retry_after_no_credit` | `"6h"` | how long a limit for no credit holds |
+| `handover_lines` | `60` | the pane lines a task moving to another agent hands to it |
 
 ## shepherd
 

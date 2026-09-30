@@ -1,14 +1,19 @@
-# A commit is only ever checked once: `pull_request` covers every commit on
-# a branch, and this project merges by fast-forwarding a PR's exact head sha
-# to main after CI passed on that same sha in the PR, so a push to main
-# never carries an unchecked commit through the normal flow. Running `check`
-# again on push to main would just repeat that same run for runner time, so
-# it is dropped; `workflow_dispatch` keeps a manual way to run it (for a
-# direct push to main that skipped a PR, or to re-check main by hand).
-# `check`, `test-machine` and `portability` only exercise what they build
-# or read, so `paths:` skips docs-only changes, but not the docs the tests
-# read (README.md, docs/manual.md, docs/recommended-setup.md, the website
-# content, everything under skills/, the plugin manifest);
+# Pull requests merge with a merge commit (`gh pr merge --merge`) and no
+# other way: not `--rebase`, not `--squash`, and not a push of the PR's head
+# straight to main.
+# `pull_request` runs CI on GitHub's merge of the PR into main as main was
+# when the run started. main can move before the PR merges, so two PRs
+# green on their own run can still break main together (#8 and #14 did,
+# fixed in #21). So `check` (with `make test-machine` and `make test-ssh`)
+# and `portability` run on push to main too, on the tree main really has.
+# `workflow_dispatch` keeps a manual way to re-check any ref. `paths:`
+# skips docs-only changes, since these jobs only exercise what they build
+# or read, but not the docs the tests read (README.md, docs/manual.md,
+# docs/recommended-setup.md, the website content, everything under
+# skills/, the plugin manifest). On push to main it also takes
+# CHANGELOG.md and changes/**, which `make check` reads through
+# `scripts/changelog.sh check`: the changelog workflow runs only on pull
+# requests, so a changelog-only merge would otherwise go unchecked on main.
 # gitleaks has no such filter because a secret can land in any file.
 name: ci
 
@@ -31,8 +36,33 @@ on:
       - "scripts/changelog.sh"
       - ".github/workflows/ci.yml"
       - ".github/workflows/release.yml"
+      - ".github/workflows/dependabot-close.yml"
       - "install.sh"
       - ".github/actions/**"
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "skills/**"
+      - "README.md"
+      - "docs/manual.md"
+      - "docs/recommended-setup.md"
+      - "docs/website/content/**"
+      - ".claude-plugin/plugin.json"
+      - "contrib/systemd/**"
+      - "contrib/launchd/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Makefile"
+      - "scripts/changelog.sh"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/release.yml"
+      - ".github/workflows/dependabot-close.yml"
+      - "install.sh"
+      - ".github/actions/**"
+      - "CHANGELOG.md"
+      - "changes/**"
   workflow_dispatch:
 
 permissions:
@@ -58,7 +88,11 @@ jobs:
       # fmt-check, clippy -D warnings and the whole suite, including
       # tests/cli.rs against fake-herdr.
       - run: make check
-      # The machine actor tests five times over, to catch timing flakes.
+      # `make check` always builds with fake-herdr on; a plain `cargo
+      # install pastor-cli` never has it, so check that default
+      # configuration compiles here too.
+      - run: cargo check --all-targets
+      # The machine actor tests on their own.
       - run: make test-machine
       # The CLI against a head over a real ssh: every other test runs a fake
       # ssh, which let a ControlPath too long for a unix socket through in
@@ -68,6 +102,20 @@ jobs:
           sudo apt-get install -y --no-install-recommends openssh-server
           sudo mkdir -p /run/sshd
       - run: make test-ssh
+
+  # Cargo.toml's rust-version is a promise every other job, on stable, never
+  # tests; this job does, so a newer language feature fails here, not for
+  # whoever builds from source on that toolchain. A `cargo check` of every
+  # target is enough: MSRV breaks are compile errors.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1, 2026-09-12
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo check --locked --all-targets
 
   # The release builds are static musl binaries and a FreeBSD build is the
   # source-only route, so a change that only compiles against glibc on
@@ -86,7 +134,4 @@ jobs:
           targets: x86_64-unknown-linux-musl, armv7-unknown-linux-musleabihf, x86_64-unknown-freebsd
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: ./.github/actions/zig
-      - run: |
-          for target in x86_64-unknown-linux-musl armv7-unknown-linux-musleabihf x86_64-unknown-freebsd; do
-            cargo-zigbuild check --locked --all-targets --target "$target"
-          done
+      - run: make portability

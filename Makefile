@@ -1,13 +1,13 @@
 # Developer entry points. Every target maps to one cargo command so the
 # Makefile stays the single list of "what you can run here".
 
-.PHONY: help build release check changelog changelog-check fmt lint test test-machine test-ssh leaks smoke smoke-profiles smoke-rc mutants mutants-diff install install-completions completions cli-reference demo site site-serve links clean
+.PHONY: help build release check changelog changelog-check fmt lint test test-machine test-ssh portability coverage coverage-check coverage-run leaks smoke smoke-profiles smoke-rc mutants mutants-diff install install-completions completions cli-reference demo site site-serve links clean
 
 help: ## list targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{ printf "  %-14s %s\n", $$1, $$2 }'
 
 build: ## debug build of pastor and fake-herdr
-	cargo build --all-targets
+	cargo build --all-targets --features fake-herdr
 
 release: ## optimised build
 	cargo build --release
@@ -30,19 +30,69 @@ fmt-check:
 	cargo fmt --check
 
 lint: ## clippy with warnings as errors
-	cargo clippy --all-targets -- -D warnings
+	cargo clippy --all-targets --features fake-herdr -- -D warnings
 
 test: ## whole suite, including the end-to-end CLI tests against the fake herdr
-	cargo test
+	cargo test --features fake-herdr
 
-test-machine: ## the machine actor tests five times, to catch timing flakes
-	@for i in 1 2 3 4 5; do cargo test --lib machine:: -q || exit 1; done
+# Once is enough: these tests run on tokio's paused clock, where a runner's
+# load changes nothing. Two shutdown tests need a second thread and keep the
+# wall clock; they only wait for something to happen, with seconds to spare.
+test-machine: ## the machine actor tests on their own
+	cargo test --lib --features fake-herdr machine:: -q
 
 # Starts an sshd of its own on a localhost port, as the user running it, and
 # drives the CLI against a head through the real ssh and `pastor bridge`;
 # see tests/real_ssh.rs. Needs OpenSSH's server (sshd) and ssh-keygen.
 test-ssh: ## the CLI against a head over a real ssh, through a throwaway sshd
-	cargo test --test real_ssh -- --ignored
+	cargo test --features fake-herdr --test real_ssh -- --ignored
+
+# The release builds are static musl binaries and FreeBSD builds from source,
+# so code that only compiles against glibc on x86_64 has to fail before the
+# tag. A `cargo check` per target finds it at compile time. This is the one
+# list of targets to check; ci.yml's toolchain step installs the same ones.
+# Not part of `make check`: it would add three cross checks to every local
+# run. Needs cargo-zigbuild, zig (libsqlite3-sys wants a C compiler that
+# knows the target) and the Rust targets; it says which are missing and
+# installs nothing. CARGO_ZIGBUILD_ZIG_PATH is where cargo-zigbuild looks for
+# zig before the PATH.
+PORTABILITY_TARGETS := x86_64-unknown-linux-musl armv7-unknown-linux-musleabihf x86_64-unknown-freebsd
+portability: ## cargo check for the musl and FreeBSD targets, as CI does
+	@missing=; \
+	command -v cargo-zigbuild >/dev/null 2>&1 || missing="$$missing, cargo-zigbuild (cargo install --locked cargo-zigbuild)"; \
+	[ -n "$$CARGO_ZIGBUILD_ZIG_PATH" ] || command -v zig >/dev/null 2>&1 || missing="$$missing, zig (the version in .github/actions/zig/action.yml, from ziglang.org/download)"; \
+	for target in $(PORTABILITY_TARGETS); do \
+	  [ -d "$$(rustc --print target-libdir --target $$target 2>/dev/null)" ] || missing="$$missing, the Rust target $$target (rustup target add $$target)"; \
+	done; \
+	if [ -n "$$missing" ]; then echo "make portability: missing $${missing#, }" >&2; exit 1; fi
+	@for target in $(PORTABILITY_TARGETS); do \
+	  echo "cargo-zigbuild check --locked --all-targets --features fake-herdr --target $$target"; \
+	  cargo-zigbuild check --locked --all-targets --features fake-herdr --target $$target || exit 1; \
+	done
+
+# Line coverage of the whole suite, instrumented by cargo-llvm-cov (see
+# CONTRIBUTING.md to install it). The pastor and fake-herdr processes that
+# tests/cli.rs spawns count too: cargo-llvm-cov sets LLVM_PROFILE_FILE, which
+# they inherit. The fakes themselves are left out of the numbers. A process
+# the suite kills mid-write leaves a corrupt profile, so a merge fails only
+# when no profile at all can be read (--failure-mode all).
+COVERAGE_IGNORE = --failure-mode all --ignore-filename-regex '(src/bin/fake-herdr\.rs|src/herdr/fake\.rs)$$'
+
+coverage-run:
+	cargo llvm-cov --workspace --all-targets --no-report
+
+coverage: coverage-run ## line coverage table, and target/lcov.info for editors
+	cargo llvm-cov report --lcov --output-path target/lcov.info $(COVERAGE_IGNORE)
+	cargo llvm-cov report $(COVERAGE_IGNORE)
+
+# coverage-floor holds one number, the total line coverage in percent that
+# the suite must not fall under. Raise it when coverage rises; lowering it
+# says so in the pull request.
+coverage-check: coverage-run ## fail when total line coverage is under coverage-floor
+	@floor=$$(cat coverage-floor); echo "$$floor" | grep -Eqx '[0-9]+(\.[0-9]+)?' \
+	  || { echo "make coverage-check: coverage-floor must hold one number, got '$$floor'" >&2; exit 1; }; \
+	cargo llvm-cov report --summary-only --fail-under-lines "$$floor" $(COVERAGE_IGNORE) \
+	  || { echo "make coverage-check: total line coverage is under the floor of $$floor% in coverage-floor" >&2; exit 1; }
 
 # The repository is public; CI runs this same scan. The rules are gitleaks'
 # own defaults at the pinned version, fetched outside the checkout; the scan
@@ -143,9 +193,10 @@ demo: build ## record the README gifs with vhs against a demo head
 	for t in docs/demo/*.tape; do vhs $$t; done; \
 	for i in 1 2 3 4; do pastor task close t-$$i >/dev/null 2>&1 || true; done
 
-# The scripts are generated from the clap definitions, so they cannot drift
-# from the real command tree; `pastor completions <shell>` prints the same
-# thing at runtime for shells not listed here.
+# The scripts are generated from the clap definitions; the checked-in copies
+# ship in the release tarball, so `make check` fails when they are stale.
+# `pastor completions <shell>` prints the same thing at runtime for shells
+# not listed here.
 completions: ## regenerate contrib/completions/pastor.{bash,fish} from the CLI
 	cargo build -q
 	mkdir -p contrib/completions

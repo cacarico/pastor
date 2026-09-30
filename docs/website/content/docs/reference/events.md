@@ -54,16 +54,22 @@ A task's state change is `task.` and the new state.
 | `task.running` | its agent took the prompt, or picked the work back up | |
 | `task.blocked` | its agent waits on a person | `question`, when it ended its turn on one |
 | `task.paused` | a critical task took its slot; it resumes later | |
+| `task.limited` | its agent stopped on a usage limit | as `agent.exhausted` |
+| `task.rate_limited` | its agent stopped on a 429 or 529 past its own retries; pastor retries it in the pane | `line`, `attempt` (from 1), `retry_at` |
+| `task.waiting` | it waits for that limit to reset, its pane closed and its worktree kept | `why` (`no_fallback`, `reset_soon` or `all_exhausted`), `until`, `shown` (`waiting 03:00`); `account`, `model` and `waited` (`reset in 12m, under wait_under 30m`) for a wait on its own model, `models` (each `account`, `model`, `until`) for one on every model of its list |
+| `task.agent_switched` | it moved to its next model after a usage limit, in the same worktree | `from` and `to` (each `agent`, `model`), `why` (`limit` or `rate_limit`), `until` (the old model's reset), `handover` (`session` or `pane_tail`) |
 | `task.done` | it finished | |
 | `task.failed` | it failed | |
 | `task.stale` | its timeout passed, or its pull machine was lost | |
 | `task.closed` | its pane was closed | |
-| `task.input` | someone ran `pastor task send` | `keys`, `text_len`, and `trust` with `--trust`; never the text |
+| `task.input` | someone ran `pastor task send`, or pastor answered Claude's limit picker with "Stop and wait" | `keys`, `text_len`, `trust` with `--trust`, `limit_picker` from the picker, `rate_retry` from a short-limit retry; never the text |
 | `task.trusted` | the head answered a folder-trust prompt from saved trust | `keys` |
 | `job.failed` | a job run failed | |
 | `connector.finish_failed` | a connector's finish command failed | `connector`, `reason` |
 | `machine.lost` | a machine stopped answering; once per outage | |
 | `machine.connected` | a lost machine answers again | |
+| `agent.exhausted` | the head recorded an account (or one model of it) as out of usage | `account`, `model`, `agent`, `until`, `retry_at`, `hard`, `no_credit`, `what`, `line` |
+| `agent.reset` | an exhausted account can be used again | `account`, `model`, `agent`, `retry_at`, `by` (`time` or `hand`) |
 
 Orchestrator events all carry `orchestrator`, its name, in `detail`. See
 [orchestrators](../../concepts/orchestrators/).

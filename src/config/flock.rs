@@ -66,6 +66,11 @@ pub struct MachineConfig {
     /// its flock's and before `[defaults]` (`Defaults::resolve_agent_on`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The `[models]` names tasks on this machine may fall back to when
+    /// their run flags or job set none, before its flock's and `[defaults]`;
+    /// `[]` means none (`Defaults::resolve_agent_on`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<Vec<String>>,
     /// The level of tasks pinned to this machine that name none, after
     /// its flock's and before `[defaults]` (see `Defaults::resolve_priority`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -210,6 +215,11 @@ pub struct FlockEntry {
     /// `[defaults] model`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The `[models]` names this flock's tasks may fall back to when their
+    /// run flags, job and machine set none, before `[defaults] fallback`;
+    /// `[]` means none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<Vec<String>>,
     /// The level of this flock's tasks that name none, before `[defaults]
     /// priority`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -225,6 +235,11 @@ pub struct FlockEntry {
     /// sets none, before `[defaults] timeout` (`Defaults::resolve_timeout`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<String>,
+    /// How long this flock's queued tasks wait before they go up a level,
+    /// or `never`, before `[defaults] age_after`
+    /// (`Defaults::resolve_age_after`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_after: Option<String>,
     /// Where this flock's tasks put their pane when the task or job sets
     /// none, before `[defaults] place` (`Defaults::resolve_place`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -238,6 +253,10 @@ pub struct FlockEntry {
     /// `[defaults] summary`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<crate::task::SummaryMode>,
+    /// Whether this flock's tasks keep their pane once they end, when the
+    /// task and its job say nothing; before `[defaults] keep_pane`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_pane: Option<bool>,
     /// One line on what the flock is for (`flock list --wide`, `describe`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -341,6 +360,10 @@ impl Flock {
             if let Some(m) = &f.model {
                 crate::config::check_model_name(m).map_err(|e| format!("flock {}: {e}", f.name))?;
             }
+            for m in f.fallback.iter().flatten() {
+                crate::config::check_model_name(m)
+                    .map_err(|e| format!("flock {}: fallback: {e}", f.name))?;
+            }
             crate::config::check_kind_agent_names(&f.agents)
                 .map_err(|e| format!("flock {}: {e}", f.name))?;
             if let Some(p) = &f.profile {
@@ -353,6 +376,10 @@ impl Flock {
             if let Some(t) = &f.timeout {
                 crate::config::parse_duration(t)
                     .map_err(|e| format!("flock {}: timeout: {e}", f.name))?;
+            }
+            if let Some(v) = &f.age_after {
+                crate::config::check_age_after(v)
+                    .map_err(|e| format!("flock {}: age_after: {e}", f.name))?;
             }
         }
         if !self.flocks.is_empty() {
@@ -408,6 +435,10 @@ impl Flock {
                 crate::config::check_model_name(model)
                     .map_err(|e| format!("machine {}: {e}", m.name))?;
             }
+            for model in m.fallback.iter().flatten() {
+                crate::config::check_model_name(model)
+                    .map_err(|e| format!("machine {}: fallback: {e}", m.name))?;
+            }
             crate::config::check_kind_agent_names(&m.agents)
                 .map_err(|e| format!("machine {}: {e}", m.name))?;
             if let Some(p) = &m.profile {
@@ -457,20 +488,38 @@ impl Flock {
         agents: &crate::config::Agents,
         profiles: &crate::config::profile::Profiles,
     ) -> anyhow::Result<()> {
-        let flocks = self
-            .flocks
-            .iter()
-            .map(|f| ("flock", &f.name, &f.model, &f.agent, &f.agents, &f.profile));
-        let machines = self.machines.iter().map(|m| {
+        let flocks = self.flocks.iter().map(|f| {
             (
-                "machine", &m.name, &m.model, &m.agent, &m.agents, &m.profile,
+                "flock",
+                &f.name,
+                &f.model,
+                &f.fallback,
+                &f.agent,
+                &f.agents,
+                &f.profile,
             )
         });
-        for (what, name, model, agent, by_kind, profile) in flocks.chain(machines) {
+        let machines = self.machines.iter().map(|m| {
+            (
+                "machine",
+                &m.name,
+                &m.model,
+                &m.fallback,
+                &m.agent,
+                &m.agents,
+                &m.profile,
+            )
+        });
+        for (what, name, model, fallback, agent, by_kind, profile) in flocks.chain(machines) {
             if let Some(model) = model {
                 models
                     .check(model)
                     .map_err(|e| anyhow::anyhow!("flock.toml: {what} {name}: {e}"))?;
+            }
+            for model in fallback.iter().flatten() {
+                models
+                    .check(model)
+                    .map_err(|e| anyhow::anyhow!("flock.toml: {what} {name}: fallback: {e}"))?;
             }
             crate::config::check_kind_agents(agent.as_deref(), by_kind, agents)
                 .map_err(|e| anyhow::anyhow!("flock.toml: {what} {name}: {e}"))?;
@@ -1283,6 +1332,7 @@ mod tests {
             agent: Some("codex".into()),
             agent_args: Some(vec![]),
             model: None,
+            fallback: None,
             priority: Some(crate::task::Priority::High),
             agents: Default::default(),
             profile: None,
@@ -1314,6 +1364,7 @@ mod tests {
             agent: None,
             agent_args: None,
             model: None,
+            fallback: None,
             priority: None,
             agents: Default::default(),
             profile: None,
@@ -2289,6 +2340,31 @@ tags = ["fast"]
         assert!(f.machines.is_empty());
     }
 
+    /// A flock's `keep_pane` is a yes or no; a flock without it leaves it
+    /// to `[defaults]`, and a misspelt key is a load error.
+    #[test]
+    fn a_flock_keep_pane_is_a_bool() {
+        let flock = |extra: &str| {
+            Flock::parse(
+                Path::new("flock.toml"),
+                &format!(
+                    "[[flock]]\nname = \"p\"\ndefault = true\n{extra}\n[[machine]]\nname = \"m\"\nlocal = true\nflock = \"p\"\n"
+                ),
+            )
+        };
+        assert_eq!(flock("").unwrap().entry("p").unwrap().keep_pane, None);
+        assert_eq!(
+            flock("keep_pane = true")
+                .unwrap()
+                .entry("p")
+                .unwrap()
+                .keep_pane,
+            Some(true)
+        );
+        assert!(flock("keep_pane = \"yes\"").is_err());
+        assert!(flock("keep_panes = true").is_err());
+    }
+
     /// A flock's `summary` is one of its words; a flock without it leaves
     /// it to `[defaults]`.
     #[test]
@@ -2353,6 +2429,47 @@ tags = ["fast"]
             .unwrap_err()
         );
         assert!(err.contains("machine m: model name"), "{err}");
+    }
+
+    /// Each name in a flock's or a machine's `fallback` must be a model
+    /// name, and one that pastor.toml's `[models]` defines.
+    #[test]
+    fn a_fallback_must_name_models_that_models_define() {
+        let parse = |text: &str| Flock::parse(Path::new("flock.toml"), text);
+        let err = format!(
+            "{:#}",
+            parse("[[flock]]\nname = \"p\"\ndefault = true\nfallback = [\"--model x\"]\n")
+                .unwrap_err()
+        );
+        assert!(err.contains("flock p: fallback: model name"), "{err}");
+        let err = format!(
+            "{:#}",
+            parse("[[machine]]\nname = \"m\"\nlocal = true\nfallback = [\"A\"]\n").unwrap_err()
+        );
+        assert!(err.contains("machine m: fallback: model name"), "{err}");
+        let models: crate::config::Models =
+            toml::from_str("[sonnet]\nkind = \"claude\"\nargs = []\n").unwrap();
+        for (text, says) in [
+            (
+                "[[flock]]\nname = \"p\"\ndefault = true\nfallback = [\"sonnet\", \"gpt\"]\n",
+                "flock.toml: flock p: fallback: model gpt is not in [models]",
+            ),
+            (
+                "[[machine]]\nname = \"m\"\nlocal = true\nfallback = [\"gpt\"]\n",
+                "flock.toml: machine m: fallback: model gpt is not in [models]",
+            ),
+        ] {
+            let err = parse(text)
+                .unwrap()
+                .check_config(&models, &Default::default(), &Default::default())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(says), "{err}");
+        }
+        let f = parse("[[machine]]\nname = \"m\"\nlocal = true\nfallback = []\n").unwrap();
+        assert_eq!(f.machines[0].fallback, Some(vec![]));
+        f.check_config(&models, &Default::default(), &Default::default())
+            .unwrap();
     }
 
     /// A flock's `label` is a label template, checked on load.

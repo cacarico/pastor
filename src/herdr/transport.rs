@@ -6,7 +6,7 @@ use std::process::Stdio;
 use super::Connection;
 use crate::config::Paths;
 use crate::config::flock::MachineConfig;
-use crate::ssh::fitting_control_path;
+use crate::ssh::{SHORTER_STATE_DIR, check_socket_path, fitting_control_path};
 
 /// How long an ssh `ControlMaster` sticks around with no channels open. Every
 /// request opens a connection, so the master is what makes them cheap: the same
@@ -43,7 +43,7 @@ impl Endpoint {
                 tracing::warn!(
                     machine = %m.name,
                     path = %paths.ssh_control_path("").display(),
-                    "ssh ControlPath is too long for a unix socket even without the machine name; connecting without multiplexing (every request pays a full ssh handshake). Set PASTOR_STATE_DIR to something shorter."
+                    "ssh ControlPath is too long for a unix socket even without the machine name; connecting without multiplexing (every request pays a full ssh handshake). {SHORTER_STATE_DIR}"
                 );
             }
             Endpoint::Ssh {
@@ -96,14 +96,24 @@ pub struct ConnectError {
 pub fn local_socket_path(session: &str) -> anyhow::Result<PathBuf> {
     // herdr keeps its socket under `~/.config/herdr` on macOS as on Linux,
     // not in `~/Library/Application Support`, which `dirs` would pick there.
-    let base = crate::config::config_home()
-        .ok_or_else(|| anyhow::anyhow!("no config dir"))?
-        .join("herdr");
-    Ok(if session == "default" {
+    let base = crate::config::config_home().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
+    socket_path_under(&base, session)
+}
+
+/// herdr's socket for `session` under the config home `base`, refused when it
+/// would not fit in `sun_path`.
+fn socket_path_under(base: &Path, session: &str) -> anyhow::Result<PathBuf> {
+    let base = base.join("herdr");
+    let path = if session == "default" {
         base.join("herdr.sock")
     } else {
         base.join("sessions").join(session).join("herdr.sock")
-    })
+    };
+    check_socket_path(
+        &path,
+        "Set XDG_CONFIG_HOME to something shorter, or use a shorter session name.",
+    )?;
+    Ok(path)
 }
 
 /// The exact command herdr's own client runs on the remote host.
@@ -344,6 +354,10 @@ pub type DirFuture<'a> =
 pub type VersionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Option<String>, ConnectError>> + Send + 'a>>;
 
+pub type UsageFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<Option<crate::usage::TaskUsage>, ConnectError>> + Send + 'a>,
+>;
+
 /// Anything that can open a fresh herdr connection. Endpoints for real use, FakeHerdr in tests.
 ///
 /// A connection carries one request (see `Connection`), so this is called once
@@ -409,6 +423,13 @@ pub trait Connector: Send + Sync {
     fn pastor_version(&self) -> VersionFuture<'_> {
         Box::pin(async { Ok(None) })
     }
+    /// The tokens Claude session `session` used, read from its files on the
+    /// machine under `config_dir` (the agent's `CLAUDE_CONFIG_DIR` as
+    /// written, `~/.claude` when `None`) by `usage::usage_command`. `None`
+    /// when there is no such session there or it cannot be known.
+    fn claude_usage(&self, _config_dir: Option<&str>, _session: &str) -> UsageFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 impl Connector for Endpoint {
@@ -449,6 +470,10 @@ impl Connector for Endpoint {
     }
     fn pastor_version(&self) -> VersionFuture<'_> {
         Box::pin(pastor_version(self))
+    }
+    fn claude_usage(&self, config_dir: Option<&str>, session: &str) -> UsageFuture<'_> {
+        let command = crate::usage::usage_command(config_dir, session);
+        Box::pin(async move { claude_usage(self, command).await })
     }
 }
 
@@ -603,6 +628,23 @@ async fn pastor_version(ep: &Endpoint) -> Result<Option<String>, ConnectError> {
         Some(p) => remote_pastor_version(&p.target, &p.out),
         None => Ok(None),
     }
+}
+
+async fn claude_usage(
+    ep: &Endpoint,
+    command: String,
+) -> Result<Option<crate::usage::TaskUsage>, ConnectError> {
+    // A local machine runs the same command here, under `sh -c`.
+    let Some(p) = probe(ep, command).await? else {
+        return Ok(None);
+    };
+    reached(&p.target, &p.out)?;
+    let raw = String::from_utf8_lossy(&p.out.stdout);
+    let usage = crate::usage::parse_usage(&raw, chrono::Utc::now());
+    if usage.is_none() && !(p.out.status.success() && raw.trim_end().ends_with("none")) {
+        tracing::warn!(target = %p.target, status = %p.out.status, stdout = ?raw, stderr = %String::from_utf8_lossy(&p.out.stderr).trim(), "no usage from the session files");
+    }
+    Ok(usage)
 }
 
 /// Asks the remote machine for `pastor --version`. ssh runs its command in a
@@ -760,6 +802,7 @@ mod tests {
             agent: None,
             agent_args: None,
             model: None,
+            fallback: None,
             priority: None,
             agents: Default::default(),
             profile: None,
@@ -795,6 +838,61 @@ mod tests {
             "fake-herdr"
         );
         assert_eq!(Endpoint::Command { argv: vec![] }.host(), "-");
+    }
+
+    /// `describe` names the target and session, unlike `host`'s short form.
+    #[test]
+    fn describe_names_the_target_and_session() {
+        let paths = Paths::new("/c", "/s");
+        assert_eq!(
+            Endpoint::from_machine(&ssh_machine("pi-3"), &paths).describe(),
+            "ssh fleet@host (session default)"
+        );
+        let local = MachineConfig {
+            local: true,
+            ssh: None,
+            ..ssh_machine("here")
+        };
+        assert_eq!(
+            Endpoint::from_machine(&local, &paths).describe(),
+            "local herdr session default"
+        );
+        let command = Endpoint::Command {
+            argv: vec!["fake-herdr".into(), "--connect".into(), "/h.sock".into()],
+        };
+        assert_eq!(command.describe(), "command fake-herdr --connect /h.sock");
+    }
+
+    /// `Endpoint`'s `Connector` impl (used through `&dyn Connector`, unlike
+    /// the tests above that call the inherent methods directly) matches the
+    /// inherent methods it delegates to.
+    #[test]
+    fn the_connector_impl_matches_endpoint_directly() {
+        let paths = Paths::new("/c", "/s");
+        let ep = Endpoint::from_machine(&ssh_machine("pi-3"), &paths);
+        let c: &dyn Connector = &ep;
+        assert_eq!(c.describe(), ep.describe());
+        assert_eq!(c.host(), ep.host());
+    }
+
+    /// A `Connector` that does not override `host` falls back to `describe`.
+    struct DescribeOnly;
+    impl Connector for DescribeOnly {
+        fn connect(&self) -> ConnectFuture<'_> {
+            Box::pin(async {
+                Err(ConnectError {
+                    message: "no".into(),
+                })
+            })
+        }
+        fn describe(&self) -> String {
+            "described".into()
+        }
+    }
+
+    #[test]
+    fn a_connector_with_no_host_of_its_own_falls_back_to_describe() {
+        assert_eq!(DescribeOnly.host(), "described");
     }
 
     /// The machine name in the ControlPath is only there to be recognisable;
@@ -856,6 +954,22 @@ mod tests {
     }
     use crate::herdr::ConnectorExt;
 
+    /// herdr's socket is under `XDG_CONFIG_HOME`, so a path there past
+    /// `sun_path` says to shorten that (or the session name), before any
+    /// connect gets the OS's bare refusal.
+    #[test]
+    fn local_socket_path_refuses_a_path_past_sun_path() {
+        let deep = PathBuf::from(format!("/{}", "x".repeat(crate::ssh::UNIX_PATH_MAX)));
+        let err = socket_path_under(&deep, "default").unwrap_err();
+        let e = err
+            .downcast_ref::<crate::cli::CliError>()
+            .expect("CliError");
+        assert_eq!(e.code, "config_error");
+        assert!(e.message.contains("XDG_CONFIG_HOME"), "{}", e.message);
+        let p = socket_path_under(Path::new("/c"), "s").unwrap();
+        assert_eq!(p, Path::new("/c/herdr/sessions/s/herdr.sock"));
+    }
+
     #[test]
     fn socket_paths_and_bridge_command() {
         let p = local_socket_path("default").unwrap();
@@ -893,6 +1007,7 @@ mod tests {
             agent: None,
             agent_args: None,
             model: None,
+            fallback: None,
             priority: None,
             agents: Default::default(),
             profile: None,
@@ -1100,6 +1215,9 @@ mod tests {
             Some("0.2.0")
         );
         assert_eq!(v(0, "welcome\nnone"), None);
+        // "none" wins even when it happens to follow "pastor": read as the
+        // no-pastor answer, never as a version literal spelled "none".
+        assert_eq!(v(0, "pastor none"), None);
         assert_eq!(v(0, "pastor 0.2.0\nmotd after"), None);
         assert_eq!(v(0, "pastor 0.2\u{1b}[0m"), None);
         assert!(remote_pastor_version("t", &out(255, "")).is_err());
@@ -1191,6 +1309,68 @@ mod tests {
         assert_eq!(command.ensure_dir("/").await.unwrap(), None);
     }
 
+    /// The command itself (every real source of "yes") is
+    /// `config::opencode`'s own to test; this only proves the wiring here
+    /// runs it and passes its answer through. The command reads opencode's
+    /// config under `$HOME` and `$XDG_CONFIG_HOME`, and the environment is
+    /// the whole test binary's, which other tests read, so the local half
+    /// runs in a child of this binary with its own empty `HOME` and managed
+    /// dir: a real config on the host running the suite cannot turn the
+    /// first answer into a yes.
+    #[tokio::test]
+    async fn opencode_permission_rules_per_endpoint() {
+        const CHILD: &str = "PASTOR_TEST_OPENCODE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let managed = std::path::PathBuf::from(
+                std::env::var_os("OPENCODE_TEST_MANAGED_CONFIG_DIR").unwrap(),
+            );
+            let local = Endpoint::Local {
+                session: "s".into(),
+            };
+            assert_eq!(
+                local.opencode_permission_rules().await.unwrap(),
+                Some(false)
+            );
+            std::fs::write(
+                managed.join("opencode.json"),
+                r#"{"permission": {"bash": "allow"}}"#,
+            )
+            .unwrap();
+            assert_eq!(local.opencode_permission_rules().await.unwrap(), Some(true));
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let managed = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "herdr::transport::tests::opencode_permission_rules_per_endpoint",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env("HOME", home.path())
+            .env_remove("XDG_CONFIG_HOME")
+            .env("OPENCODE_TEST_MANAGED_CONFIG_DIR", managed.path())
+            .env(
+                "PASTOR_TEST_MANAGED_PREFERENCES_DIR",
+                managed.path().join("prefs"),
+            )
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // The filter matched and the child really ran the local half.
+        assert!(stdout.contains("1 passed"), "{stdout}");
+        let command = Endpoint::Command {
+            argv: vec!["true".into()],
+        };
+        assert_eq!(command.opencode_permission_rules().await.unwrap(), None);
+    }
+
     /// Only ssh failing to reach the machine is an error. rc-file noise comes
     /// before the answer, so the answer is read from the end of stdout.
     #[test]
@@ -1230,6 +1410,17 @@ mod tests {
         );
         assert_eq!(remote_restore_answer("t", &out(128, "")).unwrap(), None);
         assert!(remote_restore_answer("t", &out(255, "")).is_err());
+        // "added" or "no-branch" only count when the shell that printed them
+        // also exited zero: a nonzero exit with that word on stdout (a `set
+        // -e` shell can still print before failing) is neither outcome.
+        assert_eq!(
+            remote_restore_answer("t", &out(1, "added\n")).unwrap(),
+            None
+        );
+        assert_eq!(
+            remote_restore_answer("t", &out(1, "no-branch\n")).unwrap(),
+            None
+        );
     }
 
     /// Everything that reaches the remote shell is quoted.
@@ -1269,6 +1460,8 @@ mod tests {
         );
         assert_eq!(remote_unpushed_answer("t", &out(128, "")).unwrap(), None);
         assert!(remote_unpushed_answer("t", &out(255, "")).is_err());
+        // A parseable count on a nonzero exit is not a real answer either.
+        assert_eq!(remote_unpushed_answer("t", &out(1, "2\n")).unwrap(), None);
     }
 
     /// Against a real git: a commit is unpushed until a remote has it.
@@ -1316,6 +1509,55 @@ mod tests {
         );
     }
 
+    /// Against a real git: an existing branch gets its worktree back, a
+    /// gone branch is reported rather than failing.
+    #[tokio::test]
+    async fn a_local_checkout_restores_a_removed_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(st.status.success(), "{args:?}: {st:?}");
+        };
+        git(&["init", "-q", "work"]);
+        git(&["-C", "work", "commit", "-q", "--allow-empty", "-m", "one"]);
+        git(&["-C", "work", "branch", "feature"]);
+        let ep = Endpoint::Local {
+            session: "s".into(),
+        };
+        let repo = dir.path().join("work");
+        let repo = repo.to_str().unwrap();
+        let wt = dir.path().join("wt");
+        assert_eq!(
+            ep.restore_worktree(repo, wt.to_str().unwrap(), "feature")
+                .await
+                .unwrap(),
+            Some(true)
+        );
+        assert!(wt.join(".git").exists());
+        let wt2 = dir.path().join("wt2");
+        assert_eq!(
+            ep.restore_worktree(repo, wt2.to_str().unwrap(), "no-such-branch")
+                .await
+                .unwrap(),
+            Some(false)
+        );
+        assert!(!wt2.exists());
+    }
+
     /// Only ssh itself failing (255, or killed) means the machine was not
     /// reached. An unset or relative `$HOME`, or a remote command that fails,
     /// comes from a reachable machine and must not mark it lost.
@@ -1335,6 +1577,10 @@ mod tests {
         assert!(err.message.contains("more than"), "{}", err.message);
         let err = probe_output(&argv("yes >&2")).await.unwrap_err();
         assert!(err.message.contains("more than"), "{}", err.message);
+        // Pinned against a literal, not the constant itself: every other
+        // assertion here uses `PROBE_OUTPUT_LIMIT` symbolically, so a wrong
+        // value for it would still pass them.
+        assert_eq!(PROBE_OUTPUT_LIMIT, 65536);
         // Exactly at the cap is fine.
         let out = probe_output(&argv(&format!("head -c {PROBE_OUTPUT_LIMIT} /dev/zero")))
             .await
@@ -1490,6 +1736,7 @@ mod tests {
             agent: None,
             agent_args: None,
             model: None,
+            fallback: None,
             priority: None,
             agents: Default::default(),
             profile: None,

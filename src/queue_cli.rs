@@ -7,7 +7,7 @@ use clap::{Args, Subcommand};
 use crate::cli::{CliError, ask, table, unexpected};
 use crate::config::Paths;
 use crate::config::flock::Flock;
-use crate::ipc::{Head, IpcRequest, IpcResponse};
+use crate::ipc::{Client, Head, IpcRequest, IpcResponse};
 use crate::queue::{QUEUE_HEADER, QueueEntry, QueueSpot};
 use crate::store::{Moved, Store};
 use crate::task::parse_task_id;
@@ -83,26 +83,26 @@ impl SpotArgs {
     }
 }
 
-pub async fn run(paths: &Paths, mut a: QueueArgs, head: Head) -> anyhow::Result<()> {
+pub async fn run(client: &Client, mut a: QueueArgs, head: Head) -> anyhow::Result<()> {
     match a.cmd.take() {
-        Some(QueueCmd::Move(m)) => move_task(paths, m).await,
-        None => list(paths, a, head).await,
+        Some(QueueCmd::Move(m)) => move_task(client, m).await,
+        None => list(client, a, head).await,
     }
 }
 
-async fn list(paths: &Paths, a: QueueArgs, head: Head) -> anyhow::Result<()> {
+async fn list(client: &Client, a: QueueArgs, head: Head) -> anyhow::Result<()> {
     let entries = if head.is_live() {
         let req = IpcRequest::Queue {
             flock: a.flock.clone(),
             machine: a.machine.clone(),
         };
-        match ask(paths, req).await? {
+        match ask(client, req).await? {
             IpcResponse::Queue(entries) => entries,
             other => return Err(unexpected(other)),
         }
     } else {
         eprintln!("pastor serve is not running; showing the last known queue");
-        offline(paths, a.flock.as_deref(), a.machine.as_deref())?
+        offline(&client.paths, a.flock.as_deref(), a.machine.as_deref())?
     };
     if a.json {
         let v: Vec<_> = entries.iter().map(QueueEntry::to_json).collect();
@@ -138,10 +138,10 @@ fn offline(
 }
 
 /// `pastor queue move t-N --top|--before|--after|--to`.
-async fn move_task(paths: &Paths, a: MoveArgs) -> anyhow::Result<()> {
+async fn move_task(client: &Client, a: MoveArgs) -> anyhow::Result<()> {
     let id = task_id(&a.task)?;
     let to = a.to.spot()?;
-    let moved = match ask(paths, IpcRequest::QueueMove { id, to }).await? {
+    let moved = match ask(client, IpcRequest::QueueMove { id, to }).await? {
         IpcResponse::Moved(m) => m,
         other => return Err(unexpected(other)),
     };

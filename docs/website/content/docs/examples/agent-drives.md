@@ -25,6 +25,15 @@ pastor --skill > ~/.claude/skills/pastor/SKILL.md
 An agent that meets pastor without it gets a pointer anyway: `pastor --help`
 ends with one.
 
+## scaffold a connector
+
+Feeding a job from something pastor does not know about yet — a chat
+channel, an issue tracker, a feed, a directory — starts with a connector: a
+poll or stream script plus a `pastor-connector.toml`. The `pastor:connector`
+skill scaffolds one, asks at most whether it polls or streams and which
+secrets it needs, and tests the result with `pastor connector try` and
+`pastor tick --dry-run` before anyone installs it for real.
+
 ## read with JSON
 
 Tables are for people. Every `list` and `describe` takes `--json`, and so do

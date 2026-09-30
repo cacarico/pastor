@@ -473,10 +473,20 @@ pub struct Defaults {
     /// machine name none. See `resolve_agent`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The `[models]` names a task may fall back to when its run flags,
+    /// job, machine and flock set none; `[]` means none. See
+    /// `resolve_agent_on`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<Vec<String>>,
     /// The level of tasks whose run flags, job, flock and pinned machine
     /// name none; unset, `normal`. See `resolve_priority`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<crate::task::Priority>,
+    /// How long a queued task waits before it goes up a level (`"30m"`), or
+    /// `never`, for flocks that set none; unset, `DEFAULT_AGE_AFTER`. See
+    /// `resolve_age_after`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_after: Option<String>,
     /// The agent that runs a model of another kind than `agent`'s, by kind
     /// (`{ opencode = "opencode" }`). See `resolve_agent_for`.
     #[serde(skip_serializing_if = "KindAgents::is_empty")]
@@ -501,6 +511,10 @@ pub struct Defaults {
     /// `resolve_label`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Whether tasks whose run flags, job and flock say nothing keep their
+    /// pane once they end; unset, no. See `resolve_keep_pane`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_pane: Option<bool>,
 }
 
 /// What `pastor task run` flags or a job file's `[dispatch]` say about the
@@ -521,6 +535,11 @@ pub struct AgentChoice {
     /// A `[models]` name, before the flock's, the machine's and `[defaults]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// `[models]` names the task may fall back to, before the machine's,
+    /// the flock's and `[defaults]` (`--fallback`, a job's `fallback`);
+    /// `Some(vec![])` means none (`--no-fallback`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<Vec<String>>,
     /// A permission profile, before the flock's, the machine's and
     /// `[defaults]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -564,6 +583,10 @@ pub struct AgentPick {
     /// `None` when no layer names one. Its args are not in `agent_args`:
     /// `Models::apply` puts them in front.
     pub model: Option<(String, Layer)>,
+    /// The `[models]` names the task may fall back to, and the layer that
+    /// set them; `None` when no layer does. A layer's `[]` is kept here, so
+    /// the task shows where its empty list came from.
+    pub fallback: Option<(Vec<String>, Layer)>,
     /// The agent is `agent_from`'s `agents` entry for its kind, not its
     /// `agent` (`Defaults::resolve_agent_for`).
     pub by_kind: bool,
@@ -727,6 +750,16 @@ impl Defaults {
         ]
         .into_iter()
         .find_map(|(layer, name)| Some((name?.clone(), layer)));
+        // Unlike `model`, the machine's list comes before its flock's: what
+        // a task may fall back to is what that machine is logged in to.
+        let fallback = [
+            (Layer::Ask, ask.fallback.as_ref()),
+            (Layer::Machine, machine.and_then(|m| m.fallback.as_ref())),
+            (Layer::Flock, flock.and_then(|f| f.fallback.as_ref())),
+            (Layer::Defaults, self.fallback.as_ref()),
+        ]
+        .into_iter()
+        .find_map(|(layer, names)| Some((names?.clone(), layer)));
         let profile = [
             (Layer::Ask, ask.profile.as_ref()),
             (Layer::Flock, flock.and_then(|f| f.profile.as_ref())),
@@ -743,6 +776,7 @@ impl Defaults {
             agent_from,
             args_from,
             model,
+            fallback,
             by_kind: false,
             profile,
             missing_kind: None,
@@ -914,6 +948,22 @@ impl Defaults {
         .unwrap_or_default()
     }
 
+    /// How long a queued task of `flock` waits before it ages a level
+    /// (`Store::age_queued`): the flock's `age_after`, else these defaults',
+    /// else `DEFAULT_AGE_AFTER`; `None` when that is `never`. Both files are
+    /// checked on load; one that no longer parses is passed over.
+    pub fn resolve_age_after(&self, flock: Option<&flock::FlockEntry>) -> Option<Duration> {
+        let set = [
+            flock.and_then(|f| f.age_after.as_deref()),
+            self.age_after.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|v| check_age_after(v).is_ok())
+        .unwrap_or(DEFAULT_AGE_AFTER);
+        (set.trim() != AGE_NEVER).then(|| duration_or_default(set, DEFAULT_AGE_AFTER))
+    }
+
     /// A task's timeout in seconds: from the first of `ask` (`--timeout`, a
     /// job's `[dispatch] timeout`), its flock and these defaults, and the
     /// layer that set it. No machine layer: a machine has no `timeout`.
@@ -1003,6 +1053,24 @@ impl Defaults {
         .into_iter()
         .find_map(|(layer, label)| Some((label?.to_string(), layer)))
     }
+
+    /// Whether a task keeps its pane once it ends: from the first of `ask`
+    /// (`task run --keep-pane`, a job's `keep_pane`), `flock` and these
+    /// defaults that sets it, and the layer that did; `None` is no. No
+    /// machine layer, for the reason `resolve_label` has none.
+    pub fn resolve_keep_pane(
+        &self,
+        ask: Option<bool>,
+        flock: Option<&flock::FlockEntry>,
+    ) -> Option<(bool, Layer)> {
+        [
+            (Layer::Ask, ask),
+            (Layer::Flock, flock.and_then(|f| f.keep_pane)),
+            (Layer::Defaults, self.keep_pane),
+        ]
+        .into_iter()
+        .find_map(|(layer, keep)| Some((keep?, layer)))
+    }
 }
 
 impl Default for Defaults {
@@ -1013,7 +1081,9 @@ impl Default for Defaults {
             allow: vec![],
             deny: vec![],
             model: None,
+            fallback: None,
             priority: None,
+            age_after: None,
             agents: KindAgents::new(),
             profile: None,
             max_tasks_per_run: 5,
@@ -1021,6 +1091,7 @@ impl Default for Defaults {
             summary: None,
             place: crate::task::Place::Repo,
             label: None,
+            keep_pane: None,
         }
     }
 }
@@ -1059,6 +1130,18 @@ pub struct AgentDef {
     /// Like `allow_flag`, for `deny` (`--disallowedTools` for claude).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deny_flag: Option<String>,
+    /// The agent's permissions are in its own settings on the machine (agy's
+    /// allow list), so a task under a profile starts with no permission
+    /// mode and no tool flags, its lists not passed (`lists_unapplied`).
+    /// Without it, an agent with no flags refuses a profiled task.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub own_permissions: bool,
+    /// The account the agent is logged in to, as a label: every machine
+    /// whose agent names the same account shares its usage limits
+    /// (`Agents::limit_key`). Unset, a limit holds only for this agent on
+    /// the machine it was seen on. pastor never reads it as a credential.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 }
 
 /// `[agents.<name>]`, by agent name (`claude`, `codex`).
@@ -1084,6 +1167,14 @@ const CLAUDE_TRUST_KEYS: [&str; 2] = ["Down", "Enter"];
 /// accept that; saved trust presses them only while this is on screen.
 const CLAUDE_TRUST_MARKER: &str = "Yes, I trust this folder";
 
+/// Text Codex's folder-trust dialog shows, in its newer and older wording.
+/// herdr reads Codex at that dialog idle and ready, not blocked, so a prompt
+/// sent then would go into the dialog.
+const CODEX_TRUST_MARKERS: [&str; 2] = [
+    "Do you trust the contents of this directory",
+    "allow Codex to work in this folder",
+];
+
 /// Does the prompt at the bottom of `screen` (a pane's text, scrollback
 /// included) show `marker`? Only `bottom_prompt` is searched, so a trust
 /// prompt answered earlier and still in scrollback does not count for the
@@ -1098,6 +1189,11 @@ pub fn shows_trust_marker(screen: &str, marker: &str) -> bool {
     };
     let marker = squash(marker);
     !marker.is_empty() && squash(&bottom_prompt(screen)).contains(&marker)
+}
+
+/// Does `screen` show one of `markers` at its bottom (`shows_trust_marker`)?
+pub fn shows_startup_question(screen: &str, markers: &[String]) -> bool {
+    markers.iter().any(|m| shows_trust_marker(screen, m))
 }
 
 /// The trailing lines of `screen` that make up the prompt at its bottom:
@@ -1144,11 +1240,48 @@ fn is_permission_arg(arg: &str) -> bool {
         || arg == "--allow-dangerously-skip-permissions"
 }
 
+/// What a Codex agent under a permission profile starts with: it never
+/// asks for approval, and runs its commands in a sandbox that may write only
+/// the workspace. Codex has no per-command allow or deny flag, so the sandbox
+/// stands in for the profile's lists. `unrestricted` gets no sandbox, as
+/// nothing is denied under it.
+const CODEX_NO_ASK: [&str; 2] = ["--ask-for-approval", "never"];
+const CODEX_SANDBOX: &str = "--sandbox";
+const CODEX_WORKSPACE_WRITE: &str = "workspace-write";
+const CODEX_FULL_ACCESS: &str = "danger-full-access";
+
+/// Does `arg` (after `prev`) pick Codex's approval policy or sandbox, or turn
+/// both off? A `-c` override of either key counts too.
+fn is_codex_permission_arg(prev: Option<&str>, arg: &str) -> bool {
+    let flag = |long: &str, short: &str| {
+        arg == long || arg == short || arg.starts_with(&format!("{long}="))
+    };
+    let key = |v: &str| v.starts_with("approval_policy") || v.starts_with("sandbox_mode");
+    flag("--ask-for-approval", "-a")
+        || flag("--sandbox", "-s")
+        || arg == "--full-auto"
+        || arg == "--dangerously-bypass-approvals-and-sandbox"
+        || arg == "--yolo"
+        || (matches!(prev, Some("-c" | "--config")) && key(arg))
+        || arg.strip_prefix("--config=").is_some_and(key)
+}
+
 /// Claude Code's own names for the allow and deny lists (`claude --help`).
 /// Both take several patterns and may repeat, so one flag per pattern works.
 const CLAUDE_TOOL_FLAGS: (&str, &str) = ("--allowedTools", "--disallowedTools");
 
 impl Agents {
+    /// What a usage limit of `agent` on `machine` is kept under: its
+    /// `account`, which every machine naming it shares, else
+    /// `<machine>/<agent>`, which holds only there. An account never holds a
+    /// `/`, so the two never meet.
+    pub fn limit_key(&self, machine: &str, agent: &str) -> String {
+        match self.0.get(agent).and_then(|d| d.account.as_deref()) {
+            Some(account) => account.to_string(),
+            None => format!("{machine}/{agent}"),
+        }
+    }
+
     /// The herdr kind `agent` starts: its definition's `kind`, else its name.
     pub fn kind<'a>(&'a self, agent: &'a str) -> &'a str {
         self.0
@@ -1179,6 +1312,27 @@ impl Agents {
             None => return None,
         };
         (!marker.trim().is_empty()).then_some(marker)
+    }
+
+    /// What shows that `agent` sits at a startup question herdr reads idle
+    /// and ready, so its prompt waits (`shows_startup_question`): its own
+    /// `trust_marker`, and Codex's dialog for the `codex` kind. None for
+    /// Claude, whose dialog herdr reads `blocked`.
+    pub fn startup_markers(&self, agent: &str) -> Vec<String> {
+        let kind = self.kind(agent);
+        if kind == "claude" {
+            return vec![];
+        }
+        let own = self.0.get(agent).and_then(|d| d.trust_marker.clone());
+        let builtin: &[&str] = if kind == "codex" {
+            &CODEX_TRUST_MARKERS
+        } else {
+            &[]
+        };
+        own.into_iter()
+            .chain(builtin.iter().map(|m| m.to_string()))
+            .filter(|m| !m.trim().is_empty())
+            .collect()
     }
 
     /// The flags that carry `agent`'s allow and deny lists: its own, else the
@@ -1228,17 +1382,61 @@ impl Agents {
         })
     }
 
+    /// Why `spec`'s allow and deny lists do not reach its agent, when they
+    /// do not: a Codex agent under a profile, with no flag of its own for a
+    /// list it has, runs in its sandbox instead (`launch_args`); an agent
+    /// with `own_permissions` has its own settings on the machine. `task
+    /// describe` shows it next to the lists.
+    pub fn lists_unapplied(&self, spec: &crate::task::DispatchSpec) -> Option<String> {
+        let profile = spec.profile()?;
+        if self.own_permissions(&spec.agent) {
+            return (!spec.allow.is_empty() || !spec.deny.is_empty()).then(|| {
+                format!(
+                    "not applied: agent {}'s permissions are in its own settings on the machine",
+                    spec.agent
+                )
+            });
+        }
+        if self.kind(&spec.agent) != "codex" {
+            return None;
+        }
+        let (allow_flag, deny_flag) = self.tool_flags(&spec.agent);
+        let dropped = (!spec.allow.is_empty() && allow_flag.is_none())
+            || (!spec.deny.is_empty() && deny_flag.is_none());
+        dropped.then(|| {
+            let sandbox = if profile == profile::UNRESTRICTED {
+                CODEX_FULL_ACCESS
+            } else {
+                CODEX_WORKSPACE_WRITE
+            };
+            format!(
+                "not applied: codex has no per-command allow or deny flag; it runs in its {sandbox} sandbox"
+            )
+        })
+    }
+
     /// Does `spec` run an opencode agent under a permission profile? Its
     /// lists then go in `OPENCODE_PERMISSION`, not in flags.
     pub fn opencode_profile(&self, spec: &crate::task::DispatchSpec) -> bool {
-        spec.profile().is_some() && self.kind(&spec.agent) == opencode::KIND
+        spec.profile().is_some()
+            && self.kind(&spec.agent) == opencode::KIND
+            && !self.own_permissions(&spec.agent)
+    }
+
+    /// Are `agent`'s permissions in its own settings (`own_permissions`)?
+    fn own_permissions(&self, agent: &str) -> bool {
+        self.0.get(agent).is_some_and(|d| d.own_permissions)
     }
 
     /// The argv after the agent's name for `spec`: its `agent_args`, then,
     /// under a permission profile, the args that stop a Claude agent from
-    /// asking (`--permission-mode dontAsk`), then the flag and pattern of
-    /// each `allow`, then of each `deny`; an opencode agent under a profile
-    /// gets no tool flags, its lists going in `launch`'s env. Refused when a list is not empty
+    /// asking (`--permission-mode dontAsk`) or a Codex one
+    /// (`--ask-for-approval never --sandbox workspace-write`), then the flag
+    /// and pattern of each `allow`, then of each `deny`; an opencode agent
+    /// under a profile gets no tool flags, its lists going in `launch`'s
+    /// env, and a Codex one skips a list it has no flag for
+    /// (`lists_unapplied`); an agent with `own_permissions` under a profile
+    /// gets its args alone. Refused when a list is not empty
     /// and the agent has no flag for it (`agent_tools_unsupported`):
     /// dropping a deny list without a word would be worse than not
     /// starting. Refused too when a profile applies and the args already
@@ -1251,6 +1449,10 @@ impl Agents {
     ) -> Result<Vec<String>, AgentRefusal> {
         let (allow_flag, deny_flag) = self.tool_flags(&spec.agent);
         let mut args = spec.agent_args.clone();
+        // Its own settings hold (`lists_unapplied`).
+        if spec.profile().is_some() && self.own_permissions(&spec.agent) {
+            return Ok(args);
+        }
         if let Some(profile) = spec.profile()
             && self.kind(&spec.agent) == "claude"
         {
@@ -1266,6 +1468,33 @@ impl Agents {
             }
             args.extend(CLAUDE_NO_ASK.map(str::to_string));
         }
+        let codex_profile = spec.profile().filter(|_| self.kind(&spec.agent) == "codex");
+        if let Some(profile) = codex_profile {
+            let prev = std::iter::once(None).chain(args.iter().map(|a| Some(a.as_str())));
+            if let Some((_, arg)) = prev
+                .zip(&args)
+                .find(|(prev, a)| is_codex_permission_arg(*prev, a))
+            {
+                return Err(AgentRefusal {
+                    code: PROFILE_ARGS_CONFLICT,
+                    message: format!(
+                        "task runs under profile {profile}, and agent {}'s args set {arg}; \
+                         drop it from agent_args or the model's args, or run without a profile",
+                        spec.agent
+                    ),
+                });
+            }
+            args.extend(CODEX_NO_ASK.map(str::to_string));
+            args.push(CODEX_SANDBOX.into());
+            args.push(
+                if profile == profile::UNRESTRICTED {
+                    CODEX_FULL_ACCESS
+                } else {
+                    CODEX_WORKSPACE_WRITE
+                }
+                .into(),
+            );
+        }
         if self.opencode_profile(spec) {
             return Ok(args);
         }
@@ -1277,10 +1506,15 @@ impl Agents {
                 continue;
             }
             let Some(flag) = flag else {
+                // Its sandbox stands in (`lists_unapplied`).
+                if codex_profile.is_some() {
+                    continue;
+                }
                 return Err(AgentRefusal {
                     code: "agent_tools_unsupported",
                     message: format!(
-                        "agent {} has no {key} to pass its tool list; set [agents.{}] {key} in pastor.toml",
+                        "agent {} has no {key} to pass its tool list; set [agents.{}] {key} in pastor.toml, \
+                         or own_permissions = true when its permissions are in its own settings on the machine",
                         spec.agent, spec.agent
                     ),
                 });
@@ -1430,6 +1664,22 @@ impl Models {
         spec.agent_args = def.args.iter().chain(&pick.agent_args).cloned().collect();
         Ok(())
     }
+
+    /// `pick`'s fallback list as the task keeps it: each name checked
+    /// (`unknown_model`), the task's own model and repeats dropped. Its
+    /// kind is not checked here: the model finds its agent where the task
+    /// switches to it.
+    pub fn fallback(&self, pick: &AgentPick) -> Result<Vec<String>, AgentRefusal> {
+        let mut out: Vec<String> = Vec::new();
+        for name in pick.fallback.iter().flat_map(|(names, _)| names) {
+            self.get(name)?;
+            let own = pick.model.as_ref().is_some_and(|(m, _)| m == name);
+            if !own && !out.contains(name) {
+                out.push(name.clone());
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1448,6 +1698,11 @@ pub struct PastorConfig {
     /// `pastor task attach` can still show the agent's last screen. `never`
     /// turns auto-close off.
     pub close_done_after: String,
+    /// How long a `failed` or `stale` task, or an orphaned agent (named
+    /// `t-<id>` with no open task owning it), keeps its pane once its agent
+    /// has stopped before pastor closes it. The row stays failed and
+    /// retryable. `never` keeps those panes.
+    pub close_failed_after: String,
     /// How long a pull machine (`pull = true` in flock.toml) may go without
     /// a `TaskClaim` or `TaskReport` before the head counts it lost and its
     /// starting and running tasks go stale.
@@ -1482,6 +1737,82 @@ pub struct PastorConfig {
     /// runs headless and the head has it as a pull machine.
     #[serde(skip_serializing_if = "ShepherdConfig::is_empty")]
     pub shepherd: ShepherdConfig,
+    /// `[limits]`: how the head treats an agent that ran out of usage.
+    #[serde(skip_serializing_if = "LimitsConfig::is_default")]
+    pub limits: LimitsConfig,
+}
+
+/// `[limits]` in pastor.toml: what the head does about usage limits. Every
+/// key is read here; the head acts on `unknown_reset_wait` and
+/// `retry_after_no_credit` when it records a limit, and the others shape how
+/// a limited task waits or moves on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LimitsConfig {
+    /// A limited task whose reset is closer than this waits for it; one
+    /// further off goes on under its next model. `0s` never waits.
+    pub wait_under: String,
+    /// How many times a task stopped on a 429 or 529 is sent on again
+    /// in its pane before it counts as limited.
+    pub rate_retries: u32,
+    /// How long to wait before each of those tries, the first wait first;
+    /// the last one repeats. One wait alone (`"1m"`) is a list of one.
+    #[serde(deserialize_with = "one_or_many")]
+    pub rate_backoff: Vec<String>,
+    /// How long a limit whose message names no reset holds.
+    pub unknown_reset_wait: String,
+    /// How long a limit for no credit holds before the account is tried
+    /// again.
+    pub retry_after_no_credit: String,
+    /// How many of the pane's last lines a task that moves to another model
+    /// hands over to it.
+    pub handover_lines: u32,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        LimitsConfig {
+            wait_under: "30m".into(),
+            rate_retries: 3,
+            rate_backoff: vec!["1m".into(), "5m".into(), "15m".into()],
+            unknown_reset_wait: "1h".into(),
+            retry_after_no_credit: "6h".into(),
+            handover_lines: 60,
+        }
+    }
+}
+
+impl LimitsConfig {
+    pub fn is_default(&self) -> bool {
+        self == &LimitsConfig::default()
+    }
+    pub fn wait_under_duration(&self) -> Duration {
+        if self.wait_under.trim() == "0" {
+            return Duration::ZERO;
+        }
+        duration_or_default(&self.wait_under, &LimitsConfig::default().wait_under)
+    }
+    /// The wait before retry `attempt` (from 1) of a short limit: that
+    /// entry of `rate_backoff`, else its last.
+    pub fn rate_backoff_for(&self, attempt: u32) -> Duration {
+        let at = (attempt.max(1) - 1) as usize;
+        match self.rate_backoff.get(at).or(self.rate_backoff.last()) {
+            Some(wait) => duration_or_default(wait, "1m"),
+            None => Duration::from_secs(60),
+        }
+    }
+    pub fn unknown_reset_wait_duration(&self) -> Duration {
+        duration_or_default(
+            &self.unknown_reset_wait,
+            &LimitsConfig::default().unknown_reset_wait,
+        )
+    }
+    pub fn retry_after_no_credit_duration(&self) -> Duration {
+        duration_or_default(
+            &self.retry_after_no_credit,
+            &LimitsConfig::default().retry_after_no_credit,
+        )
+    }
 }
 
 /// The variable that makes a headless serve take flock work, as
@@ -1578,6 +1909,7 @@ impl Default for PastorConfig {
             request_timeout: "60s".into(),
             agent_ready_timeout: "30s".into(),
             close_done_after: "5s".into(),
+            close_failed_after: "5s".into(),
             pull_lost_after: "10m".into(),
             agents_change_fleet: false,
             max_orchestrators: 1,
@@ -1588,6 +1920,7 @@ impl Default for PastorConfig {
             profiles: profile::Profiles::default(),
             watch: WatchConfig::default(),
             shepherd: ShepherdConfig::default(),
+            limits: LimitsConfig::default(),
         }
     }
 }
@@ -1636,16 +1969,44 @@ impl PastorConfig {
             ("agent_ready_timeout", &cfg.agent_ready_timeout, false),
             ("defaults.timeout", &cfg.defaults.timeout, true),
             ("close_done_after", &cfg.close_done_after, false),
+            ("close_failed_after", &cfg.close_failed_after, false),
             ("pull_lost_after", &cfg.pull_lost_after, false),
+            ("limits.wait_under", &cfg.limits.wait_under, true),
+            (
+                "limits.unknown_reset_wait",
+                &cfg.limits.unknown_reset_wait,
+                false,
+            ),
+            (
+                "limits.retry_after_no_credit",
+                &cfg.limits.retry_after_no_credit,
+                false,
+            ),
         ] {
-            if name == "close_done_after" && v == CLOSE_NEVER {
+            if name.starts_with("close_") && v == CLOSE_NEVER {
                 continue;
             }
+            // A bare `0` is zero in any unit, where zero is allowed.
+            let v = if zero_ok && v.trim() == "0" { "0s" } else { v };
             let d = parse_duration(v)
                 .map_err(|e| anyhow::anyhow!("{}: {name}: {e}", path.display()))?;
             if !zero_ok && d.is_zero() {
                 anyhow::bail!("{}: {name}: must not be zero", path.display());
             }
+        }
+        if cfg.limits.rate_backoff.is_empty() {
+            anyhow::bail!(
+                "{}: limits.rate_backoff: name at least one wait",
+                path.display()
+            );
+        }
+        for v in &cfg.limits.rate_backoff {
+            parse_duration(v)
+                .map_err(|e| anyhow::anyhow!("{}: limits.rate_backoff: {e}", path.display()))?;
+        }
+        if let Some(v) = &cfg.defaults.age_after {
+            check_age_after(v)
+                .map_err(|e| anyhow::anyhow!("{}: defaults.age_after: {e}", path.display()))?;
         }
         for (key, list) in [
             ("defaults.allow", &cfg.defaults.allow),
@@ -1687,6 +2048,20 @@ impl PastorConfig {
                 if flag.as_deref().is_some_and(|f| f.trim().is_empty()) {
                     anyhow::bail!("{}: agents.{name}.{key} must not be empty", path.display());
                 }
+                if def.own_permissions && flag.is_some() {
+                    anyhow::bail!(
+                        "{}: agents.{name}.own_permissions: the agent's own settings hold its permissions, so it takes no {key}",
+                        path.display()
+                    );
+                }
+            }
+            if let Some(account) = &def.account
+                && (account.trim().is_empty() || account.contains('/'))
+            {
+                anyhow::bail!(
+                    "{}: agents.{name}.account must not be empty or hold a /",
+                    path.display()
+                );
             }
             if def.trust_keys.iter().flatten().any(|k| k.trim().is_empty()) {
                 anyhow::bail!(
@@ -1715,6 +2090,11 @@ impl PastorConfig {
             cfg.models
                 .check(m)
                 .map_err(|e| anyhow::anyhow!("{}: defaults.model: {e}", path.display()))?;
+        }
+        for m in cfg.defaults.fallback.iter().flatten() {
+            cfg.models
+                .check(m)
+                .map_err(|e| anyhow::anyhow!("{}: defaults.fallback: {e}", path.display()))?;
         }
         cfg.profiles
             .validate()
@@ -1774,6 +2154,16 @@ impl PastorConfig {
             &PastorConfig::default().close_done_after,
         ))
     }
+    /// `None` when failed and stale tasks keep their panes (`never`).
+    pub fn close_failed_after_duration(&self) -> Option<Duration> {
+        if self.close_failed_after == CLOSE_NEVER {
+            return None;
+        }
+        Some(duration_or_default(
+            &self.close_failed_after,
+            &PastorConfig::default().close_failed_after,
+        ))
+    }
     pub fn pull_lost_after_duration(&self) -> Duration {
         duration_or_default(
             &self.pull_lost_after,
@@ -1788,10 +2178,44 @@ impl PastorConfig {
     }
 }
 
-/// The `close_done_after` value that turns auto-close off.
+/// The `close_done_after` or `close_failed_after` value that turns that
+/// auto-close off.
 const CLOSE_NEVER: &str = "never";
 
+/// How long a queued task waits before it ages a level when neither its
+/// flock nor `[defaults]` says (`Defaults::resolve_age_after`).
+pub const DEFAULT_AGE_AFTER: &str = "30m";
+
+/// `age_after = "never"`: queued tasks keep their level however long they
+/// wait.
+const AGE_NEVER: &str = "never";
+
+/// Whether `v` is an `age_after`: `never`, or a duration above zero.
+pub fn check_age_after(v: &str) -> Result<(), String> {
+    if v.trim() == AGE_NEVER {
+        return Ok(());
+    }
+    if parse_duration(v)?.is_zero() {
+        return Err("must not be zero; `never` turns ageing off".into());
+    }
+    Ok(())
+}
+
 /// Parse `value`, falling back to `default` (assumed valid) if `value` is bad.
+/// A list of strings, or one string alone as a list of one.
+fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(d)? {
+        OneOrMany::One(s) => vec![s],
+        OneOrMany::Many(v) => v,
+    })
+}
+
 fn duration_or_default(value: &str, default: &str) -> Duration {
     parse_duration(value)
         .or_else(|_| parse_duration(default))
@@ -1828,6 +2252,96 @@ mod tests {
         assert!(!PastorConfig::default().agents_change_fleet);
         let cfg: PastorConfig = toml::from_str("agents_change_fleet = true").unwrap();
         assert!(cfg.agents_change_fleet);
+    }
+
+    /// `[limits]` takes every key, each checked as it loads; unset keys keep
+    /// their defaults.
+    #[test]
+    fn limits_parse_and_check_every_key() {
+        let path = Path::new("pastor.toml");
+        let cfg = PastorConfig::parse(
+            path,
+            "[limits]\nwait_under = \"30m\"\nrate_retries = 5\nrate_backoff = \"10s\"\nunknown_reset_wait = \"2h\"\nretry_after_no_credit = \"1d\"\nhandover_lines = 40\n",
+        )
+        .unwrap();
+        let l = &cfg.limits;
+        assert_eq!(l.wait_under_duration(), Duration::from_secs(1800));
+        assert_eq!(l.rate_retries, 5);
+        // One wait alone is a list of one, which repeats.
+        assert_eq!(l.rate_backoff_for(1), Duration::from_secs(10));
+        assert_eq!(l.rate_backoff_for(4), Duration::from_secs(10));
+        assert_eq!(l.unknown_reset_wait_duration(), Duration::from_secs(7200));
+        assert_eq!(
+            l.retry_after_no_credit_duration(),
+            Duration::from_secs(86400)
+        );
+        assert_eq!(l.handover_lines, 40);
+        let d = PastorConfig::parse(path, "[limits]\nrate_retries = 1\n").unwrap();
+        assert_eq!(d.limits.unknown_reset_wait, "1h");
+        assert_eq!(
+            PastorConfig::parse(path, "[limits]\nwait_under = \"0\"\n")
+                .unwrap()
+                .limits
+                .wait_under_duration(),
+            Duration::ZERO
+        );
+        for (bad, key) in [
+            ("unknown_reset_wait = \"0s\"", "limits.unknown_reset_wait"),
+            (
+                "retry_after_no_credit = \"soon\"",
+                "limits.retry_after_no_credit",
+            ),
+            ("wait_under = \"5\"", "limits.wait_under"),
+            ("rate_backoff = \"1y\"", "limits.rate_backoff"),
+            ("rate_backoff = [\"1m\", \"soon\"]", "limits.rate_backoff"),
+            ("rate_backoff = []", "limits.rate_backoff"),
+            ("handover = 3", "handover"),
+        ] {
+            let err = PastorConfig::parse(path, &format!("[limits]\n{bad}\n")).unwrap_err();
+            assert!(err.to_string().contains(key), "{bad}: {err}");
+        }
+    }
+
+    /// `rate_backoff` is a list of waits, one per retry of a short limit,
+    /// the last one repeating: `1m, 5m, 15m` unless set.
+    #[test]
+    fn rate_backoff_is_a_list_whose_last_wait_repeats() {
+        let path = Path::new("pastor.toml");
+        let d = PastorConfig::default().limits;
+        let mins = |m: u64| Duration::from_secs(60 * m);
+        assert_eq!(d.rate_backoff_for(1), mins(1));
+        assert_eq!(d.rate_backoff_for(2), mins(5));
+        assert_eq!(d.rate_backoff_for(3), mins(15));
+        assert_eq!(d.rate_backoff_for(9), mins(15));
+        let l = PastorConfig::parse(path, "[limits]\nrate_backoff = [\"30s\", \"2m\"]\n")
+            .unwrap()
+            .limits;
+        assert_eq!(l.rate_backoff_for(1), Duration::from_secs(30));
+        assert_eq!(l.rate_backoff_for(2), mins(2));
+        assert_eq!(l.rate_backoff_for(3), mins(2));
+    }
+
+    /// An agent's `account` names who shares its limits: every machine
+    /// whose agent names it gets one key, and with none the key is the
+    /// machine and the agent, so each machine keeps its own.
+    #[test]
+    fn a_limit_is_kept_under_the_account_else_the_machine_and_agent() {
+        let path = Path::new("pastor.toml");
+        let cfg = PastorConfig::parse(
+            path,
+            "[agents.claude-personal]\nkind = \"claude\"\naccount = \"me-at-home\"\n",
+        )
+        .unwrap();
+        let a = &cfg.agents;
+        assert_eq!(a.limit_key("pi-1", "claude-personal"), "me-at-home");
+        assert_eq!(a.limit_key("pi-2", "claude-personal"), "me-at-home");
+        assert_eq!(a.limit_key("pi-1", "claude"), "pi-1/claude");
+        assert_eq!(a.limit_key("pi-2", "claude"), "pi-2/claude");
+        for bad in ["\"\"", "\"a/b\""] {
+            let err =
+                PastorConfig::parse(path, &format!("[agents.x]\naccount = {bad}\n")).unwrap_err();
+            assert!(err.to_string().contains("agents.x.account"), "{bad}: {err}");
+        }
     }
 
     /// `head_address` is an ssh destination: optional, and when set a
@@ -2184,6 +2698,47 @@ mod tests {
         assert_eq!(got(&Defaults::default(), None, &bare), None);
     }
 
+    /// `keep_pane` comes from the first of the ask, the flock and
+    /// `[defaults]` that sets it, so a job's `false` beats a flock's `true`;
+    /// none leaves it unset, which is no.
+    #[test]
+    fn keep_pane_comes_from_its_layers() {
+        let kept = flock::FlockEntry {
+            name: "kept".into(),
+            keep_pane: Some(true),
+            ..Default::default()
+        };
+        let bare = flock::FlockEntry {
+            name: "bare".into(),
+            ..Default::default()
+        };
+        let d = Defaults {
+            keep_pane: Some(true),
+            ..Default::default()
+        };
+        let got = |d: &Defaults, ask, f: &flock::FlockEntry| d.resolve_keep_pane(ask, Some(f));
+        assert_eq!(got(&d, Some(false), &kept), Some((false, Layer::Ask)));
+        assert_eq!(
+            got(&Defaults::default(), None, &kept),
+            Some((true, Layer::Flock))
+        );
+        assert_eq!(got(&d, None, &bare), Some((true, Layer::Defaults)));
+        assert_eq!(got(&Defaults::default(), None, &bare), None);
+    }
+
+    /// `[defaults] keep_pane` loads, and a misspelt key is a load error.
+    #[test]
+    fn a_defaults_keep_pane_loads_and_a_typo_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(&path, "[defaults]\nkeep_pane = true\n").unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        assert_eq!(cfg.defaults.keep_pane, Some(true));
+        std::fs::write(&path, "[defaults]\nkeep_panes = true\n").unwrap();
+        let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
+        assert!(err.contains("keep_panes"), "{err}");
+    }
+
     /// `[defaults] label` is checked on load like any other template.
     #[test]
     fn a_defaults_label_is_checked_on_load() {
@@ -2280,18 +2835,20 @@ mod tests {
     }
 
     /// `[models.<name>]` needs a kind and args, a name in the job names'
-    /// alphabet, and nothing else; `[defaults] model` must name one.
+    /// alphabet, and nothing else; `[defaults] model` must name one, and so
+    /// must each of `[defaults] fallback`.
     #[test]
     fn models_load_and_bad_ones_are_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("pastor.toml");
         std::fs::write(
             &path,
-            "[defaults]\nmodel = \"sonnet\"\n[models.sonnet]\nkind = \"claude\"\nargs = [\"--model\", \"claude-sonnet-5\"]\n[models.plain]\nkind = \"codex\"\nargs = []\n",
+            "[defaults]\nmodel = \"sonnet\"\nfallback = [\"plain\"]\n[models.sonnet]\nkind = \"claude\"\nargs = [\"--model\", \"claude-sonnet-5\"]\n[models.plain]\nkind = \"codex\"\nargs = []\n",
         )
         .unwrap();
         let cfg = PastorConfig::load(&path).unwrap();
         assert_eq!(cfg.defaults.model.as_deref(), Some("sonnet"));
+        assert_eq!(cfg.defaults.fallback, Some(vec!["plain".to_string()]));
         assert_eq!(
             cfg.models.0["sonnet"].args,
             vec!["--model", "claude-sonnet-5"]
@@ -2317,6 +2874,10 @@ mod tests {
                 "env",
             ),
             ("[defaults]\nmodel = \"haiku\"\n", "defaults.model"),
+            (
+                "[defaults]\nfallback = [\"haiku\"]\n",
+                "defaults.fallback: model haiku is not in [models]",
+            ),
         ] {
             std::fs::write(&path, text).unwrap();
             let err = PastorConfig::load(&path).unwrap_err().to_string();
@@ -2524,6 +3085,73 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.code, "unknown_model");
+    }
+
+    /// The fallback list comes whole from the first of the ask, the
+    /// machine, the flock and `[defaults]` that sets one; lists do not
+    /// merge, and `[]` stops the lookup with none.
+    #[test]
+    fn the_fallback_comes_whole_from_the_first_layer_that_sets_one() {
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let d = Defaults {
+            fallback: Some(names(&["haiku"])),
+            ..Default::default()
+        };
+        let flock = flock::FlockEntry {
+            name: "p".into(),
+            fallback: Some(names(&["sonnet", "gpt"])),
+            ..Default::default()
+        };
+        let machine = |text: &str| -> flock::MachineConfig {
+            toml::from_str(&format!("name = \"m\"\nlocal = true\n{text}")).unwrap()
+        };
+        let ask = |fallback: Option<&[&str]>| AgentChoice {
+            fallback: fallback.map(names),
+            ..Default::default()
+        };
+        let fallback = |p: AgentPick| p.fallback;
+        let own = machine("fallback = [\"opus\"]\n");
+        assert_eq!(
+            fallback(d.resolve_agent_on(&ask(Some(&["gpt"])), Some(&own), Some(&flock))),
+            Some((names(&["gpt"]), Layer::Ask))
+        );
+        assert_eq!(
+            fallback(d.resolve_agent_on(&ask(Some(&[])), Some(&own), Some(&flock))),
+            Some((vec![], Layer::Ask))
+        );
+        assert_eq!(
+            fallback(d.resolve_agent_on(&ask(None), Some(&own), Some(&flock))),
+            Some((names(&["opus"]), Layer::Machine))
+        );
+        let none = machine("fallback = []\n");
+        assert_eq!(
+            fallback(d.resolve_agent_on(&ask(None), Some(&none), Some(&flock))),
+            Some((vec![], Layer::Machine))
+        );
+        assert_eq!(
+            fallback(d.resolve_agent_on(&ask(None), Some(&machine("")), Some(&flock))),
+            Some((names(&["sonnet", "gpt"]), Layer::Flock))
+        );
+        assert_eq!(
+            fallback(d.resolve_agent_on(&ask(None), Some(&machine("")), None)),
+            Some((names(&["haiku"]), Layer::Defaults))
+        );
+        assert_eq!(
+            fallback(Defaults::default().resolve_agent(&ask(None), None)),
+            None
+        );
+
+        // Each name must be in `[models]`; the task's own model is dropped.
+        let models: Models = toml::from_str(
+            "[sonnet]\nkind = \"claude\"\nargs = []\n[gpt]\nkind = \"opencode\"\nargs = []\n",
+        )
+        .unwrap();
+        let mut pick = d.resolve_agent(&ask(Some(&["sonnet", "gpt", "sonnet"])), None);
+        assert_eq!(models.fallback(&pick).unwrap(), names(&["sonnet", "gpt"]));
+        pick.model = Some(("sonnet".into(), Layer::Ask));
+        assert_eq!(models.fallback(&pick).unwrap(), names(&["gpt"]));
+        let pick = d.resolve_agent(&ask(Some(&["sonnet", "opus"])), None);
+        assert_eq!(models.fallback(&pick).unwrap_err().code, "unknown_model");
     }
 
     /// A model of another kind than the default agent's runs on the first
@@ -2792,6 +3420,7 @@ mod tests {
 
     fn spec_with(agent: &str, allow: &[&str], deny: &[&str]) -> crate::task::DispatchSpec {
         crate::task::DispatchSpec {
+            now: false,
             agent: agent.into(),
             agent_args: vec!["--model".into(), "m".into()],
             allow: allow.iter().map(|s| s.to_string()).collect(),
@@ -2810,6 +3439,9 @@ mod tests {
             label: Default::default(),
             summary: Default::default(),
             cwd: None,
+            keep_pane: None,
+            keep_pane_from: None,
+            rounds: Default::default(),
         }
     }
 
@@ -2859,8 +3491,8 @@ mod tests {
 
     /// Under a profile a Claude agent starts with `--permission-mode
     /// dontAsk` after its args and before its tool flags; args that pick a
-    /// permission mode of their own are refused. An agent of another kind
-    /// gets the lists only, through its own flags.
+    /// permission mode of their own are refused. A Codex agent with flags of
+    /// its own gets its lists through them (`a_profile_starts_codex_in_its_sandbox`).
     #[test]
     fn a_profile_starts_claude_without_asking() {
         let with_profile = |agent: &str, args: &[&str]| {
@@ -2872,10 +3504,14 @@ mod tests {
                 agent_args: None,
                 model: None,
                 model_from: None,
+                fallback: vec![],
+                fallback_from: None,
+                fallback_use: None,
                 profile: Some("develop".into()),
                 profile_from: Some("defaults".into()),
                 timeout_from: None,
                 place_from: None,
+                lists_unapplied: None,
             }));
             spec
         };
@@ -2930,11 +3566,121 @@ mod tests {
             vec![
                 "--permission-mode",
                 "x",
+                "--ask-for-approval",
+                "never",
+                "--sandbox",
+                "workspace-write",
                 "--allow",
                 "Edit",
                 "--deny",
                 "Bash(sudo:*)"
             ]
+        );
+    }
+
+    /// Under a profile a Codex agent starts with `--ask-for-approval never
+    /// --sandbox workspace-write` after its args; `unrestricted` gets
+    /// `danger-full-access`. Codex has no per-command flag, so its lists are
+    /// left out rather than refused, and `lists_unapplied` says so. Args
+    /// that pick an approval policy or sandbox are refused.
+    #[test]
+    fn a_profile_starts_codex_in_its_sandbox() {
+        let with_profile = |agent: &str, profile: &str, args: &[&str]| {
+            let mut spec = spec_with(agent, &["Edit"], &["Bash(sudo:*)"]);
+            spec.agent_args = args.iter().map(|s| s.to_string()).collect();
+            spec.agent_source = Some(Box::new(crate::task::AgentSource {
+                agent: "defaults".into(),
+                profile: Some(profile.into()),
+                ..Default::default()
+            }));
+            spec
+        };
+        let agents = Agents::default();
+        let spec = with_profile("codex", "review", &["--model", "m"]);
+        assert_eq!(
+            agents.launch_args(&spec).unwrap(),
+            vec![
+                "--model",
+                "m",
+                "--ask-for-approval",
+                "never",
+                "--sandbox",
+                "workspace-write"
+            ]
+        );
+        let why = agents.lists_unapplied(&spec).unwrap();
+        assert!(
+            why.contains("not applied") && why.contains("workspace-write"),
+            "{why}"
+        );
+        let spec = with_profile("codex", "unrestricted", &[]);
+        assert_eq!(
+            agents.launch_args(&spec).unwrap(),
+            vec![
+                "--ask-for-approval",
+                "never",
+                "--sandbox",
+                "danger-full-access"
+            ]
+        );
+        assert!(
+            agents
+                .lists_unapplied(&spec)
+                .unwrap()
+                .contains("danger-full-access")
+        );
+        // A network override is not a sandbox pick.
+        let args = ["-c", "sandbox_workspace_write.network_access=true"];
+        assert_eq!(
+            agents
+                .launch_args(&with_profile("codex", "develop", &args))
+                .unwrap()[..2],
+            args
+        );
+        for arg in [
+            &["--ask-for-approval", "on-request"][..],
+            &["-a", "never"],
+            &["--ask-for-approval=never"],
+            &["--sandbox", "read-only"],
+            &["-s", "read-only"],
+            &["--sandbox=read-only"],
+            &["--full-auto"],
+            &["--dangerously-bypass-approvals-and-sandbox"],
+            &["--yolo"],
+            &["-c", "approval_policy=never"],
+            &["--config", "sandbox_mode=\"read-only\""],
+            &["--config=sandbox_mode=read-only"],
+        ] {
+            let err = agents
+                .launch_args(&with_profile("codex", "develop", arg))
+                .unwrap_err();
+            assert_eq!(err.code, PROFILE_ARGS_CONFLICT, "{arg:?}");
+            assert!(err.message.contains("profile develop"), "{err}");
+        }
+        // A definition of kind codex is codex.
+        let mine: Agents = toml::from_str("[cx]\nkind = \"codex\"\n").unwrap();
+        let spec = with_profile("cx", "develop", &[]);
+        assert!(
+            mine.launch_args(&spec)
+                .unwrap()
+                .contains(&"never".to_string())
+        );
+        assert!(mine.lists_unapplied(&spec).is_some());
+        // Without a profile the lists still need flags, and the args pass.
+        let mut plain = with_profile("codex", "develop", &["--full-auto"]);
+        plain.agent_source = None;
+        assert_eq!(
+            agents.launch_args(&plain).unwrap_err().code,
+            "agent_tools_unsupported"
+        );
+        assert_eq!(agents.lists_unapplied(&plain), None);
+        plain.allow.clear();
+        plain.deny.clear();
+        assert_eq!(agents.launch_args(&plain).unwrap(), vec!["--full-auto"]);
+        // Nor does a Claude agent's lists go unapplied.
+        assert_eq!(
+            agents.lists_unapplied(&with_profile("claude", "develop", &[])),
+            None
         );
     }
 
@@ -2951,10 +3697,14 @@ mod tests {
             agent_args: None,
             model: None,
             model_from: None,
+            fallback: vec![],
+            fallback_from: None,
+            fallback_use: None,
             profile: Some("develop".into()),
             profile_from: Some("defaults".into()),
             timeout_from: None,
             place_from: None,
+            lists_unapplied: None,
         }));
         let agents: Agents = toml::from_str(
             "[opencode]\nallow_flag = \"--allow\"\n\
@@ -2992,6 +3742,69 @@ mod tests {
         spec.deny.clear();
         // Nor is the repo's own config turned off.
         assert!(Agents::default().launch(&spec).unwrap().env.is_empty());
+    }
+
+    /// An agent whose permissions are in its own settings on the machine
+    /// (`own_permissions`, agy's allow list) starts under a profile with
+    /// its args alone: no mode, no tool flags, its lists not passed, and
+    /// `task describe` says why. Without the field it is refused, and the
+    /// message names the field.
+    #[test]
+    fn an_agent_with_its_own_permissions_starts_under_a_profile_without_flags() {
+        let mut spec = spec_with("agy", &["Edit"], &["Bash(sudo:*)"]);
+        spec.agent_source = Some(Box::new(crate::task::AgentSource {
+            agent: "defaults".into(),
+            profile: Some("develop".into()),
+            profile_from: Some("defaults".into()),
+            ..Default::default()
+        }));
+
+        let err = Agents::default().launch(&spec).unwrap_err();
+        assert_eq!(err.code, "agent_tools_unsupported");
+        assert!(err.message.contains("own_permissions"), "{err}");
+        assert_eq!(Agents::default().lists_unapplied(&spec), None);
+
+        let agents: Agents = toml::from_str("[agy]\nown_permissions = true\n").unwrap();
+        let launch = agents.launch(&spec).unwrap();
+        assert_eq!(launch.kind, "agy");
+        assert_eq!(launch.args, vec!["--model", "m"]);
+        assert!(launch.env.is_empty());
+        let why = agents.lists_unapplied(&spec).unwrap();
+        assert!(why.starts_with("not applied:"), "{why}");
+        assert!(why.contains("own settings on the machine"), "{why}");
+
+        // A definition of kind agy under another name, as a machine picks
+        // with `agents = { agy = "agy-builder" }`.
+        let mine: Agents =
+            toml::from_str("[agy-builder]\nkind = \"agy\"\nown_permissions = true\n").unwrap();
+        spec.agent = "agy-builder".into();
+        assert_eq!(mine.launch(&spec).unwrap().args, vec!["--model", "m"]);
+        assert!(mine.lists_unapplied(&spec).is_some());
+
+        // Without a profile the lists still need flags.
+        spec.agent_source = None;
+        assert_eq!(
+            mine.launch(&spec).unwrap_err().code,
+            "agent_tools_unsupported"
+        );
+        assert_eq!(mine.lists_unapplied(&spec), None);
+    }
+
+    /// `own_permissions` and a tool flag contradict each other: pastor
+    /// would pass the lists on one path and not on the other.
+    #[test]
+    fn own_permissions_refuses_a_tool_flag_beside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pastor.toml");
+        std::fs::write(
+            &path,
+            "[agents.agy]\nown_permissions = true\nallow_flag = \"--allow\"\n",
+        )
+        .unwrap();
+        let err = PastorConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("agents.agy.own_permissions"), "{err}");
+        std::fs::write(&path, "[agents.agy]\nown_permissions = true\n").unwrap();
+        assert!(PastorConfig::load(&path).unwrap().agents.0["agy"].own_permissions);
     }
 
     /// A task's profile comes from the first layer that names one, like its
@@ -3201,6 +4014,36 @@ mod tests {
             None,
             "empty turns it off"
         );
+    }
+
+    /// A prompt waits for Codex's folder-trust dialog, which herdr reads
+    /// idle, and for any agent's own `trust_marker`; never for Claude,
+    /// whose dialog herdr reads `blocked`.
+    #[test]
+    fn codex_and_agents_with_a_trust_marker_hold_their_prompt() {
+        let cfg = PastorConfig::default();
+        assert!(cfg.agents.startup_markers("claude").is_empty());
+        assert!(cfg.agents.startup_markers("agy").is_empty());
+        let codex = cfg.agents.startup_markers("codex");
+        let screen = "  Do you trust the contents of this directory? Working with\n\u{203a} 1. Yes, continue\n  2. No, quit\n";
+        assert!(shows_startup_question(screen, &codex));
+        assert!(!shows_startup_question(
+            "\u{203a} Explain this codebase\n",
+            &codex
+        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(
+            &path,
+            "[agents.agy]\ntrust_marker = \"Trust this workspace?\"\n[agents.claude]\ntrust_marker = \"Other\"\n",
+        )
+        .unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        assert_eq!(
+            cfg.agents.startup_markers("agy"),
+            vec!["Trust this workspace?"]
+        );
+        assert!(cfg.agents.startup_markers("claude").is_empty());
     }
 
     #[test]
@@ -3731,6 +4574,27 @@ mod tests {
         assert_eq!(c.close_done_after_duration(), None);
     }
 
+    #[test]
+    fn close_failed_after_defaults_to_five_seconds_and_never_keeps_panes() {
+        let path = Path::new("pastor.toml");
+        let d = PastorConfig::default();
+        assert_eq!(
+            d.close_failed_after_duration(),
+            Some(Duration::from_secs(5))
+        );
+        let cfg = PastorConfig::parse(path, "close_failed_after = \"never\"").unwrap();
+        assert_eq!(cfg.close_failed_after_duration(), None);
+        let cfg = PastorConfig::parse(path, "close_failed_after = \"1h\"").unwrap();
+        assert_eq!(
+            cfg.close_failed_after_duration(),
+            Some(Duration::from_secs(3600))
+        );
+        let err = PastorConfig::parse(path, "close_failed_after = \"0s\"")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("close_failed_after"), "{err}");
+    }
+
     /// `[shepherd]` names the pull machine this one is, the hostname when
     /// it does not; an empty name or command and an unknown key are refused.
     #[test]
@@ -3773,6 +4637,61 @@ mod tests {
         assert!(err.contains("pull_lost_after"), "{err}");
     }
 
+    /// A queued task ages after its flock's `age_after`, else `[defaults]`,
+    /// else 30 minutes; `never` at either turns it off, and zero or a bad
+    /// duration is refused on load.
+    #[test]
+    fn age_after_layers_flock_over_defaults() {
+        let path = Path::new("pastor.toml");
+        let d = Defaults::default();
+        assert_eq!(d.resolve_age_after(None), Some(Duration::from_secs(1800)));
+        let cfg = PastorConfig::parse(path, "[defaults]\nage_after = \"2h\"").unwrap();
+        let d = cfg.defaults;
+        assert_eq!(d.resolve_age_after(None), Some(Duration::from_secs(7200)));
+        let fast = flock::FlockEntry {
+            name: "fast".into(),
+            age_after: Some("5m".into()),
+            ..Default::default()
+        };
+        let still = flock::FlockEntry {
+            name: "still".into(),
+            age_after: Some("never".into()),
+            ..Default::default()
+        };
+        let bare = flock::FlockEntry {
+            name: "bare".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            d.resolve_age_after(Some(&fast)),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(d.resolve_age_after(Some(&still)), None);
+        assert_eq!(
+            d.resolve_age_after(Some(&bare)),
+            Some(Duration::from_secs(7200))
+        );
+        let off = PastorConfig::parse(path, "[defaults]\nage_after = \"never\"").unwrap();
+        assert_eq!(off.defaults.resolve_age_after(None), None);
+        assert_eq!(
+            off.defaults.resolve_age_after(Some(&fast)),
+            Some(Duration::from_secs(300))
+        );
+        for bad in ["0m", "soon"] {
+            let err = PastorConfig::parse(path, &format!("[defaults]\nage_after = {bad:?}"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("defaults.age_after"), "{err}");
+        }
+        let err = flock::Flock::parse(
+            Path::new("flock.toml"),
+            "[[flock]]\nname = \"f\"\ndefault = true\nage_after = \"0s\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("flock f: age_after"), "{err}");
+    }
+
     /// The manual's pastor.toml block shows every top-level key with its
     /// default, and every `[shepherd]` key; its flock.toml example shows a
     /// pull machine.
@@ -3810,6 +4729,17 @@ mod tests {
                     .trim()
                     .starts_with(&format!("{key} ="))),
                 "the manual's [shepherd] table has no {key}"
+            );
+        }
+        let limits = &block[block.find("[limits]").expect("no [limits]")..];
+        let want = toml::Value::try_from(LimitsConfig::default()).unwrap();
+        for (key, value) in want.as_table().unwrap() {
+            let want = format!("{key} = {value}");
+            assert!(
+                limits.lines().any(|l| l
+                    .strip_prefix(&want)
+                    .is_some_and(|tail| tail.is_empty() || tail.starts_with(char::is_whitespace))),
+                "the manual's [limits] table has no `{want}`"
             );
         }
         assert!(text.contains("\npull = true"), "no pull machine example");

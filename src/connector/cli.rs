@@ -270,7 +270,9 @@ async fn reload_note(socket: &std::path::Path, head: Head) -> Option<String> {
         return None;
     }
     Some(
-        match crate::ipc::request(socket, &IpcRequest::Reload).await {
+        match crate::ipc::request(socket, &IpcRequest::Reload, &crate::ipc::Caller::from_env())
+            .await
+        {
             Ok(IpcResponse::Error { message, .. }) => {
                 format!("pastor serve did not reload ({message}); run `pastor job reload`")
             }
@@ -437,7 +439,13 @@ async fn job_statuses(
 ) -> anyhow::Result<Vec<crate::scheduler::JobStatus>> {
     use crate::ipc::{IpcRequest, IpcResponse};
     if head.is_live() {
-        return match crate::ipc::request(&paths.socket_file(), &IpcRequest::JobList).await? {
+        return match crate::ipc::request(
+            &paths.socket_file(),
+            &IpcRequest::JobList,
+            &crate::ipc::Caller::from_env(),
+        )
+        .await?
+        {
             IpcResponse::Jobs(jobs) => Ok(jobs),
             IpcResponse::Error { message, .. } => bail!("{message}"),
             other => bail!("unexpected reply to a job list: {other:?}"),

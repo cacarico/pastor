@@ -11,14 +11,15 @@ use crate::config::flock::{
 };
 use crate::config::{
     AGENT_KIND_MISSING, AgentChoice, AgentPick, AgentRefusal, Agents, Defaults, Layer,
-    MODEL_KIND_MISMATCH, Models, PastorConfig, Paths, profile::PROFILE_NOT_ALLOWED,
+    LimitsConfig, MODEL_KIND_MISMATCH, Models, PastorConfig, Paths, profile::PROFILE_NOT_ALLOWED,
 };
 use crate::dispatch::{
-    Claim, FlockSeat, MachineView, flock_held, mark_waiting_under_share, pick_machine,
+    Claim, FlockSeat, MachineView, flock_held, mark_waiting_under_share, now_machine, pick_machine,
     pick_machine_where,
 };
 use crate::herdr::{Connector, Endpoint};
 use crate::ipc::{HeadPing, IpcRequest, IpcResponse};
+use crate::limit::AccountLimit;
 use crate::machine::{
     ActorStopped, MachineHandle, MachineSettings, OrphanClosed, PastorEvent, SendInput,
     SendRefused, ShutdownOutcome, spawn_machine,
@@ -55,8 +56,10 @@ pub fn machine_settings(config: &PastorConfig) -> MachineSettings {
         agent_ready_timeout: config.agent_ready_timeout_duration(),
         poll_every: config.tick_duration(),
         close_done_after: config.close_done_after_duration(),
+        close_failed_after: config.close_failed_after_duration(),
         agents: config.agents.clone(),
         head_address: config.head_address.clone(),
+        limits: Some(config.limits.clone()),
         ..Default::default()
     }
 }
@@ -284,6 +287,10 @@ impl Drop for Reservation {
 /// What a dispatch pass sends for one placed task, once the lock is let go.
 enum Outbound {
     Dispatch,
+    /// A `--now` task: dispatch it on the actor's urgent channel
+    /// (`MachineHandle::dispatch_now`), so it starts even while the actor
+    /// is still starting an earlier task.
+    Now,
     /// Pause this task on the machine first (`preempt`), then dispatch.
     PauseFor(i64),
     Resume,
@@ -392,6 +399,14 @@ pub struct Fleet {
     agents_change_fleet: std::sync::atomic::AtomicBool,
     /// `max_orchestrators` as last applied.
     max_orchestrators: std::sync::atomic::AtomicU32,
+    /// `[limits]` as last applied: how long a limit holds.
+    limits: RwLock<LimitsConfig>,
+    /// The limits table as last read (`live_limits`): a pass settles each
+    /// queued task against each machine, and the later tasks again for
+    /// each one, so reading the store every time adds up. Dropped whenever
+    /// this fleet writes the table; a row another process writes (the CLI
+    /// with no head) shows within `LIMITS_FRESH`.
+    limits_seen: std::sync::Mutex<Option<(std::time::Instant, Vec<AccountLimit>)>>,
     store: Arc<Store>,
     /// `None` for a fixed fleet (`Fleet::new`): tests and the daemon-less CLI.
     spawner: Option<Spawner>,
@@ -408,6 +423,37 @@ pub struct Fleet {
     /// (`Fleet::bounded`), in milliseconds: `REPLY_WAIT_FACTOR` times
     /// `request_timeout` as last applied.
     reply_wait_ms: std::sync::atomic::AtomicU64,
+}
+
+/// `Fleet::queue_run_as`'s arguments, grouped: the `IpcRequest::Run` fields
+/// that reach it (`now` is settled into `spec` before this, so it carries
+/// none).
+pub struct RunAsk<'a> {
+    pub prompt: String,
+    pub spec: crate::task::DispatchSpec,
+    /// `None`: the flock of the pinned machine, or the default flock.
+    pub flock: Option<&'a str>,
+    /// What the run's flags said about the agent; `None` keeps the agent
+    /// `spec` already carries.
+    pub ask: Option<&'a AgentChoice>,
+    /// `--priority`; `None` lets the flock, the pinned machine or
+    /// `[defaults]` set the level.
+    pub priority: Option<Priority>,
+    pub role: TaskRole,
+    pub description: Option<String>,
+    pub preempt: bool,
+    pub summary: Option<crate::task::SummaryMode>,
+}
+
+/// `Fleet::pausable_for`'s arguments, grouped.
+struct PausableFor<'a> {
+    views: &'a [MachineView],
+    flock: &'a str,
+    task: &'a Task,
+    claim: Claim,
+    accepts: &'a dyn Fn(&str) -> bool,
+    later: &'a [Task],
+    takes: &'a dyn Fn(&Task, &str) -> bool,
 }
 
 impl Fleet {
@@ -431,6 +477,8 @@ impl Fleet {
             profiles: RwLock::default(),
             agents_change_fleet: Default::default(),
             max_orchestrators: std::sync::atomic::AtomicU32::new(1),
+            limits: RwLock::default(),
+            limits_seen: Default::default(),
             store,
             spawner: None,
             forward: None,
@@ -475,6 +523,8 @@ impl Fleet {
             profiles: RwLock::default(),
             agents_change_fleet: Default::default(),
             max_orchestrators: std::sync::atomic::AtomicU32::new(1),
+            limits: RwLock::default(),
+            limits_seen: Default::default(),
             store,
             spawner: Some(Spawner { connect, events }),
             forward: None,
@@ -512,7 +562,19 @@ impl Fleet {
                     self.count_pull(&m.handle);
                 }
                 let s = m.handle.snapshot();
+                // On a store error none are named; the count stands.
+                let now = self
+                    .store
+                    .tasks_on_machine(&m.handle.name)
+                    .map(|ts| {
+                        ts.iter()
+                            .filter(|t| t.spec.now)
+                            .map(Task::display_id)
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 crate::machine::MachineStatus {
+                    now,
                     profile: self.own_profile(&flock, Some(&m.handle.name)),
                     flock: Some(flock),
                     flocks: seats(&wanted, &s),
@@ -550,6 +612,7 @@ impl Fleet {
         *self.agents.write().recover() = config.agents.clone();
         *self.models.write().recover() = config.models.clone();
         *self.profiles.write().recover() = config.profiles.clone();
+        *self.limits.write().recover() = config.limits.clone();
         self.agents_change_fleet.store(
             config.agents_change_fleet,
             std::sync::atomic::Ordering::Relaxed,
@@ -573,7 +636,7 @@ impl Fleet {
     }
 
     /// Set `reply_wait` below any `request_timeout`, for a test.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "fake-herdr"))]
     fn set_reply_wait(&self, wait: Duration) {
         self.reply_wait_ms.store(
             u64::try_from(wait.as_millis()).unwrap(),
@@ -602,6 +665,11 @@ impl Fleet {
     /// `[defaults]` as last applied.
     pub fn defaults(&self) -> Defaults {
         self.defaults.read().recover().clone()
+    }
+
+    /// `[agents]` as last applied.
+    pub fn agents(&self) -> Agents {
+        self.agents.read().recover().clone()
     }
 
     /// Whether `pastor.toml` as last applied lets an agent pastor started
@@ -642,11 +710,13 @@ impl Fleet {
 
     /// `resolve_agent` written into `spec`, with the ask and where the agent
     /// and its args came from (`DispatchSpec::agent_source`), its model's
-    /// args put in front (`Models::apply`) and its profile's lists added
+    /// args put in front (`Models::apply`), its fallback list
+    /// (`Models::fallback`) and its profile's lists added
     /// (`Profiles::apply`). `asked_by` names the ask: `task run` or `job
-    /// <name>`. Refused when the model is not in `[models]` or not of the
-    /// agent's kind, or the profile is unknown or `unrestricted` where the
-    /// machine's own is not; `spec` is then only partly settled.
+    /// <name>`. Refused when the model or a fallback is not in `[models]`,
+    /// the model is not of the agent's kind, or the profile is unknown or
+    /// `unrestricted` where the machine's own is not; `spec` is then only
+    /// partly settled.
     fn settle(
         &self,
         spec: &mut crate::task::DispatchSpec,
@@ -696,10 +766,14 @@ impl Fleet {
             agent_args: pick.args_from.map(label),
             model: pick.model.as_ref().map(|(name, _)| name.clone()),
             model_from: pick.model.as_ref().map(|&(_, layer)| label(layer)),
+            fallback: models.fallback(&pick)?,
+            fallback_from: pick.fallback.as_ref().map(|&(_, layer)| label(layer)),
+            fallback_use: None,
             profile: pick.profile.as_ref().map(|(name, _)| name.clone()),
             profile_from: pick.profile.as_ref().map(|&(_, layer)| label(layer)),
             timeout_from,
             place_from,
+            lists_unapplied: None,
         }));
         models.apply(&pick, &agents, spec)?;
         // What the machine's owner lets run there (the unrestricted rule).
@@ -707,7 +781,12 @@ impl Fleet {
         self.profiles
             .read()
             .recover()
-            .apply(&pick, own.as_deref(), spec)
+            .apply(&pick, own.as_deref(), spec)?;
+        let unapplied = agents.lists_unapplied(spec);
+        if let Some(source) = spec.agent_source.as_mut() {
+            source.lists_unapplied = unapplied;
+        }
+        Ok(())
     }
 
     /// The level of a task being queued in `flock`, pinned to `pinned` if it
@@ -752,6 +831,20 @@ impl Fleet {
             template: picked.map(|(template, _)| template),
             ..Default::default()
         };
+    }
+
+    /// A task's `keep_pane` as it is queued in `flock`: what its run or job
+    /// asked for (the spec's own), else the flock's, else `[defaults]`
+    /// (`Defaults::resolve_keep_pane`), with where it came from.
+    fn settle_keep_pane(&self, spec: &mut crate::task::DispatchSpec, flock: &str, asked_by: &str) {
+        let wanted = self.wanted.read().recover();
+        let picked = self
+            .defaults
+            .read()
+            .recover()
+            .resolve_keep_pane(spec.keep_pane, wanted.entry(flock));
+        spec.keep_pane = picked.map(|(keep, _)| keep);
+        spec.keep_pane_from = picked.map(|(_, layer)| layer_label(layer, asked_by, flock, None));
     }
 
     /// A task's timeout and place as it is queued in `flock`, from what its
@@ -1204,40 +1297,60 @@ impl Fleet {
         ask: Option<&AgentChoice>,
         priority: Option<Priority>,
     ) -> Result<Task, QueueError> {
-        self.queue_run_as(
+        self.queue_run_as(RunAsk {
             prompt,
             spec,
             flock,
             ask,
             priority,
-            TaskRole::Agent,
-            None,
-            false,
-            None,
-        )
+            role: TaskRole::Agent,
+            description: None,
+            preempt: false,
+            summary: None,
+        })
         .await
     }
 
     /// `queue_run`, for a task of `role` (`task run --role`). `summary` is
     /// `task run --summary`; without it the flock or `[defaults]` decide.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn queue_run_as(
-        &self,
-        prompt: String,
-        mut spec: crate::task::DispatchSpec,
-        flock: Option<&str>,
-        ask: Option<&AgentChoice>,
-        priority: Option<Priority>,
-        role: TaskRole,
-        description: Option<String>,
-        preempt: bool,
-        summary: Option<crate::task::SummaryMode>,
-    ) -> Result<Task, QueueError> {
+    pub async fn queue_run_as(&self, run: RunAsk<'_>) -> Result<Task, QueueError> {
+        let RunAsk {
+            prompt,
+            mut spec,
+            flock,
+            ask,
+            priority,
+            role,
+            description,
+            preempt,
+            summary,
+        } = run;
         let _pass = self.dispatch_lock.lock().await;
         if let Some(m) = &spec.machine
             && !self.in_flock(m)
         {
             return Err(QueueError::UnknownMachine(m.clone()));
+        }
+        if spec.now {
+            let refuse = |code, message| {
+                Err(QueueError::Agent(crate::config::AgentRefusal {
+                    code,
+                    message,
+                }))
+            };
+            let Some(m) = &spec.machine else {
+                return refuse(
+                    "now_needs_machine",
+                    "--now needs --machine: name the machine the task may run past the limits of"
+                        .into(),
+                );
+            };
+            if !self.views().iter().any(|v| &v.name == m && v.healthy) {
+                return refuse(
+                    "machine_not_connected",
+                    format!("machine {m} is not connected, so --now cannot start the task there"),
+                );
+            }
         }
         let flock = self
             .flock()
@@ -1249,6 +1362,7 @@ impl Fleet {
             self.settle_run(&mut spec, ask, &flock, "task run");
         }
         self.settle_label(&mut spec, &flock, "task run");
+        self.settle_keep_pane(&mut spec, &flock, "task run");
         let (priority, from) =
             self.settle_priority(priority, &flock, spec.machine.as_deref(), "task run");
         spec.summary = self.settle_summary(summary, &flock);
@@ -1302,6 +1416,7 @@ impl Fleet {
         let mut settled = job.spec.clone();
         let ask = AgentChoice {
             model: job.model_for(item).map_err(anyhow::Error::msg)?,
+            fallback: job.fallback_for(item).map_err(anyhow::Error::msg)?,
             ..job.agent.clone()
         };
         let asked_by = format!("job {}", job.name);
@@ -1309,6 +1424,7 @@ impl Fleet {
             .map_err(|e| anyhow::Error::msg(e.message))?;
         self.settle_run(&mut settled, &ask, &flock, &asked_by);
         self.settle_label(&mut settled, &flock, &asked_by);
+        self.settle_keep_pane(&mut settled, &flock, &asked_by);
         let (priority, from) = self.settle_priority(
             job.priority_for(item).map_err(anyhow::Error::msg)?,
             &flock,
@@ -1322,27 +1438,32 @@ impl Fleet {
         let preempt = job.preempt && priority == Priority::Critical;
         let description = job.task_description_for(item);
         let summary = self.settle_summary(job.summary, &flock);
-        self.store.insert_job_task_at(
-            &job.name,
-            &flock,
-            item,
-            level,
-            preempt,
-            description.as_deref(),
-            |id| {
-                let (prompt, mut spec) = render(id)?;
-                spec.agent = settled.agent;
-                spec.agent_args = settled.agent_args;
-                spec.allow = settled.allow;
-                spec.deny = settled.deny;
-                spec.agent_source = settled.agent_source;
-                spec.timeout_secs = settled.timeout_secs;
-                spec.place = settled.place;
-                spec.label = settled.label;
-                spec.summary = summary;
-                Ok((prompt, spec))
-            },
-        )
+        self.store
+            .insert_job_task_at(crate::store::InsertJobTaskAt {
+                job: &job.name,
+                flock: &flock,
+                item,
+                level,
+                preempt,
+                description: description.as_deref(),
+                render: |id| {
+                    let (prompt, mut spec) = render(id)?;
+                    spec.agent = settled.agent;
+                    spec.agent_args = settled.agent_args;
+                    spec.allow = settled.allow;
+                    spec.deny = settled.deny;
+                    spec.agent_source = settled.agent_source;
+                    spec.timeout_secs = settled.timeout_secs;
+                    spec.place = settled.place;
+                    spec.label = settled.label;
+                    spec.keep_pane = settled.keep_pane;
+                    spec.keep_pane_from = settled.keep_pane_from;
+                    spec.summary = summary;
+                    // Only a person's `task run --now` skips the queue.
+                    spec.now = false;
+                    Ok((prompt, spec))
+                },
+            })
     }
 
     /// Whether job runs send their items to a head (`Fleet::headless`)
@@ -1580,19 +1701,9 @@ impl Fleet {
         // Same model/agent compatibility check `dispatch_queued` applies: a
         // machine whose agent cannot run the task's model does not take it.
         let accepts = |task: &Task, machine: &str| {
-            let Some(source) = task.spec.agent_source.as_ref() else {
-                return true;
-            };
             let target = task.flock.as_deref().unwrap_or(wanted.default_flock());
-            let mut spec = task.spec.clone();
-            self.settle(
-                &mut spec,
-                &source.ask,
-                target,
-                Some(machine),
-                &asked_by(task),
-            )
-            .is_ok()
+            self.settled_on(task, target, machine)
+                .is_none_or(|r| r.is_ok())
         };
         let mut entries =
             crate::queue::entries(queued, &self.views(), wanted.default_flock(), &accepts);
@@ -1612,14 +1723,496 @@ impl Fleet {
         flock: &str,
         machine: &str,
     ) -> Option<Result<crate::task::DispatchSpec, AgentRefusal>> {
+        let now = chrono::Utc::now();
+        let live = self.live_limits(now);
+        let Some(source) = task.spec.agent_source.as_ref() else {
+            // It keeps its agent, so only that agent's limit can stop it.
+            let held = self.limits_holding(&live, machine, &task.spec);
+            return (!held.is_empty()).then(|| Err(exhausted(&held, now)));
+        };
+        let mut ask = source.ask.clone();
+        if ask.profile.is_none() {
+            ask.profile = source.profile.clone();
+        }
+        let by = asked_by(task);
+        let mut spec = task.spec.clone();
+        if let Err(e) = self.settle(&mut spec, &ask, flock, Some(machine), &by) {
+            return Some(Err(e));
+        }
+        let mut held = self.limits_holding(&live, machine, &spec);
+        if held.is_empty() {
+            return Some(Ok(spec));
+        }
+        // Its own model's account is exhausted here: the first model of its
+        // fallback list whose account is not, as that model settles here.
+        let primary = spec.agent_source.clone().expect("settled");
+        for (i, name) in primary.fallback.iter().enumerate() {
+            let Some(mut fb) = self.settle_model(task, flock, machine, name) else {
+                continue;
+            };
+            let more = self.limits_holding(&live, machine, &fb);
+            if !more.is_empty() {
+                for l in more {
+                    if !held
+                        .iter()
+                        .any(|h| h.account == l.account && h.model == l.model)
+                    {
+                        held.push(l);
+                    }
+                }
+                continue;
+            }
+            if let Some(src) = fb.agent_source.as_mut() {
+                src.model_from = primary.fallback_from.clone();
+                src.fallback = primary.fallback.clone();
+                src.fallback_from = primary.fallback_from.clone();
+                src.fallback_use = Some(crate::task::FallbackUse {
+                    pos: i + 1,
+                    of: primary.fallback.len(),
+                    why: held
+                        .iter()
+                        .map(|l| l.short_note(now))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                });
+            }
+            return Some(Ok(fb));
+        }
+        Some(Err(exhausted(&held, now)))
+    }
+
+    /// `task`'s spec settled for `machine` in `flock` with the `[models]`
+    /// name `model` in place of its own, as its ask would have it there;
+    /// `None` when the machine cannot run it.
+    fn settle_model(
+        &self,
+        task: &Task,
+        flock: &str,
+        machine: &str,
+        model: &str,
+    ) -> Option<crate::task::DispatchSpec> {
         let source = task.spec.agent_source.as_ref()?;
         let mut ask = source.ask.clone();
         if ask.profile.is_none() {
             ask.profile = source.profile.clone();
         }
+        ask.model = Some(model.to_string());
         let mut spec = task.spec.clone();
-        let r = self.settle(&mut spec, &ask, flock, Some(machine), &asked_by(task));
-        Some(r.map(|()| spec))
+        self.settle(&mut spec, &ask, flock, Some(machine), &asked_by(task))
+            .ok()?;
+        Some(spec)
+    }
+
+    /// What waiting `task`, pinned to `machine`, does now that its time has
+    /// come, as its limit left it (`task::LimitStop::then`) and `live`
+    /// holds its models there. Its own model is its own session; another
+    /// model is a new round. A task that was to move on takes the first
+    /// free model after its own, else before it; with every one of them
+    /// exhausted, or none it can run here, it waits.
+    fn wake(&self, task: &Task, machine: &str, live: &[AccountLimit]) -> Wake {
+        use crate::task::NextRound;
+        let own = self.limits_holding(live, machine, &task.spec);
+        let then = task
+            .spec
+            .rounds
+            .stop
+            .as_deref()
+            .map_or(NextRound::Own, |s| s.then);
+        let source = task.spec.agent_source.as_deref();
+        let Some(source) = source.filter(|s| then != NextRound::Own && !s.fallback.is_empty())
+        else {
+            return if own.is_empty() {
+                Wake::Own
+            } else {
+                Wake::Hold
+            };
+        };
+        let flock = self.flock();
+        let target = task.flock.as_deref().unwrap_or(flock.default_flock());
+        // Its models in order: the one it started on, then its list.
+        let current = task.model().map(str::to_string);
+        let first = match task.spec.rounds.ended.first() {
+            Some(r) => r.model.clone(),
+            None => current.clone(),
+        };
+        let mut list = vec![first];
+        for m in &source.fallback {
+            if !list.contains(&Some(m.clone())) {
+                list.push(Some(m.clone()));
+            }
+        }
+        let from = match then {
+            NextRound::Switch => list.iter().position(|m| *m == current).map_or(0, |i| i + 1),
+            _ => 0,
+        };
+        let mut held: Vec<AccountLimit> = Vec::new();
+        let mut hold = |more: Vec<AccountLimit>| {
+            for l in more {
+                if !held
+                    .iter()
+                    .any(|h| h.account == l.account && h.model == l.model)
+                {
+                    held.push(l);
+                }
+            }
+        };
+        // A move tries the models after its own first, then the ones
+        // before it: they are its models too, and a wait lasts until the
+        // earliest reset among all of them.
+        let (before, after) = list.split_at(from);
+        let mut runnable = false;
+        for model in after.iter().chain(before) {
+            if *model == current {
+                // Its own model just stopped on the limit: a move does not
+                // go back to it before `waiting_until`.
+                if then != NextRound::Switch && own.is_empty() {
+                    return Wake::Own;
+                }
+                continue;
+            }
+            let Some(name) = model else { continue };
+            let Some(spec) = self.settle_model(task, target, machine, name) else {
+                continue;
+            };
+            runnable = true;
+            let more = self.limits_holding(live, machine, &spec);
+            if more.is_empty() {
+                return Wake::Switch(Box::new(spec));
+            }
+            hold(more);
+        }
+        if then != NextRound::Switch {
+            return Wake::Hold;
+        }
+        // Its own model does not make it `runnable`: that is always in the
+        // list. With no other model this machine can run, it waits on its
+        // own, as a task with no list does.
+        if !runnable {
+            return Wake::Wait {
+                why: "no_fallback",
+                held: own,
+            };
+        }
+        hold(own);
+        Wake::Wait {
+            why: "all_exhausted",
+            held,
+        }
+    }
+
+    /// Move waiting `task` to `spec`, its next model as `wake` settled it
+    /// on `machine`: the round that stopped on the limit ends with `limit:
+    /// <line>`, the new one carries on in the same session when the agent
+    /// is of the same kind and account and has one, else from the prompt
+    /// with the end of the last pane. The row is written for the resume to
+    /// claim, and `task.agent_switched` says so.
+    fn switch_model(
+        &self,
+        task: &Task,
+        machine: &str,
+        mut spec: crate::task::DispatchSpec,
+    ) -> anyhow::Result<Option<Task>> {
+        use crate::task::{AgentRound, Handover, NextRound};
+        let Some(mut stop) = task.spec.rounds.stop.clone() else {
+            return Ok(None);
+        };
+        let old = task.spec.agent_source.as_deref();
+        let (same_kind, same_account) = {
+            let agents = self.agents.read().recover();
+            (
+                agents.kind(&task.spec.agent) == agents.kind(&spec.agent),
+                agents.limit_key(machine, &task.spec.agent)
+                    == agents.limit_key(machine, &spec.agent),
+            )
+        };
+        let handover = if same_kind && same_account && task.spec.session_id.is_some() {
+            Handover::Session
+        } else {
+            spec.session_id = None;
+            Handover::PaneTail
+        };
+        if let (Some(src), Some(old)) = (spec.agent_source.as_mut(), old) {
+            src.model_from = Some(format!("fallback after a {}", stop.why.replace('_', " ")));
+            src.fallback = old.fallback.clone();
+            src.fallback_from = old.fallback_from.clone();
+            src.fallback_use = None;
+        }
+        spec.rounds = task.spec.rounds.clone();
+        spec.rounds.ended.push(AgentRound {
+            agent: task.spec.agent.clone(),
+            model: task.model().map(str::to_string),
+            ended: format!("limit: {}", stop.line),
+        });
+        let from = serde_json::json!({ "agent": task.spec.agent, "model": task.model() });
+        stop.then = NextRound::Own;
+        stop.waited = None;
+        stop.handover = Some(handover);
+        let (why, until, line) = (stop.why.clone(), stop.until, stop.line.clone());
+        spec.rounds.stop = Some(stop);
+        let Some(mut fresh) = self.store.get_task(task.id)? else {
+            return Ok(None);
+        };
+        if fresh.state != TaskState::Waiting || fresh.spec != task.spec {
+            return Ok(None);
+        }
+        fresh.spec = spec;
+        self.store.update_task(&mut fresh)?;
+        if let Err(err) = self.store.end_round_on_limit(task.id, &line) {
+            tracing::error!(task = %task.display_id(), %err, "save the round's summary");
+        }
+        tracing::info!(task = %task.display_id(), machine, from = %task.spec.agent, to = %fresh.spec.agent, model = ?fresh.model(), "moves to its next model");
+        self.emit(
+            "task.agent_switched",
+            machine,
+            Some(&fresh),
+            Some(serde_json::json!({
+                "from": from,
+                "to": { "agent": fresh.spec.agent, "model": fresh.model() },
+                "why": why,
+                "until": until,
+                "handover": handover.as_str(),
+            })),
+        );
+        Ok(Some(fresh))
+    }
+
+    /// Keep waiting `task` until the earliest of `held`, the limits on
+    /// every model it may run: no other one was free
+    /// (`Wake::Wait`). At that time it starts on the first of its models
+    /// that is free. With `no_fallback` it has no other model here: it
+    /// waits on its own and resumes on it, and `task.waiting` names that
+    /// account and model as a wait with no list does. Emits
+    /// `task.waiting`.
+    fn wait_longer(
+        &self,
+        task: &Task,
+        machine: &str,
+        why: &str,
+        held: &[AccountLimit],
+    ) -> anyhow::Result<()> {
+        let now = chrono::Utc::now();
+        let Some(mut fresh) = self.store.get_task(task.id)? else {
+            return Ok(());
+        };
+        if fresh.state != TaskState::Waiting || fresh.spec != task.spec {
+            return Ok(());
+        }
+        let until = held
+            .iter()
+            .map(|l| l.retry_at)
+            .min()
+            .or(fresh.spec.rounds.stop.as_ref().map(|s| s.until))
+            .unwrap_or(now);
+        let own = why == "no_fallback";
+        fresh.waiting_until = Some(until);
+        if let Some(stop) = fresh.spec.rounds.stop.as_mut() {
+            stop.then = if own {
+                crate::task::NextRound::Own
+            } else {
+                crate::task::NextRound::First
+            };
+        }
+        self.store.update_task(&mut fresh)?;
+        tracing::info!(task = %task.display_id(), machine, why, %until, "waiting for a usage limit to reset");
+        let shown = format!("waiting {}", crate::limit::local_time(until, now));
+        let detail = if own {
+            serde_json::json!({
+                "why": why,
+                "account": held.first().map(|l| &l.account),
+                "model": fresh.model(),
+                "until": until,
+                "shown": shown,
+            })
+        } else {
+            let models: Vec<_> = held
+                .iter()
+                .map(|l| serde_json::json!({ "account": l.account, "model": l.model, "until": l.retry_at }))
+                .collect();
+            serde_json::json!({
+                "why": why,
+                "until": until,
+                "models": models,
+                "shown": shown,
+            })
+        };
+        self.emit("task.waiting", machine, Some(&fresh), Some(detail));
+        Ok(())
+    }
+
+    /// The live limits, as the store has them at `now`; none when it cannot
+    /// be read, so a store error never holds work back.
+    fn live_limits(&self, now: chrono::DateTime<chrono::Utc>) -> Vec<AccountLimit> {
+        let mut seen = self.limits_seen.lock().recover();
+        let rows = match &*seen {
+            Some((at, rows)) if at.elapsed() < LIMITS_FRESH => rows.clone(),
+            _ => match self.store.limits() {
+                Ok(rows) => {
+                    *seen = Some((std::time::Instant::now(), rows.clone()));
+                    rows
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "read the usage limits");
+                    Vec::new()
+                }
+            },
+        };
+        rows.into_iter().filter(|l| l.retry_at > now).collect()
+    }
+
+    /// Forget the limits as last read: the table changed.
+    fn limits_changed(&self) {
+        *self.limits_seen.lock().recover() = None;
+    }
+
+    /// Of `live`, the limits that stop `spec`'s agent and model on
+    /// `machine`: those of its account (`Agents::limit_key`) for the whole
+    /// account or for its model.
+    fn limits_holding(
+        &self,
+        live: &[AccountLimit],
+        machine: &str,
+        spec: &crate::task::DispatchSpec,
+    ) -> Vec<AccountLimit> {
+        let key = self.agents.read().recover().limit_key(machine, &spec.agent);
+        let model = spec.agent_source.as_ref().and_then(|s| s.model.as_deref());
+        live.iter()
+            .filter(|l| l.account == key && l.stops(model))
+            .cloned()
+            .collect()
+    }
+
+    /// Keep `limit` and say so (`agent.exhausted`). A headless serve keeps
+    /// none: the head owns the table.
+    pub fn record_limit(&self, limit: &AccountLimit) -> anyhow::Result<()> {
+        self.store.record_limit(limit)?;
+        self.limits_changed();
+        tracing::warn!(account = %limit.account, model = ?limit.model, retry_at = %limit.retry_at, "account exhausted");
+        self.emit_limit("agent.exhausted", limit, None);
+        Ok(())
+    }
+
+    /// The live limit that stops `agent` running `model` on `machine` at
+    /// `now`, if one does.
+    pub fn limit_holding(
+        &self,
+        machine: &str,
+        agent: &str,
+        model: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<AccountLimit> {
+        let key = self.agents.read().recover().limit_key(machine, agent);
+        self.live_limits(now)
+            .into_iter()
+            .find(|l| l.account == key && l.stops(model))
+    }
+
+    /// `[limits]` as last applied.
+    pub fn limits_config(&self) -> LimitsConfig {
+        self.limits.read().recover().clone()
+    }
+
+    /// Keep `limit`, which `task`'s agent stopped on at `now` on `machine`,
+    /// under the account that agent names there (`Agents::limit_key`); a
+    /// limit that is one model's is kept for the task's model.
+    pub fn note_limit(
+        &self,
+        task: &Task,
+        machine: &str,
+        limit: &crate::limit::Limit,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<AccountLimit> {
+        let key = self
+            .agents
+            .read()
+            .recover()
+            .limit_key(machine, &task.spec.agent);
+        let row = AccountLimit::of(
+            &key,
+            task.model(),
+            limit,
+            Some(task.id),
+            Some(machine),
+            Some(&task.spec.agent),
+            now,
+            &self.limits_config(),
+        );
+        self.record_limit(&row)?;
+        Ok(row)
+    }
+
+    /// Drop the limits past their `retry_at`, each with `agent.reset`
+    /// (`by: time`).
+    pub fn expire_limits(&self) {
+        match self.store.expire_limits(chrono::Utc::now()) {
+            Ok(gone) => {
+                if !gone.is_empty() {
+                    self.limits_changed();
+                }
+                for l in gone {
+                    tracing::info!(account = %l.account, model = ?l.model, "usage limit reset");
+                    self.emit_limit("agent.reset", &l, Some("time"));
+                }
+            }
+            Err(err) => tracing::warn!(%err, "expire the usage limits"),
+        }
+    }
+
+    /// Clear `account`'s limits by hand (`limit clear`), each with
+    /// `agent.reset` (`by: hand`), then dispatch what they held. A waiting
+    /// task they held is due now, not at its reset.
+    pub fn clear_limits(
+        &self,
+        account: &str,
+        model: Option<&str>,
+    ) -> anyhow::Result<Vec<AccountLimit>> {
+        let gone = self.store.clear_limits(account, model)?;
+        self.limits_changed();
+        for l in &gone {
+            tracing::info!(account = %l.account, model = ?l.model, "usage limit cleared by hand");
+            self.emit_limit("agent.reset", l, Some("hand"));
+        }
+        if !gone.is_empty() {
+            self.wake_waiting(&gone);
+        }
+        Ok(gone)
+    }
+
+    /// Bring forward the waiting tasks `gone` held, so the next pass
+    /// resumes them. A store error leaves them to their reset.
+    fn wake_waiting(&self, gone: &[AccountLimit]) {
+        let waiting = match self.store.waiting_tasks() {
+            Ok(w) => w,
+            Err(err) => return tracing::error!(%err, "list waiting"),
+        };
+        let now = chrono::Utc::now();
+        for task in waiting {
+            let Some(machine) = task.pinned_machine() else {
+                continue;
+            };
+            if self.limits_holding(gone, machine, &task.spec).is_empty() {
+                continue;
+            }
+            if let Err(err) = self.store.wake_waiting(task.id, now) {
+                tracing::error!(task = %task.display_id(), %err, "wake a waiting task");
+            }
+        }
+    }
+
+    /// `agent.exhausted` or `agent.reset` about `limit`, with `by` for a
+    /// reset.
+    fn emit_limit(&self, kind: &str, limit: &AccountLimit, by: Option<&str>) {
+        let Some(spawner) = &self.spawner else {
+            return;
+        };
+        let detail = limit.event_detail(by);
+        let _ = spawner.events.send(PastorEvent {
+            kind: kind.into(),
+            task_id: limit.task_id,
+            machine: limit.machine.clone(),
+            job: None,
+            detail: Some(detail),
+            summary: None,
+        });
     }
 
     /// Is `name` a pull machine (`MachineConfig::pull`) of the fleet?
@@ -1785,11 +2378,7 @@ impl Fleet {
             if let Some(Ok(spec)) = settled {
                 on.spec = spec;
             }
-            if on
-                .error
-                .as_deref()
-                .is_some_and(|e| e.starts_with(WAITING_FOR_MODEL))
-            {
+            if on.error.as_deref().is_some_and(is_waiting_note) {
                 on.error = None;
             }
             if (on.spec != task.spec || on.error != task.error)
@@ -1822,10 +2411,22 @@ impl Fleet {
         state: TaskState,
         pane: Option<String>,
         detail: Option<String>,
+        limit: Option<crate::limit::Limit>,
     ) -> anyhow::Result<Task> {
         let handle = self.pull_handle(machine)?;
         self.heard(&handle);
-        if matches!(state, TaskState::Queued | TaskState::Paused) {
+        // The head owns the limits: one a pull machine read goes in the
+        // table as one this head read would, keyed by the machine it ran on.
+        if let Some(limit) = &limit
+            && let Some(task) = self.store.get_task(id)?
+            && task.machine.as_deref() == Some(machine)
+        {
+            self.note_limit(&task, machine, limit, chrono::Utc::now())?;
+        }
+        if matches!(
+            state,
+            TaskState::Queued | TaskState::Paused | TaskState::Waiting
+        ) {
             return Err(crate::cli::CliError::err(
                 "invalid_report",
                 format!("a pull machine cannot report a task {state}"),
@@ -2048,6 +2649,15 @@ impl Fleet {
                 None => by_machine.push((p.handle.name.clone(), vec![p])),
             }
         }
+        // A `--now` placement is urgent: send it ahead of this pass's other
+        // placements for the same machine, so an earlier queued task's
+        // dispatch (up to `reply_wait`) never makes it wait. `sort_by_key`
+        // is stable, so it does not reorder within either group. One sent
+        // by an earlier pass that the actor is still starting does not hold
+        // it up either: it goes on the actor's urgent channel (`Outbound::Now`).
+        for (_, sends) in &mut by_machine {
+            sends.sort_by_key(|p| !p.task.spec.now);
+        }
         let mut sending = tokio::task::JoinSet::new();
         for (_, sends) in by_machine {
             sending.spawn(async move {
@@ -2059,11 +2669,43 @@ impl Fleet {
         while sending.join_next().await.is_some() {}
     }
 
+    /// Lift the queued tasks that have waited their flock's `age_after` a
+    /// level (`Store::age_queued`), so a `low` task still runs behind a
+    /// steady stream of `normal` and `high` ones (never `critical` ones:
+    /// ageing stops at `high`). Each dispatch pass does it first,
+    /// under the dispatch lock, so a hand change never races it.
+    /// A task in flight has left the queue though its row still says
+    /// `queued`, and keeps the level it was placed at.
+    fn age_queued(&self, now: chrono::DateTime<chrono::Utc>) {
+        let flock = self.flock();
+        let defaults = self.defaults.read().recover().clone();
+        let after = |t: &Task| {
+            let theirs = t.flock.as_deref().unwrap_or(flock.default_flock());
+            defaults.resolve_age_after(flock.entry(theirs))
+        };
+        let in_flight: Vec<i64> = self.in_flight.placed().iter().map(|p| p.task_id).collect();
+        match self.store.age_queued(now, after, &in_flight) {
+            Ok(aged) => {
+                for t in aged {
+                    tracing::info!(
+                        task = t.id,
+                        aged_from = %t.aged_from.unwrap_or(t.priority),
+                        to = %t.priority,
+                        "queued task aged a level"
+                    );
+                }
+            }
+            Err(err) => tracing::error!(%err, "age queued"),
+        }
+    }
+
     /// `dispatch_queued`'s decisions, under the dispatch lock: every task
     /// placed is reserved on its machine before the next one is looked at.
     async fn place_queued(&self) -> Vec<Placement> {
         let _pass = self.dispatch_lock.lock().await;
+        self.expire_limits();
         let mut placed = Vec::new();
+        self.age_queued(chrono::Utc::now());
         let queued = match self.store.queued_tasks() {
             Ok(q) => q,
             Err(err) => {
@@ -2079,6 +2721,47 @@ impl Fleet {
             self.settled_on(task, theirs, machine)
                 .is_none_or(|r| r.is_ok())
         };
+        // A waiting task goes on once its `waiting_until` has passed and no
+        // live limit holds its agent and model on its machine: at its
+        // reset, or when its limit is cleared (`clear_limits` brings
+        // `waiting_until` forward). The time alone holds it when its limit
+        // never reached the table, or the table was read before it did.
+        // Before the queue: it has started already, and its checkout and
+        // slot are on its machine only.
+        match self.store.waiting_tasks() {
+            Ok(waiting) => {
+                let now = chrono::Utc::now();
+                let live = self.live_limits(now);
+                for task in &waiting {
+                    let Some(machine) = task.pinned_machine() else {
+                        continue;
+                    };
+                    if self.is_in_flight(task.id) || task.waiting_until.is_some_and(|u| u > now) {
+                        continue;
+                    }
+                    let task = match self.wake(task, machine, &live) {
+                        Wake::Hold => continue,
+                        Wake::Own => task.clone(),
+                        Wake::Switch(spec) => match self.switch_model(task, machine, *spec) {
+                            Ok(Some(t)) => t,
+                            Ok(None) => continue,
+                            Err(err) => {
+                                tracing::error!(task = %task.display_id(), %err, "move to the next model");
+                                continue;
+                            }
+                        },
+                        Wake::Wait { why, held } => {
+                            if let Err(err) = self.wait_longer(task, machine, why, &held) {
+                                tracing::error!(task = %task.display_id(), %err, "wait for a usage limit");
+                            }
+                            continue;
+                        }
+                    };
+                    placed.extend(self.resume_paused(&task, &queued, &takes));
+                }
+            }
+            Err(err) => tracing::error!(%err, "list waiting"),
+        }
         for (i, task) in queued.iter().enumerate() {
             let later = &queued[i + 1..];
             if self.is_in_flight(task.id) {
@@ -2101,6 +2784,28 @@ impl Fleet {
             let settled_on = |machine: &str| self.settled_on(task, target, machine);
             let claim = Claim::of(task);
             let accepts = |m: &str| settled_on(m).is_none_or(|r| r.is_ok());
+            // A `--now` task takes its pinned machine past its limits, or
+            // nothing: it neither waits for a slot nor pauses another task.
+            if task.spec.now {
+                let Some(name) = now_machine(&views, target, &task.spec, &accepts) else {
+                    continue;
+                };
+                let Some(handle) = self.get(&name) else {
+                    continue;
+                };
+                if let Some(Ok(spec)) = settled_on(&name) {
+                    let mut on = task.clone();
+                    on.spec = spec;
+                    if on.spec != task.spec
+                        && let Err(err) = self.store.update_task(&mut on)
+                    {
+                        tracing::warn!(task = %task.display_id(), machine = %name, %err, "settle agent");
+                        continue;
+                    }
+                }
+                placed.push(self.reserve(task, handle, Outbound::Now));
+                continue;
+            }
             let mut picked = pick_machine_where(&views, target, &task.spec, claim, &accepts);
             // A critical task with `preempt` that finds no room pauses the
             // newest low Claude task on a machine it would fit once that one
@@ -2110,8 +2815,15 @@ impl Fleet {
             if picked.is_none()
                 && task.pause.preempt
                 && task.priority == Priority::Critical
-                && let Some((machine, victim)) =
-                    self.pausable_for(&views, target, task, claim, &accepts, later, &takes)
+                && let Some((machine, victim)) = self.pausable_for(PausableFor {
+                    views: &views,
+                    flock: target,
+                    task,
+                    claim,
+                    accepts: &accepts,
+                    later,
+                    takes: &takes,
+                })
             {
                 picked = Some(machine);
                 send = Outbound::PauseFor(victim);
@@ -2161,17 +2873,22 @@ impl Fleet {
                         })
                         .find_map(|v| flock_held(v, target))
                 };
+                // Or every model it may run there is on an exhausted
+                // account, which gets a note of its own.
                 let why = none_has()
+                    .map(|why| format!("{WAITING_FOR_MODEL}: {why}"))
                     .or_else(|| {
                         let m = pick_machine(&views, target, &task.spec, claim)?;
-                        Some(settled_on(&m)?.err()?.to_string())
+                        let refused = settled_on(&m)?.err()?;
+                        Some(if refused.code == ACCOUNT_EXHAUSTED {
+                            format!("{WAITING_FOR_ACCOUNT}: {}", refused.message)
+                        } else {
+                            format!("{WAITING_FOR_MODEL}: {refused}")
+                        })
                     })
-                    .or_else(flock_full);
-                let note = why.map(|why| format!("{WAITING_FOR_MODEL}: {why}"));
-                let stale = task
-                    .error
-                    .as_deref()
-                    .is_some_and(|e| e.starts_with(WAITING_FOR_MODEL));
+                    .or_else(|| flock_full().map(|why| format!("{WAITING_FOR_MODEL}: {why}")));
+                let note = why;
+                let stale = task.error.as_deref().is_some_and(is_waiting_note);
                 if note.is_some() && task.error != note || note.is_none() && stale {
                     let mut t = task.clone();
                     t.error = note;
@@ -2188,11 +2905,7 @@ impl Fleet {
             if let Some(Ok(spec)) = settled_on(&name) {
                 on.spec = spec;
             }
-            if on
-                .error
-                .as_deref()
-                .is_some_and(|e| e.starts_with(WAITING_FOR_MODEL))
-            {
+            if on.error.as_deref().is_some_and(is_waiting_note) {
                 on.error = None;
             }
             if (on.spec != task.spec || on.error != task.error)
@@ -2264,17 +2977,16 @@ impl Fleet {
     /// under its share there has a task in `later` waiting for it, the same
     /// rule dispatch applies, so a pause never frees a slot the task then
     /// may not take. Answers the machine and that task's id.
-    #[allow(clippy::too_many_arguments)]
-    fn pausable_for(
-        &self,
-        views: &[MachineView],
-        flock: &str,
-        task: &Task,
-        claim: Claim,
-        accepts: &dyn Fn(&str) -> bool,
-        later: &[Task],
-        takes: &dyn Fn(&Task, &str) -> bool,
-    ) -> Option<(String, i64)> {
+    fn pausable_for(&self, ask: PausableFor<'_>) -> Option<(String, i64)> {
+        let PausableFor {
+            views,
+            flock,
+            task,
+            claim,
+            accepts,
+            later,
+            takes,
+        } = ask;
         let agents = self.agents.read().recover().clone();
         let default = self.flock().default_flock().to_string();
         let now = chrono::Utc::now();
@@ -2323,9 +3035,9 @@ impl Fleet {
             .map(|(_, name, id)| (name, id))
     }
 
-    /// Resume paused task `task` on the machine it was paused on, once that
-    /// machine is healthy, still in the flock and has room for it, its own
-    /// flock under its number there. Past its share, it also waits while a
+    /// Resume paused or waiting task `task` on the machine it was paused or
+    /// waiting on, once that machine is healthy, still in the flock and has
+    /// room for it, its own flock under its number there. Past its share, it also waits while a
     /// flock under its share there has a task in `later` for that slot, as
     /// a queued task would (`MachineView::flock_may_take`). It is not
     /// settled again: it goes back to the agent and session it had.
@@ -2393,6 +3105,7 @@ async fn run_placement(p: Placement) {
             (handle.dispatch(task.id).await, "dispatch")
         }
         Outbound::Dispatch => (handle.dispatch(task.id).await, "dispatch"),
+        Outbound::Now => (handle.dispatch_now(task.id).await, "dispatch"),
     };
     match res {
         Ok(t) if what == "resume" => {
@@ -2418,7 +3131,47 @@ fn layer_label(layer: Layer, asked_by: &str, flock: &str, machine: Option<&str>)
     }
 }
 
-use crate::queue::{WAITING_FOR_MODEL, asked_by};
+use crate::queue::{WAITING_FOR_ACCOUNT, WAITING_FOR_MODEL, asked_by, is_waiting_note};
+
+/// The code `task retry` refuses a waiting task with.
+pub const TASK_WAITING: &str = "task_waiting";
+
+/// How long `Fleet::live_limits` trusts the table as last read.
+const LIMITS_FRESH: Duration = Duration::from_secs(1);
+
+/// What a waiting task does once its time has come (`Fleet::wake`).
+enum Wake {
+    /// Its models are still exhausted: it keeps waiting.
+    Hold,
+    /// Its own model is free: it resumes on it.
+    Own,
+    /// It goes on under another model, its spec settled for it.
+    Switch(Box<crate::task::DispatchSpec>),
+    /// It was to move on, and no other model of its list is free: it
+    /// waits for the earliest of `held` (`all_exhausted`); or none runs on
+    /// its machine: it waits on its own model, `held` its limits
+    /// (`no_fallback`).
+    Wait {
+        why: &'static str,
+        held: Vec<AccountLimit>,
+    },
+}
+
+/// The code of a task every model of which is on an exhausted account
+/// where it would run.
+pub const ACCOUNT_EXHAUSTED: &str = "account_exhausted";
+
+/// The refusal for a task that `held` stops, as its waiting note says it.
+fn exhausted(held: &[AccountLimit], now: chrono::DateTime<chrono::Utc>) -> AgentRefusal {
+    AgentRefusal {
+        code: ACCOUNT_EXHAUSTED,
+        message: held
+            .iter()
+            .map(|l| l.note(now))
+            .collect::<Vec<_>>()
+            .join("; "),
+    }
+}
 
 /// An error from code the CLI shares with the head, as a reply: its
 /// `CliError` code when it has one, else `runtime_error`.
@@ -2584,6 +3337,9 @@ impl ExtraSignals {
 /// replace. `Daemon::bind_socket` checks this before it binds, and a
 /// background `pastor serve` before it starts the head that would.
 pub async fn refuse_live_socket(socket: &std::path::Path) -> anyhow::Result<()> {
+    // A path past `sun_path` fails the ping's connect, which would read as an
+    // unresponsive daemon; say what is wrong instead.
+    crate::ssh::check_socket_path(socket, crate::ssh::SHORTER_STATE_DIR)?;
     // Staleness is a property of the connect, not of the reply: a live
     // daemon mid-request (e.g. `dispatch_queued` against a slow or wedged
     // herdr) can go a while without answering a ping, and a busy daemon
@@ -2783,6 +3539,7 @@ impl Daemon {
     pub(crate) async fn bind_socket(
         socket: &std::path::Path,
     ) -> anyhow::Result<tokio::net::UnixListener> {
+        crate::ssh::check_socket_path(socket, crate::ssh::SHORTER_STATE_DIR)?;
         if socket.exists() {
             refuse_live_socket(socket).await?;
             std::fs::remove_file(socket)?;
@@ -2849,6 +3606,21 @@ impl Daemon {
     /// task and an orchestrator is the task: an agent cannot widen its
     /// rights by setting the other.
     pub async fn handle_as(&self, req: IpcRequest, caller: &crate::ipc::Caller) -> IpcResponse {
+        // `task run --now` runs past a machine's limits on a person's say,
+        // `agents_change_fleet` or not.
+        if matches!(req, IpcRequest::Run { now: true, .. }) {
+            let who = match (&caller.task, &caller.orchestrator) {
+                (Some(task), _) => Some(format!("{task} is a task")),
+                (None, Some(o)) => Some(format!("orchestrator {o}'s script is not a person")),
+                (None, None) => None,
+            };
+            if let Some(who) = who {
+                return IpcResponse::error(
+                    "now_refused",
+                    format!("{who}, and only a person may run a task with --now"),
+                );
+            }
+        }
         if let Some(task) = caller.task.as_deref() {
             if let Some(why) = self.makes_orchestrator(&req) {
                 return IpcResponse::error("role_refused", format!("{task} is a task, and {why}"));
@@ -3010,7 +3782,7 @@ impl Daemon {
             },
             IpcRequest::Run {
                 prompt,
-                spec,
+                mut spec,
                 flock,
                 agent,
                 priority,
@@ -3018,7 +3790,11 @@ impl Daemon {
                 description,
                 preempt,
                 summary,
+                now,
             } => {
+                // From the flag alone: a spec that says so does not skip
+                // the queue.
+                spec.now = now;
                 // clap refuses this too; checked here as well so no other
                 // client can queue a task dispatch can only fail.
                 if spec.worktree && spec.repo.is_none() {
@@ -3040,17 +3816,17 @@ impl Daemon {
                 }
                 let task = match self
                     .fleet
-                    .queue_run_as(
+                    .queue_run_as(RunAsk {
                         prompt,
                         spec,
-                        flock.as_deref(),
-                        agent.as_ref(),
+                        flock: flock.as_deref(),
+                        ask: agent.as_ref(),
                         priority,
                         role,
-                        crate::config::clean_description(description.as_deref()),
+                        description: crate::config::clean_description(description.as_deref()),
                         preempt,
                         summary,
-                    )
+                    })
                     .await
                 {
                     Ok(t) => t,
@@ -3083,6 +3859,42 @@ impl Daemon {
                 });
                 self.fleet.dispatch_queued_for(task.id).await;
                 match self.store.get_task(task.id) {
+                    // A `--now` task never waits in the queue: one its
+                    // machine did not take (it went away since the check,
+                    // or its agent cannot run the model) is closed.
+                    Ok(Some(t)) if t.spec.now && t.state == TaskState::Queued => {
+                        let why = t.error.clone().unwrap_or_else(|| {
+                            format!(
+                                "{} did not take it",
+                                t.spec.machine.as_deref().unwrap_or("its machine")
+                            )
+                        });
+                        match self.store.close_queued(t.id) {
+                            Ok(Some(closed)) => {
+                                let _ = self.events.send(PastorEvent {
+                                    detail: None,
+                                    kind: "task.closed".into(),
+                                    task_id: Some(closed.id),
+                                    machine: None,
+                                    job: Some(closed.job.clone()),
+                                    summary: None,
+                                });
+                            }
+                            // A claim or another close won the race since
+                            // the read above: whichever did it says so.
+                            Ok(None) => {}
+                            Err(err) => {
+                                tracing::warn!(task = %t.display_id(), %err, "close a --now task");
+                            }
+                        }
+                        IpcResponse::error(
+                            "now_not_started",
+                            format!(
+                                "{} could not start at once ({why}), and is closed",
+                                t.display_id()
+                            ),
+                        )
+                    }
                     Ok(Some(t)) => IpcResponse::Task(t),
                     Ok(None) => IpcResponse::error("task_not_found", task.id),
                     Err(err) => IpcResponse::error("store_error", err),
@@ -3395,6 +4207,20 @@ impl Daemon {
                     )),
                 }
             }
+            IpcRequest::LimitList => match self.store.limits() {
+                Ok(list) => IpcResponse::Limits(list),
+                Err(err) => IpcResponse::error("store_error", err),
+            },
+            IpcRequest::LimitClear { account, model } => {
+                match self.fleet.clear_limits(&account, model.as_deref()) {
+                    Ok(gone) if gone.is_empty() => IpcResponse::error(
+                        crate::limit_cli::NOT_EXHAUSTED,
+                        crate::limit_cli::not_exhausted(&account, model.as_deref()),
+                    ),
+                    Ok(gone) => IpcResponse::Limits(gone),
+                    Err(err) => IpcResponse::error("store_error", err),
+                }
+            }
             IpcRequest::TrustList => match self.store.trusted_repos() {
                 Ok(list) => IpcResponse::Trusted(list),
                 Err(err) => IpcResponse::error("store_error", err),
@@ -3436,7 +4262,12 @@ impl Daemon {
                 state,
                 pane,
                 detail,
-            } => match self.fleet.report(&machine, id, state, pane, detail).await {
+                limit,
+            } => match self
+                .fleet
+                .report(&machine, id, state, pane, detail, limit)
+                .await
+            {
                 Ok(task) => IpcResponse::Task(task),
                 Err(err) => cli_error(err),
             },
@@ -3595,6 +4426,7 @@ impl Daemon {
             row: crate::cli::MachineRow::from(&status),
             session: m.session.clone(),
             model: m.model.clone(),
+            fallback: m.fallback.clone(),
             agents_by_kind: m.agents.clone(),
             tasks,
             recent_errors: crate::describe::machine_errors(events, name),
@@ -3834,6 +4666,20 @@ impl Daemon {
             Err(QueueError::Store(err @ RetryError::NotFound(_))) => {
                 return IpcResponse::error("task_not_found", err);
             }
+            // A waiting task goes on by itself when its limit resets; a
+            // retry would start a second agent on the same work.
+            Err(QueueError::Store(RetryError::NotRetryable {
+                id,
+                state: TaskState::Waiting,
+            })) => {
+                return IpcResponse::error(
+                    TASK_WAITING,
+                    format!(
+                        "t-{id} is waiting for a usage limit to reset and resumes by itself; \
+                         `pastor limit clear` wakes it sooner, `pastor task close t-{id}` gives it up"
+                    ),
+                );
+            }
             Err(QueueError::Store(err @ RetryError::NotRetryable { .. })) => {
                 return IpcResponse::error("not_retryable", err);
             }
@@ -3916,10 +4762,11 @@ impl Daemon {
             if t.state == TaskState::Closed && !remove_worktree {
                 return IpcResponse::Task(t);
             }
-            // A paused task holds no pane: a plain close is its row alone,
-            // unless a resume claims it first. Its checkout is on its
-            // machine, so `--remove-worktree` goes there.
-            let paused = t.state == TaskState::Paused && !remove_worktree;
+            // A paused or waiting task holds no pane: a plain close is its
+            // row alone, unless a resume claims it first. Its checkout is on
+            // its machine, so `--remove-worktree` goes there.
+            let paused =
+                matches!(t.state, TaskState::Paused | TaskState::Waiting) && !remove_worktree;
             if !paused && let Some(m) = t.machine.clone() {
                 break m;
             }
@@ -4064,7 +4911,7 @@ pub async fn serve(paths: Paths) -> anyhow::Result<()> {
     daemon.run_with_listener(listener).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fake-herdr"))]
 mod tests {
     use super::*;
     use crate::config::flock::MachineConfig;
@@ -4094,6 +4941,7 @@ mod tests {
             agent: None,
             agent_args: None,
             model: None,
+            fallback: None,
             priority: None,
             agents: Default::default(),
             profile: None,
@@ -4102,6 +4950,7 @@ mod tests {
 
     fn spec() -> DispatchSpec {
         DispatchSpec {
+            now: false,
             agent: "claude".into(),
             agent_args: vec![],
             allow: vec![],
@@ -4120,6 +4969,9 @@ mod tests {
             label: Default::default(),
             summary: Default::default(),
             cwd: None,
+            keep_pane: None,
+            keep_pane_from: None,
+            rounds: Default::default(),
         }
     }
 
@@ -4155,6 +5007,7 @@ mod tests {
             agent_ready_timeout: Duration::from_millis(500),
             poll_every: Duration::from_millis(200),
             close_done_after: None,
+            close_failed_after: None,
             agents: Default::default(),
             ..Default::default()
         }
@@ -4180,6 +5033,23 @@ mod tests {
             assert!(Instant::now() < deadline, "{name} never connected");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// A state dir deep enough that `pastor.sock` overflows `sun_path` is
+    /// refused before bind, with the hint to shorten `PASTOR_STATE_DIR`.
+    #[tokio::test]
+    async fn bind_socket_refuses_a_socket_path_past_sun_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp
+            .path()
+            .join("x".repeat(crate::ssh::UNIX_PATH_MAX))
+            .join("pastor.sock");
+        let err = Daemon::bind_socket(&socket).await.unwrap_err();
+        let e = err
+            .downcast_ref::<crate::cli::CliError>()
+            .expect("CliError");
+        assert_eq!(e.code, "config_error");
+        assert!(e.message.contains("PASTOR_STATE_DIR"), "{}", e.message);
     }
 
     #[tokio::test]
@@ -4561,6 +5431,7 @@ mod tests {
 
     fn run_on(prompt: &str, machine: Option<&str>) -> IpcRequest {
         IpcRequest::Run {
+            now: false,
             preempt: false,
             prompt: prompt.into(),
             spec: DispatchSpec {
@@ -4609,6 +5480,7 @@ mod tests {
             state,
             pane: Some("p-9".into()),
             detail: detail.map(str::to_string),
+            limit: None,
         }
     }
 
@@ -4902,6 +5774,43 @@ mod tests {
         );
     }
 
+    /// A done task that keeps its pane holds no slot: a machine at
+    /// `max_agents = 1` starts the next task while the kept pane stays.
+    #[tokio::test]
+    async fn a_kept_done_task_does_not_hold_a_slot() {
+        let fake = FakeHerdr::new();
+        let (d, _tmp) = daemon(&[("a", 1, fake.clone())]).await;
+        let task = |resp: IpcResponse| match resp {
+            IpcResponse::Task(t) => t,
+            other => panic!("{other:?}"),
+        };
+        let mut kept = run_at("1", None);
+        if let IpcRequest::Run { spec, .. } = &mut kept {
+            spec.keep_pane = Some(true);
+        }
+        let first = task(d.handle(kept).await);
+        assert_eq!(first.state, TaskState::Running);
+        let next = task(d.handle(run_at("2", None)).await);
+        assert_eq!(next.state, TaskState::Queued);
+        let done = task(
+            d.handle(IpcRequest::TaskDone {
+                id: first.id,
+                summary: Some("done".into()),
+            })
+            .await,
+        );
+        assert_eq!(done.state, TaskState::Done);
+        d.fleet().dispatch_queued().await;
+        let state = |id: i64| d.store.get_task(id).unwrap().unwrap().state;
+        assert_eq!(state(next.id), TaskState::Running);
+        assert_eq!(state(first.id), TaskState::Done);
+        assert!(
+            fake.agents()
+                .iter()
+                .any(|a| Some(&a.pane_id) == first.pane_id.as_ref())
+        );
+    }
+
     /// `JobSubmit` queues another machine's items as this head's own job
     /// would: rendered the same, deduplicated by `seen`, capped by
     /// `max_tasks_per_run`, and refused for a name a job file owns or a
@@ -5111,6 +6020,7 @@ mod tests {
         let mut events = d.subscribe();
         let resp = d
             .handle(IpcRequest::Run {
+                now: false,
                 preempt: false,
                 summary: None,
                 role: Default::default(),
@@ -5164,6 +6074,7 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 1, fake.clone())]).await;
         let IpcResponse::Task(first) = d
             .handle(IpcRequest::Run {
+                now: false,
                 preempt: false,
                 summary: None,
                 role: Default::default(),
@@ -5181,6 +6092,7 @@ mod tests {
         assert_eq!(first.state, TaskState::Running);
         let IpcResponse::Task(second) = d
             .handle(IpcRequest::Run {
+                now: false,
                 preempt: false,
                 summary: None,
                 role: Default::default(),
@@ -5217,6 +6129,7 @@ mod tests {
 
     fn run_at(prompt: &str, priority: Option<Priority>) -> IpcRequest {
         IpcRequest::Run {
+            now: false,
             preempt: false,
             summary: None,
             prompt: prompt.into(),
@@ -5328,6 +6241,7 @@ mod tests {
         )
         .await;
         let run = |machine: Option<&str>, priority: Option<Priority>| IpcRequest::Run {
+            now: false,
             preempt: false,
             summary: None,
             prompt: "x".into(),
@@ -5422,6 +6336,7 @@ mod tests {
         };
         let (d, _tmp) = daemon_with_flock(flock, &[("pi", 4, FakeHerdr::new())]).await;
         let run = |ask: AgentChoice| IpcRequest::Run {
+            now: false,
             preempt: false,
             summary: None,
             prompt: "x".into(),
@@ -5518,6 +6433,7 @@ mod tests {
         config.defaults.label = Some("{{ machine }}/{{ task.id }}".into());
         d.fleet().set_config(&config);
         let run = |label: Option<&str>, flock: &str| IpcRequest::Run {
+            now: false,
             prompt: "x".into(),
             spec: DispatchSpec {
                 label: crate::task::WorkspaceLabel {
@@ -5672,6 +6588,7 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
         let resp = d
             .handle(IpcRequest::Run {
+                now: false,
                 preempt: false,
                 summary: None,
                 role: Default::default(),
@@ -5703,6 +6620,7 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new()), ("b", 2, FakeHerdr::new())]).await;
         let resp = d
             .handle(IpcRequest::Run {
+                now: false,
                 preempt: false,
                 summary: None,
                 role: Default::default(),
@@ -5722,6 +6640,149 @@ mod tests {
         };
         assert_eq!(t.machine.as_deref(), Some("b"));
         assert_eq!(t.state, TaskState::Running);
+    }
+
+    /// `task run --now` (`Run::now`, `DispatchSpec::now`).
+    mod now {
+        use super::*;
+
+        fn run_now(prompt: &str, machine: Option<&str>) -> IpcRequest {
+            let mut req = run_on(prompt, machine);
+            if let IpcRequest::Run { now, .. } = &mut req {
+                *now = true;
+            }
+            req
+        }
+
+        fn no_rows(d: &Daemon) -> bool {
+            d.store
+                .list_tasks(&TaskFilter::default())
+                .unwrap()
+                .is_empty()
+        }
+
+        /// On a full machine a `--now` task starts in the same request,
+        /// past `max_agents`, while a plain task stays queued; it counts
+        /// there, so the queue does not fill the machine further, and
+        /// `machine list` names it.
+        #[tokio::test]
+        async fn a_now_task_starts_past_its_machines_limits() {
+            let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+            let busy = queued(&d, "busy", Some("a")).await;
+            assert_eq!(busy.state, TaskState::Running);
+            let waiting = queued(&d, "waits", Some("a")).await;
+            assert_eq!(waiting.state, TaskState::Queued);
+
+            let IpcResponse::Task(t) = d.handle(run_now("urgent", Some("a"))).await else {
+                panic!()
+            };
+            assert_eq!(t.state, TaskState::Running, "{:?}", t.error);
+            assert_eq!(t.machine.as_deref(), Some("a"));
+            assert!(t.spec.now);
+            let view = d
+                .fleet()
+                .views()
+                .into_iter()
+                .find(|v| v.name == "a")
+                .unwrap();
+            assert_eq!((view.live, view.max_agents), (2, 1));
+
+            d.fleet().dispatch_queued().await;
+            assert_eq!(
+                d.store.get_task(waiting.id).unwrap().unwrap().state,
+                TaskState::Queued,
+                "the queue still waits for a slot"
+            );
+            let status = d.fleet().statuses();
+            let a = status.iter().find(|m| m.name == "a").unwrap();
+            assert_eq!(a.now, vec![t.display_id()]);
+        }
+
+        /// `--now` needs `--machine`, and a machine that is connected (a
+        /// pull machine never is: it takes its own tasks). Nothing is
+        /// queued either way.
+        #[tokio::test]
+        async fn now_needs_a_connected_machine() {
+            let (d, _tmp) = pull_daemon(1).await;
+            assert_eq!(
+                error_code(d.handle(run_now("x", None)).await),
+                "now_needs_machine"
+            );
+            assert_eq!(
+                error_code(d.handle(run_now("x", Some("laptop"))).await),
+                "machine_not_connected"
+            );
+            assert!(no_rows(&d));
+        }
+
+        /// Only a person may skip the queue: an agent, an orchestrator
+        /// task and an orchestrator's script are refused.
+        #[tokio::test]
+        async fn only_a_person_runs_a_task_now() {
+            let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+            let mut req = run_on("orchestrate", None);
+            if let IpcRequest::Run { role, .. } = &mut req {
+                *role = TaskRole::Orchestrator;
+            }
+            let IpcResponse::Task(orch) = d.handle(req).await else {
+                panic!()
+            };
+            for caller in [
+                crate::ipc::Caller::task(Some("t-9")),
+                crate::ipc::Caller::task(Some(&orch.display_id())),
+                crate::ipc::Caller {
+                    task: None,
+                    orchestrator: Some("merge".into()),
+                },
+            ] {
+                let resp = d.handle_as(run_now("x", Some("a")), &caller).await;
+                assert_eq!(error_code(resp), "now_refused", "{caller:?}");
+            }
+            assert_eq!(d.store.list_tasks(&TaskFilter::default()).unwrap().len(), 1);
+        }
+
+        /// A `--now` task whose pinned machine will not take it (its tags
+        /// do not match) never waits in the queue: it is closed at once,
+        /// and that close is announced like any other, not left silent
+        /// (GPT review on #103, finding 3).
+        #[tokio::test]
+        async fn a_now_task_that_cannot_start_is_closed_and_announced() {
+            let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+            let mut req = run_now("urgent", Some("a"));
+            if let IpcRequest::Run { spec, .. } = &mut req {
+                spec.tags = vec!["gpu".into()];
+            }
+            let mut events = d.subscribe();
+            let resp = d.handle(req).await;
+            assert_eq!(error_code(resp), "now_not_started");
+            let rows = d.store.list_tasks(&TaskFilter::default()).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].state, TaskState::Closed);
+            let events = events_of(&mut events);
+            assert!(
+                events
+                    .iter()
+                    .any(|(kind, id, _)| kind == "task.closed" && *id == Some(rows[0].id)),
+                "{events:?}"
+            );
+        }
+
+        /// The head sets `spec.now` from `Run::now` alone: a spec that
+        /// claims it without the flag queues like any other task.
+        #[tokio::test]
+        async fn a_spec_that_says_now_without_the_flag_queues() {
+            let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+            queued(&d, "busy", Some("a")).await;
+            let mut req = run_on("sneaky", Some("a"));
+            if let IpcRequest::Run { spec, .. } = &mut req {
+                spec.now = true;
+            }
+            let IpcResponse::Task(t) = d.handle(req).await else {
+                panic!()
+            };
+            assert_eq!(t.state, TaskState::Queued);
+            assert!(!t.spec.now);
+        }
     }
 
     /// `home` (the default) holds `h`, `work` holds `w`.
@@ -5760,6 +6821,7 @@ mod tests {
 
     fn run_in(flock: Option<&str>, machine: Option<&str>) -> IpcRequest {
         IpcRequest::Run {
+            now: false,
             preempt: false,
             summary: None,
             role: Default::default(),
@@ -5789,6 +6851,7 @@ mod tests {
         )
         .await;
         let run = |flock: &str, agent: Option<AgentChoice>| IpcRequest::Run {
+            now: false,
             preempt: false,
             summary: None,
             role: Default::default(),
@@ -5881,6 +6944,7 @@ mod tests {
         )
         .await;
         let run = |agent: Option<&str>| IpcRequest::Run {
+            now: false,
             preempt: false,
             summary: None,
             role: Default::default(),
@@ -5952,6 +7016,7 @@ mod tests {
         std::fs::write(d.paths.config_file(), toml::to_string(&config).unwrap()).unwrap();
         let resp = d
             .handle(IpcRequest::Run {
+                now: false,
                 preempt: false,
                 summary: None,
                 role: Default::default(),
@@ -6030,6 +7095,7 @@ mod tests {
 
     fn run_model(model: Option<&str>, agent: Option<&str>, machine: Option<&str>) -> IpcRequest {
         IpcRequest::Run {
+            now: false,
             preempt: false,
             summary: None,
             role: Default::default(),
@@ -6366,6 +7432,963 @@ mod tests {
         assert_eq!(copy.model(), Some("sonnet"));
     }
 
+    /// `models_daemon` whose flock falls back to sonnet then gpt, over pi,
+    /// which falls back to opus, and cx, which sets `[]`; `models_config`
+    /// is the fleet's too, for a job's tasks, which re-read nothing.
+    async fn fallback_daemon() -> (Daemon, tempfile::TempDir) {
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let pi = MachineConfig {
+            fallback: Some(names(&["opus"])),
+            ..machine("pi", 2)
+        };
+        let cx = MachineConfig {
+            fallback: Some(vec![]),
+            ..machine("cx", 2)
+        };
+        let (d, tmp) = models_daemon(
+            None,
+            vec![pi, cx, machine("bare", 2)],
+            &[
+                ("pi", 2, FakeHerdr::new()),
+                ("cx", 2, FakeHerdr::new()),
+                ("bare", 2, FakeHerdr::new()),
+            ],
+        )
+        .await;
+        let mut flock = Flock::load(&d.paths.flock_file()).unwrap();
+        flock.flocks[0].fallback = Some(names(&["sonnet", "gpt"]));
+        flock.save(&d.paths.flock_file()).unwrap();
+        d.fleet().replace_flock(flock).await;
+        d.fleet().set_config(&models_config());
+        (d, tmp)
+    }
+
+    fn run_fallback(
+        model: Option<&str>,
+        fallback: Option<&[&str]>,
+        machine: Option<&str>,
+    ) -> IpcRequest {
+        let IpcRequest::Run {
+            preempt,
+            summary,
+            role,
+            description,
+            prompt,
+            spec,
+            flock,
+            agent,
+            priority,
+            now,
+        } = run_model(model, None, machine)
+        else {
+            unreachable!()
+        };
+        IpcRequest::Run {
+            preempt,
+            summary,
+            role,
+            description,
+            prompt,
+            spec,
+            flock,
+            agent: agent.map(|a| AgentChoice {
+                fallback: fallback.map(|f| f.iter().map(|s| s.to_string()).collect()),
+                ..a
+            }),
+            priority,
+            now,
+        }
+    }
+
+    /// The fallback list a task names is kept with where it came from, less
+    /// the task's own model; `task describe` shows it.
+    #[tokio::test]
+    async fn a_task_keeps_the_fallback_it_names() {
+        let (d, _tmp) = fallback_daemon().await;
+        let run = |model, fallback| d.handle(run_fallback(model, Some(fallback), Some("bare")));
+        let IpcResponse::Task(t) = run(Some("opus"), &["sonnet", "gpt"]).await else {
+            panic!()
+        };
+        assert_eq!(t.fallback(), ["sonnet", "gpt"]);
+        let source = t.spec.agent_source.clone().unwrap();
+        assert_eq!(source.fallback_from.as_deref(), Some("task run"));
+        let text = crate::cli::task_detail(&t);
+        assert!(
+            text.contains("fallback:   sonnet, gpt (from task run)\n"),
+            "{text}"
+        );
+        let IpcResponse::Task(t) = run(Some("sonnet"), &["sonnet", "gpt"]).await else {
+            panic!()
+        };
+        assert_eq!(t.fallback(), ["gpt"]);
+        let IpcResponse::Task(t) = run(None, &[]).await else {
+            panic!()
+        };
+        assert!(t.fallback().is_empty());
+    }
+
+    /// With no list of its own, a task takes its machine's, else its
+    /// flock's; a machine's `[]` gives it none although the flock has one.
+    #[tokio::test]
+    async fn a_machines_fallback_beats_its_flocks() {
+        let (d, _tmp) = fallback_daemon().await;
+        let placed = |machine| {
+            let d = &d;
+            async move {
+                let IpcResponse::Task(t) = d.handle(run_fallback(None, None, Some(machine))).await
+                else {
+                    panic!()
+                };
+                let from = t.spec.agent_source.as_ref().unwrap().fallback_from.clone();
+                (t.fallback().to_vec(), from)
+            }
+        };
+        assert_eq!(
+            placed("pi").await,
+            (vec!["opus".to_string()], Some("machine pi".into()))
+        );
+        assert_eq!(placed("cx").await, (vec![], Some("machine cx".into())));
+        assert_eq!(
+            placed("bare").await,
+            (
+                vec!["sonnet".to_string(), "gpt".to_string()],
+                Some("flock personal".into())
+            )
+        );
+    }
+
+    /// `models_daemon` over `pi` and `pi-2`, whose flock runs
+    /// `claude-personal`, logged in to the account `me` when `account`; and
+    /// `desk`, whose codex agent runs `gpt`, with room for one each.
+    async fn limits_daemon(account: bool) -> (Daemon, tempfile::TempDir) {
+        let desk = MachineConfig {
+            agents: [("codex".to_string(), "codex".to_string())].into(),
+            ..machine("desk", 1)
+        };
+        let (d, tmp) = models_daemon(
+            None,
+            vec![machine("pi", 1), machine("pi-2", 1), desk],
+            &[
+                ("pi", 1, FakeHerdr::new()),
+                ("pi-2", 1, FakeHerdr::new()),
+                ("desk", 1, FakeHerdr::new()),
+            ],
+        )
+        .await;
+        let mut config = models_config();
+        if account {
+            config.agents.0.get_mut("claude-personal").unwrap().account = Some("me".into());
+        }
+        std::fs::write(d.paths.config_file(), toml::to_string(&config).unwrap()).unwrap();
+        d.fleet().set_config(&config);
+        (d, tmp)
+    }
+
+    /// A limit read on `machine`'s `claude-personal` by task 9, under the
+    /// key its config gives, for `model` alone when set; it resets in an
+    /// hour.
+    fn seen_limit(d: &Daemon, machine: &str, model: Option<&str>) -> AccountLimit {
+        let now = chrono::Utc::now();
+        let limit = crate::limit::Limit {
+            hard: true,
+            until: Some(now + chrono::Duration::hours(1)),
+            model_scoped: model.is_some(),
+            no_credit: false,
+            line: "You've hit your session limit".into(),
+        };
+        let key = d.fleet().agents().limit_key(machine, "claude-personal");
+        AccountLimit::of(
+            &key,
+            model,
+            &limit,
+            Some(9),
+            Some(machine),
+            Some("claude-personal"),
+            now,
+            &Default::default(),
+        )
+    }
+
+    /// Two machines whose agent names one account share its limit: one
+    /// row, seen on pi, keeps a new task off pi-2 too, and the task says why.
+    #[tokio::test]
+    async fn machines_whose_agent_names_one_account_share_its_limit() {
+        let (d, _tmp) = limits_daemon(true).await;
+        let mut events = d.subscribe();
+        d.fleet().record_limit(&seen_limit(&d, "pi", None)).unwrap();
+        d.fleet()
+            .record_limit(&seen_limit(&d, "pi-2", None))
+            .unwrap();
+        let rows = d.store.limits().unwrap();
+        assert_eq!(rows.len(), 1, "one account, one row: {rows:?}");
+        assert_eq!(rows[0].account, "me");
+        let ev = events.recv().await.unwrap();
+        assert_eq!(ev.kind, "agent.exhausted");
+        assert_eq!(ev.detail.as_ref().unwrap()["account"], "me");
+        let IpcResponse::Task(t) = d
+            .handle(run_fallback(Some("sonnet"), Some(&[]), None))
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(t.state, TaskState::Queued);
+        let err = t.error.clone().unwrap_or_default();
+        assert!(err.starts_with("waiting: me exhausted until "), "{err}");
+        assert!(err.ends_with("(session limit, seen by t-9)"), "{err}");
+        let IpcResponse::Queue(q) = d
+            .handle(IpcRequest::Queue {
+                flock: None,
+                machine: None,
+            })
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(q[0].why, err);
+    }
+
+    /// A waiting task stays so while its limit holds, whatever room its
+    /// machine has; `limit clear` wakes it on the next pass, back on its
+    /// machine with its session. `task retry` refuses it.
+    #[tokio::test]
+    async fn a_waiting_task_goes_on_when_its_limit_is_cleared() {
+        let (d, _tmp) = limits_daemon(true).await;
+        d.fleet().record_limit(&seen_limit(&d, "pi", None)).unwrap();
+        let IpcResponse::Task(t) = d
+            .handle(run_fallback(Some("sonnet"), Some(&[]), Some("pi")))
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(t.state, TaskState::Queued);
+        let mut t = d.store.claim_task(t.id, "pi").unwrap().unwrap();
+        t.state = TaskState::Waiting;
+        t.agent_name = None;
+        t.error = Some("me exhausted until 03:00 (session limit, seen by t-9)".into());
+        t.spec.session_id = crate::task::new_session_id();
+        t.waiting_until = d.store.limits().unwrap().first().map(|l| l.retry_at);
+        d.store.update_task(&mut t).unwrap();
+
+        d.fleet().dispatch_queued().await;
+        let get = |d: &Daemon, id: i64| d.store.get_task(id).unwrap().unwrap();
+        assert_eq!(get(&d, t.id).state, TaskState::Waiting, "its limit holds");
+        let IpcResponse::Error { code, .. } = d
+            .handle(IpcRequest::TaskRetry {
+                id: t.id,
+                place: None,
+            })
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(code, TASK_WAITING);
+
+        let IpcResponse::Limits(gone) = d
+            .handle(IpcRequest::LimitClear {
+                account: "me".into(),
+                model: None,
+            })
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(gone.len(), 1);
+        d.fleet().dispatch_queued().await;
+        let back = get(&d, t.id);
+        assert_eq!(back.state, TaskState::Running, "{:?}", back.error);
+        assert_eq!(back.machine.as_deref(), Some("pi"));
+        assert_eq!(back.waiting_until, None);
+        assert_eq!(back.spec.session_id, t.spec.session_id);
+    }
+
+    /// The card's walk: `fallback = ["sonnet", "gpt5"]` and limits with no
+    /// reset near. Opus runs out on its own (`Opus weekly limit`): the task
+    /// goes on under Sonnet in its own session with the switch line. Then
+    /// the whole account runs out: it goes on under the machine's opencode
+    /// with its prompt, the handover and the end of the last pane. Same
+    /// worktree and branch each time, one row, one round per model. Once
+    /// Opus is cleared, the task stays on the model it moved to, and a new
+    /// task starts on Opus again.
+    #[tokio::test]
+    async fn a_limited_task_moves_down_its_fallback_list() {
+        let pi = MachineConfig {
+            agents: [("opencode".to_string(), "opencode".to_string())].into(),
+            ..machine("pi", 3)
+        };
+        let fake = FakeHerdr::new();
+        let (d, _tmp) = opencode_daemon(vec![pi], &[("pi", 3, fake.clone())]).await;
+        let mut config = models_config();
+        config.models.0.insert(
+            "gpt5".into(),
+            crate::config::ModelDef {
+                kind: "opencode".into(),
+                args: vec!["--model".into(), "openai/gpt-5.5".into()],
+            },
+        );
+        config.agents.0.get_mut("claude-personal").unwrap().account = Some("me".into());
+        std::fs::write(d.paths.config_file(), toml::to_string(&config).unwrap()).unwrap();
+        d.fleet().set_config(&config);
+        let mut events = d.subscribe();
+        let IpcRequest::Run {
+            preempt,
+            summary,
+            role,
+            description,
+            prompt,
+            mut spec,
+            flock,
+            agent,
+            priority,
+            now,
+        } = run_fallback(Some("opus"), Some(&["sonnet", "gpt5"]), Some("pi"))
+        else {
+            unreachable!()
+        };
+        spec.repo = Some("/r".into());
+        spec.worktree = true;
+        let run = IpcRequest::Run {
+            preempt,
+            summary,
+            role,
+            description,
+            prompt,
+            spec,
+            flock,
+            agent,
+            priority,
+            now,
+        };
+        let IpcResponse::Task(t) = d.handle(run).await else {
+            panic!()
+        };
+        let get = |id: i64| d.store.get_task(id).unwrap().unwrap();
+        let until = async |what: &str, f: &dyn Fn(&Task) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let t = get(t.id);
+                if f(&t) {
+                    return t;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {what}: {t:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let first = until("running", &|t| t.state == TaskState::Running).await;
+        assert_eq!(first.model(), Some("opus"));
+        let checkout = first.spec.checkout.clone().expect("a worktree");
+        let session = first.spec.session_id.clone().expect("a Claude session");
+        let stop_on = |pane: &str, line: &str| {
+            fake.set_status(pane, crate::herdr::AgentStatus::Working);
+            fake.set_pane_text(
+                pane,
+                &format!("❯ x\n\n● Half of it is done.\n\n● {line}\n\n────────\n❯ \n────────\n"),
+            );
+        };
+        let idle = |pane: &str| fake.set_status(pane, crate::herdr::AgentStatus::Idle);
+        let last = |method: &str| {
+            fake.requests()
+                .into_iter()
+                .rev()
+                .find(|r| r.method == method)
+                .unwrap()
+                .params
+        };
+
+        // Opus runs out alone: Sonnet, in the same session.
+        let pane = first.pane_id.clone().unwrap();
+        stop_on(&pane, "Opus weekly limit reached");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        idle(&pane);
+        until("moved on", &|t| t.state == TaskState::Waiting).await;
+        d.fleet().dispatch_queued().await;
+        let second = until("running on sonnet", &|t| {
+            t.state == TaskState::Running && t.model() == Some("sonnet")
+        })
+        .await;
+        assert_eq!(second.spec.session_id.as_deref(), Some(session.as_str()));
+        assert_eq!(second.spec.checkout, Some(checkout.clone()));
+        let start = last("agent.start");
+        let args = start["args"].to_string();
+        assert!(
+            args.contains("claude-sonnet-5") && args.contains(&session),
+            "{args}"
+        );
+        assert_eq!(
+            last("agent.prompt")["text"],
+            crate::task::switch_prompt("claude-personal (opus)", "claude-personal (sonnet)")
+        );
+        assert_eq!(second.spec.rounds.ended.len(), 1);
+        assert_eq!(
+            second.spec.rounds.ended[0].ended,
+            "limit: Opus weekly limit reached"
+        );
+
+        // Opus is back: the task stays on Sonnet, a new one starts on Opus.
+        let IpcResponse::Limits(_) = d
+            .handle(IpcRequest::LimitClear {
+                account: "me".into(),
+                model: Some("opus".into()),
+            })
+            .await
+        else {
+            panic!()
+        };
+        let IpcResponse::Task(other) = d
+            .handle(run_fallback(Some("opus"), Some(&["sonnet"]), Some("pi")))
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(other.model(), Some("opus"));
+        assert_eq!(other.spec.agent_source.unwrap().fallback_use, None);
+        d.fleet().dispatch_queued().await;
+        assert_eq!(get(t.id).model(), Some("sonnet"));
+
+        // The whole account runs out: opencode, from the prompt with the
+        // handover and the end of the last pane.
+        let pane = second.pane_id.clone().unwrap();
+        stop_on(&pane, "You've hit your limit");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        idle(&pane);
+        until("moved on", &|t| t.state == TaskState::Waiting).await;
+        d.fleet().dispatch_queued().await;
+        let third = until("running on gpt5", &|t| {
+            t.state == TaskState::Running && t.model() == Some("gpt5")
+        })
+        .await;
+        assert_eq!(third.spec.agent, "opencode");
+        assert_eq!(third.spec.checkout, Some(checkout.clone()));
+        assert_eq!(last("agent.start")["kind"], "opencode");
+        let text = last("agent.prompt")["text"].as_str().unwrap().to_string();
+        assert!(text.starts_with("x"), "{text}");
+        assert!(
+            text.contains("another agent (claude-personal (sonnet))"),
+            "{text}"
+        );
+        assert!(text.contains("Half of it is done."), "{text}");
+        assert!(text.contains("You've hit your limit"), "{text}");
+        let summaries = d.store.summaries(t.id).unwrap();
+        let texts: Vec<_> = summaries.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "limit: Opus weekly limit reached",
+                "limit: You've hit your limit"
+            ]
+        );
+
+        let mut switched = Vec::new();
+        while let Ok(ev) = events.try_recv() {
+            if ev.kind == "task.agent_switched" && ev.task_id == Some(t.id) {
+                switched.push(ev.detail.unwrap());
+            }
+        }
+        assert_eq!(switched.len(), 2, "{switched:?}");
+        assert_eq!(switched[0]["from"]["model"], "opus");
+        assert_eq!(switched[0]["to"]["model"], "sonnet");
+        assert_eq!(switched[0]["why"], "limit");
+        assert_eq!(switched[0]["handover"], "session");
+        assert!(switched[0]["until"].is_string(), "{:?}", switched[0]);
+        assert_eq!(switched[1]["to"]["agent"], "opencode");
+        assert_eq!(switched[1]["handover"], "pane_tail");
+    }
+
+    /// A task that was to move on finds every model after its own
+    /// exhausted: it waits, until the earliest reset of them, with
+    /// `all_exhausted`; at that time it starts on the first free one.
+    #[tokio::test]
+    async fn a_task_with_every_fallback_exhausted_waits_for_the_earliest_reset() {
+        let (d, _tmp) = limits_daemon(true).await;
+        let mut events = d.subscribe();
+        let IpcResponse::Task(t) = d
+            .handle(run_fallback(Some("opus"), Some(&["sonnet"]), Some("pi")))
+            .await
+        else {
+            panic!()
+        };
+        // The whole account is out, as the actor left it: to move on now.
+        d.fleet().record_limit(&seen_limit(&d, "pi", None)).unwrap();
+        let mut t = d.store.get_task(t.id).unwrap().unwrap();
+        t.state = TaskState::Waiting;
+        t.pane_id = None;
+        t.waiting_until = Some(chrono::Utc::now());
+        t.spec.rounds.stop = Some(Box::new(crate::task::LimitStop {
+            agent: t.spec.agent.clone(),
+            model: Some("opus".into()),
+            why: "limit".into(),
+            line: "You've hit your session limit".into(),
+            until: chrono::Utc::now() + chrono::Duration::hours(1),
+            tail: String::new(),
+            then: crate::task::NextRound::Switch,
+            waited: None,
+            handover: None,
+        }));
+        d.store.update_task(&mut t).unwrap();
+        d.fleet().dispatch_queued().await;
+        let back = d.store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(back.state, TaskState::Waiting);
+        let limit = d.store.limits().unwrap()[0].retry_at;
+        assert_eq!(back.waiting_until, Some(limit));
+        assert_eq!(
+            back.spec.rounds.stop.as_ref().map(|s| s.then),
+            Some(crate::task::NextRound::First)
+        );
+        let waiting = std::iter::from_fn(|| events.try_recv().ok())
+            .find(|e| e.kind == "task.waiting")
+            .and_then(|e| e.detail)
+            .unwrap();
+        assert_eq!(waiting["why"], "all_exhausted");
+        assert_eq!(waiting["until"], serde_json::json!(limit));
+        assert_eq!(waiting["models"][0]["account"], "me");
+    }
+
+    /// Task on pi that moved from opus to sonnet, the last model of its
+    /// list, and stopped there on a limit: to move on now, with `limits`
+    /// (each a model and the minutes to its reset) in the table.
+    async fn limited_on_the_last_model(d: &Daemon, limits: &[(&str, i64)]) -> Task {
+        let IpcResponse::Task(t) = d
+            .handle(run_fallback(Some("opus"), Some(&["sonnet"]), Some("pi")))
+            .await
+        else {
+            panic!()
+        };
+        let now = chrono::Utc::now();
+        for (model, mins) in limits {
+            let mut row = seen_limit(d, "pi", Some(model));
+            row.retry_at = now + chrono::Duration::minutes(*mins);
+            row.until = Some(row.retry_at);
+            d.fleet().record_limit(&row).unwrap();
+        }
+        let mut t = d.store.get_task(t.id).unwrap().unwrap();
+        t.state = TaskState::Waiting;
+        t.pane_id = None;
+        t.waiting_until = Some(now);
+        t.spec.agent_source.as_mut().unwrap().model = Some("sonnet".into());
+        t.spec.rounds.ended.push(crate::task::AgentRound {
+            agent: t.spec.agent.clone(),
+            model: Some("opus".into()),
+            ended: "limit: Opus weekly limit reached".into(),
+        });
+        t.spec.rounds.stop = Some(Box::new(crate::task::LimitStop {
+            agent: t.spec.agent.clone(),
+            model: Some("sonnet".into()),
+            why: "limit".into(),
+            line: "You've hit your session limit".into(),
+            until: now + chrono::Duration::hours(1),
+            tail: String::new(),
+            then: crate::task::NextRound::Switch,
+            waited: None,
+            handover: None,
+        }));
+        d.store.update_task(&mut t).unwrap();
+        t
+    }
+
+    /// A task on the last model of its list has no model after its own,
+    /// but the ones before it are still its models: it waits with
+    /// `all_exhausted` until the earliest reset among all of them, here
+    /// opus's, which comes before sonnet's.
+    #[tokio::test]
+    async fn a_task_on_its_last_model_waits_for_the_earliest_reset_of_its_list() {
+        let (d, _tmp) = limits_daemon(true).await;
+        let mut events = d.subscribe();
+        let t = limited_on_the_last_model(&d, &[("opus", 20), ("sonnet", 60)]).await;
+        d.fleet().dispatch_queued().await;
+        let back = d.store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(back.state, TaskState::Waiting);
+        let opus = d
+            .store
+            .limits()
+            .unwrap()
+            .into_iter()
+            .find(|l| l.model.as_deref() == Some("opus"))
+            .unwrap()
+            .retry_at;
+        assert_eq!(back.waiting_until, Some(opus));
+        let waiting = std::iter::from_fn(|| events.try_recv().ok())
+            .find(|e| e.kind == "task.waiting")
+            .and_then(|e| e.detail)
+            .unwrap();
+        assert_eq!(waiting["why"], "all_exhausted");
+        assert_eq!(waiting["until"], serde_json::json!(opus));
+        let mut models: Vec<_> = waiting["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["model"].as_str().unwrap().to_string())
+            .collect();
+        models.sort();
+        assert_eq!(models, vec!["opus", "sonnet"]);
+    }
+
+    /// A task on the last model of its list whose first model is free
+    /// again goes on under it at once instead of waiting for nothing.
+    #[tokio::test]
+    async fn a_task_on_its_last_model_goes_back_to_a_free_earlier_one() {
+        let (d, _tmp) = limits_daemon(true).await;
+        let t = limited_on_the_last_model(&d, &[("sonnet", 60)]).await;
+        d.fleet().dispatch_queued().await;
+        let back = d.store.get_task(t.id).unwrap().unwrap();
+        assert_ne!(back.state, TaskState::Waiting, "{:?}", back.error);
+        assert_eq!(back.model(), Some("opus"));
+    }
+
+    /// A task whose list has no other model its machine can run (pi has
+    /// no codex agent for gpt) waits on its own model, as a task with no
+    /// list does: `no_fallback`, with its account and model, until its
+    /// own reset, and it resumes on that model.
+    #[tokio::test]
+    async fn a_task_with_no_fallback_its_machine_runs_waits_on_its_own_model() {
+        let (d, _tmp) = limits_daemon(true).await;
+        let mut events = d.subscribe();
+        let IpcResponse::Task(t) = d
+            .handle(run_fallback(Some("opus"), Some(&["sonnet"]), Some("pi")))
+            .await
+        else {
+            panic!()
+        };
+        let now = chrono::Utc::now();
+        let mut row = seen_limit(&d, "pi", Some("opus"));
+        row.retry_at = now + chrono::Duration::minutes(40);
+        row.until = Some(row.retry_at);
+        d.fleet().record_limit(&row).unwrap();
+        let mut t = d.store.get_task(t.id).unwrap().unwrap();
+        t.state = TaskState::Waiting;
+        t.pane_id = None;
+        t.waiting_until = Some(now);
+        t.spec.agent_source.as_mut().unwrap().fallback = vec!["gpt".into()];
+        t.spec.rounds.stop = Some(Box::new(crate::task::LimitStop {
+            agent: t.spec.agent.clone(),
+            model: Some("opus".into()),
+            why: "limit".into(),
+            line: "You've hit your session limit".into(),
+            until: now + chrono::Duration::hours(1),
+            tail: String::new(),
+            then: crate::task::NextRound::Switch,
+            waited: None,
+            handover: None,
+        }));
+        d.store.update_task(&mut t).unwrap();
+        d.fleet().dispatch_queued().await;
+        let back = d.store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(back.state, TaskState::Waiting);
+        let opus = d.store.limits().unwrap()[0].retry_at;
+        assert_eq!(back.waiting_until, Some(opus));
+        assert_eq!(back.model(), Some("opus"));
+        assert_eq!(
+            back.spec.rounds.stop.as_ref().map(|s| s.then),
+            Some(crate::task::NextRound::Own)
+        );
+        let waiting = std::iter::from_fn(|| events.try_recv().ok())
+            .find(|e| e.kind == "task.waiting")
+            .and_then(|e| e.detail)
+            .unwrap();
+        assert_eq!(waiting["why"], "no_fallback");
+        assert_eq!(waiting["account"], "me");
+        assert_eq!(waiting["model"], "opus");
+        assert_eq!(waiting["until"], serde_json::json!(opus));
+        assert!(waiting.get("models").is_none(), "{waiting}");
+    }
+
+    /// Tasks on pi that wait for a limit, each until `in_mins` from now,
+    /// as `wait_on_limit` leaves them. The limit that kept them queued is
+    /// then taken out of the table behind the fleet's back, as though it
+    /// never reached it: only their own time holds them.
+    async fn waiting_on_pi(d: &Daemon, in_mins: &[i64]) -> Vec<Task> {
+        d.fleet().record_limit(&seen_limit(d, "pi", None)).unwrap();
+        let now = chrono::Utc::now();
+        let mut waiting = Vec::new();
+        for mins in in_mins {
+            let IpcResponse::Task(t) = d
+                .handle(run_fallback(Some("sonnet"), Some(&[]), Some("pi")))
+                .await
+            else {
+                panic!()
+            };
+            let mut t = d.store.claim_task(t.id, "pi").unwrap().unwrap();
+            t.state = TaskState::Waiting;
+            t.error = Some("me exhausted (session limit, seen by t-9)".into());
+            t.spec.session_id = crate::task::new_session_id();
+            t.waiting_until = Some(now + chrono::Duration::minutes(*mins));
+            d.store.update_task(&mut t).unwrap();
+            waiting.push(t);
+        }
+        d.store.clear_limits("me", None).unwrap();
+        d.fleet().limits_changed();
+        waiting
+    }
+
+    /// A waiting task whose limit never reached the table (or was read
+    /// before it did) still waits for its own `waiting_until`: no live
+    /// limit is not enough to resume it early.
+    #[tokio::test]
+    async fn a_waiting_task_waits_for_its_time_with_no_limit_in_the_table() {
+        let (d, _tmp) = limits_daemon(true).await;
+        let t = waiting_on_pi(&d, &[60]).await.remove(0);
+        d.fleet().dispatch_queued().await;
+        let get = |id: i64| d.store.get_task(id).unwrap().unwrap();
+        assert_eq!(get(t.id).state, TaskState::Waiting);
+    }
+
+    /// A waiting task goes on by itself once its reset passes: the pass
+    /// drops the row (`agent.reset`, `by: time`) and resumes it on its
+    /// machine with its session.
+    #[tokio::test]
+    async fn a_waiting_task_goes_on_at_its_reset() {
+        let (d, _tmp) = limits_daemon(true).await;
+        let mut events = d.subscribe();
+        let t = waiting_on_pi(&d, &[-1]).await.remove(0);
+        let mut row = seen_limit(&d, "pi", None);
+        row.retry_at = t.waiting_until.unwrap();
+        row.until = Some(row.retry_at);
+        d.store.record_limit(&row).unwrap();
+        d.fleet().limits_changed();
+
+        d.fleet().dispatch_queued().await;
+        let back = d.store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(back.state, TaskState::Running, "{:?}", back.error);
+        assert_eq!(back.machine.as_deref(), Some("pi"));
+        assert_eq!(back.spec.session_id, t.spec.session_id);
+        assert!(d.store.limits().unwrap().is_empty());
+        let mut by_time = false;
+        while let Ok(e) = events.try_recv() {
+            by_time |=
+                e.kind == "agent.reset" && e.detail.as_ref().is_some_and(|d| d["by"] == "time");
+        }
+        assert!(by_time, "the reset is said");
+    }
+
+    /// Two tasks wait on pi, which has room for one: the soonest reset
+    /// goes on, whatever the order they were made in, and the other keeps
+    /// waiting for the slot.
+    #[tokio::test]
+    async fn waiting_tasks_on_a_full_machine_go_on_soonest_first() {
+        let (d, _tmp) = limits_daemon(true).await;
+        let w = waiting_on_pi(&d, &[-1, -2]).await;
+        let (later, sooner) = (&w[0], &w[1]);
+        d.fleet().dispatch_queued().await;
+        let get = |id: i64| d.store.get_task(id).unwrap().unwrap();
+        assert_eq!(get(sooner.id).state, TaskState::Running);
+        assert_eq!(get(later.id).state, TaskState::Waiting);
+    }
+
+    /// With no account, a limit holds only for the machine it was seen on:
+    /// two machines give two rows, and a task still starts on a third.
+    #[tokio::test]
+    async fn an_agent_with_no_account_keeps_a_limit_per_machine() {
+        let (d, _tmp) = limits_daemon(false).await;
+        d.fleet().record_limit(&seen_limit(&d, "pi", None)).unwrap();
+        let IpcResponse::Task(t) = d
+            .handle(run_fallback(Some("sonnet"), Some(&[]), None))
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(t.machine.as_deref(), Some("pi-2"), "{:?}", t.error);
+        d.fleet()
+            .record_limit(&seen_limit(&d, "pi-2", None))
+            .unwrap();
+        let keys: Vec<String> = d
+            .store
+            .limits()
+            .unwrap()
+            .into_iter()
+            .map(|l| l.account)
+            .collect();
+        assert_eq!(keys, ["pi-2/claude-personal", "pi/claude-personal"]);
+    }
+
+    /// Every model of the account exhausted: the task starts on the first
+    /// free model of its fallback list, and describe says which and why.
+    #[tokio::test]
+    async fn a_task_starts_on_its_first_free_fallback() {
+        let (d, _tmp) = limits_daemon(true).await;
+        d.fleet().record_limit(&seen_limit(&d, "pi", None)).unwrap();
+        let IpcResponse::Task(t) = d
+            .handle(run_fallback(Some("sonnet"), Some(&["opus", "gpt"]), None))
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (t.machine.as_deref(), t.spec.agent.as_str(), t.model()),
+            (Some("desk"), "codex", Some("gpt")),
+            "{:?}",
+            t.error
+        );
+        assert_eq!(t.error, None);
+        assert_eq!(t.fallback(), ["opus", "gpt"]);
+        let used = t
+            .spec
+            .agent_source
+            .as_ref()
+            .unwrap()
+            .fallback_use
+            .clone()
+            .unwrap();
+        assert_eq!((used.pos, used.of), (2, 2));
+        let text = crate::cli::task_detail(&t);
+        assert!(
+            text.contains("model:      gpt (fallback 2 of 2; me exhausted until "),
+            "{text}"
+        );
+        assert_eq!(used.why.matches("me exhausted").count(), 1, "{}", used.why);
+    }
+
+    /// A limit that is one model's stops only that model: the task goes on
+    /// under the next one, on the same account and machine.
+    #[tokio::test]
+    async fn a_model_scoped_limit_stops_only_that_model() {
+        let (d, _tmp) = limits_daemon(true).await;
+        d.fleet()
+            .record_limit(&seen_limit(&d, "pi", Some("sonnet")))
+            .unwrap();
+        let IpcResponse::Task(t) = d
+            .handle(run_fallback(Some("sonnet"), Some(&["opus"]), None))
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (t.spec.agent.as_str(), t.model()),
+            ("claude-personal", Some("opus"))
+        );
+        assert_eq!(t.spec.agent_args[..2], ["--model", "claude-opus-5-5"]);
+        let IpcResponse::Task(t) = d.handle(run_fallback(Some("opus"), Some(&[]), None)).await
+        else {
+            panic!()
+        };
+        assert_eq!(t.model(), Some("opus"), "opus is free");
+        assert!(t.machine.is_some(), "{:?}", t.error);
+    }
+
+    /// Clearing the account lets the task it held start on the next pass,
+    /// with `agent.reset` by hand; a row past its retry goes on its own,
+    /// with `agent.reset` by time.
+    #[tokio::test]
+    async fn a_cleared_or_expired_limit_lets_the_task_start() {
+        let (d, _tmp) = limits_daemon(true).await;
+        d.fleet().record_limit(&seen_limit(&d, "pi", None)).unwrap();
+        let IpcResponse::Task(t) = d
+            .handle(run_fallback(Some("sonnet"), Some(&[]), None))
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(t.state, TaskState::Queued);
+        let mut events = d.subscribe();
+        assert_eq!(d.fleet().clear_limits("me", None).unwrap().len(), 1);
+        let ev = events.recv().await.unwrap();
+        assert_eq!(ev.kind, "agent.reset");
+        assert_eq!(ev.detail.as_ref().unwrap()["by"], "hand");
+        d.fleet().dispatch_queued().await;
+        let t = d.store.get_task(t.id).unwrap().unwrap();
+        assert_ne!(t.state, TaskState::Queued);
+        assert_eq!(t.error, None);
+
+        let mut past = seen_limit(&d, "pi", None);
+        past.retry_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        d.store.record_limit(&past).unwrap();
+        d.fleet().dispatch_queued().await;
+        assert!(d.store.limits().unwrap().is_empty());
+        let ev = loop {
+            let ev = events.recv().await.unwrap();
+            if ev.kind == "agent.reset" {
+                break ev;
+            }
+        };
+        assert_eq!(ev.detail.as_ref().unwrap()["by"], "time");
+    }
+
+    /// A fallback name `[models]` lacks is refused by `task run`, and by a
+    /// retry once it is dropped from `[models]`.
+    #[tokio::test]
+    async fn an_unknown_fallback_is_refused_on_run_and_retry() {
+        let (d, _tmp) = fallback_daemon().await;
+        let resp = d
+            .handle(run_fallback(None, Some(&["sonnet", "haiku"]), Some("bare")))
+            .await;
+        match resp {
+            IpcResponse::Error { code, message } => {
+                assert_eq!(code, "unknown_model", "{message}");
+                assert!(message.contains("model haiku"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let IpcResponse::Task(mut t) = d
+            .handle(run_fallback(None, Some(&["opus"]), Some("bare")))
+            .await
+        else {
+            panic!()
+        };
+        t.state = TaskState::Failed;
+        t.finished_at = Some(chrono::Utc::now());
+        d.store.update_task(&mut t).unwrap();
+        let mut config = models_config();
+        config.models.0.remove("opus");
+        d.fleet().set_config(&config);
+        let retry = IpcRequest::TaskRetry {
+            id: t.id,
+            place: None,
+        };
+        assert_eq!(error_code(d.handle(retry.clone()).await), "unknown_model");
+        d.fleet().set_config(&models_config());
+        let IpcResponse::Task(copy) = d.handle(retry).await else {
+            panic!()
+        };
+        assert_eq!(copy.fallback(), ["opus"]);
+    }
+
+    /// A job's fallback renders per item: an item with none leaves the
+    /// task no list although its flock has one, and a name `[models]`
+    /// lacks refuses the item.
+    #[tokio::test]
+    async fn a_jobs_fallback_renders_per_item_and_is_checked() {
+        let (d, _tmp) = fallback_daemon().await;
+        let text = "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nmachine = \"bare\"\nfallback = [\"{{ item.fallback }}\"]\nprompt = \"p\"\n";
+        let job = crate::config::job::Job::parse(
+            text,
+            "j",
+            &models_config().defaults,
+            &crate::connector::Builtins,
+        )
+        .unwrap();
+        let queue = |item: serde_json::Value| {
+            let job = &job;
+            let d = &d;
+            async move {
+                d.fleet()
+                    .queue_job_task(job, &item, |_| Ok(("p".into(), job.spec.clone())))
+                    .await
+            }
+        };
+        let t = queue(serde_json::json!({"key": "k1"})).await.unwrap();
+        assert!(t.fallback().is_empty());
+        assert_eq!(
+            t.spec
+                .agent_source
+                .as_ref()
+                .unwrap()
+                .fallback_from
+                .as_deref(),
+            Some("job j")
+        );
+        let t = queue(serde_json::json!({"key": "k2", "fallback": "gpt"}))
+            .await
+            .unwrap();
+        assert_eq!(t.fallback(), ["gpt"]);
+        let err = queue(serde_json::json!({"key": "k3", "fallback": "haiku"}))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("model haiku is not in [models]"),
+            "{err:#}"
+        );
+    }
+
     /// `models_config` with `[profiles.ci]`, develop plus make.
     fn profiles_config() -> PastorConfig {
         let mut c = models_config();
@@ -6402,6 +8425,7 @@ mod tests {
     fn run_profile(profile: Option<&str>, machine: Option<&str>) -> IpcRequest {
         let IpcRequest::Run {
             preempt: false,
+            now: false,
             summary: _,
             prompt,
             spec,
@@ -6415,6 +8439,7 @@ mod tests {
             unreachable!()
         };
         IpcRequest::Run {
+            now: false,
             preempt: false,
             summary: None,
             prompt,
@@ -6475,6 +8500,178 @@ mod tests {
         assert!(t.spec.allow.is_empty());
     }
 
+    /// A profiled Codex task runs with no approval prompts in its
+    /// workspace-write sandbox, not refused for its lists, which it keeps
+    /// and `task describe` marks as not applied.
+    #[tokio::test]
+    async fn a_codex_task_runs_under_a_profile_in_its_sandbox() {
+        let fake = FakeHerdr::new();
+        let (d, _tmp) = profiles_daemon(vec![machine("pi", 2)], &[("pi", 2, fake.clone())]).await;
+        let IpcRequest::Run {
+            agent: Some(choice),
+            ..
+        } = run_profile(Some("ci"), None)
+        else {
+            unreachable!()
+        };
+        let IpcRequest::Run {
+            now,
+            preempt,
+            summary,
+            prompt,
+            spec,
+            flock,
+            priority,
+            role,
+            description,
+            ..
+        } = run_profile(Some("ci"), None)
+        else {
+            unreachable!()
+        };
+        let run = IpcRequest::Run {
+            now,
+            preempt,
+            summary,
+            prompt,
+            spec,
+            flock,
+            priority,
+            role,
+            description,
+            agent: Some(AgentChoice {
+                agent: Some("codex".into()),
+                ..choice
+            }),
+        };
+        let resp = d.handle(run).await;
+        let IpcResponse::Task(t) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(t.spec.agent, "codex");
+        assert!(t.spec.deny.contains(&"Bash(sudo:*)".to_string()));
+        let why = t
+            .spec
+            .agent_source
+            .as_ref()
+            .unwrap()
+            .lists_unapplied
+            .clone();
+        assert!(
+            why.as_deref().unwrap().contains("workspace-write"),
+            "{why:?}"
+        );
+        let reqs = fake.requests();
+        let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
+        let args: Vec<&str> = start.params["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        assert!(
+            args.ends_with(&[
+                "--ask-for-approval",
+                "never",
+                "--sandbox",
+                "workspace-write"
+            ]),
+            "{args:?}"
+        );
+        let text = crate::cli::task_detail(&t);
+        assert!(
+            text.contains("(not applied: codex has no per-command"),
+            "{text}"
+        );
+    }
+
+    /// A profiled agy task is refused before it starts while its agent has
+    /// no flags and no `own_permissions`, the message naming the field; with
+    /// the field it starts with no permission flag or mode added, and `task
+    /// describe` says its own settings hold, not the profile's lists.
+    #[tokio::test]
+    async fn an_agy_task_under_a_profile_needs_its_own_permissions() {
+        let run_agy = || {
+            let IpcRequest::Run {
+                now,
+                preempt,
+                summary,
+                prompt,
+                spec,
+                flock,
+                priority,
+                role,
+                description,
+                agent: Some(choice),
+            } = run_profile(Some("develop"), None)
+            else {
+                unreachable!()
+            };
+            IpcRequest::Run {
+                now,
+                preempt,
+                summary,
+                prompt,
+                spec,
+                flock,
+                priority,
+                role,
+                description,
+                agent: Some(AgentChoice {
+                    agent: Some("agy".into()),
+                    ..choice
+                }),
+            }
+        };
+        let fake = FakeHerdr::new();
+        let (d, _tmp) = profiles_daemon(vec![machine("pi", 2)], &[("pi", 2, fake.clone())]).await;
+        let resp = d.handle(run_agy()).await;
+        let IpcResponse::Error { code, message } = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(code, "agent_tools_unsupported");
+        assert!(message.contains("own_permissions"), "{message}");
+        assert!(
+            !fake.requests().iter().any(|r| r.method == "agent.start"),
+            "{:?}",
+            fake.requests()
+        );
+
+        let mut config = profiles_config();
+        config.agents.0.insert(
+            "agy".into(),
+            crate::config::AgentDef {
+                own_permissions: true,
+                ..Default::default()
+            },
+        );
+        apply_config(&d, &config).await;
+        let resp = d.handle(run_agy()).await;
+        let IpcResponse::Task(t) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(t.profile(), Some("develop"));
+        assert!(!t.spec.deny.is_empty());
+        let reqs = fake.requests();
+        let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
+        assert_eq!(start.params["kind"], "agy", "{:?}", start.params);
+        let args: Vec<&str> = start.params["args"]
+            .as_array()
+            .map(|a| a.iter().map(|a| a.as_str().unwrap()).collect())
+            .unwrap_or_default();
+        assert_eq!(args, t.spec.agent_args, "{args:?}");
+        for d in &t.spec.deny {
+            assert!(!args.contains(&d.as_str()), "{args:?}");
+        }
+        let text = crate::cli::task_detail(&t);
+        assert!(
+            text.contains(
+                "(not applied: agent agy's permissions are in its own settings on the machine)"
+            ),
+            "{text}"
+        );
+    }
+
     /// A machine's profile reaches its tasks, before its flock's; a name
     /// that is no profile is refused, and so are agent args that pick a
     /// permission mode while a profile applies.
@@ -6501,6 +8698,7 @@ mod tests {
         );
         let IpcRequest::Run {
             preempt: false,
+            now: false,
             summary: _,
             prompt,
             spec,
@@ -6514,6 +8712,7 @@ mod tests {
             unreachable!()
         };
         let conflict = IpcRequest::Run {
+            now: false,
             preempt: false,
             summary: None,
             prompt,
@@ -6648,6 +8847,7 @@ mod tests {
         // Occupy pi's one slot so the new task must wait.
         let IpcResponse::Task(busy) = d
             .handle(IpcRequest::Run {
+                now: false,
                 preempt: false,
                 summary: None,
                 prompt: "busy".into(),
@@ -6848,6 +9048,7 @@ mod tests {
         )
         .await;
         let run = || IpcRequest::Run {
+            now: false,
             preempt: false,
             summary: None,
             role: Default::default(),
@@ -7605,6 +9806,7 @@ mod tests {
         assert!(diff.is_empty(), "{diff:?}");
         let resp = d
             .handle(IpcRequest::Run {
+                now: false,
                 preempt: false,
                 summary: None,
                 role: Default::default(),
@@ -7633,6 +9835,7 @@ mod tests {
         let (d, _tmp, _unwedge) = daemon_with_b_shutting_down(false).await;
         let resp = d
             .handle(IpcRequest::Run {
+                now: false,
                 preempt: false,
                 summary: None,
                 role: Default::default(),
@@ -7709,6 +9912,7 @@ mod tests {
         let resp = crate::ipc::request(
             &socket,
             &IpcRequest::Run {
+                now: false,
                 preempt: false,
                 summary: None,
                 role: Default::default(),
@@ -7719,6 +9923,7 @@ mod tests {
                 agent: None,
                 priority: None,
             },
+            &crate::ipc::Caller::default(),
         )
         .await
         .unwrap();
@@ -7767,6 +9972,7 @@ mod tests {
 
     fn run_hi_as(role: TaskRole) -> IpcRequest {
         IpcRequest::Run {
+            now: false,
             preempt: false,
             summary: None,
             role,
@@ -7970,6 +10176,68 @@ mod tests {
             ))
             .await;
         assert_eq!(job_task(from_job), SummaryMode::Require);
+    }
+
+    /// A task's `keep_pane` comes from `task run --keep-pane`, else its
+    /// job's, else its flock's, else `[defaults]` (unset here: no layer),
+    /// and is stored on the task with where it came from.
+    #[tokio::test]
+    async fn keep_pane_is_settled_when_a_task_is_queued() {
+        let mut flock = home_and_work();
+        flock.flocks.push(crate::config::flock::FlockEntry {
+            name: "kept".into(),
+            keep_pane: Some(true),
+            ..Default::default()
+        });
+        let (d, _tmp) = daemon_with_flock(
+            flock,
+            &[("h", 2, FakeHerdr::new()), ("w", 2, FakeHerdr::new())],
+        )
+        .await;
+        let settled = |resp: IpcResponse| match resp {
+            IpcResponse::Task(t) => (t.spec.keep_pane, t.spec.keep_pane_from),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(settled(d.handle(run_in(None, None)).await), (None, None));
+        assert_eq!(
+            settled(d.handle(run_in(Some("kept"), None)).await),
+            (Some(true), Some("flock kept".into()))
+        );
+        let mut asked = run_in(None, None);
+        if let IpcRequest::Run { spec, .. } = &mut asked {
+            spec.keep_pane = Some(true);
+        }
+        assert_eq!(
+            settled(d.handle(asked).await),
+            (Some(true), Some("task run".into()))
+        );
+        let submit = |job: &str, dispatch: serde_json::Value| IpcRequest::JobSubmit {
+            job: job.into(),
+            dispatch,
+            prompt: "p".into(),
+            items: vec![serde_json::json!({"key": "k"})],
+        };
+        let job_task = |resp: IpcResponse| match resp {
+            IpcResponse::JobSubmitted { tasks, .. } => (
+                tasks[0].spec.keep_pane,
+                tasks[0].spec.keep_pane_from.clone(),
+            ),
+            other => panic!("{other:?}"),
+        };
+        let from_flock = d
+            .handle(submit("j1", serde_json::json!({"flock": "kept"})))
+            .await;
+        assert_eq!(
+            job_task(from_flock),
+            (Some(true), Some("flock kept".into()))
+        );
+        let from_job = d
+            .handle(submit(
+                "j2",
+                serde_json::json!({"flock": "kept", "keep_pane": false}),
+            ))
+            .await;
+        assert_eq!(job_task(from_job), (Some(false), Some("job j2".into())));
     }
 
     /// A task with no pane has nothing to end.
@@ -8303,6 +10571,7 @@ mod tests {
                     agent: None,
                     agent_args: None,
                     model: None,
+                    fallback: None,
                     priority: None,
                     agents: Default::default(),
                     profile: None,
@@ -9042,9 +11311,14 @@ mod tests {
         let (d, tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
         let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
         std::fs::create_dir_all(paths.jobs_dir()).unwrap();
+        // Disabled, so only the ticks below run it. Enabled, a new interval
+        // job is due at once and the scheduler's own pass may run it first;
+        // the clock item is keyed by the second, so a pass in the same second
+        // leaves the dry run nothing new to create. A forced tick and
+        // `JobRun` ignore `enabled`.
         std::fs::write(
             paths.jobs_dir().join("clock.toml"),
-            "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"tick {{ item.key }} {{ task.id }}\"\n",
+            "every = \"1h\"\nenabled = false\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"tick {{ item.key }} {{ task.id }}\"\n",
         )
         .unwrap();
         let IpcResponse::Jobs(jobs) = d.handle(IpcRequest::Reload).await else {
@@ -9207,6 +11481,7 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, fake.clone())]).await;
         let IpcResponse::Task(t) = d
             .handle(IpcRequest::Run {
+                now: false,
                 preempt: false,
                 summary: None,
                 role: Default::default(),
@@ -9345,6 +11620,7 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, fake.clone())]).await;
         let IpcResponse::Task(t) = d
             .handle(IpcRequest::Run {
+                now: false,
                 preempt: false,
                 summary: None,
                 role: Default::default(),
@@ -9381,6 +11657,7 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, fake.clone())]).await;
         let IpcResponse::Task(t) = d
             .handle(IpcRequest::Run {
+                now: false,
                 preempt: false,
                 summary: None,
                 role: Default::default(),
@@ -9750,6 +12027,7 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
         let resp = d
             .handle(IpcRequest::Run {
+                now: false,
                 preempt: false,
                 summary: None,
                 role: Default::default(),
@@ -9792,6 +12070,7 @@ mod tests {
 
         fn run(prompt: &str, spec: DispatchSpec, priority: Priority, preempt: bool) -> IpcRequest {
             IpcRequest::Run {
+                now: false,
                 prompt: prompt.into(),
                 spec,
                 flock: None,
@@ -10244,6 +12523,200 @@ mod tests {
             let left = fake.worktree_list("/srv/app").await.unwrap();
             assert!(!left.iter().any(|w| w.path == checkout.path), "{left:?}");
         }
+
+        /// A low task paused for a critical one, then turned `waiting` as
+        /// `wait_on_limit` would leave it: its pane closed the same way,
+        /// its checkout kept, due in an hour. The critical task is closed,
+        /// so the slot is free and only the wait holds it.
+        async fn waiting_low(d: &Daemon, spec: DispatchSpec) -> Task {
+            let low = start(d, run("low", spec, Priority::Low, false)).await;
+            let crit = start(d, run("crit", super::spec(), Priority::Critical, true)).await;
+            let mut t = get(d, low.id);
+            assert_eq!(t.state, TaskState::Paused);
+            t.state = TaskState::Waiting;
+            t.waiting_until = Some(chrono::Utc::now() + chrono::Duration::hours(1));
+            d.store.update_task(&mut t).unwrap();
+            d.handle(IpcRequest::TaskClose {
+                id: crit.id,
+                remove_worktree: false,
+            })
+            .await;
+            t
+        }
+
+        /// A waiting task has no agent: `send` has nothing to type into,
+        /// and `close` closes its row, with nothing asked of the machine.
+        #[tokio::test]
+        async fn send_and_close_on_a_waiting_task() {
+            let fake = FakeHerdr::new();
+            let (d, _tmp) = daemon(&[("a", 1, fake.clone())]).await;
+            let t = waiting_low(&d, spec()).await;
+            let resp = d
+                .handle(IpcRequest::TaskSend {
+                    id: t.id,
+                    input: SendInput {
+                        text: Some("hi".into()),
+                        enter: true,
+                        ..Default::default()
+                    },
+                })
+                .await;
+            assert_eq!(error_code(resp), "task_not_live");
+            let before = fake.requests().len();
+            let IpcResponse::Task(closed) = d
+                .handle(IpcRequest::TaskClose {
+                    id: t.id,
+                    remove_worktree: false,
+                })
+                .await
+            else {
+                panic!()
+            };
+            assert_eq!(closed.state, TaskState::Closed);
+            assert_eq!(fake.requests().len(), before, "the row alone");
+            assert!(d.store.waiting_tasks().unwrap().is_empty());
+        }
+
+        /// `close --remove-worktree` on a waiting task removes its kept
+        /// checkout, as for a paused one.
+        #[tokio::test]
+        async fn close_remove_worktree_on_a_waiting_task_removes_its_checkout() {
+            let fake = FakeHerdr::new();
+            let (d, _tmp) = daemon(&[("a", 1, fake.clone())]).await;
+            let t = waiting_low(&d, wt()).await;
+            let checkout = t.spec.checkout.clone().unwrap();
+            let IpcResponse::Task(closed) = d
+                .handle(IpcRequest::TaskClose {
+                    id: t.id,
+                    remove_worktree: true,
+                })
+                .await
+            else {
+                panic!()
+            };
+            assert_eq!(closed.state, TaskState::Closed);
+            let left = fake.worktree_list("/srv/app").await.unwrap();
+            assert!(!left.iter().any(|w| w.path == checkout.path), "{left:?}");
+        }
+    }
+
+    /// Each dispatch pass first ages the queue: a task that waited its
+    /// flock's `age_after` goes up a level, and one in a flock that never
+    /// ages keeps its own.
+    #[tokio::test]
+    async fn a_dispatch_pass_ages_the_queue_by_flock() {
+        use crate::config::flock::FlockEntry;
+        let flock = Flock {
+            flocks: vec![
+                FlockEntry {
+                    name: "work".into(),
+                    default: true,
+                    age_after: Some("5m".into()),
+                    ..Default::default()
+                },
+                FlockEntry {
+                    name: "still".into(),
+                    age_after: Some("never".into()),
+                    ..Default::default()
+                },
+            ],
+            machines: vec![],
+        };
+        let (d, _tmp) = daemon_with_flock(flock, &[]).await;
+        let store = d.store();
+        let at = |flock: &str| {
+            store
+                .insert_task_at(
+                    NewTask {
+                        description: None,
+                        job: "run".into(),
+                        item: serde_json::Value::Null,
+                        prompt: "p".into(),
+                        spec: spec(),
+                        flock: flock.into(),
+                    },
+                    Priority::Low,
+                    Some("task run"),
+                    crate::task::TaskRole::Agent,
+                )
+                .unwrap()
+        };
+        let work = at("work");
+        let still = at("still");
+        let fresh = at("work");
+        let ago = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+        store.execute_raw(&format!(
+            "UPDATE tasks SET created_at = '{ago}' WHERE id IN ({}, {})",
+            work.id, still.id
+        ));
+        d.fleet().dispatch_queued().await;
+        let level = |id| {
+            let t = store.get_task(id).unwrap().unwrap();
+            (t.priority, t.aged_from)
+        };
+        assert_eq!(level(work.id), (Priority::Normal, Some(Priority::Low)));
+        assert_eq!(level(still.id), (Priority::Low, None));
+        assert_eq!(level(fresh.id), (Priority::Low, None));
+    }
+
+    /// A task a pass placed keeps its `queued` row while its machine's
+    /// actor works through what came before it (`in_flight`). It has left
+    /// the queue, so a later pass must not age it: the level it runs at,
+    /// and a retry keeps, is the one it was placed at, even when the
+    /// placement is held across an ageing deadline.
+    #[tokio::test]
+    async fn a_placement_held_across_an_ageing_deadline_keeps_its_level() {
+        use crate::config::flock::FlockEntry;
+        let flock = Flock {
+            flocks: vec![FlockEntry {
+                name: "work".into(),
+                default: true,
+                age_after: Some("5m".into()),
+                ..Default::default()
+            }],
+            machines: vec![],
+        };
+        let (d, _tmp) = daemon_with_flock(flock, &[]).await;
+        let store = d.store();
+        let fleet = d.fleet();
+        let t = store
+            .insert_task_at(
+                NewTask {
+                    description: None,
+                    job: "run".into(),
+                    item: serde_json::Value::Null,
+                    prompt: "p".into(),
+                    spec: spec(),
+                    flock: "work".into(),
+                },
+                Priority::Low,
+                Some("task run"),
+                crate::task::TaskRole::Agent,
+            )
+            .unwrap();
+        fleet.in_flight.placed.lock().unwrap().push(Placed {
+            task_id: t.id,
+            machine: "nowhere".into(),
+            flock: t.flock.clone(),
+            from_job: false,
+        });
+        let held = Reservation {
+            in_flight: fleet.in_flight.clone(),
+            task_id: t.id,
+        };
+        // The deadline passes while the placement is held.
+        let ago = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+        store.execute_raw(&format!(
+            "UPDATE tasks SET created_at = '{ago}' WHERE id = {}",
+            t.id
+        ));
+        fleet.dispatch_queued().await;
+        let got = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(
+            (got.priority, got.aged_from, got.aged_at),
+            (Priority::Low, None, None)
+        );
+        drop(held);
     }
 
     /// A queued task pinned to `machine`, straight into the store.
@@ -10261,6 +12734,176 @@ mod tests {
                 flock: "default".into(),
             })
             .unwrap()
+    }
+
+    /// A queued `--now` task pinned to `machine`, straight into the store,
+    /// as the head would have set `DispatchSpec::now` from `Run::now`.
+    fn queue_now_on(store: &Store, prompt: &str, machine: &str) -> Task {
+        store
+            .insert_task(NewTask {
+                description: None,
+                job: "run".into(),
+                item: serde_json::Value::Null,
+                prompt: prompt.into(),
+                spec: DispatchSpec {
+                    now: true,
+                    machine: Some(machine.into()),
+                    ..spec()
+                },
+                flock: "default".into(),
+            })
+            .unwrap()
+    }
+
+    /// A `--now` placement is urgent: queued behind a slower placement for
+    /// the same machine in one pass, its own dispatch must start without
+    /// waiting for that placement to finish (`dispatch_queued` sorts a
+    /// machine's sends so `now` goes first; GPT review on #103, finding 1).
+    #[tokio::test]
+    async fn now_starts_ahead_of_a_slower_placement_on_the_same_machine() {
+        let slow = FakeHerdr::new();
+        // Wide next to the deadline below: a loaded runner (many `#[tokio::test]`s
+        // sharing the machine's cores) can leave this task's thread waiting well
+        // past a few hundred millis before it is next polled.
+        slow.set_ready_after(Duration::from_secs(1));
+        let (d, _tmp) = daemon(&[("a", 1, slow.clone())]).await;
+        let first = queue_on(&d.store(), "slow", Some("a"));
+        let urgent = queue_now_on(&d.store(), "urgent", "a");
+        let fleet = d.fleet();
+        let pass = tokio::spawn({
+            let fleet = fleet.clone();
+            async move { fleet.dispatch_queued().await }
+        });
+        let deadline = Instant::now() + Duration::from_millis(700);
+        while state_of(&d, &urgent) != TaskState::Starting {
+            assert!(Instant::now() < deadline, "the --now task never started");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            state_of(&d, &first),
+            TaskState::Queued,
+            "a slower placement for the same machine must not go out ahead of --now"
+        );
+        tokio::time::timeout(Duration::from_secs(10), pass)
+            .await
+            .expect("the pass ends once both agents are up")
+            .unwrap();
+        assert_eq!(state_of(&d, &urgent), TaskState::Running);
+        assert_eq!(state_of(&d, &first), TaskState::Running);
+    }
+
+    /// A `--now` task sent while an earlier pass's task is still starting on
+    /// the same machine starts beside it, on the actor's urgent channel,
+    /// instead of waiting in the actor's queue behind that startup (GPT
+    /// review on #103, second round).
+    #[tokio::test]
+    async fn now_starts_while_an_earlier_task_is_starting_on_its_machine() {
+        let slow = FakeHerdr::new();
+        // Wide next to the deadlines below (their sum is 5s): on a runner busy
+        // with the rest of the suite, the two wait loops can themselves eat
+        // seconds of real time before either one notices its state changed.
+        slow.set_ready_after(Duration::from_secs(8));
+        let (d, _tmp) = daemon(&[("a", 1, slow.clone())]).await;
+        let first = queue_on(&d.store(), "slow", Some("a"));
+        let fleet = d.fleet();
+        let pass = tokio::spawn({
+            let fleet = fleet.clone();
+            async move { fleet.dispatch_queued().await }
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while state_of(&d, &first) != TaskState::Starting {
+            assert!(Instant::now() < deadline, "a never claimed its task");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let urgent = queue_now_on(&d.store(), "urgent", "a");
+        let now_pass = tokio::spawn({
+            let fleet = fleet.clone();
+            async move { fleet.dispatch_queued().await }
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while state_of(&d, &urgent) != TaskState::Starting {
+            assert!(
+                Instant::now() < deadline,
+                "the --now task waited behind the earlier task's startup"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(state_of(&d, &first), TaskState::Starting);
+        assert!(!pass.is_finished(), "the earlier task is still starting");
+        slow.set_ready_after(Duration::ZERO);
+        tokio::time::timeout(Duration::from_secs(10), now_pass)
+            .await
+            .expect("the --now pass ends once its agent is up")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), pass)
+            .await
+            .expect("the earlier pass ends once its agent is up")
+            .unwrap();
+        assert_eq!(state_of(&d, &urgent), TaskState::Running);
+        assert_eq!(state_of(&d, &first), TaskState::Running);
+        assert_eq!(slow.agents().len(), 2);
+    }
+
+    /// A `--now` task sent after the earlier task has started, while an
+    /// earlier `--now` task is still starting beside it, starts at once too:
+    /// `run_dispatch` keeps taking urgent dispatches while it waits on the
+    /// ones in flight (Gemini review on #103).
+    #[tokio::test]
+    async fn now_starts_while_an_earlier_now_task_is_still_starting() {
+        let slow = FakeHerdr::new();
+        slow.set_ready_after(Duration::from_secs(1));
+        let (d, _tmp) = daemon(&[("a", 1, slow.clone())]).await;
+        let first = queue_on(&d.store(), "slow", Some("a"));
+        let fleet = d.fleet();
+        let pass = tokio::spawn({
+            let fleet = fleet.clone();
+            async move { fleet.dispatch_queued().await }
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while state_of(&d, &first) != TaskState::Starting {
+            assert!(Instant::now() < deadline, "a never claimed its task");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Half the window later, so `first` is up well before `urgent`.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let urgent = queue_now_on(&d.store(), "urgent", "a");
+        let now_pass = tokio::spawn({
+            let fleet = fleet.clone();
+            async move { fleet.dispatch_queued().await }
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while state_of(&d, &first) != TaskState::Running {
+            assert!(Instant::now() < deadline, "the earlier task never started");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Hold `urgent` in its startup from here on.
+        slow.set_ready_after(Duration::from_secs(60));
+        assert_eq!(state_of(&d, &urgent), TaskState::Starting);
+        let later = queue_now_on(&d.store(), "later", "a");
+        let later_pass = tokio::spawn({
+            let fleet = fleet.clone();
+            async move { fleet.dispatch_queued().await }
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while state_of(&d, &later) != TaskState::Starting {
+            assert!(
+                Instant::now() < deadline,
+                "the later --now task waited behind the earlier --now task's startup"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(state_of(&d, &urgent), TaskState::Starting);
+        slow.set_ready_after(Duration::ZERO);
+        for p in [pass, now_pass, later_pass] {
+            tokio::time::timeout(Duration::from_secs(3), p)
+                .await
+                .expect("each pass ends once its agent is up")
+                .unwrap();
+        }
+        assert_eq!(state_of(&d, &first), TaskState::Running);
+        assert_eq!(state_of(&d, &urgent), TaskState::Running);
+        assert_eq!(state_of(&d, &later), TaskState::Running);
+        assert_eq!(slow.agents().len(), 3);
     }
 
     /// A pass sends outside the dispatch lock: while `a` is still starting
@@ -10302,9 +12945,20 @@ mod tests {
         .await
         .expect("a run on b does not wait for a's dispatch");
         assert_eq!(state_of(&d, &run), TaskState::Running);
-        assert!(!pass.is_finished(), "a is still starting its agent");
+        // Ask the task, not `pass`: the scheduler's own tick also dispatches,
+        // and under load it can claim `a`'s task first, leaving `pass` with
+        // nothing to send.
+        assert_eq!(
+            state_of(&d, &first),
+            TaskState::Starting,
+            "a is still starting its agent"
+        );
         pass.await.unwrap();
-        assert_eq!(state_of(&d, &first), TaskState::Running);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state_of(&d, &first) != TaskState::Running {
+            assert!(Instant::now() < deadline, "a never started its agent");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// Two passes racing for one task that two machines could take send it

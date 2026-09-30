@@ -727,6 +727,7 @@ mod tests {
 
     fn spec() -> DispatchSpec {
         DispatchSpec {
+            now: false,
             agent: "claude".into(),
             agent_args: vec![],
             allow: vec![],
@@ -745,6 +746,9 @@ mod tests {
             label: Default::default(),
             summary: Default::default(),
             cwd: None,
+            keep_pane: None,
+            keep_pane_from: None,
+            rounds: Default::default(),
         }
     }
 

@@ -30,6 +30,8 @@ pub enum Kind {
     Priority,
     /// A queued task, in the order dispatch takes them.
     QueuedTask,
+    /// An account the head keeps a usage limit for.
+    Account,
 }
 
 /// The kind of name the argument `id` of the subcommand at `path` (canonical
@@ -39,11 +41,12 @@ pub fn kind_of(path: &[&str], id: &str) -> Option<Kind> {
         // A new flock's or machine's name is the user's to choose.
         ([_, "add"], "name") => None,
         (["queue", "move"], "task" | "before" | "after") => Some(Kind::QueuedTask),
+        (["limit", "clear"], "account") => Some(Kind::Account),
         (_, "flock") => Some(Kind::Flock),
         (_, "machine") | (["flock", "add"], "machines") => Some(Kind::Machine),
         (_, "task") | (["task", "close"], "tasks") => Some(Kind::Task),
         (_, "job") => Some(Kind::Job),
-        (_, "model") => Some(Kind::Model),
+        (_, "model" | "fallback") => Some(Kind::Model),
         (_, "profile") => Some(Kind::Profile),
         (_, "priority") | (["task", "priority"], "level") => Some(Kind::Priority),
         (["connector", ..], "id") => Some(Kind::Connector),
@@ -57,11 +60,22 @@ pub fn kind_of(path: &[&str], id: &str) -> Option<Kind> {
     }
 }
 
-/// The kind of name `words` ends in: the words after `pastor`, the last one
+/// A name slot: the kind of name it takes, and what every candidate starts
+/// with. An option that takes a comma-separated list as one word
+/// (`--fallback sonnet,g`) completes the name after the last comma, so the
+/// names typed before it, comma included, are the prefix; any other slot
+/// completes the whole word, commas and all, and its prefix is empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Slot {
+    pub kind: Kind,
+    pub prefix: String,
+}
+
+/// The name slot `words` ends in: the words after `pastor`, the last one
 /// being the word under the cursor (empty for a fresh one). `None` when that
 /// word is a subcommand, a flag, a value that is not a name, or a slot that
 /// is already filled. `root` is the whole command tree.
-pub fn slot(root: &Command, words: &[String]) -> Option<Kind> {
+pub fn slot(root: &Command, words: &[String]) -> Option<Slot> {
     let (current, done) = match words.split_last() {
         Some((c, d)) => (c.as_str(), d),
         None => ("", &[][..]),
@@ -98,21 +112,30 @@ pub fn slot(root: &Command, words: &[String]) -> Option<Kind> {
             positionals += 1;
         }
     }
-    let arg = match pending {
-        Some(arg) => arg,
+    let (arg, value) = match pending {
+        Some(arg) => (arg, current),
         None if !only_positionals && current.starts_with('-') && current.len() > 1 => {
             // `--flock=<TAB>`: the value of the option before the `=`.
-            let (flag, _) = current.split_once('=')?;
-            option(node, flag).filter(|a| a.get_action().takes_values())?
+            let (flag, value) = current.split_once('=')?;
+            let arg = option(node, flag).filter(|a| a.get_action().takes_values())?;
+            (arg, value)
         }
         // Past the last positional, one that takes many values takes more.
-        None => node.get_positionals().nth(positionals).or_else(|| {
-            node.get_positionals()
-                .last()
-                .filter(|a| matches!(a.get_action(), clap::ArgAction::Append))
-        })?,
+        None => {
+            let arg = node.get_positionals().nth(positionals).or_else(|| {
+                node.get_positionals()
+                    .last()
+                    .filter(|a| matches!(a.get_action(), clap::ArgAction::Append))
+            })?;
+            (arg, current)
+        }
     };
-    kind_of(&path, arg.get_id().as_str())
+    let kind = kind_of(&path, arg.get_id().as_str())?;
+    let prefix = match (arg.get_value_delimiter(), value.rfind(',')) {
+        (Some(','), Some(i)) => value[..=i].to_string(),
+        _ => String::new(),
+    };
+    Some(Slot { kind, prefix })
 }
 
 /// The option `word` names on `node`: `--long`, `--long=value` or `-s`.
@@ -202,6 +225,7 @@ pub fn names(paths: &Paths, kind: Kind) -> Vec<(String, Option<String>)> {
         }
         Kind::Task => tasks(paths),
         Kind::QueuedTask => queued_tasks(paths),
+        Kind::Account => accounts(paths),
         Kind::Priority => crate::task::Priority::ALL
             .iter()
             .map(|p| (p.to_string(), None))
@@ -275,6 +299,23 @@ fn queued_tasks(paths: &Paths) -> Vec<(String, Option<String>)> {
         .collect()
 }
 
+/// The accounts with a usage limit, each once, with what ran out.
+fn accounts(paths: &Paths) -> Vec<(String, Option<String>)> {
+    let Ok(store) = Store::open_read_only(&paths.db_file()) else {
+        return Vec::new();
+    };
+    let Ok(limits) = store.limits() else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, Option<String>)> = Vec::new();
+    for l in limits {
+        if !out.iter().any(|(a, _)| *a == l.account) {
+            out.push((l.account.clone(), Some(l.what())));
+        }
+    }
+    out
+}
+
 /// The entries of `dir`, sorted, hidden ones left out; with `ext`, only files
 /// with that extension, named by their stem.
 fn dir_names(dir: &Path, ext: Option<&str>) -> Vec<(String, Option<String>)> {
@@ -316,7 +357,10 @@ pub fn render(names: &[(String, Option<String>)], descriptions: bool) -> String 
 
 /// Appended to `pastor completions fish`. The condition runs pastor once and
 /// keeps its answer for the argument list; it fails, leaving the static
-/// completions alone, where the word takes no name.
+/// completions alone, where the word takes no name. The word under the
+/// cursor goes to pastor whole, `--fallback=` and commas included: pastor
+/// knows which option it belongs to and which slots take a comma list, and
+/// answers with candidates that start with the names already typed.
 pub fn fish_hook(root: &Command) -> String {
     let longs: String = name_options(root)
         .iter()
@@ -344,7 +388,8 @@ _pastor_names() {
     if names=$(pastor __complete bash -- "${COMP_WORDS[@]:1:COMP_CWORD-1}" "${cur}" 2>/dev/null); then
         [[ ${cur} == "=" ]] && cur=""
         # One name per line, kept whole: a flock or machine name may hold a
-        # space, which compgen -W would split into two words.
+        # space, which compgen -W would split into two words. After
+        # `--fallback sonnet,` pastor already puts `sonnet,` before each name.
         COMPREPLY=()
         local name
         while IFS= read -r name; do

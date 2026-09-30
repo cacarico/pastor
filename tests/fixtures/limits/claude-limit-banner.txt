@@ -1,0 +1,26 @@
+#! kind: claude
+#! source: spec
+#! now: 2026-09-29T21:00:00Z
+#! limit: hard
+#! model_scoped: no
+#! until: 2026-09-30T02:00:00Z
+> Read AGENTS.md, then fix the flaky transport test.
+
+● Read(AGENTS.md)
+  ⎿  Read 132 lines
+
+● Bash(cargo test --test transport)
+  ⎿  running 14 tests
+     test result: ok. 14 passed; 0 failed
+     … +12 lines (ctrl+o to expand)
+
+● The test races the fake herdr's exit. I made it wait for the reply
+  before closing stdin.
+
+✻ Baked for 4m 12s
+
+──────────────────────────────────────────────────────────────────────────────
+❯ 
+──────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents
+  You've hit your limit · resets 3am (Europe/Lisbon)

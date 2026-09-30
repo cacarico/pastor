@@ -51,6 +51,13 @@ down here because getting them wrong cost a day.
   Claude picks the turn up when the shell ends. The same pane read
   (`task::background_shell_running`) keeps such a task pending and running,
   and looks again after the next settle window.
+- herdr reads agy idle in a long thinking pause and while it waits on a
+  command it started, and Codex idle and ready at its folder-trust dialog.
+  So a task whose agent is not Claude is done only on its `pastor task done`
+  (`PaneEnd::NotEnded` blocks it otherwise, unless its `summary` is `off`),
+  agy's `· N task` footer keeps it running (`task::tasks_running`), and a
+  prompt to such an agent waits while its pane shows a startup question
+  (`Agents::startup_markers`).
 - A herdr error reply is an API error with a code, never a dead connection.
   Only EOF before a reply, spawn failure or a non-zero exit with no reply are
   transport failures, and only those make a machine `lost`.
@@ -69,15 +76,24 @@ down here because getting them wrong cost a day.
 
 - `make check` is the gate: fmt check, clippy with warnings as errors, the
   full suite. Run it before every commit. `make help` lists the rest.
-- CI (`.github/workflows/ci.yml`) runs `make check`, `make test-machine` and
-  `make test-ssh` (the CLI against a head over a real ssh, through a
-  throwaway sshd on localhost; `tests/real_ssh.rs`) on every pull request
-  that touches code (`paths:` skips docs-only diffs), or by hand
-  (`workflow_dispatch`). Push to main does not run `check`. Pull requests
-  land as merge commits, so the merge sha on main is never checked itself:
-  only each PR's head was. Two PRs that pass alone can still break main
-  together, and a direct push that skips a PR goes unchecked, unless someone
-  dispatches CI on main by hand.
+- `make portability` is a `cargo check` for the musl and FreeBSD targets
+  (the list is `PORTABILITY_TARGETS` in the Makefile), which finds code that
+  only compiles against glibc on x86_64. It is not part of `make check`: run
+  it on a change to platform code (cfg gates, libc, sockets) or a
+  dependency. It needs `cargo-zigbuild`, `zig` and the Rust targets, names
+  what is missing in one line and installs nothing.
+- CI (`.github/workflows/ci.yml`) runs `make check`, `make test-machine`,
+  `make portability` and `make test-ssh` (the CLI against a head over a real
+  ssh, through a throwaway sshd on localhost; `tests/real_ssh.rs`) on every
+  pull request that touches code (`paths:` skips docs-only diffs), on every
+  push to `main` that touches code or the changelog, and by hand
+  (`workflow_dispatch`).
+- Pull requests merge with a merge commit (`gh pr merge --merge`) and no
+  other way: not `--rebase`, not `--squash`, and not a push of the PR's head
+  straight to `main`. PR CI runs on GitHub's merge of the PR into `main` as
+  `main` was when the run started; `main` can move before the PR merges, so
+  two PRs green on their own run can still break it together. That is why
+  push to `main` runs the checks again, on the tree `main` really has.
 - The repository is public. `.github/workflows/gitleaks.yml` scans the whole
   history of every ref on every pull request, on push to `main`, and weekly,
   and `make leaks` runs the same scan here. It does not run on push to other
@@ -90,6 +106,9 @@ down here because getting them wrong cost a day.
   cargo and GitHub Actions, minor and patch grouped into one pull request per
   ecosystem, plus security updates; malware alerts and private vulnerability
   reporting are repository settings. Its pull requests pass CI like any other.
+  The file is the same in the public repo, which gets the same pull requests;
+  there `.github/workflows/dependabot-close.yml` closes them with a note,
+  since the update arrives with the sync.
 - Nothing in the suite talks to a real herdr. `make smoke SESSION=s` runs the
   opt-in test against one on the same host; do it on a fleet machine before
   trusting a change to the transport or dispatch. `make smoke-profiles`
@@ -117,9 +136,11 @@ down here because getting them wrong cost a day.
 - Vocabulary is fixed: machine, flock, head, job, task, connector, agent,
   shepherd (a headless `pastor serve` on a machine whose head is elsewhere),
   orchestrator (an agent pastor runs to drive the others, from
-  `orchestrators/<name>.toml`) and pull machine (`pull = true`: its
-  shepherd asks the head for work, the head never connects to it).
-  Agents are never renamed; hosts are not "sheep". "Plugin" is kept free
+  `orchestrators/<name>.toml`), pull machine (`pull = true`: its
+  shepherd asks the head for work, the head never connects to it) and
+  provisioner. What checks and sets up a machine for agents is a
+  provisioner; it is installed and run like a connector, and it is never
+  called a plugin. Agents are never renamed; hosts are not "sheep". "Plugin" is kept free
   for code that changes how pastor itself behaves; what installs a connector
   command or event hooks is a connector. The Claude Code plugin `pastor` that
   ships the skills is Claude Code's word, not pastor's.
@@ -215,12 +236,12 @@ Still open as of the last review; none of them blocks normal use.
 ## Where things live
 
 ```
-~/.config/pastor/pastor.toml      tick, settle, reconcile_every, close_done_after, defaults
+~/.config/pastor/pastor.toml      tick, settle, reconcile_every, close_done_after, close_failed_after, defaults
 ~/.config/pastor/flock.toml       machines
 ~/.config/pastor/jobs/<name>.toml one job per file
 ~/.config/pastor/orchestrators/<name>.toml one orchestrator per file (kind scheduled or session)
 ~/.config/pastor/client.toml      [head]: a head on another machine (`pastor head`)
-~/.local/state/pastor/pastor.db   tasks (schema 13), seen keys, event seq, job state (SQLite)
+~/.local/state/pastor/pastor.db   tasks (schema 16), token usage, seen keys, usage limits, event seq, job state (SQLite)
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/fleet.lock  offline fleet edits and a starting `pastor serve` take turns on it
 ~/.local/state/pastor/shepherd.db a headless serve's job state, seen keys, head event cursor
@@ -259,7 +280,12 @@ in the actor (`Task::ended` keeps an ended task done, and lets auto-close
 skip its sequence checks; the fleet guard lets an agent through only for its
 own task, `IpcRequest::ends_own_task`); auto-close of done tasks after `close_done_after` is
 `Actor::auto_close_done`, run after each connected reconcile through the same
-`run_close` (`CloseBy::AutoClose`); orphan detection is
+`run_close` (`CloseBy::AutoClose`); the panes of failed and stale tasks and
+orphans whose agents stopped go after `close_failed_after` in
+`Actor::auto_close_stopped`, which keeps the rows failed; both skip a task
+whose spec keeps its pane (`DispatchSpec::keeps_pane`, settled at queue time
+by `Fleet::settle_keep_pane`), and `machine::count_live` leaves such a task
+out while it is done; orphan detection is
 `machine::orphan_agents`, used by reconcile and by the head-less probe in
 `machine list`.
 

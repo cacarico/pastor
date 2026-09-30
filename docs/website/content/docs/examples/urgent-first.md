@@ -52,8 +52,10 @@ POS  TASK  LEVEL   WHERE          FROM        WAITED  WHY NOT YET
 ```
 
 POS is the order the tasks will start in. FROM says who asked: `task run`
-or a job. Levels do not age, so a `low` task can wait for ever; WAITED shows
-how long it has.
+or a job. WAITED shows how long each has waited. After `age_after` (30
+minutes by default) a queued task goes up a level, never past `high`, so
+`t-16` runs in the end behind `normal` and `high` work; a steady stream of
+`critical` tasks would still go first.
 
 ## reorder
 
@@ -122,6 +124,28 @@ When a slot on `server-1` frees and nothing higher waits, `t-14` resumes its
 own Claude session there. Only a `critical` task may preempt, and only a
 `low` Claude task is ever paused. A paused task keeps its place: `queue move`
 does not move it.
+
+## start it now
+
+Sometimes you know exactly where the fix must run, and it cannot wait for
+anything. `--now` with `--machine` starts the task there in the same
+command, past the machine's limits, and pauses nothing:
+
+```sh
+pastor task run "Roll back the bad migration" --repo '~/src/app' --machine server-1 --now
+pastor machine list
+```
+
+```text
+NAME      HOST            FLOCKS   PROFILE  CHANNEL    HERDR  PASTOR  AGENTS          ORPHANS  TAGS  ERROR
+desk      local           default  -        connected  0.9.1  0.8.0   2/2             -        -
+server-1  user@server-1   default  -        connected  0.9.1  0.8.0   4/3 now:t-23    -        -
+```
+
+`t-23` counts on `server-1`, so the queue starts nothing more there until
+its count is under 3 again. `--now` needs `--machine`, and a connected one;
+a job cannot set it, and an agent or orchestrator is refused, a guard
+against mistakes rather than a boundary.
 
 ## next
 

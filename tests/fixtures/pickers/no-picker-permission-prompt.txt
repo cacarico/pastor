@@ -1,0 +1,18 @@
+#! kind: claude
+#! source: made
+#! now: 2026-09-29T21:00:00Z
+#! picker: none
+> Read AGENTS.md, then fix the flaky transport test.
+
+● Bash(grep -rn "usage limit" src/limit.rs)
+
+──────────────────────────────────────────────────────────────────────────────
+ Bash command
+
+   grep -rn "usage limit" src/limit.rs
+   Search the limit parser
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for grep commands in this project
+   3. No, and tell Claude what to do differently (esc)

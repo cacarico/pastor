@@ -1,9 +1,8 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-use crate::config::Paths;
 use crate::config::flock::{DEFAULT_FLOCK, Flock, FlockNumber};
-use crate::ipc::{IpcRequest, IpcResponse, RequestError, connect_error_means_no_daemon};
+use crate::ipc::{Client, IpcRequest, IpcResponse, RequestError, connect_error_means_no_daemon};
 use crate::machine::MachineStatus;
 use crate::scheduler::{JobRunReport, JobStatus};
 use crate::task::Task;
@@ -161,9 +160,28 @@ pub fn task_rows(tasks: &[Task]) -> Vec<Vec<String>> {
         .iter()
         .map(|t| {
             let note = task_note(t);
+            // A done task whose pane pastor left open on purpose: someone
+            // may still be talking to its agent.
+            let state = if t.state == crate::task::TaskState::Done
+                && t.spec.keeps_pane()
+                && t.pane_id.is_some()
+            {
+                format!("{} (kept)", t.state)
+            } else if t.state == crate::task::TaskState::Waiting
+                && let Some(until) = t.waiting_until
+            {
+                // When its usage limit resets and it goes on.
+                format!(
+                    "{} {}",
+                    t.state,
+                    crate::limit::local_time(until, chrono::Utc::now())
+                )
+            } else {
+                t.state.to_string()
+            };
             vec![
                 t.display_id(),
-                t.state.to_string(),
+                state,
                 t.priority.to_string(),
                 t.machine.clone().unwrap_or_else(|| "-".into()),
                 t.flock.clone().unwrap_or_else(|| "-".into()),
@@ -175,6 +193,16 @@ pub fn task_rows(tasks: &[Task]) -> Vec<Vec<String>> {
             ]
         })
         .collect()
+}
+
+/// `task list`'s order: the waiting tasks first, the soonest reset first
+/// (`waiting_until`), then the rest as they came, newest first.
+pub fn waiting_first(mut tasks: Vec<Task>) -> Vec<Task> {
+    tasks.sort_by_key(|t| match t.state {
+        crate::task::TaskState::Waiting => (0, t.waiting_until),
+        _ => (1, None),
+    });
+    tasks
 }
 
 /// The NOTE column of `task list`, one escaped line: the error, else the
@@ -198,7 +226,10 @@ pub fn task_note(t: &Task) -> String {
                 .take(60)
                 .collect()
         });
-    let note = one_line(&note);
+    let mut note = one_line(&note);
+    if t.spec.now {
+        note = format!("now: {note}");
+    }
     match t.retry_of {
         Some(of) => format!("retry of t-{of}: {note}"),
         None => note,
@@ -283,13 +314,29 @@ pub fn task_detail_with(t: &Task, summaries: &[crate::task::TaskSummary]) -> Str
     let source = t.spec.agent_source.as_deref();
     let from = |label: Option<&String>| label.map(|l| format!(" (from {l})")).unwrap_or_default();
     let agent = format!("{}{}", t.spec.agent, from(source.map(|s| &s.agent)));
-    let model = match t.model() {
-        Some(m) => format!("{m}{}", from(source.and_then(|s| s.model_from.as_ref()))),
-        None => "-".to_string(),
+    let model = match (t.model(), source.and_then(|s| s.fallback_use.as_ref())) {
+        (Some(m), Some(used)) => format!("{m} ({used})"),
+        (Some(m), None) => format!("{m}{}", from(source.and_then(|s| s.model_from.as_ref()))),
+        (None, _) => "-".to_string(),
     };
-    let mut priority = format!("{}{}", t.priority, from(t.priority_from.as_ref()));
+    // `-` with where it came from: a layer's `[]` gave the task none.
+    let fallback = match t.fallback() {
+        [] => "-".to_string(),
+        names => names.join(", "),
+    } + &from(source.and_then(|s| s.fallback_from.as_ref()));
+    let mut priority = match t.aged_from {
+        Some(was) => format!(
+            "{}, aged from {was}{}",
+            t.priority,
+            from(t.priority_from.as_ref())
+        ),
+        None => format!("{}{}", t.priority, from(t.priority_from.as_ref())),
+    };
     if t.pause.preempt {
         priority.push_str(", preempt: pauses a low task on a full machine");
+    }
+    if t.spec.now {
+        priority.push_str(", now: started at once, past its machine's limits");
     }
     let profile = match t.profile() {
         Some(p) => format!("{p}{}", from(source.and_then(|s| s.profile_from.as_ref()))),
@@ -317,6 +364,11 @@ pub fn task_detail_with(t: &Task, summaries: &[crate::task::TaskSummary]) -> Str
                 .join(" ")
         }
     };
+    // A list the agent never gets (`AgentSource::lists_unapplied`) says so.
+    let unapplied = |shown: String| match source.and_then(|s| s.lists_unapplied.as_deref()) {
+        Some(why) if shown != "-" => format!("{shown} ({why})"),
+        _ => shown,
+    };
     let mut repo = opt(&t.spec.repo);
     if t.spec.worktree {
         repo.push_str(" (worktree");
@@ -342,10 +394,11 @@ pub fn task_detail_with(t: &Task, summaries: &[crate::task::TaskSummary]) -> Str
         ("machine", opt(&t.machine)),
         ("agent", agent),
         ("model", model),
+        ("fallback", fallback),
         ("profile", profile),
         ("agent args", args),
-        ("allow", list(&t.spec.allow)),
-        ("deny", list(&t.spec.deny)),
+        ("allow", unapplied(list(&t.spec.allow))),
+        ("deny", unapplied(list(&t.spec.deny))),
         ("repo", repo),
         (
             "place",
@@ -356,6 +409,14 @@ pub fn task_detail_with(t: &Task, summaries: &[crate::task::TaskSummary]) -> Str
             ),
         ),
         ("label", label),
+        (
+            "keep pane",
+            format!(
+                "{}{}",
+                if t.spec.keeps_pane() { "yes" } else { "no" },
+                from(t.spec.keep_pane_from.as_ref())
+            ),
+        ),
         ("tags", tags),
         (
             "timeout",
@@ -382,8 +443,65 @@ pub fn task_detail_with(t: &Task, summaries: &[crate::task::TaskSummary]) -> Str
     if t.pause.resumed_at.is_some() {
         fields.push(("resumed", when(t.pause.resumed_at)));
     }
+    // A waiting task's error is the limit it waits on: which account,
+    // until when, what ran out and the task that saw it.
+    let waiting = t.state == crate::task::TaskState::Waiting;
+    if waiting && let Some(until) = t.waiting_until {
+        fields.push((
+            "waiting",
+            format!(
+                "until {} ({})",
+                crate::limit::local_time(until, Utc::now()),
+                until.format("%Y-%m-%d %H:%M:%S UTC")
+            ),
+        ));
+    }
     if let Some(e) = &t.error {
-        fields.push(("error", e.clone()));
+        fields.push((if waiting { "limit" } else { "error" }, e.clone()));
+    }
+    // Why it waits when it could have moved to its next model.
+    if let Some(waited) = t.spec.rounds.stop.as_ref().and_then(|s| s.waited.as_ref())
+        && waiting
+    {
+        fields.push(("waited", waited.clone()));
+    }
+    // Each model it ran on, and why that round ended; the last is now.
+    if !t.spec.rounds.ended.is_empty() {
+        let now = crate::task::agent_and_model(&t.spec.agent, t.model());
+        let rounds = t
+            .spec
+            .rounds
+            .ended
+            .iter()
+            .map(|r| format!("{r}: {}", r.ended))
+            .chain(std::iter::once(format!("{now}: {}", t.state)))
+            .enumerate()
+            .map(|(i, r)| format!("{} {r}", i + 1))
+            .collect::<Vec<_>>()
+            .join("; ");
+        fields.push(("rounds", rounds));
+    }
+    // What the task's Claude session used, as read when its last round
+    // ended: its model is the one the machine gave it when `model` is `-`.
+    if let Some(u) = &t.usage {
+        let calls = format!("{} API calls", grouped(u.api_calls));
+        fields.push((
+            "used",
+            match &u.model {
+                Some(m) => format!("{m}, {calls}"),
+                None => calls,
+            },
+        ));
+        fields.push((
+            "tokens",
+            format!(
+                "input {}, cache write {}, cache read {}, output {}",
+                grouped(u.input),
+                grouped(u.cache_write),
+                grouped(u.cache_read),
+                grouped(u.output)
+            ),
+        ));
     }
     // Branch, repo and the prompt can come from an item; every field is
     // escaped the same way so none of them reaches the terminal raw.
@@ -416,6 +534,19 @@ pub fn task_detail_with(t: &Task, summaries: &[crate::task::TaskSummary]) -> Str
             .map(|l| format!("  {l}").trim_end().to_string()),
     );
     out.join("\n")
+}
+
+/// `n` with a comma between each group of three digits: `3,400,500`.
+fn grouped(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// A summary's first line in `task describe`: its outcome, round, who wrote
@@ -499,8 +630,8 @@ pub fn reply(got: Result<IpcResponse, RequestError>) -> Result<IpcResponse, CliE
 /// One request to the head, the local serve or the remote head, whichever
 /// `request_head` reaches. The error is for the caller to return, print or
 /// act on (an invalid edit reopens the editor); nothing here exits.
-pub async fn ask(paths: &Paths, req: IpcRequest) -> Result<IpcResponse, CliError> {
-    reply(crate::ipc::request_head(paths, &req).await)
+pub async fn ask(client: &Client, req: IpcRequest) -> Result<IpcResponse, CliError> {
+    reply(crate::ipc::request_head(client, &req).await)
 }
 
 /// A reply of a variant the command does not expect, as from a head of
@@ -764,6 +895,9 @@ pub struct MachineRow {
     /// `MachineStatus::orphans`; a probe works them out itself from
     /// `agent.list` and the store, and leaves them empty when it cannot.
     pub orphans: Vec<String>,
+    /// `MachineStatus::now`; a probe leaves it empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub now: Vec<String>,
     /// `MachineStatus::profile`; a probe settles it from this machine's
     /// pastor.toml and flock.toml.
     #[serde(default)]
@@ -820,6 +954,7 @@ impl From<&MachineStatus> for MachineRow {
             burst: m.burst,
             tags: m.tags.clone(),
             orphans: m.orphans.clone(),
+            now: m.now.clone(),
             profile: m.profile.clone(),
             description: m.description.clone(),
         }
@@ -877,6 +1012,20 @@ pub fn capacity(max_agents: u32, job_slots: u32, burst: u32) -> String {
     out
 }
 
+/// The AGENTS column: live over capacity, then the `--now` tasks that may
+/// have taken it past (`4/3 now:t-9`).
+fn agents_cell(m: &MachineRow) -> String {
+    let mut out = format!(
+        "{}/{}",
+        m.live.map_or_else(|| "-".to_string(), |n| n.to_string()),
+        capacity(m.max_agents, m.job_slots, m.burst)
+    );
+    if !m.now.is_empty() {
+        out.push_str(&format!(" now:{}", m.now.join(",")));
+    }
+    out
+}
+
 /// One row per machine, in the order given.
 pub fn machine_rows(ms: &[MachineRow]) -> Vec<Vec<String>> {
     let dash = || "-".to_string();
@@ -890,11 +1039,7 @@ pub fn machine_rows(ms: &[MachineRow]) -> Vec<Vec<String>> {
                 m.channel.clone(),
                 m.herdr_version.clone().unwrap_or_else(dash),
                 m.pastor_version.clone().unwrap_or_else(dash),
-                format!(
-                    "{}/{}",
-                    m.live.map_or_else(dash, |n| n.to_string()),
-                    capacity(m.max_agents, m.job_slots, m.burst)
-                ),
+                agents_cell(m),
                 if m.orphans.is_empty() {
                     dash()
                 } else {
@@ -1091,7 +1236,11 @@ mod tests {
             priority: Default::default(),
             priority_from: None,
             queue_pos: 0,
+            aged_from: None,
+            aged_at: None,
             pause: Default::default(),
+            waiting_until: None,
+            usage: None,
             summary: None,
             created_at: now,
             started_at: Some(now),
@@ -1104,6 +1253,7 @@ mod tests {
 
     fn status(name: &str, host: &str) -> MachineStatus {
         MachineStatus {
+            now: Vec::new(),
             description: None,
             name: name.into(),
             host: host.into(),
@@ -1288,6 +1438,7 @@ mod tests {
         use crate::config::flock::{Flock, MachineConfig};
         use crate::task::TaskState;
         let spec = crate::task::DispatchSpec {
+            now: false,
             agent: "claude".into(),
             agent_args: vec![],
             allow: vec![],
@@ -1306,6 +1457,9 @@ mod tests {
             label: Default::default(),
             summary: Default::default(),
             cwd: None,
+            keep_pane: None,
+            keep_pane_from: None,
+            rounds: Default::default(),
         };
         let running_gone = task_with(spec.clone()); // on pi-3, running
         let closed_gone = Task {
@@ -1335,6 +1489,7 @@ mod tests {
                 agent: None,
                 agent_args: None,
                 model: None,
+                fallback: None,
                 priority: None,
                 agents: Default::default(),
                 profile: None,
@@ -1353,6 +1508,7 @@ mod tests {
     #[test]
     fn task_detail_prints_the_agent_args_shell_quoted() {
         let spec = crate::task::DispatchSpec {
+            now: false,
             agent: "claude".into(),
             agent_args: vec![
                 "--model".into(),
@@ -1376,6 +1532,9 @@ mod tests {
             label: Default::default(),
             summary: Default::default(),
             cwd: None,
+            keep_pane: None,
+            keep_pane_from: None,
+            rounds: Default::default(),
         };
         let out = task_detail(&task_with(spec.clone()));
         assert!(
@@ -1416,10 +1575,14 @@ mod tests {
                 agent_args: Some("flock personal".into()),
                 model: None,
                 model_from: None,
+                fallback: vec![],
+                fallback_from: None,
+                fallback_use: None,
                 profile: None,
                 profile_from: None,
                 timeout_from: None,
                 place_from: None,
+                lists_unapplied: None,
             })),
             ..serde_json::from_str(r#"{"agent": "claude"}"#).unwrap()
         };
@@ -1440,10 +1603,14 @@ mod tests {
                 agent_args: None,
                 model: None,
                 model_from: None,
+                fallback: vec![],
+                fallback_from: None,
+                fallback_use: None,
                 profile: None,
                 profile_from: None,
                 timeout_from: None,
                 place_from: None,
+                lists_unapplied: None,
             })),
             ..spec
         }));
@@ -1452,6 +1619,128 @@ mod tests {
             "{bare}"
         );
         assert!(bare.contains("agent args: -\n"), "{bare}");
+    }
+
+    /// `task describe` shows the fallback list and where it came from; a
+    /// layer's `[]` reads as none from that layer.
+    #[test]
+    fn task_detail_prints_the_fallback_and_where_it_came_from() {
+        let spec = |fallback: &[&str], from: Option<&str>| crate::task::DispatchSpec {
+            agent_source: Some(Box::new(crate::task::AgentSource {
+                agent: "defaults".into(),
+                fallback: fallback.iter().map(|s| s.to_string()).collect(),
+                fallback_from: from.map(Into::into),
+                ..Default::default()
+            })),
+            ..serde_json::from_str(r#"{"agent": "claude"}"#).unwrap()
+        };
+        let out = task_detail(&task_with(spec(&["sonnet", "gpt"], Some("flock personal"))));
+        assert!(
+            out.contains("fallback:   sonnet, gpt (from flock personal)\n"),
+            "{out}"
+        );
+        let out = task_detail(&task_with(spec(&[], Some("machine m"))));
+        assert!(out.contains("fallback:   - (from machine m)\n"), "{out}");
+        let out = task_detail(&task_with(spec(&[], None)));
+        assert!(out.contains("fallback:   -\n"), "{out}");
+    }
+
+    /// `task describe` says when the lists never reach the agent (a
+    /// profiled Codex task), and says nothing on an empty list.
+    #[test]
+    fn task_detail_says_when_the_lists_are_not_applied() {
+        let why = "not applied: codex has no per-command allow or deny flag; it runs in its workspace-write sandbox";
+        let spec = crate::task::DispatchSpec {
+            allow: vec!["Edit".into()],
+            agent_source: Some(Box::new(crate::task::AgentSource {
+                agent: "defaults".into(),
+                profile: Some("develop".into()),
+                lists_unapplied: Some(why.into()),
+                ..Default::default()
+            })),
+            ..serde_json::from_str(r#"{"agent": "codex"}"#).unwrap()
+        };
+        let out = task_detail(&task_with(spec));
+        assert!(
+            out.contains(&format!("allow:      Edit ({why})\n")),
+            "{out}"
+        );
+        assert!(out.contains("deny:       -\n"), "{out}");
+    }
+
+    /// `task describe` lists the rounds a task ran on other models and why
+    /// each ended, and says why a waiting task did not move on.
+    #[test]
+    fn task_detail_prints_the_rounds_and_why_it_waited() {
+        let mut t = task_with(serde_json::from_str(r#"{"agent": "claude"}"#).unwrap());
+        assert!(!task_detail(&t).contains("rounds:"));
+        t.spec.agent_source = Some(Box::new(crate::task::AgentSource {
+            model: Some("sonnet".into()),
+            ..Default::default()
+        }));
+        t.spec.rounds.ended.push(crate::task::AgentRound {
+            agent: "claude".into(),
+            model: Some("opus".into()),
+            ended: "limit: Opus weekly limit reached".into(),
+        });
+        t.state = crate::task::TaskState::Waiting;
+        t.spec.rounds.stop = Some(Box::new(crate::task::LimitStop {
+            agent: "claude".into(),
+            model: Some("sonnet".into()),
+            why: "limit".into(),
+            line: "You've hit your limit".into(),
+            until: Utc::now(),
+            tail: String::new(),
+            then: crate::task::NextRound::Own,
+            waited: Some("reset in 12m, under wait_under 30m".into()),
+            handover: None,
+        }));
+        let out = task_detail(&t);
+        assert!(
+            out.contains(
+                "rounds:     1 claude (opus): limit: Opus weekly limit reached; 2 claude (sonnet): waiting\n"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("waited:     reset in 12m, under wait_under 30m\n"),
+            "{out}"
+        );
+    }
+
+    /// `task describe` shows what a finished Claude task's session used,
+    /// and nothing for a task pastor has read no usage for.
+    #[test]
+    fn a_task_with_usage_shows_its_model_and_tokens() {
+        let mut t = task_with(serde_json::from_str(r#"{"agent": "claude"}"#).unwrap());
+        assert!(!task_detail(&t).contains("tokens:"));
+        t.usage = Some(crate::usage::TaskUsage {
+            model: Some("claude-opus-4-5".into()),
+            api_calls: 42,
+            input: 1_234,
+            cache_write: 56_000,
+            cache_read: 3_400_500,
+            output: 12,
+            read_at: Utc::now(),
+        });
+        let out = task_detail(&t);
+        assert!(
+            out.contains("\nused:       claude-opus-4-5, 42 API calls\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "\ntokens:     input 1,234, cache write 56,000, cache read 3,400,500, output 12\n"
+            ),
+            "{out}"
+        );
+        assert_eq!(
+            t.to_json()["usage"]["cache_read"],
+            3_400_500,
+            "task list --json"
+        );
+        t.usage.as_mut().unwrap().model = None;
+        assert!(task_detail(&t).contains("\nused:       42 API calls\n"));
     }
 
     /// `task describe` says when a paused task was paused and for which
@@ -1470,6 +1759,41 @@ mod tests {
         t.pause.preempt = true;
         t.priority = crate::task::Priority::Critical;
         assert!(task_detail(&t).contains("critical, preempt: "));
+    }
+
+    /// A `task run --now` task says it ran past its machine's limits, in
+    /// `task describe` and in `task list`'s NOTE.
+    #[test]
+    fn a_now_task_says_it_skipped_the_queue() {
+        let mut t = task_with(serde_json::from_str(r#"{"agent": "claude"}"#).unwrap());
+        assert!(!task_detail(&t).contains("now:"));
+        assert!(!task_note(&t).starts_with("now"));
+        t.spec.now = true;
+        assert!(
+            task_detail(&t).contains("normal, now: started at once, past its machine's limits"),
+            "{}",
+            task_detail(&t)
+        );
+        assert!(task_note(&t).starts_with("now: "), "{}", task_note(&t));
+    }
+
+    /// `machine list` AGENTS names the `--now` tasks that run past the
+    /// machine's limits beside the count, which may pass them.
+    #[test]
+    fn machine_rows_name_now_tasks() {
+        let m = MachineStatus {
+            live: 4,
+            max_agents: 3,
+            now: vec!["t-9".into()],
+            ..status("pi", "local")
+        };
+        let rows = machine_rows(&[MachineRow::from(&m)]);
+        assert_eq!(rows[0][7], "4/3 now:t-9");
+        let plain = MachineStatus {
+            now: vec![],
+            ..m.clone()
+        };
+        assert_eq!(machine_rows(&[MachineRow::from(&plain)])[0][7], "4/3");
     }
 
     /// `task describe` gives the level and the layer that set it, and
@@ -1495,6 +1819,77 @@ mod tests {
         let json = t.to_json();
         assert_eq!(json["priority"], "high");
         assert_eq!(json["priority_from"], "flock work");
+        t.priority = crate::task::Priority::High;
+        t.aged_from = Some(crate::task::Priority::Low);
+        let out = task_detail(&t);
+        assert!(
+            out.contains("priority:   high, aged from low (from flock work)\n"),
+            "{out}"
+        );
+    }
+
+    /// `task describe` says whether the task keeps its pane and where that
+    /// came from, `--json` carries both, and `task list` marks a done task
+    /// whose pane was kept.
+    #[test]
+    fn keep_pane_shows_with_where_it_came_from_and_marks_the_list() {
+        use crate::task::TaskState;
+        let mut t = task_with(serde_json::from_str(r#"{"agent": "claude"}"#).unwrap());
+        t.state = TaskState::Done;
+        t.pane_id = Some("p1".into());
+        let out = task_detail(&t);
+        assert!(out.contains("keep pane:  no\n"), "{out}");
+        assert_eq!(task_rows(std::slice::from_ref(&t))[0][1], "done");
+        t.spec.keep_pane = Some(true);
+        t.spec.keep_pane_from = Some("task run".into());
+        let out = task_detail(&t);
+        assert!(out.contains("keep pane:  yes (from task run)\n"), "{out}");
+        assert_eq!(task_rows(std::slice::from_ref(&t))[0][1], "done (kept)");
+        assert_eq!(t.to_json()["spec"]["keep_pane"], true);
+        assert_eq!(t.to_json()["spec"]["keep_pane_from"], "task run");
+        t.state = TaskState::Running;
+        assert_eq!(task_rows(std::slice::from_ref(&t))[0][1], "running");
+    }
+
+    /// A waiting task reads `waiting 03:00` in `task list`, and `task
+    /// describe` says until when and on which limit.
+    #[test]
+    fn a_waiting_task_shows_its_reset_and_its_limit() {
+        use crate::task::TaskState;
+        let mut t = task_with(serde_json::from_str(r#"{"agent": "claude"}"#).unwrap());
+        let until = chrono::Utc::now() + chrono::Duration::minutes(30);
+        t.state = TaskState::Waiting;
+        t.waiting_until = Some(until);
+        t.error = Some("me exhausted until 03:00 (5-hour limit, seen by t-4)".into());
+        let shown = crate::limit::local_time(until, chrono::Utc::now());
+        assert_eq!(
+            task_rows(std::slice::from_ref(&t))[0][1],
+            format!("waiting {shown}")
+        );
+        let out = task_detail(&t);
+        assert!(out.contains("\nwaiting:    until "), "{out}");
+        assert!(
+            out.contains("\nlimit:      me exhausted until 03:00 (5-hour limit, seen by t-4)\n"),
+            "{out}"
+        );
+        assert!(!out.contains("\nerror:"), "{out}");
+        // Listed first, the soonest reset first; the rest as they came.
+        let at = |id: i64, state: TaskState, mins: i64| {
+            let mut t = t.clone();
+            t.id = id;
+            t.state = state;
+            t.waiting_until = Some(until + chrono::Duration::minutes(mins));
+            t
+        };
+        let listed = waiting_first(vec![
+            at(5, TaskState::Running, 0),
+            at(4, TaskState::Waiting, 60),
+            at(3, TaskState::Queued, 0),
+            at(2, TaskState::Waiting, 5),
+        ]);
+        let ids: Vec<i64> = listed.iter().map(|t| t.id).collect();
+        assert_eq!(ids, [2, 4, 5, 3]);
+        assert_eq!(t.to_json()["waiting_until"], serde_json::json!(until));
     }
 
     /// `task describe` gives the workspace label and where it came from:
@@ -1572,6 +1967,7 @@ mod tests {
     #[test]
     fn task_detail_shows_the_description_and_its_source() {
         let mut t = task_with(crate::task::DispatchSpec {
+            now: false,
             agent: "claude".into(),
             agent_args: vec![],
             allow: vec![],
@@ -1590,6 +1986,9 @@ mod tests {
             label: Default::default(),
             summary: Default::default(),
             cwd: None,
+            keep_pane: None,
+            keep_pane_from: None,
+            rounds: Default::default(),
         });
         let out = task_detail(&t);
         assert!(
@@ -1609,6 +2008,7 @@ mod tests {
     #[test]
     fn task_detail_keeps_a_multiline_error_on_its_line() {
         let mut t = task_with(crate::task::DispatchSpec {
+            now: false,
             agent: "claude".into(),
             agent_args: vec![],
             allow: vec![],
@@ -1627,6 +2027,9 @@ mod tests {
             label: Default::default(),
             summary: Default::default(),
             cwd: None,
+            keep_pane: None,
+            keep_pane_from: None,
+            rounds: Default::default(),
         });
         t.error = Some("ssh failed:\nPermission denied\r\nbye".into());
         let out = task_detail(&t);
@@ -1657,6 +2060,7 @@ mod tests {
     #[test]
     fn task_rows_escape_and_cap_an_item_title() {
         let mut t = task_with(crate::task::DispatchSpec {
+            now: false,
             agent: "claude".into(),
             agent_args: vec![],
             allow: vec![],
@@ -1675,6 +2079,9 @@ mod tests {
             label: Default::default(),
             summary: Default::default(),
             cwd: None,
+            keep_pane: None,
+            keep_pane_from: None,
+            rounds: Default::default(),
         });
         t.item = serde_json::json!({"key": "k", "title": format!("x\n t-9  done\x1b[2K{}", "y".repeat(80))});
         let note = task_rows(std::slice::from_ref(&t))[0]
@@ -1689,6 +2096,7 @@ mod tests {
     #[test]
     fn task_detail_escapes_item_text_in_the_prompt_and_fields() {
         let mut t = task_with(crate::task::DispatchSpec {
+            now: false,
             agent: "claude".into(),
             agent_args: vec!["--x\x1b[2J".into()],
             allow: vec![],
@@ -1707,6 +2115,9 @@ mod tests {
             label: Default::default(),
             summary: Default::default(),
             cwd: None,
+            keep_pane: None,
+            keep_pane_from: None,
+            rounds: Default::default(),
         });
         t.prompt = "look at\x1b]8;;http://x\x07this\r\nand stop".into();
         let out = task_detail(&t);

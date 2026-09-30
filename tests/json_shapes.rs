@@ -120,6 +120,8 @@ fn assert_sparse_keys(what: &str, v: &Value, want: &[(&str, &str)], may_be_absen
 
 /// `Task::to_json`, as `task list` and `task describe` print each task.
 const TASK: &[(&str, &str)] = &[
+    ("aged_at", "string"),
+    ("aged_from", "string"),
     ("agent_name", "string|null"),
     ("created_at", "string"),
     ("description", "string"),
@@ -127,6 +129,7 @@ const TASK: &[(&str, &str)] = &[
     ("ended", "bool"),
     ("error", "string|null"),
     ("finished_at", "string|null"),
+    ("fallback", "array"),
     ("flock", "string|null"),
     ("id", "number"),
     ("item", "object|string|number|bool|array|null"),
@@ -157,6 +160,8 @@ const TASK: &[(&str, &str)] = &[
 
 /// Left out of a task's JSON unless set.
 const TASK_MAY_BE_ABSENT: &[&str] = &[
+    "aged_at",
+    "aged_from",
     "ended",
     "paused_at",
     "paused_for",
@@ -177,6 +182,7 @@ const SUMMARY: &[(&str, &str)] = &[
 
 fn spec() -> DispatchSpec {
     DispatchSpec {
+        now: false,
         agent: "claude".into(),
         agent_args: vec![],
         allow: vec![],
@@ -195,6 +201,9 @@ fn spec() -> DispatchSpec {
         label: Default::default(),
         summary: Default::default(),
         cwd: None,
+        keep_pane: None,
+        keep_pane_from: None,
+        rounds: Default::default(),
     }
 }
 
@@ -234,6 +243,8 @@ fn full_task() -> Task {
     t.ended = true;
     t.retry_of = Some(1);
     t.priority_from = Some("task run".into());
+    t.aged_from = Some(pastor::task::Priority::Low);
+    t.aged_at = Some(now);
     t.description = Some("fix the suite".into());
     t.pause.preempt = true;
     t.pause.paused_at = Some(now);
@@ -246,6 +257,8 @@ fn full_task() -> Task {
             "ask": {},
             "agent": "claude",
             "model": "opus",
+            "fallback": ["sonnet"],
+            "fallback_from": "task run",
             "profile": "safe",
         }))
         .unwrap(),
@@ -384,6 +397,7 @@ fn queue_json_is_entries_with_their_task() {
         task,
     };
     let want = [
+        ("aged_from", "string|null"),
         ("flock", "string"),
         ("from", "string"),
         ("id", "string"),
@@ -426,6 +440,7 @@ const MACHINE: &[(&str, &str)] = &[
     ("live", "number|null"),
     ("max_agents", "number"),
     ("name", "string"),
+    ("now", "array"),
     ("orphans", "array"),
     ("pastor_version", "string|null"),
     ("profile", "string|null"),
@@ -433,11 +448,13 @@ const MACHINE: &[(&str, &str)] = &[
     ("tags", "array"),
 ];
 
-/// Left out of a machine's JSON when it is in no named flock.
-const MACHINE_MAY_BE_ABSENT: &[&str] = &["flocks"];
+/// Left out of a machine's JSON when it is in no named flock, or starts
+/// no `--now` task.
+const MACHINE_MAY_BE_ABSENT: &[&str] = &["flocks", "now"];
 
 fn machine_row() -> MachineRow {
     MachineRow {
+        now: vec!["t-9".into()],
         name: "pi-1".into(),
         host: "user@pi-1".into(),
         endpoint: "ssh user@pi-1".into(),
@@ -467,6 +484,7 @@ fn machine_row() -> MachineRow {
 /// A machine never reached, in no named flock, with nothing optional set.
 fn bare_machine_row() -> MachineRow {
     MachineRow {
+        now: Vec::new(),
         name: "pi-1".into(),
         host: "user@pi-1".into(),
         endpoint: "ssh user@pi-1".into(),
@@ -607,7 +625,7 @@ fn job_list_json_is_an_array_of_jobs() {
 
 const FLOCK_TOML: &str = "[[flock]]\nname = \"work\"\ndefault = true\ndescription = \"work \
      things\"\nagent = \"claude\"\nagent_args = [\"-v\"]\nallow = [\"Bash\"]\ndeny = \
-     [\"Web\"]\nmodel = \"opus\"\nprofile = \"safe\"\ntimeout = \"1h\"\nplace = \"own\"\n\n\
+     [\"Web\"]\nmodel = \"opus\"\nfallback = [\"sonnet\"]\nprofile = \"safe\"\ntimeout = \"1h\"\nplace = \"own\"\n\n\
      [[machine]]\nname = \"pi-1\"\nssh = \"user@pi-1\"\nflock = \"work\"\n";
 
 #[test]
@@ -621,6 +639,7 @@ fn flock_describe_json_is_the_flock_and_its_tasks() {
         ("default", "bool"),
         ("deny", "array"),
         ("description", "string|null"),
+        ("fallback", "array|null"),
         ("machines", "array"),
         ("model", "string|null"),
         ("name", "string"),
@@ -655,6 +674,7 @@ fn machine_describe_json_is_the_row_its_tasks_and_errors() {
         row: machine_row(),
         session: "default".into(),
         model: Some("opus".into()),
+        fallback: Some(vec!["sonnet".into()]),
         agents_by_kind: Default::default(),
         tasks: vec![full_task()],
         recent_errors: vec![],
@@ -663,6 +683,7 @@ fn machine_describe_json_is_the_row_its_tasks_and_errors() {
     let mut want: Vec<(&str, &str)> = MACHINE.to_vec();
     want.extend([
         ("agents_by_kind", "object"),
+        ("fallback", "array|null"),
         ("model", "string|null"),
         ("recent_errors", "array"),
         ("session", "string"),
@@ -677,6 +698,7 @@ fn machine_describe_json_is_the_row_its_tasks_and_errors() {
         row: bare_machine_row(),
         session: "default".into(),
         model: None,
+        fallback: None,
         agents_by_kind: Default::default(),
         tasks: vec![],
         recent_errors: vec![],

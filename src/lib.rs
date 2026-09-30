@@ -14,6 +14,8 @@ pub mod head;
 pub mod herdr;
 pub mod hooks;
 pub mod ipc;
+pub mod limit;
+pub mod limit_cli;
 pub mod machine;
 pub mod orchestrator;
 pub mod orchestrator_cli;
@@ -33,6 +35,7 @@ pub mod task;
 pub mod task_cli;
 pub mod template;
 pub mod trust_cli;
+pub mod usage;
 pub mod watch;
 
 /// Lowest herdr socket protocol pastor speaks. herdr 0.9.0 and 0.9.1 ship 22.

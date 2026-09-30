@@ -263,6 +263,26 @@ mod tests {
         })
     }
 
+    /// A machine reporting several flocks and no single `flock`, as
+    /// `Fleet::statuses` fills a head with many flocks.
+    fn many_flocks_machine_json(name: &str, flocks: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "name": name, "endpoint": "", "channel": "connected", "herdr_version": null,
+            "protocol": null, "error": null, "live": 0, "max_agents": 2, "tags": [],
+            "flock": null, "shutting_down": false,
+            "flocks": flocks.iter().map(|f| serde_json::json!({"name": f})).collect::<Vec<_>>(),
+        })
+    }
+
+    /// A machine from a head that predates flocks: neither field is set.
+    fn no_flock_info_machine_json(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": name, "endpoint": "", "channel": "connected", "herdr_version": null,
+            "protocol": null, "error": null, "live": 0, "max_agents": 2, "tags": [],
+            "flock": null, "shutting_down": false,
+        })
+    }
+
     fn fake_head() -> FakeHead {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("head.sock");
@@ -285,7 +305,12 @@ mod tests {
                     "flock_list" => serde_json::json!({"kind": "machines", "data": [
                         machine_json("pi-1", "home"), machine_json("pi-2", "work"),
                         shutting_down_machine_json("pi-3", "home", true),
+                        many_flocks_machine_json("pi-4", &["a", "b"]),
+                        no_flock_info_machine_json("pi-5"),
                     ]}),
+                    "list" if v["filter"]["job"] == "boom" => {
+                        serde_json::json!({"kind": "error", "data": {"code": "boom_error", "message": "no"}})
+                    }
                     "list" => serde_json::json!({"kind": "tasks", "data": tasks}),
                     "task_show" if (1..=2).contains(&id) => {
                         serde_json::json!({"kind": "task", "data": tasks[id as usize - 1]})
@@ -412,34 +437,55 @@ mod tests {
     #[tokio::test]
     async fn an_agent_may_not_change_the_fleet() {
         let head = fake_head();
-        for req in [
-            IpcRequest::TaskClose {
-                id: 1,
-                remove_worktree: false,
-            },
-            IpcRequest::TaskRetry { id: 1, place: None },
-            IpcRequest::TaskSend {
-                id: 1,
-                input: crate::machine::SendInput::default(),
-            },
-            IpcRequest::TaskPrune {
-                states: vec![],
-                older_than_secs: 0,
-            },
-            IpcRequest::FlockList,
-            IpcRequest::FlockRemove {
-                name: "home".into(),
-            },
-            IpcRequest::JobList,
-            IpcRequest::JobRun { name: "j".into() },
-            IpcRequest::Reload,
-            IpcRequest::Tick {
-                job: None,
-                dry_run: true,
-            },
+        for (req, op) in [
+            (
+                IpcRequest::TaskClose {
+                    id: 1,
+                    remove_worktree: false,
+                },
+                "task_close",
+            ),
+            (IpcRequest::TaskRetry { id: 1, place: None }, "task_retry"),
+            (
+                IpcRequest::TaskSend {
+                    id: 1,
+                    input: crate::machine::SendInput::default(),
+                },
+                "task_send",
+            ),
+            (
+                IpcRequest::TaskPrune {
+                    states: vec![],
+                    older_than_secs: 0,
+                },
+                "task_prune",
+            ),
+            (IpcRequest::FlockList, "flock_list"),
+            (
+                IpcRequest::FlockRemove {
+                    name: "home".into(),
+                },
+                "flock_remove",
+            ),
+            (IpcRequest::JobList, "job_list"),
+            (IpcRequest::JobRun { name: "j".into() }, "job_run"),
+            (IpcRequest::Reload, "reload"),
+            (
+                IpcRequest::Tick {
+                    job: None,
+                    dry_run: true,
+                },
+                "tick",
+            ),
         ] {
             let resp = head.ask(&req, Some("t-1")).await;
             assert!(refused(&resp), "{req:?}: {resp:?}");
+            // The refusal names the actual op the agent tried, not a
+            // placeholder: the message is how an agent tells requests apart.
+            let IpcResponse::Error { message, .. } = &resp else {
+                panic!("{resp:?}")
+            };
+            assert!(message.contains(op), "{op}: {message}");
         }
         assert!(head.ops().is_empty(), "{:?}", head.ops());
     }
@@ -475,6 +521,38 @@ mod tests {
             .unwrap();
         let resp: IpcResponse = serde_json::from_slice(&reply).unwrap();
         assert!(refused(&resp), "{resp:?}");
+    }
+
+    #[tokio::test]
+    async fn machine_flocks_falls_back_to_flocks_then_excludes_a_head_with_neither() {
+        let head = fake_head();
+        // No single `flock`, but `flocks` carries several: read from there.
+        let many = machine_flocks(&head.socket, "pi-4").await.unwrap();
+        assert_eq!(many, Some(vec!["a".into(), "b".into()]));
+        // Neither field set: a head from before flocks, machine unknown here.
+        let neither = machine_flocks(&head.socket, "pi-5").await.unwrap();
+        assert_eq!(neither, None, "{neither:?}");
+    }
+
+    #[tokio::test]
+    async fn an_error_from_the_head_passes_through_a_list_unchanged() {
+        let head = fake_head();
+        let filter = TaskFilter {
+            job: Some("boom".into()),
+            ..TaskFilter::default()
+        };
+        let resp = head.ask(&IpcRequest::List { filter }, None).await;
+        assert!(
+            matches!(&resp, IpcResponse::Error { code, .. } if code == "boom_error"),
+            "{resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn showing_a_task_asks_the_head_only_once() {
+        let head = fake_head();
+        head.ask(&IpcRequest::TaskShow { id: 1 }, None).await;
+        assert_eq!(head.ops(), ["task_show"], "{:?}", head.ops());
     }
 
     #[tokio::test]
@@ -527,6 +605,23 @@ mod tests {
         assert!(matches!(replies[1], IpcResponse::Pong { .. }));
     }
 
+    #[tokio::test]
+    async fn a_connect_error_that_is_not_no_daemon_is_not_reported_as_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("head.sock");
+        // A live socket with no permissions: connecting fails with a
+        // permission error, not the "nothing is listening here" kind
+        // `relay`'s guard checks for.
+        let _listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let err = run(&socket, b"{}\n".as_slice(), &mut Vec::new())
+            .await
+            .unwrap_err();
+        let err = err.downcast::<CliError>().unwrap();
+        assert_eq!(err.code, "runtime_error", "{}", err.message);
+    }
+
     #[test]
     fn the_authorized_key_line_locks_the_key_to_the_agent_bridge() {
         let line = authorized_key_line(
@@ -546,6 +641,15 @@ mod tests {
             );
         }
         assert!(authorized_key_line(Path::new("/a b/pastor"), "pi-1", "ssh-ed25519 A").is_err());
+    }
+
+    #[test]
+    fn the_authorized_key_line_accepts_a_minimal_two_token_key() {
+        // Exactly a type and a key, with no comment: the boundary the count
+        // check must let through, not just anything above it.
+        let line =
+            authorized_key_line(Path::new("/opt/pastor"), "pi-1", "ssh-ed25519 AAAA").unwrap();
+        assert!(line.ends_with("ssh-ed25519 AAAA"), "{line}");
     }
 
     #[test]

@@ -62,14 +62,16 @@ flock lists is in the default flock.
 | `agent`, `agent_args` | unset | the agent for tasks here that name none, before the flock's |
 | `agents` | `{}` | the agent for a model of another kind, by kind, as in `[defaults]` |
 | `model` | unset | a `[models]` name for tasks here that name none, after the flock's |
+| `fallback` | unset | `[models]` names tasks here may fall back to, before the flock's; `[]` means none |
 | `priority` | unset | the level of tasks pinned here that name none, after the flock's |
 | `profile` | unset | the profile for tasks here that name none, after the flock's; also whether a task may ask for `unrestricted` here |
 | `description` | unset | one line on what it is for, for `pastor machine list --wide` |
 | `flock` | unset | the old way to join one flock, with the machine's own limits; `machines` on the flock is the current way |
 
 Set exactly one of `ssh`, `local`, `pull` and `command`. Unknown keys in a
-`[[machine]]` are refused, as everywhere in the file. `model`, `agents` and
-`profile` must exist in [pastor.toml](../pastor-toml/).
+`[[machine]]` are refused, as everywhere in the file. `model`, each
+`fallback` name, `agents` and `profile` must exist in
+[pastor.toml](../pastor-toml/).
 
 ## flock
 
@@ -82,12 +84,14 @@ Set exactly one of `ssh`, `local`, `pull` and `command`. Unknown keys in a
 | `agents` | `{}` | the agent for a model of another kind, by kind |
 | `allow`, `deny` | `[]` | tool patterns added to `[defaults]` for its tasks |
 | `model` | unset | a `[models]` name for its tasks that name none |
+| `fallback` | unset | `[models]` names its tasks may fall back to, after the machine's; `[]` means none |
 | `priority` | unset | the level of its tasks that name none |
 | `profile` | unset | the permission profile for its tasks that name none |
 | `timeout` | unset | how long its tasks may run, like `"2h"` |
 | `place` | unset | where its tasks' panes go: `repo`, `own`, `pastor` or `pane:<workspace>` |
 | `label` | unset | the workspace name template for its tasks |
 | `summary` | unset | `ask`, `require` or `off` for its tasks |
+| `keep_pane` | unset | `true` keeps its tasks' panes once they end, until `pastor task close` |
 | `description` | unset | one line on what it is for, for `pastor flock list --wide` |
 
 Unknown keys in a `[[flock]]` are refused. Each key applies when the task or

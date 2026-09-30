@@ -53,10 +53,6 @@ pub const NOTE_MAX: usize = 4096;
 /// agent part of the list.
 pub const LINES_MAX_BYTES: usize = 64 * 1024;
 
-/// How long the head waits after a quota error whose message names no reset
-/// time.
-pub const QUOTA_WAIT: Duration = Duration::from_secs(3600);
-
 /// How many times a session's agent is restarted in any hour; past that the
 /// session waits for the oldest restart to be an hour old.
 pub const RESTARTS_PER_HOUR: usize = 3;
@@ -712,6 +708,7 @@ pub fn works(task: &Task) -> bool {
             | TaskState::Running
             | TaskState::Blocked
             | TaskState::Paused
+            | TaskState::Waiting
     )
 }
 
@@ -725,6 +722,7 @@ pub fn working_orchestrators(store: &Store) -> anyhow::Result<usize> {
             TaskState::Running,
             TaskState::Blocked,
             TaskState::Paused,
+            TaskState::Waiting,
         ]),
         ..Default::default()
     })?;
@@ -732,87 +730,6 @@ pub fn working_orchestrators(store: &Store) -> anyhow::Result<usize> {
         .iter()
         .filter(|t| t.role == TaskRole::Orchestrator)
         .count())
-}
-
-/// When a quota lets an agent start again, if `text` (a task's error and
-/// the last lines of its pane) says its agent stopped on one: the reset time
-/// the message names (`|<unix time>`, or `resets 3am`, `resets at 15:30`,
-/// the next such time of day in local time), else `QUOTA_WAIT` from `now`.
-pub fn quota_reset(text: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    const MARKS: [&str; 5] = [
-        "usage limit",
-        "limit reached",
-        "hit your limit",
-        "quota exceeded",
-        "exceeded your current quota",
-    ];
-    let lower = text.to_lowercase();
-    let at = MARKS.iter().filter_map(|m| lower.rfind(m)).max()?;
-    let rest = &lower[at..];
-    let line = rest.lines().next().unwrap_or("");
-    if let Some((_, epoch)) = line.split_once('|') {
-        let digits: String = epoch.chars().take_while(char::is_ascii_digit).collect();
-        if let Ok(secs) = digits.parse::<i64>()
-            && let Some(t) = Utc.timestamp_opt(secs, 0).single()
-            && t > now
-        {
-            return Some(t);
-        }
-    }
-    if let Some(i) = line.find("reset")
-        && let Some(time) = clock_after(&line[i + "reset".len()..])
-    {
-        let local = now.with_timezone(&Local);
-        let mut day = local.date_naive();
-        for _ in 0..3 {
-            if let Some(t) = Local
-                .from_local_datetime(&day.and_time(time))
-                .earliest()
-                .map(|t| t.with_timezone(&Utc))
-                && t > now
-            {
-                return Some(t);
-            }
-            day = day.succ_opt()?;
-        }
-    }
-    Some(now + chrono::Duration::from_std(QUOTA_WAIT).expect("an hour fits"))
-}
-
-/// The time of day at the start of `s` (after `reset`): `s at 3am`,
-/// ` 3:30 pm`, ` at 15:00`.
-fn clock_after(s: &str) -> Option<NaiveTime> {
-    let s = s.strip_prefix('s').unwrap_or(s).trim_start();
-    let s = s.strip_prefix("at ").unwrap_or(s).trim_start();
-    let hour: String = s.chars().take_while(char::is_ascii_digit).collect();
-    if hour.is_empty() || hour.len() > 2 {
-        return None;
-    }
-    let mut rest = &s[hour.len()..];
-    let mut minute = 0;
-    if let Some(m) = rest.strip_prefix(':') {
-        let digits: String = m.chars().take_while(char::is_ascii_digit).collect();
-        if digits.len() != 2 {
-            return None;
-        }
-        minute = digits.parse().ok()?;
-        rest = &m[2..];
-    }
-    let mut hour: u32 = hour.parse().ok()?;
-    let rest = rest.trim_start().replace('.', "");
-    if rest.starts_with("am") || rest.starts_with("pm") {
-        if !(1..=12).contains(&hour) {
-            return None;
-        }
-        hour %= 12;
-        if rest.starts_with("pm") {
-            hour += 12;
-        }
-    } else if !s[..].contains(':') {
-        // `resets 3` alone is too thin to read as a time.
-        return None;
-    }
-    NaiveTime::from_hms_opt(hour, minute, 0)
 }
 
 /// One orchestrator as `orchestrator list` shows it.
@@ -1390,6 +1307,72 @@ impl Runner {
             .is_some_and(|t| works(&t))
     }
 
+    /// When a quota lets an agent start again, if the agent of `task` ended
+    /// on a usage limit (`limit::limit_in`): the reset its message names,
+    /// else an hour from `now`. The message is at the end of `pane`, the
+    /// last lines of its pane, or in its error when it died at its start;
+    /// they are read apart, since a prompt in the pane would put the error
+    /// above the turn. A 429 or 529 is no quota: the agent is restarted like
+    /// any other that ended.
+    ///
+    /// A weekday, date or time of day in the message is resolved against
+    /// `task.finished_at`, not `now`: this can run well after the agent
+    /// actually ended, and reading a message that says `resets Mon 9am`
+    /// after that Monday 9am has come and gone would otherwise pick next
+    /// week's, or next year's `resets Oct 6` once Oct 6 has passed. A reset
+    /// resolved that way, but already behind `now` by the time this runs,
+    /// means the quota is not held back at all.
+    ///
+    /// The limit also goes in the head's table (`Fleet::note_limit`), under
+    /// the account the agent names on its machine, so no task starts on
+    /// that account either; `orchestrator.quota` is as before.
+    fn quota_until(&self, task: &Task, pane: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let agents = self.fleet.agents();
+        let kind = agents.kind(&task.spec.agent);
+        let read_at = task.finished_at.unwrap_or(now);
+        let limit = [pane, task.error.as_deref().unwrap_or("")]
+            .iter()
+            .find_map(|said| {
+                crate::limit::limit_in(kind, said, read_at).filter(|limit| limit.hard)
+            })?;
+        let until = limit.retry_at(now);
+        if until <= now {
+            return None;
+        }
+        if let Some(machine) = task.machine.as_deref()
+            && let Err(err) = self.fleet.note_limit(task, machine, &limit, read_at)
+        {
+            tracing::warn!(task = %task.display_id(), %err, "keep the usage limit");
+        }
+        Some(until)
+    }
+
+    /// When the account `orch`'s agent would run on is exhausted, hold it
+    /// as for a quota its own agent found: `quota_until` becomes the
+    /// account's `retry_at`, unless a later wait already holds it.
+    fn hold_for_account(&self, orch: &Orchestrator, state: &mut State, now: DateTime<Utc>) {
+        if state.quota_until.is_some_and(|u| u > now) {
+            return;
+        }
+        let flock = self.fleet.flock();
+        let Some(head) = flock.machines.iter().find(|m| m.local) else {
+            return;
+        };
+        let ask = AgentChoice {
+            model: orch.model.clone(),
+            ..Default::default()
+        };
+        let pick = self.fleet.defaults().resolve_agent(&ask, None);
+        let model = pick.model.as_ref().map(|(m, _)| m.as_str());
+        if let Some(row) = self
+            .fleet
+            .limit_holding(&head.name, &pick.agent, model, now)
+        {
+            tracing::info!(orchestrator = %orch.name, account = %row.account, until = %row.retry_at, "its agent's account is exhausted; no agent before the reset");
+            state.quota_until = Some(row.retry_at);
+        }
+    }
+
     fn emit(&self, kind: &str, name: &str, task: Option<i64>, extra: serde_json::Value) {
         let mut detail = serde_json::json!({ "orchestrator": name });
         if let (Some(d), serde_json::Value::Object(extra)) = (detail.as_object_mut(), extra) {
@@ -1501,6 +1484,7 @@ impl Runner {
             return self.save_run(name, state, run);
         }
         run.lines = lines.clone();
+        self.hold_for_account(orch, &mut state, now);
         if let Some(until) = state.quota_until.filter(|u| *u > now) {
             run.outcome = RunOutcome::Held;
             run.detail = Some(format!(
@@ -1622,6 +1606,7 @@ impl Runner {
             })
             .as_secs();
         let spec = DispatchSpec {
+            now: false,
             agent: pick.agent,
             agent_args: pick.agent_args,
             allow: pick.allow,
@@ -1640,20 +1625,23 @@ impl Runner {
             label: Default::default(),
             summary: Default::default(),
             cwd: None,
+            keep_pane: None,
+            keep_pane_from: None,
+            rounds: Default::default(),
         };
         let task = self
             .fleet
-            .queue_run_as(
+            .queue_run_as(crate::daemon::RunAsk {
                 prompt,
                 spec,
-                None,
-                Some(&ask),
-                None,
-                TaskRole::Orchestrator,
-                Some(description),
-                false,
-                None,
-            )
+                flock: None,
+                ask: Some(&ask),
+                priority: None,
+                role: TaskRole::Orchestrator,
+                description: Some(description),
+                preempt: false,
+                summary: None,
+            })
             .await
             .map_err(|e| match e {
                 QueueError::UnknownMachine(m) => format!("machine {m} is not in the flock"),
@@ -1836,6 +1824,7 @@ impl Runner {
         state.stopped_until = None;
         state.held_since = None;
         state.last_run_at = Some(now);
+        self.hold_for_account(orch, state, now);
         if let Some(wait) = state.quota_until.filter(|u| *u > now) {
             state.record(RunRecord {
                 at: now,
@@ -2027,18 +2016,20 @@ impl Runner {
         // A claim moves a task out of `queued` once; two reads settle it.
         for _ in 0..3 {
             let result = match t.state {
-                TaskState::Queued | TaskState::Paused => match self.store.close_queued(t.id) {
-                    Ok(Some(_)) => return true,
-                    Ok(None) => match self.store.get_task(t.id) {
-                        Ok(Some(fresh)) => {
-                            t = fresh;
-                            continue;
-                        }
-                        Ok(None) => return true,
+                TaskState::Queued | TaskState::Paused | TaskState::Waiting => {
+                    match self.store.close_queued(t.id) {
+                        Ok(Some(_)) => return true,
+                        Ok(None) => match self.store.get_task(t.id) {
+                            Ok(Some(fresh)) => {
+                                t = fresh;
+                                continue;
+                            }
+                            Ok(None) => return true,
+                            Err(err) => Err(err),
+                        },
                         Err(err) => Err(err),
-                    },
-                    Err(err) => Err(err),
-                },
+                    }
+                }
                 s if s.occupies_pane() => {
                     match t.machine.as_deref().and_then(|m| self.fleet.get(m)) {
                         Some(h) => self
@@ -2125,12 +2116,8 @@ impl Runner {
             Some(_) => {}
             None => {
                 if let Some(t) = &task {
-                    let said = format!(
-                        "{}\n{}",
-                        t.error.as_deref().unwrap_or(""),
-                        self.store.pane_tail(t.id).unwrap_or_default()
-                    );
-                    if let Some(until) = quota_reset(&said, now) {
+                    let pane = self.store.pane_tail(t.id).unwrap_or_default();
+                    if let Some(until) = self.quota_until(t, &pane, now) {
                         tracing::warn!(orchestrator = name, task = %t.display_id(), until = %until, "session agent stopped on a quota; restarting at the reset");
                         state.quota_until = Some(until);
                         // A failed close is tried again before the restart.
@@ -2143,6 +2130,10 @@ impl Runner {
                         );
                         return;
                     }
+                }
+                self.hold_for_account(orch, state, now);
+                if state.quota_until.is_some_and(|u| u > now) {
+                    return;
                 }
             }
         }
@@ -2243,8 +2234,7 @@ impl Runner {
             _ => return,
         };
         let last_output = self.store.pane_tail(id).unwrap_or_default();
-        let said = format!("{}\n{last_output}", task.error.as_deref().unwrap_or(""));
-        if let Some(until) = quota_reset(&said, now) {
+        if let Some(until) = self.quota_until(&task, &last_output, now) {
             tracing::warn!(orchestrator = name, task = %task.display_id(), until = %until, "agent stopped on a quota; no agent before the reset");
             state.quota_until = Some(until);
             self.emit(
@@ -2416,6 +2406,7 @@ struct ScriptRun {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::PastorConfig;
     use crate::config::flock::Flock;
     use std::os::unix::fs::PermissionsExt;
 
@@ -2501,39 +2492,6 @@ prompt = "You are the night orchestrator."
         assert!(prompt < skill && skill < note && note < line, "{p}");
         assert!(p.ends_with("TASK t-4 blocked"), "{p}");
         assert!(!o.agent_prompt(None, &[]).contains("handover"));
-    }
-
-    #[test]
-    fn a_quota_message_names_its_reset_or_waits_an_hour() {
-        let now = Utc.with_ymd_and_hms(2026, 9, 28, 12, 0, 0).unwrap();
-        assert_eq!(quota_reset("all good, merged #31", now), None);
-        assert_eq!(
-            quota_reset("Claude AI usage limit reached|1800000000", now),
-            Utc.timestamp_opt(1_800_000_000, 0).single()
-        );
-        let hour = quota_reset("You've hit your limit · resets 3am (Europe/Lisbon)", now).unwrap();
-        let local = hour.with_timezone(&Local);
-        assert_eq!(
-            (
-                chrono::Timelike::hour(&local),
-                chrono::Timelike::minute(&local)
-            ),
-            (3, 0)
-        );
-        assert!(hour > now && hour - now <= chrono::Duration::hours(24));
-        let at = quota_reset("5-hour limit reached ∙ resets at 15:30", now).unwrap();
-        let local = at.with_timezone(&Local);
-        assert_eq!(
-            (
-                chrono::Timelike::hour(&local),
-                chrono::Timelike::minute(&local)
-            ),
-            (15, 30)
-        );
-        assert_eq!(
-            quota_reset("quota exceeded, try later", now),
-            Some(now + chrono::Duration::hours(1))
-        );
     }
 
     #[test]
@@ -2930,6 +2888,7 @@ prompt = "You are the night orchestrator."
                     item: serde_json::Value::Null,
                     prompt: "plan".into(),
                     spec: DispatchSpec {
+                        now: false,
                         agent: "claude".into(),
                         agent_args: vec![],
                         allow: vec![],
@@ -2948,6 +2907,9 @@ prompt = "You are the night orchestrator."
                         label: Default::default(),
                         summary: Default::default(),
                         cwd: None,
+                        keep_pane: None,
+                        keep_pane_from: None,
+                        rounds: Default::default(),
                     },
                     flock: "default".into(),
                 },
@@ -2981,6 +2943,196 @@ prompt = "You are the night orchestrator."
         assert_eq!(head.kinds(), ["orchestrator.held"]);
         let st = head.runner.statuses(Utc::now());
         assert_eq!(st[0].state, "waiting for quota");
+    }
+
+    /// A quota its agent stopped on also goes in the head's table, under
+    /// the account of the agent on the machine it ran on.
+    #[tokio::test]
+    async fn a_quota_its_agent_found_is_kept_for_the_account() {
+        let mut head = Head::new(&scheduled(), "echo 'PR #31'", "");
+        let id = head.run().await.task.unwrap();
+        head.store
+            .note_pane_tail(id, "working...\nClaude AI usage limit reached|4102444800\n");
+        let mut t = head.store.get_task(id).unwrap().unwrap();
+        t.machine = Some("head".into());
+        t.state = TaskState::Done;
+        head.store.update_task(&mut t).unwrap();
+        head.runner.finish_now(&head.orch()).await;
+        assert_eq!(head.kinds(), ["orchestrator.started", "orchestrator.quota"]);
+        let rows = head.store.limits().unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].account, "head/claude");
+        assert_eq!(rows[0].task_id, Some(id));
+        assert_eq!(
+            rows[0].retry_at,
+            Utc.timestamp_opt(4_102_444_800, 0).single().unwrap()
+        );
+    }
+
+    /// An orchestrator whose agent's account is exhausted on the head's
+    /// machine starts no agent before the account's reset.
+    #[tokio::test]
+    async fn an_exhausted_account_holds_the_orchestrator() {
+        let mut head = Head::new(&scheduled(), "echo 'PR #31'", "");
+        let now = Utc::now();
+        let reset = now + chrono::Duration::hours(2);
+        head.store
+            .record_limit(&crate::limit::AccountLimit {
+                account: "head/claude".into(),
+                model: None,
+                hard: true,
+                no_credit: false,
+                until: Some(reset),
+                retry_at: reset,
+                line: "You've hit your limit".into(),
+                task_id: None,
+                machine: Some("head".into()),
+                agent: Some("claude".into()),
+                seen_at: now,
+            })
+            .unwrap();
+        let run = head.run().await;
+        assert_eq!(run.outcome, RunOutcome::Held, "{run:?}");
+        assert!(head.tasks().is_empty());
+        assert_eq!(head.kinds(), ["orchestrator.held"]);
+        assert_eq!(head.state().quota_until, Some(reset));
+        let st = head.runner.statuses(Utc::now());
+        assert_eq!(st[0].state, "waiting for quota");
+        // Cleared, it holds nothing.
+        head.runner.fleet.clear_limits("head/claude", None).unwrap();
+        let mut state = head.state();
+        state.quota_until = None;
+        save_state(&head.paths, "merge", &state);
+        assert_eq!(head.run().await.outcome, RunOutcome::Started);
+    }
+
+    /// A scheduled orchestrator whose agent, run by `agent`, ended with
+    /// `error` and `pane`: the events of its finish and the quota it holds.
+    async fn ended_with(
+        agent: &str,
+        error: Option<&str>,
+        pane: &str,
+    ) -> (Vec<String>, Option<DateTime<Utc>>) {
+        let mut head = Head::new(&scheduled(), "echo 'PR #31'", "");
+        let config = "[agents.claude-personal]\nkind = \"claude\"\n";
+        let config = PastorConfig::parse(Path::new("pastor.toml"), config).unwrap();
+        head.runner.fleet.set_config(&config);
+        let id = head.run().await.task.unwrap();
+        let mut task = head.store.get_task(id).unwrap().unwrap();
+        task.spec.agent = agent.into();
+        task.error = error.map(str::to_string);
+        task.state = TaskState::Done;
+        head.store.update_task(&mut task).unwrap();
+        head.store.note_pane_tail(id, pane);
+        head.runner.finish_now(&head.orch()).await;
+        (head.kinds(), head.state().quota_until)
+    }
+
+    #[tokio::test]
+    async fn a_limit_that_did_not_end_the_turn_holds_nothing() {
+        let limit = "Claude AI usage limit reached|4102444800";
+        for pane in [
+            // Above the last prompt.
+            format!("● {limit}\n\n> carry on\n\n● Merged #31.\n"),
+            // What a tool printed: pastor's own source has these words.
+            format!("● Bash(grep -rn limit src/limit.rs)\n  ⎿  {limit}\n     {limit}\n"),
+            format!("● Merged #31. The parser reads \"{limit}\".\n"),
+            format!("● {limit}\n\n● Merged #31.\n"),
+            // Busy, not out of tokens: restarted like any agent that ended.
+            "● API Error: 529 {\"type\":\"error\"}\n".to_string(),
+        ] {
+            let (kinds, quota) = ended_with("claude", None, &pane).await;
+            assert_eq!(kinds, ["orchestrator.started"], "{pane}");
+            assert_eq!(quota, None, "{pane}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_limit_is_read_as_the_agents_kind_prints_it() {
+        let reset = Utc.timestamp_opt(4_102_444_800, 0).single();
+        let pane = "● Claude AI usage limit reached|4102444800\n\n────\n❯ \n────\n";
+        let quota = ["orchestrator.started", "orchestrator.quota"];
+        assert_eq!(
+            ended_with("claude", None, pane).await,
+            (quota.map(String::from).to_vec(), reset)
+        );
+        assert_eq!(
+            ended_with("claude-personal", None, pane).await,
+            (quota.map(String::from).to_vec(), reset)
+        );
+        // Only Claude's messages are known.
+        assert_eq!(
+            ended_with("opencode", None, pane).await,
+            (vec!["orchestrator.started".to_string()], None)
+        );
+        // An agent that died at its start left its message in the error,
+        // whatever its pane shows.
+        let error = "Claude AI usage limit reached|4102444800";
+        for pane in ["", "> Decide what to do.\n\n────\n❯ \n────\n"] {
+            assert_eq!(
+                ended_with("claude", Some(error), pane).await,
+                (quota.map(String::from).to_vec(), reset),
+                "{pane}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_limit_that_names_no_reset_waits_an_hour() {
+        let before = Utc::now();
+        let (kinds, quota) = ended_with("claude", None, "● Credit balance is too low\n").await;
+        assert_eq!(kinds, ["orchestrator.started", "orchestrator.quota"]);
+        let wait = quota.unwrap() - before;
+        assert!(
+            wait >= chrono::Duration::hours(1) && wait < chrono::Duration::minutes(61),
+            "{wait}"
+        );
+    }
+
+    /// The head handles a finished agent later than it actually ended
+    /// (`finished`): its message's weekday or date must resolve against
+    /// that, not the head's own `now`, or a reset already behind `now`
+    /// (`processed`) is read as next week's or next year's instead of
+    /// already passed.
+    async fn finished_late(pane: &str, finished: DateTime<Utc>, processed: DateTime<Utc>) -> State {
+        let head = Head::new(&scheduled(), "echo 'PR #31'", "");
+        let id = head.run().await.task.unwrap();
+        head.store.note_pane_tail(id, pane);
+        let mut t = head.store.get_task(id).unwrap().unwrap();
+        t.state = TaskState::Done;
+        t.finished_at = Some(finished);
+        head.store.update_task(&mut t).unwrap();
+        head.runner.finish(&head.orch(), processed).await;
+        head.state()
+    }
+
+    #[tokio::test]
+    async fn a_delayed_finish_does_not_push_a_weekday_reset_to_next_week() {
+        // The agent's turn ended just before the reset it named; the head
+        // handles it a minute later, after that Monday 9am has come.
+        let finished = Utc.with_ymd_and_hms(2026, 10, 5, 8, 59, 0).unwrap();
+        let processed = Utc.with_ymd_and_hms(2026, 10, 5, 9, 1, 0).unwrap();
+        let state = finished_late(
+            "● Weekly limit reached ∙ resets Mon 9am (UTC)\n",
+            finished,
+            processed,
+        )
+        .await;
+        assert_eq!(state.quota_until, None);
+    }
+
+    #[tokio::test]
+    async fn a_delayed_finish_does_not_push_a_date_reset_to_next_year() {
+        // Same, a minute past a named date instead of a weekday.
+        let finished = Utc.with_ymd_and_hms(2026, 10, 6, 8, 59, 0).unwrap();
+        let processed = Utc.with_ymd_and_hms(2026, 10, 6, 9, 1, 0).unwrap();
+        let state = finished_late(
+            "● Opus weekly limit reached ∙ resets Oct 6, 9am (UTC)\n",
+            finished,
+            processed,
+        )
+        .await;
+        assert_eq!(state.quota_until, None);
     }
 
     #[tokio::test]

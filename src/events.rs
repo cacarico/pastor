@@ -23,7 +23,6 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::config::Paths;
 use crate::machine::{MachineHandle, MachineStatus, PastorEvent};
 use crate::store::Store;
 use crate::task::{Task, parse_task_id};
@@ -615,7 +614,8 @@ pub struct EventsArgs {
 }
 
 /// `pastor events`.
-pub async fn cli(paths: &Paths, args: EventsArgs) -> anyhow::Result<()> {
+pub async fn cli(client: &crate::ipc::Client, args: EventsArgs) -> anyhow::Result<()> {
+    let paths = &client.paths;
     let task = args
         .task
         .as_deref()
@@ -631,7 +631,7 @@ pub async fn cli(paths: &Paths, args: EventsArgs) -> anyhow::Result<()> {
         // A closed stdout (`pastor events | head`) ends the command quietly.
         writeln!(std::io::stdout(), "{line}").is_ok()
     };
-    if crate::ipc::remote_head().is_some() {
+    if client.head.is_some() {
         let fetch = |after| {
             let req = crate::ipc::IpcRequest::EventsSince {
                 after,
@@ -639,7 +639,7 @@ pub async fn cli(paths: &Paths, args: EventsArgs) -> anyhow::Result<()> {
                 task,
             };
             async move {
-                let resp = crate::ipc::request_head(paths, &req)
+                let resp = crate::ipc::request_head(client, &req)
                     .await
                     .map_err(|e| crate::head::failure(&e))?;
                 match resp {
@@ -692,6 +692,7 @@ mod tests {
                 item: serde_json::json!({"key": "k1", "title": "fix it"}),
                 prompt: "do it".into(),
                 spec: DispatchSpec {
+                    now: false,
                     agent: "claude".into(),
                     agent_args: vec![],
                     allow: vec![],
@@ -710,6 +711,9 @@ mod tests {
                     label: Default::default(),
                     summary: Default::default(),
                     cwd: None,
+                    keep_pane: None,
+                    keep_pane_from: None,
+                    rounds: Default::default(),
                 },
                 flock: "work".into(),
             })
@@ -785,6 +789,7 @@ mod tests {
 
     fn handle(name: &str, channel: ChannelState) -> MachineHandle {
         let (tx, _rx) = mpsc::channel(1);
+        let (now_tx, _now_rx) = mpsc::channel(1);
         MachineHandle {
             name: name.into(),
             max_agents: 2,
@@ -792,7 +797,9 @@ mod tests {
             burst: 0,
             tags: vec![],
             tx,
+            now_tx,
             status: Arc::new(RwLock::new(MachineStatus {
+                now: Vec::new(),
                 description: None,
                 name: name.into(),
                 host: name.into(),

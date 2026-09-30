@@ -1,0 +1,22 @@
+#! kind: claude
+#! source: spec
+#! now: 2026-09-29T12:00:00Z
+#! limit: hard
+#! model_scoped: yes
+#! until: local 2026-10-06 09:00
+> Read AGENTS.md, then fix the flaky transport test.
+
+● Read(AGENTS.md)
+  ⎿  Read 132 lines
+
+● Bash(cargo test --test transport)
+  ⎿  running 14 tests
+     test result: ok. 14 passed; 0 failed
+     … +12 lines (ctrl+o to expand)
+
+● Opus weekly limit reached ∙ resets Oct 6, 9am
+
+──────────────────────────────────────────────────────────────────────────────
+❯ 
+──────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

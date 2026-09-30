@@ -165,10 +165,15 @@ pub async fn run(paths: Paths, head: String, ask: Ask) -> anyhow::Result<()> {
         config.shepherd.machine_name(),
         config.shepherd.flock_work(),
         shepherd_connector(&config),
-        crate::daemon::machine_settings(&PastorConfig {
-            head_address: None,
-            ..config.clone()
-        }),
+        // The head keeps the limits: a limit read here would be one it never
+        // hears of, so this machine's tasks settle as before.
+        MachineSettings {
+            limits: None,
+            ..crate::daemon::machine_settings(&PastorConfig {
+                head_address: None,
+                ..config.clone()
+            })
+        },
         store.clone(),
         ask.clone(),
     );
@@ -411,6 +416,8 @@ impl Puller {
                 state: t.state,
                 pane: t.pane_id.clone(),
                 detail: t.error.clone(),
+                // Nothing here reads a limit from a pane yet.
+                limit: None,
             };
             let head_row = match (self.ask)(req).await {
                 Ok(IpcResponse::Task(row)) => row,
@@ -563,7 +570,7 @@ impl Follower {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fake-herdr"))]
 mod tests {
     use super::*;
     use std::sync::Mutex;
@@ -857,15 +864,18 @@ mod tests {
             agent_ready_timeout: Duration::from_millis(500),
             poll_every: Duration::from_millis(200),
             close_done_after: None,
+            close_failed_after: None,
             ..Default::default()
         }
     }
 
     async fn run_pinned(head: &Daemon, machine: Option<&str>) -> Task {
         let req = IpcRequest::Run {
+            now: false,
             preempt: false,
             prompt: "fix it".into(),
             spec: crate::task::DispatchSpec {
+                now: false,
                 agent: "claude".into(),
                 agent_args: vec![],
                 allow: vec![],
@@ -884,6 +894,9 @@ mod tests {
                 label: Default::default(),
                 summary: Default::default(),
                 cwd: None,
+                keep_pane: None,
+                keep_pane_from: None,
+                rounds: Default::default(),
             },
             flock: None,
             agent: None,

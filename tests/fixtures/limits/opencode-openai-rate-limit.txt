@@ -1,0 +1,43 @@
+#! kind: opencode
+#! source: real
+#! now: 2026-09-29T21:00:00Z
+#! limit: short
+#! model_scoped: no
+#! until: 2026-09-29T21:00:20Z
+  ┃
+  ┃  Fix the flaky transport test
+  ┃
+
+  ┃
+  ┃  Rate limit reached for gpt-4.1 in organization org-example on tokens per min (TPM): Limit
+  ┃  30000, Used 29800, Requested 1200. Please try again in 20s. Visit https://platform.openai.
+  ┃  com/account/rate-limits to learn more.
+  ┃
+
+     ▣  Build · GPT-4.1
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ┃
+  ┃
+  ┃
+  ┃  Build · GPT-4.1 OpenAI
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   work/pastor                                                              tab agents  ctrl+p commands

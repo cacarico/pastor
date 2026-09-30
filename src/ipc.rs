@@ -34,8 +34,13 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 /// flock's own `timeout` and `place` (`FlockEntry::timeout`,
 /// `FlockEntry::place`). 25: session orchestrators (`OrchestratorStart`,
 /// `OrchestratorStop`). 26: a flock's share and max on a machine
-/// (`FlockNumber::Split`, `FlockSeat::share`).
-pub const IPC_PROTOCOL: u32 = 26;
+/// (`FlockNumber::Split`, `FlockSeat::share`). 27: fallback models
+/// (`AgentChoice::fallback`, a job's `[dispatch] fallback`). 28: `task run
+/// --now` (`Run::now`, `MachineStatus::now`). 29: keeping a task's pane
+/// (`DispatchSpec::keep_pane`, a job's `[dispatch] keep_pane`,
+/// `FlockEntry::keep_pane`). 30: usage limits (`LimitList`, `LimitClear`,
+/// `TaskReport::limit`).
+pub const IPC_PROTOCOL: u32 = 30;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -70,6 +75,36 @@ impl Caller {
         Caller {
             task: task.map(str::to_string),
             orchestrator: None,
+        }
+    }
+
+    /// Who this process's own requests come from: `TASK_ENV` when set, else
+    /// `orchestrator::ORCHESTRATOR_ENV` (a task always wins over an
+    /// orchestrator script), else a person.
+    pub fn from_env() -> Caller {
+        let task = task_from_env();
+        let orchestrator = task.is_none().then(orchestrator_from_env).flatten();
+        Caller { task, orchestrator }
+    }
+}
+
+/// The CLI's own identity and routing, resolved once at startup: the paths
+/// it reads config and state from, the head it talks to (a remote one over
+/// ssh, or this machine's own socket when `None`), and who its requests say
+/// they come from.
+#[derive(Debug, Clone)]
+pub struct Client {
+    pub paths: crate::config::Paths,
+    pub head: Option<crate::head::RemoteHead>,
+    pub caller: Caller,
+}
+
+impl Client {
+    pub fn new(paths: crate::config::Paths, head: Option<crate::head::RemoteHead>) -> Client {
+        Client {
+            paths,
+            head,
+            caller: Caller::from_env(),
         }
     }
 }
@@ -169,6 +204,16 @@ pub const JOB_SUBMIT_PROTOCOL: u32 = 7;
 /// on its default model without a word.
 pub const MODEL_PROTOCOL: u32 = 8;
 
+/// The first protocol whose head keeps a task's fallback models
+/// (`--fallback`, `--no-fallback`, a job's `fallback`). An older one would
+/// drop them without a word.
+pub const FALLBACK_PROTOCOL: u32 = 27;
+
+/// The first protocol whose head keeps usage limits: it answers
+/// `LimitList` and `LimitClear`, and records `TaskReport::limit`. An older
+/// one refuses the first two as unreadable and drops the third.
+pub const LIMIT_PROTOCOL: u32 = 30;
+
 /// The first protocol whose head honours `Run::priority` and knows
 /// `TaskPriority`. An older one would queue the task at its own level
 /// without a word, or refuse the request as unreadable.
@@ -189,6 +234,10 @@ pub const QUEUE_PROTOCOL: u32 = 14;
 /// and it would wait behind low work, without a word.
 pub const PREEMPT_PROTOCOL: u32 = 16;
 
+/// The first protocol whose head honours `Run::now`. An older one would
+/// queue the task behind the machine's limits without a word.
+pub const NOW_PROTOCOL: u32 = 28;
+
 /// The first protocol whose head keeps what `task done --summary` sends and
 /// knows `TaskSummaries`. An older one would drop the summary without a
 /// word, or refuse the request as unreadable.
@@ -198,6 +247,12 @@ pub const SUMMARY_PROTOCOL: u32 = 17;
 /// `[dispatch] summary`. An older one would ask for a summary on its own
 /// terms, or refuse the job's dispatch table as unreadable.
 pub const SUMMARY_MODE_PROTOCOL: u32 = 20;
+
+/// The first protocol whose head keeps a task's pane once it ends
+/// (`task run --keep-pane`, a job's or flock's `keep_pane`). An older one
+/// would close it after `close_done_after` without a word, or refuse the
+/// job's dispatch table as unreadable.
+pub const KEEP_PANE_PROTOCOL: u32 = 29;
 
 /// The first protocol whose head runs orchestrator files and answers the
 /// `Orchestrator*` requests; an older one refuses them as unreadable.
@@ -241,6 +296,7 @@ const PRIORITY: &str =
 const ROLE: &str = "predates task roles and permission profiles, and would start a plain agent without them instead of an orchestrator";
 const DESCRIPTION: &str = "predates descriptions and would drop the description";
 const PREEMPT: &str = "predates pausing a low task, and would queue the task without --preempt";
+const NOW: &str = "predates --now, and would queue the task behind the machine's limits";
 const LABEL: &str = "predates workspace labels and would name the workspace t-N";
 const SUMMARY_MODE: &str =
     "predates the summary setting, and would queue the task without --summary";
@@ -256,6 +312,9 @@ const JOB_SUBMIT: &str = "predates job submits from a headless serve, and would 
 const JOB_TASK: &str = "predates job tasks from a headless serve, and would refuse them";
 const JOB_MODEL: &str =
     "predates a job naming a model, and would start its agents on their default model";
+const FALLBACK: &str = "predates fallback models, and would queue the task without --fallback";
+const JOB_FALLBACK: &str =
+    "predates a job naming fallback models, and would queue its tasks without them";
 const JOB_PROFILE: &str =
     "predates a job naming a permission profile, and would start its agents unenforced";
 const JOB_DESCRIPTION: &str =
@@ -265,9 +324,13 @@ const JOB_PREEMPT: &str = "predates a job with preempt, and would refuse its dis
 const JOB_LABEL: &str =
     "predates a job naming a workspace label, and would name its workspaces t-N";
 const JOB_SUMMARY: &str = "predates a job with summary, and would refuse its dispatch table";
+const KEEP_PANE: &str = "predates keeping a task's pane, and would close it once the task is done";
+const JOB_KEEP_PANE: &str = "predates a job with keep_pane, and would refuse its dispatch table";
 const PULL: &str = "predates pull machines, and would refuse the claim or report";
 const ORCHESTRATOR: &str = "predates orchestrator files, and would refuse the request";
 const SESSION: &str = "predates session orchestrators, and would refuse the request";
+const LIMITS: &str = "predates usage limits, and would refuse the request";
+const REPORT_LIMIT: &str = "predates usage limits, and would drop the limit the report carries";
 
 /// How long a head's `Pong` settles the protocol check before it is asked
 /// again: a long-lived sender (a headless serve) sees a restarted head
@@ -338,12 +401,12 @@ static HEAD_GATES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<ProtocolGate>>>,
 > = std::sync::LazyLock::new(Default::default);
 
-/// The gate of the head `request_head` reaches from `paths`: the remote
+/// The gate of the head `request_head` reaches from `client`: the remote
 /// head when one is set, else this machine's socket.
-pub fn head_gate(paths: &crate::config::Paths) -> std::sync::Arc<ProtocolGate> {
-    let key = match remote_head() {
+pub fn head_gate(client: &Client) -> std::sync::Arc<ProtocolGate> {
+    let key = match &client.head {
         Some(head) => format!("ssh {}", head.ssh),
-        None => paths.socket_file().display().to_string(),
+        None => client.paths.socket_file().display().to_string(),
     };
     HEAD_GATES
         .lock()
@@ -397,6 +460,13 @@ pub enum IpcRequest {
         /// `SUMMARY_MODE_PROTOCOL` or later.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         summary: Option<crate::task::SummaryMode>,
+        /// `task run --now`: start the task at once on its pinned machine,
+        /// past that machine's limits. The head sets `DispatchSpec::now`
+        /// from this alone, whatever `spec` says. Left out when not given,
+        /// so an older head still reads the request; given, the CLI sends
+        /// it only to a head of `NOW_PROTOCOL` or later.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        now: bool,
     },
     List {
         filter: TaskFilter,
@@ -654,6 +724,20 @@ pub enum IpcRequest {
         pane: Option<String>,
         #[serde(default)]
         detail: Option<String>,
+        /// The usage limit the task's agent stopped on, as the pull machine
+        /// read it; the head keeps it under the account the task's agent
+        /// names on that machine (`Fleet::report`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<crate::limit::Limit>,
+    },
+    /// Every usage limit the head keeps. Answers `Limits`.
+    LimitList,
+    /// Forget `account`'s limits, only `model`'s when given. Answers
+    /// `Limits`, those cleared.
+    LimitClear {
+        account: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     /// Every orchestrator file the head reads. Answers `Orchestrators`.
     OrchestratorList,
@@ -725,6 +809,7 @@ impl IpcRequest {
                 preempt,
                 summary,
                 spec,
+                now,
                 ..
             } => {
                 // A run with a role needs roles as much as profiles, and
@@ -739,6 +824,9 @@ impl IpcRequest {
                 }
                 if agent.as_ref().is_some_and(|a| a.model.is_some()) {
                     need.at(MODEL_PROTOCOL, queues);
+                }
+                if agent.as_ref().is_some_and(|a| a.fallback.is_some()) {
+                    need.at(FALLBACK_PROTOCOL, FALLBACK);
                 }
                 if priority.is_some() {
                     need.at(PRIORITY_PROTOCOL, PRIORITY);
@@ -757,6 +845,12 @@ impl IpcRequest {
                 }
                 if summary.is_some() {
                     need.at(SUMMARY_MODE_PROTOCOL, SUMMARY_MODE);
+                }
+                if *now {
+                    need.at(NOW_PROTOCOL, NOW);
+                }
+                if spec.keep_pane.is_some() {
+                    need.at(KEEP_PANE_PROTOCOL, KEEP_PANE);
                 }
             }
             R::Tick { dry_run, .. } => {
@@ -826,6 +920,9 @@ impl IpcRequest {
                 if has("model") {
                     need.at(MODEL_PROTOCOL, JOB_MODEL);
                 }
+                if has("fallback") {
+                    need.at(FALLBACK_PROTOCOL, JOB_FALLBACK);
+                }
                 if has("priority") {
                     need.at(PRIORITY_PROTOCOL, JOB_PRIORITY);
                 }
@@ -844,6 +941,10 @@ impl IpcRequest {
                 if has("summary") {
                     need.at(SUMMARY_MODE_PROTOCOL, JOB_SUMMARY);
                 }
+                // `false` too: an older head refuses the key whatever it says.
+                if dispatch.get("keep_pane").is_some_and(|v| !v.is_null()) {
+                    need.at(KEEP_PANE_PROTOCOL, JOB_KEEP_PANE);
+                }
             }
             R::JobTask {
                 agent,
@@ -855,6 +956,9 @@ impl IpcRequest {
                 if agent.profile.is_some() {
                     need.at(PROFILE_PROTOCOL, JOB_PROFILE);
                 }
+                if agent.fallback.is_some() {
+                    need.at(FALLBACK_PROTOCOL, JOB_FALLBACK);
+                }
                 if description.is_some() {
                     need.at(DESCRIPTION_PROTOCOL, JOB_DESCRIPTION);
                 }
@@ -864,13 +968,23 @@ impl IpcRequest {
                 if !spec.summary.is_ask() {
                     need.at(SUMMARY_MODE_PROTOCOL, JOB_SUMMARY);
                 }
+                if spec.keep_pane.is_some() {
+                    need.at(KEEP_PANE_PROTOCOL, JOB_KEEP_PANE);
+                }
             }
             R::TrustList
             | R::TrustAdd { .. }
             | R::TrustRemove { .. }
             | R::FlockDescribe { .. }
             | R::MachineDescribe { .. } => need.at(HEAD_READS_PROTOCOL, HEAD_READS),
-            R::TaskClaim { .. } | R::TaskReport { .. } => need.at(PULL_PROTOCOL, PULL),
+            R::TaskClaim { .. } => need.at(PULL_PROTOCOL, PULL),
+            R::TaskReport { limit, .. } => {
+                need.at(PULL_PROTOCOL, PULL);
+                if limit.is_some() {
+                    need.at(LIMIT_PROTOCOL, REPORT_LIMIT);
+                }
+            }
+            R::LimitList | R::LimitClear { .. } => need.at(LIMIT_PROTOCOL, LIMITS),
             R::OrchestratorStart { .. } | R::OrchestratorStop { .. } => {
                 need.at(SESSION_PROTOCOL, SESSION);
             }
@@ -902,6 +1016,7 @@ impl IpcRequest {
             | IpcRequest::MachineDescribe { .. }
             | IpcRequest::OrchestratorList
             | IpcRequest::OrchestratorDescribe { .. }
+            | IpcRequest::LimitList
             | IpcRequest::Queue { .. } => false,
             IpcRequest::FileGet { .. } | IpcRequest::JobDescribe { .. } => false,
             IpcRequest::Reload
@@ -931,6 +1046,7 @@ impl IpcRequest {
             | IpcRequest::TrustRemove { .. }
             | IpcRequest::TaskClaim { .. }
             | IpcRequest::TaskReport { .. }
+            | IpcRequest::LimitClear { .. }
             | IpcRequest::OrchestratorRun { .. }
             | IpcRequest::OrchestratorStart { .. }
             | IpcRequest::OrchestratorStop { .. }
@@ -1005,28 +1121,14 @@ pub fn parse_request_line(line: &str) -> serde_json::Result<(IpcRequest, Caller)
     Ok((serde_json::from_value(v)?, caller))
 }
 
-static CALLER_TASK: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-
 /// The task `TASK_ENV` names: `None` outside a pane pastor started, or when
-/// the variable is empty.
+/// the variable is empty. The library never reads the variable itself
+/// beyond this: tests run from an agent's pane build their own `Caller`
+/// instead of picking it up here, so they don't send the mark and get
+/// their own requests refused.
 pub fn task_from_env() -> Option<String> {
     std::env::var(TASK_ENV).ok().filter(|t| !t.is_empty())
 }
-
-/// Sets the task this process's requests carry. Only the `pastor` binary
-/// calls it, from `task_from_env`: the library never reads the variable
-/// itself, so tests run from an agent's pane don't send the mark and get
-/// their own requests refused.
-pub fn set_caller_task(task: Option<String>) {
-    let _ = CALLER_TASK.set(task);
-}
-
-/// The task this process's requests carry, as `set_caller_task` left it.
-pub fn caller_task() -> Option<String> {
-    CALLER_TASK.get().cloned().flatten()
-}
-
-static CALLER_ORCHESTRATOR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
 /// The orchestrator `orchestrator::ORCHESTRATOR_ENV` names: `None` outside
 /// its pre and post scripts, or when the variable is empty.
@@ -1034,25 +1136,6 @@ pub fn orchestrator_from_env() -> Option<String> {
     std::env::var(crate::orchestrator::ORCHESTRATOR_ENV)
         .ok()
         .filter(|o| !o.is_empty())
-}
-
-/// Sets the orchestrator this process's requests carry when they carry no
-/// task (`PASTOR_TASK` wins). Only the `pastor` binary calls it, as for
-/// `set_caller_task`.
-pub fn set_caller_orchestrator(orchestrator: Option<String>) {
-    let _ = CALLER_ORCHESTRATOR.set(orchestrator);
-}
-
-/// Who this process's requests say they come from.
-pub fn caller() -> Caller {
-    let task = caller_task();
-    Caller {
-        orchestrator: task
-            .is_none()
-            .then(|| CALLER_ORCHESTRATOR.get().cloned().flatten())
-            .flatten(),
-        task,
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1104,6 +1187,7 @@ pub enum IpcResponse {
     Summaries(Vec<crate::task::TaskSummary>),
     Orchestrators(Vec<crate::orchestrator::OrchestratorStatus>),
     Orchestrator(crate::orchestrator::OrchestratorDescription),
+    Limits(Vec<crate::limit::AccountLimit>),
 }
 
 /// One of the head's config files as `FileGet` found it.
@@ -1173,61 +1257,51 @@ impl From<crate::cli::CliError> for RequestError {
     }
 }
 
-static REMOTE_HEAD: std::sync::OnceLock<Option<crate::head::RemoteHead>> =
-    std::sync::OnceLock::new();
-
-/// Sets the head this process's requests go to over ssh. Only the `pastor`
-/// binary calls it, once, from `--head`, `PASTOR_HEAD` or client.toml.
-pub fn set_remote_head(head: Option<crate::head::RemoteHead>) {
-    let _ = REMOTE_HEAD.set(head);
-}
-
-/// The remote head `set_remote_head` left, if any.
-pub fn remote_head() -> Option<&'static crate::head::RemoteHead> {
-    REMOTE_HEAD.get().and_then(Option::as_ref)
-}
-
 /// One request to the head, wherever it is: over ssh to a remote head when
-/// one is set, else to this machine's socket. Every CLI request goes through
-/// here, and none goes to a head too old for it (`ProtocolGate`).
-pub async fn request_head(
-    paths: &crate::config::Paths,
-    req: &IpcRequest,
-) -> Result<IpcResponse, RequestError> {
-    request_head_with_timeout(paths, req, DEFAULT_REQUEST_TIMEOUT).await
+/// `client` has one set, else to this machine's socket. Every CLI request
+/// goes through here, and none goes to a head too old for it
+/// (`ProtocolGate`).
+pub async fn request_head(client: &Client, req: &IpcRequest) -> Result<IpcResponse, RequestError> {
+    request_head_with_timeout(client, req, DEFAULT_REQUEST_TIMEOUT).await
 }
 
 /// `request_head` with its own bound on the round trip.
 pub async fn request_head_with_timeout(
-    paths: &crate::config::Paths,
+    client: &Client,
     req: &IpcRequest,
     timeout: Duration,
 ) -> Result<IpcResponse, RequestError> {
-    head_gate(paths)
-        .check(req, send_to_head(paths, &IpcRequest::Ping, timeout))
+    head_gate(client)
+        .check(req, send_to_head(client, &IpcRequest::Ping, timeout))
         .await?;
-    send_to_head(paths, req, timeout).await
+    send_to_head(client, req, timeout).await
 }
 
 /// `request_head_with_timeout` without the protocol check.
 async fn send_to_head(
-    paths: &crate::config::Paths,
+    client: &Client,
     req: &IpcRequest,
     timeout: Duration,
 ) -> Result<IpcResponse, RequestError> {
-    match remote_head() {
+    match &client.head {
         Some(head) => {
-            let line = request_line_as(req, &caller()).map_err(RequestError::Exchange)?;
+            let line = request_line_as(req, &client.caller).map_err(RequestError::Exchange)?;
             head.request(&line, timeout).await
         }
-        None => request_with_timeout(&paths.socket_file(), req, timeout).await,
+        None => {
+            request_with_timeout(&client.paths.socket_file(), req, &client.caller, timeout).await
+        }
     }
 }
 
 /// One request, one reply, then the connection closes. Bounded by
 /// `DEFAULT_REQUEST_TIMEOUT`; use `request_with_timeout` to choose a different bound.
-pub async fn request(socket: &Path, req: &IpcRequest) -> Result<IpcResponse, RequestError> {
-    request_with_timeout(socket, req, DEFAULT_REQUEST_TIMEOUT).await
+pub async fn request(
+    socket: &Path,
+    req: &IpcRequest,
+    caller: &Caller,
+) -> Result<IpcResponse, RequestError> {
+    request_with_timeout(socket, req, caller, DEFAULT_REQUEST_TIMEOUT).await
 }
 
 /// Like `request`, but bounds the whole round trip (connect + write + read) by
@@ -1237,13 +1311,14 @@ pub async fn request(socket: &Path, req: &IpcRequest) -> Result<IpcResponse, Req
 pub async fn request_with_timeout(
     socket: &Path,
     req: &IpcRequest,
+    caller: &Caller,
     timeout: Duration,
 ) -> Result<IpcResponse, RequestError> {
     let exchange = async {
         let stream = tokio::net::UnixStream::connect(socket)
             .await
             .map_err(RequestError::Connect)?;
-        round_trip(stream, req)
+        round_trip(stream, req, caller)
             .await
             .map_err(RequestError::Exchange)
     };
@@ -1292,9 +1367,10 @@ pub async fn relay_line(socket: &Path, line: &[u8]) -> Result<Vec<u8>, RequestEr
 async fn round_trip(
     stream: tokio::net::UnixStream,
     req: &IpcRequest,
+    caller: &Caller,
 ) -> anyhow::Result<IpcResponse> {
     let (r, mut w) = stream.into_split();
-    let line = request_line_as(req, &caller())?;
+    let line = request_line_as(req, caller)?;
     w.write_all(line.as_bytes()).await?;
     w.flush().await?;
     let mut reply = String::new();
@@ -1354,7 +1430,12 @@ pub async fn ping_head(socket: &Path) -> HeadPing {
         Err(err) if connect_error_means_no_daemon(&err) => return HeadPing::NotRunning,
         Err(_) => return HeadPing::Unresponsive,
     };
-    match tokio::time::timeout(PING_TIMEOUT, round_trip(stream, &IpcRequest::Ping)).await {
+    match tokio::time::timeout(
+        PING_TIMEOUT,
+        round_trip(stream, &IpcRequest::Ping, &Caller::default()),
+    )
+    .await
+    {
         Ok(Ok(IpcResponse::Pong {
             version,
             protocol,
@@ -1418,9 +1499,14 @@ mod tests {
         });
 
         let start = Instant::now();
-        let err = request_with_timeout(&socket, &IpcRequest::Ping, Duration::from_millis(100))
-            .await
-            .unwrap_err();
+        let err = request_with_timeout(
+            &socket,
+            &IpcRequest::Ping,
+            &Caller::default(),
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
         assert!(
             start.elapsed() < Duration::from_secs(2),
             "did not bound the round trip: took {:?}",
@@ -1436,6 +1522,7 @@ mod tests {
         let err = request_with_timeout(
             &tmp.path().join("absent.sock"),
             &IpcRequest::Ping,
+            &Caller::default(),
             Duration::from_millis(100),
         )
         .await
@@ -1455,6 +1542,7 @@ mod tests {
             item: serde_json::Value::Null,
             prompt: "hi".into(),
             spec: DispatchSpec {
+                now: false,
                 agent: "claude".into(),
                 agent_args: vec![],
                 allow: vec![],
@@ -1473,6 +1561,9 @@ mod tests {
                 label: Default::default(),
                 summary: Default::default(),
                 cwd: None,
+                keep_pane: None,
+                keep_pane_from: None,
+                rounds: Default::default(),
             },
             machine: None,
             workspace_id: None,
@@ -1488,7 +1579,11 @@ mod tests {
             priority: Default::default(),
             priority_from: None,
             queue_pos: 0,
+            aged_from: None,
+            aged_at: None,
             pause: Default::default(),
+            waiting_until: None,
+            usage: None,
             summary: None,
             created_at: now,
             started_at: None,
@@ -1650,6 +1745,7 @@ mod tests {
                 state: crate::task::TaskState::Blocked,
                 pane: Some("p1".into()),
                 detail: Some("agent asked: go on?".into()),
+                limit: None,
             },
         ] {
             let json = serde_json::to_string(&req).unwrap();
@@ -1698,6 +1794,7 @@ mod tests {
             },
             IpcRequest::OrchestratorList,
             IpcRequest::OrchestratorDescribe { name: "o".into() },
+            IpcRequest::LimitList,
         ];
         for req in reads {
             assert!(!req.changes_fleet(), "{req:?}");
@@ -1711,6 +1808,7 @@ mod tests {
     fn fleet_changes() -> Vec<IpcRequest> {
         vec![
             IpcRequest::Run {
+                now: false,
                 preempt: false,
                 summary: None,
                 description: None,
@@ -1777,6 +1875,7 @@ mod tests {
                     agent: None,
                     agent_args: None,
                     model: None,
+                    fallback: None,
                     priority: None,
                     agents: Default::default(),
                     profile: None,
@@ -1823,6 +1922,10 @@ mod tests {
             IpcRequest::TrustRemove {
                 machine: "m".into(),
                 repo: "/r".into(),
+            },
+            IpcRequest::LimitClear {
+                account: "me".into(),
+                model: None,
             },
             IpcRequest::OrchestratorRun { name: "o".into() },
             IpcRequest::OrchestratorStart { name: "o".into() },
@@ -1885,6 +1988,7 @@ mod tests {
     #[test]
     fn run_names_its_role_only_when_not_a_plain_agent() {
         let run = |role| IpcRequest::Run {
+            now: false,
             preempt: false,
             summary: None,
             prompt: "p".into(),
@@ -2031,6 +2135,16 @@ mod tests {
                 "priority",
             ),
             (
+                submit(serde_json::json!({"fallback": ["fast"]})),
+                FALLBACK_PROTOCOL,
+                "fallback models",
+            ),
+            (
+                run(serde_json::json!({"agent": {"fallback": []}})),
+                FALLBACK_PROTOCOL,
+                "--fallback",
+            ),
+            (
                 req(
                     serde_json::json!({"op": "job_task", "job": "j", "agent": {}, "prompt": "p", "spec": {"agent": "claude"}, "item": {"key": "k"}}),
                 ),
@@ -2084,6 +2198,7 @@ mod tests {
                 PREEMPT_PROTOCOL,
                 "preempt",
             ),
+            (run(serde_json::json!({"now": true})), NOW_PROTOCOL, "--now"),
             (
                 req(serde_json::json!({"op": "task_done", "id": 1, "summary": "s"})),
                 SUMMARY_PROTOCOL,
@@ -2108,6 +2223,16 @@ mod tests {
                 submit(serde_json::json!({"summary": "off"})),
                 SUMMARY_MODE_PROTOCOL,
                 "summary",
+            ),
+            (
+                run(serde_json::json!({"spec": {"agent": "claude", "keep_pane": true}})),
+                KEEP_PANE_PROTOCOL,
+                "keeping a task's pane",
+            ),
+            (
+                submit(serde_json::json!({"keep_pane": false})),
+                KEEP_PANE_PROTOCOL,
+                "keep_pane",
             ),
             (
                 req(serde_json::json!({"op": "task_claim", "machine": "m", "free_slots": 1})),
@@ -2189,6 +2314,7 @@ mod tests {
             DESCRIPTION_PROTOCOL,
             QUEUE_PROTOCOL,
             PREEMPT_PROTOCOL,
+            NOW_PROTOCOL,
             SUMMARY_PROTOCOL,
             LABEL_PROTOCOL,
             SUMMARY_MODE_PROTOCOL,
@@ -2196,6 +2322,8 @@ mod tests {
             JOIN_PROTOCOL,
             ORCHESTRATOR_PROTOCOL,
             SESSION_PROTOCOL,
+            FALLBACK_PROTOCOL,
+            KEEP_PANE_PROTOCOL,
         ] {
             assert!(covered.contains(&p), "no request needs protocol {p}");
         }
@@ -2291,7 +2419,8 @@ mod tests {
             flock: None,
             machine: None,
         };
-        match request_head(&paths, &queue).await {
+        let client = Client::new(paths, None);
+        match request_head(&client, &queue).await {
             Err(RequestError::Refused { code, message }) => {
                 assert_eq!(code, "head_too_old");
                 assert!(message.contains("pastor queue"), "{message}");

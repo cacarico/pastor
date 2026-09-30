@@ -73,11 +73,6 @@ impl MachineView {
         self.seat(flock).is_some()
     }
 
-    /// Is `flock` under its number here? Job slots and burst never pass it.
-    pub fn flock_has_room(&self, flock: &str) -> bool {
-        self.seat(flock).is_some_and(FlockSeat::has_room)
-    }
-
     /// May a task of `flock` take a slot here, as far as the flock's number
     /// goes? Under its share, yes; from its share up to its max, only while
     /// no flock under its share here has a task waiting; at its max, no.
@@ -153,6 +148,33 @@ pub fn pick_machine_where(
         .iter()
         .filter(|m| fits(m))
         .min_by_key(|m| m.live)
+        .map(|m| m.name.clone())
+}
+
+/// Where a `task run --now` task (`DispatchSpec::now`) goes: its pinned
+/// machine, if it is healthy, is still in the task's flock, has the task's
+/// tags and `accepts` it, however many tasks it runs. `max_agents`, job
+/// slots, burst and the flock's number there are not looked at: the person
+/// who pinned it chose to run past them, but not to run in another flock.
+/// `queue_run_as` checked membership before the row was inserted, under a
+/// lock it releases before placement, so it is checked again here in case a
+/// flock edit moved the machine in between.
+pub fn now_machine(
+    machines: &[MachineView],
+    flock: &str,
+    spec: &DispatchSpec,
+    accepts: &dyn Fn(&str) -> bool,
+) -> Option<String> {
+    let pinned = spec.machine.as_ref()?;
+    machines
+        .iter()
+        .find(|m| &m.name == pinned)
+        .filter(|m| {
+            m.healthy
+                && m.in_flock(flock)
+                && spec.tags.iter().all(|t| m.tags.contains(t))
+                && accepts(&m.name)
+        })
         .map(|m| m.name.clone())
 }
 
@@ -244,6 +266,12 @@ pub enum DispatchError {
     /// never came up, the agent exited. The task failed; the machine is fine.
     #[error("{0}")]
     Task(String),
+    /// The agent exited before it took its prompt. `tail` is the end of its
+    /// pane as it was then, empty when it could not be read: an agent can
+    /// die at its start on a usage limit, and only its pane says so
+    /// (`limit::limit_in`).
+    #[error("{message}")]
+    Exited { message: String, tail: String },
 }
 
 impl From<HerdrError> for DispatchError {
@@ -256,7 +284,7 @@ impl DispatchError {
     pub fn code(&self) -> Option<&str> {
         match self {
             DispatchError::Call(err) => err.code(),
-            DispatchError::Task(_) => None,
+            DispatchError::Task(_) | DispatchError::Exited { .. } => None,
         }
     }
 
@@ -354,6 +382,22 @@ async fn dispatch_steps(
     resume: bool,
 ) -> Result<DispatchOutcome, DispatchError> {
     let spec = task.spec.clone();
+    // A waiting task goes on after a usage limit (`TaskState::Waiting`): with
+    // its session when it has one, else from its prompt again, in the same
+    // checkout.
+    let limited = resume && task.waiting_until.take().is_some();
+    let restart = limited && spec.session_id.is_none();
+    // What the round that stopped on the limit left; one that went to
+    // another model says how that model learns what it did.
+    let stop = if limited {
+        task.spec.rounds.stop.take()
+    } else {
+        None
+    };
+    let moved = stop.as_deref().filter(|s| s.handover.is_some()).map(|s| {
+        let from = crate::task::agent_and_model(&s.agent, s.model.as_deref());
+        (from, s.tail.clone())
+    });
     // Before anything is made on the machine: a task whose agent cannot take
     // its tool lists (an `[agents]` edit since it was queued) leaves nothing
     // behind.
@@ -384,7 +428,7 @@ async fn dispatch_steps(
     // task that failed before then never had that conversation to resume.
     // A paused task goes back to the session it recorded instead.
     let mut session = None;
-    if resume {
+    if resume && !restart {
         let id = spec
             .session_id
             .clone()
@@ -542,36 +586,68 @@ async fn dispatch_steps(
         }
     };
     // A resumed session already has the line asking for a summary.
-    let prompt = if resume {
+    let to = crate::task::agent_and_model(&task.spec.agent, task.model());
+    let prompt = if let Some((from, tail)) = moved.as_ref().filter(|_| restart) {
+        format!(
+            "{}\n\n{}",
+            crate::task::prompt_to_send(task).trim_end(),
+            crate::task::limit_handover(from, tail)
+        )
+    } else if let Some((from, _)) = &moved {
+        crate::task::switch_prompt(from, &to)
+    } else if restart {
+        format!(
+            "{}\n\n{}",
+            crate::task::prompt_to_send(task).trim_end(),
+            crate::task::LIMIT_HANDOVER
+        )
+    } else if limited {
+        crate::task::LIMIT_RESUME_PROMPT.to_string()
+    } else if resume {
         crate::task::RESUME_PROMPT.to_string()
     } else {
         crate::task::prompt_to_send(task)
     };
-    finish_dispatch(
+    finish_dispatch(FinishDispatch {
         conn,
         task,
         name,
-        &launch,
+        launch: &launch,
         session,
-        &pane_id,
-        &prompt,
+        pane_id: &pane_id,
+        prompt: &prompt,
+        agents,
         ready_timeout,
-    )
+    })
     .await
 }
 
-/// Start the agent in its pane, wait for it to come up and give it `prompt`.
-#[allow(clippy::too_many_arguments)]
-async fn finish_dispatch(
-    conn: &dyn Connector,
-    task: &mut Task,
-    name: &str,
-    launch: &crate::config::Launch,
+/// `finish_dispatch`'s arguments, grouped.
+struct FinishDispatch<'a> {
+    conn: &'a dyn Connector,
+    task: &'a mut Task,
+    name: &'a str,
+    launch: &'a crate::config::Launch,
     session: Option<String>,
-    pane_id: &str,
-    prompt: &str,
+    pane_id: &'a str,
+    prompt: &'a str,
+    agents: &'a Agents,
     ready_timeout: Duration,
-) -> Result<DispatchOutcome, DispatchError> {
+}
+
+/// Start the agent in its pane, wait for it to come up and give it `prompt`.
+async fn finish_dispatch(ask: FinishDispatch<'_>) -> Result<DispatchOutcome, DispatchError> {
+    let FinishDispatch {
+        conn,
+        task,
+        name,
+        launch,
+        session,
+        pane_id,
+        prompt,
+        agents,
+        ready_timeout,
+    } = ask;
     // herdr's `agent.start` returns as soon as it has launched the agent in the
     // pane; it never reports `agent_not_ready` (its errors are about the name,
     // the kind and the pane). Readiness shows up afterwards, in `agent.list` and
@@ -579,7 +655,9 @@ async fn finish_dispatch(
     start_agent(conn, name, &launch.kind, &launch.args, pane_id).await?;
     task.spec.session_id = session;
 
-    let (outcome, prompted) = prompt_when_ready(conn, task, name, prompt, ready_timeout).await?;
+    let hold = agents.startup_markers(&task.spec.agent);
+    let (outcome, prompted) =
+        prompt_when_ready(conn, task, name, prompt, &hold, ready_timeout).await?;
     // The baseline a completion must move past, and whether the agent was
     // already at work when the prompt went in; see
     // `task::completed_since_prompt`.
@@ -975,12 +1053,16 @@ async fn check_repo_exists(
 /// `agent.list`: gone means failed now, present-but-`unknown` means wait.
 /// Present-and-`blocked` is a third case, checked before either: herdr answers
 /// that with `agent_blocked`, not `agent_not_ready`, and dispatch returns
-/// `Blocked` without prompting or waiting.
+/// `Blocked` without prompting or waiting. So is an agent whose pane shows
+/// one of `hold` (`Agents::startup_markers`): a startup question herdr reads
+/// idle and ready (Codex's folder trust), which a prompt would answer and
+/// be lost in.
 async fn prompt_when_ready(
     conn: &dyn Connector,
     task: &Task,
     name: &str,
     prompt: &str,
+    hold: &[String],
     ready_timeout: Duration,
 ) -> Result<(DispatchOutcome, Option<AgentInfo>), DispatchError> {
     let machine = task.machine.as_deref().unwrap_or("that machine");
@@ -988,10 +1070,15 @@ async fn prompt_when_ready(
     loop {
         let agents = conn.agent_list().await?;
         let Some(agent) = agents.iter().find(|a| a.name.as_deref() == Some(name)) else {
-            return Err(DispatchError::Task(format!(
-                "agent {name} exited before accepting a prompt (is `{}` installed on {machine}?)",
-                task.spec.agent
-            )));
+            return Err(exited(
+                conn,
+                task,
+                format!(
+                    "agent {name} exited before accepting a prompt (is `{}` installed on {machine}?)",
+                    task.spec.agent
+                ),
+            )
+            .await);
         };
         if agent.agent_status == AgentStatus::Blocked {
             // Waiting for a human, usually on the agent's own startup question
@@ -1012,6 +1099,13 @@ async fn prompt_when_ready(
         if agent.launch_pending {
             // still launching: fall through to the wait below
         } else if can_prompt {
+            if !hold.is_empty() {
+                // A pane that cannot be read is prompted as before.
+                let screen = conn.agent_read(name, 100).await.unwrap_or_default();
+                if crate::config::shows_startup_question(&screen, hold) {
+                    return Ok((DispatchOutcome::Blocked, None));
+                }
+            }
             match conn.agent_prompt(name, prompt).await {
                 // The reply carries the agent's `state_change_seq` and status
                 // as the prompt went in.
@@ -1026,10 +1120,15 @@ async fn prompt_when_ready(
                 Err(err) => return Err(err.into()),
             }
         } else {
-            return Err(DispatchError::Task(format!(
-                "agent {name} exited before becoming interactive (is `{}` installed on {machine}?)",
-                task.spec.agent
-            )));
+            return Err(exited(
+                conn,
+                task,
+                format!(
+                    "agent {name} exited before becoming interactive (is `{}` installed on {machine}?)",
+                    task.spec.agent
+                ),
+            )
+            .await);
         }
         let now = Instant::now();
         if now >= deadline {
@@ -1042,7 +1141,24 @@ async fn prompt_when_ready(
     }
 }
 
-#[cfg(test)]
+/// How many lines of an agent's pane `exited` keeps.
+const EXIT_TAIL_LINES: u32 = 30;
+
+/// `DispatchError::Exited` with `message` and the end of `task`'s pane,
+/// read by its pane id since the agent is gone. A pane that cannot be read
+/// leaves the tail empty: the task fails as it would have anyway.
+async fn exited(conn: &dyn Connector, task: &Task, message: String) -> DispatchError {
+    let tail = match task.pane_id.as_deref() {
+        Some(pane) => conn
+            .agent_read(pane, EXIT_TAIL_LINES)
+            .await
+            .unwrap_or_default(),
+        None => String::new(),
+    };
+    DispatchError::Exited { message, tail }
+}
+
+#[cfg(all(test, feature = "fake-herdr"))]
 mod tests {
     use super::*;
     use crate::config::flock::FlockNumber;
@@ -1077,6 +1193,167 @@ mod tests {
             max,
             live,
         }
+    }
+
+    /// One more live task of `flock`, counted on `live`, on `live_jobs`
+    /// when the claim comes from a job, and on that flock's own seat; for
+    /// a flock the machine is not in, `live` still counts it and no seat
+    /// changes.
+    #[test]
+    fn take_counts_the_task_on_live_and_its_seat() {
+        let mut m = MachineView {
+            flocks: vec![seat("work", Some(4), 0), seat("home", Some(4), 0)],
+            ..mv("desk", 4, 0, &[], true)
+        };
+        m.take("work", RUN);
+        assert_eq!(m.live, 1);
+        assert_eq!(m.live_jobs, 0, "not from a job");
+        assert_eq!(m.seat("work").unwrap().live, 1);
+        assert_eq!(
+            m.seat("home").unwrap().live,
+            0,
+            "the other flock is untouched"
+        );
+
+        m.take("work", JOB);
+        assert_eq!(m.live, 2);
+        assert_eq!(m.live_jobs, 1, "a job claim counts here too");
+        assert_eq!(m.seat("work").unwrap().live, 2);
+
+        m.take("play", RUN);
+        assert_eq!(m.live, 3, "live counts every task, seated or not");
+        assert_eq!(
+            m.seat("play"),
+            None,
+            "no seat for a flock not on the machine"
+        );
+    }
+
+    /// `later`'s tasks join `waiting_under_share` only for a machine where
+    /// `flock` is past its share and under its max, and only when each is
+    /// itself queued, of a different flock under its own share here, with
+    /// no pin elsewhere, no tag the machine lacks, room for its claim,
+    /// and `accepts` it; a flock already in the list does not join twice.
+    #[test]
+    fn mark_waiting_under_share_filters_each_later_task() {
+        let work = |live: usize| FlockSeat::new("work", Some(FlockNumber::split(1, 3)), live);
+        let desk = |work_live: usize, home_live: usize| MachineView {
+            flocks: vec![work(work_live), seat("home", Some(2), home_live)],
+            tags: vec!["arm".into()],
+            ..mv("desk", 10, work_live + home_live, &[], true)
+        };
+        let home_task = |over: fn(&mut Task)| {
+            let mut t = Task {
+                flock: Some("home".into()),
+                ..task(spec())
+            };
+            over(&mut t);
+            t
+        };
+        let accepts_all = |_: &Task, _: &str| true;
+        let run =
+            |views: &mut [MachineView], later: &[Task], accepts: &dyn Fn(&Task, &str) -> bool| {
+                mark_waiting_under_share(views, "work", later, "default", accepts);
+            };
+
+        // Under its share, no waiting is computed even for a task that
+        // would otherwise qualify.
+        let mut views = vec![desk(0, 1)];
+        run(&mut views, &[home_task(|_| {})], &accepts_all);
+        assert!(views[0].waiting_under_share.is_empty(), "under its share");
+
+        // At its max, none either.
+        let mut views = vec![desk(3, 1)];
+        run(&mut views, &[home_task(|_| {})], &accepts_all);
+        assert!(views[0].waiting_under_share.is_empty(), "at its max");
+
+        // Past its share, under its max: a plain queued task of another
+        // flock under its own share here joins the list.
+        let mut views = vec![desk(1, 1)];
+        run(&mut views, &[home_task(|_| {})], &accepts_all);
+        assert_eq!(views[0].waiting_under_share, vec!["home".to_string()]);
+
+        // The flock being placed never joins, whatever else is true.
+        let mut views = vec![desk(1, 1)];
+        let same = Task {
+            flock: Some("work".into()),
+            ..task(spec())
+        };
+        run(&mut views, &[same], &accepts_all);
+        assert!(views[0].waiting_under_share.is_empty(), "its own flock");
+
+        // A flock already in the list does not join twice.
+        let mut views = vec![desk(1, 1)];
+        let twice = [home_task(|_| {}), home_task(|_| {})];
+        run(&mut views, &twice, &accepts_all);
+        assert_eq!(views[0].waiting_under_share, vec!["home".to_string()]);
+
+        // Not queued.
+        let mut views = vec![desk(1, 1)];
+        let not_queued = home_task(|t| t.state = TaskState::Running);
+        run(&mut views, &[not_queued], &accepts_all);
+        assert!(views[0].waiting_under_share.is_empty(), "not queued");
+
+        // Its own seat is not under share.
+        let mut views = vec![desk(1, 2)];
+        run(&mut views, &[home_task(|_| {})], &accepts_all);
+        assert!(
+            views[0].waiting_under_share.is_empty(),
+            "home is at its share"
+        );
+
+        // Pinned to another machine.
+        let mut views = vec![desk(1, 1)];
+        let pinned = home_task(|t| t.spec.machine = Some("elsewhere".into()));
+        run(&mut views, &[pinned], &accepts_all);
+        assert!(views[0].waiting_under_share.is_empty(), "pinned elsewhere");
+
+        // Asks for a tag the machine lacks.
+        let mut views = vec![desk(1, 1)];
+        let tagged = home_task(|t| t.spec.tags = vec!["gpu".into()]);
+        run(&mut views, &[tagged], &accepts_all);
+        assert!(
+            views[0].waiting_under_share.is_empty(),
+            "tag the machine lacks"
+        );
+
+        // No room for its claim: the machine's own limit is already met.
+        let full = MachineView {
+            max_agents: 2,
+            ..desk(1, 1)
+        };
+        let mut views = vec![full];
+        run(&mut views, &[home_task(|_| {})], &accepts_all);
+        assert!(
+            views[0].waiting_under_share.is_empty(),
+            "the machine has no room"
+        );
+
+        // `accepts` refuses it.
+        let mut views = vec![desk(1, 1)];
+        run(&mut views, &[home_task(|_| {})], &|_, _| false);
+        assert!(
+            views[0].waiting_under_share.is_empty(),
+            "accepts refused it"
+        );
+    }
+
+    /// `flock_held` clears a seat under its share on its own, whatever
+    /// `waiting_under_share` says: that list only matters to a seat past
+    /// its share (`mark_waiting_under_share` never fills it otherwise, but
+    /// `flock_held` reads it as given).
+    #[test]
+    fn flock_held_clears_a_seat_under_share_even_with_others_waiting() {
+        let v = MachineView {
+            flocks: vec![seat("work", Some(4), 1)],
+            waiting_under_share: vec!["home".to_string()],
+            ..mv("desk", 4, 1, &[], true)
+        };
+        assert_eq!(
+            flock_held(&v, "work"),
+            None,
+            "under its share holds nothing off"
+        );
     }
 
     /// Only the task's flock takes it, whatever the others have free.
@@ -1207,6 +1484,7 @@ mod tests {
 
     fn spec() -> DispatchSpec {
         DispatchSpec {
+            now: false,
             agent: "claude".into(),
             agent_args: vec!["--model".into(), "opus".into()],
             allow: vec![],
@@ -1225,6 +1503,9 @@ mod tests {
             label: Default::default(),
             summary: Default::default(),
             cwd: None,
+            keep_pane: None,
+            keep_pane_from: None,
+            rounds: Default::default(),
         }
     }
 
@@ -1311,7 +1592,11 @@ mod tests {
             priority: Default::default(),
             priority_from: None,
             queue_pos: 0,
+            aged_from: None,
+            aged_at: None,
             pause: Default::default(),
+            waiting_until: None,
+            usage: None,
             summary: None,
             created_at: now,
             started_at: None,
@@ -1479,6 +1764,89 @@ mod tests {
             pick_machine(&ms, "default", &spec(), JOB).as_deref(),
             Some("a"),
             "a's job slot is room for a job task, and a has fewest live"
+        );
+    }
+
+    /// `task run --now` takes its pinned machine whatever its count, even
+    /// past `max_agents`, burst and the flock's number there, so long as it
+    /// is healthy, has the task's tags and `accepts` it.
+    #[test]
+    fn now_machine_takes_the_pin_past_its_limits() {
+        let full = MachineView {
+            flocks: vec![seat("default", Some(1), 3)],
+            ..mv("a", 2, 3, &["fast"], true)
+        };
+        let ms = vec![full, mv("b", 2, 0, &[], false)];
+        let now = |machine: &str, tags: &[&str]| DispatchSpec {
+            machine: Some(machine.into()),
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            now: true,
+            ..spec()
+        };
+        assert_eq!(
+            pick_machine(&ms, "default", &now("a", &[]), Claim::default()),
+            None,
+            "the queue would wait"
+        );
+        assert_eq!(
+            now_machine(&ms, "default", &now("a", &["fast"]), &|_| true).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            now_machine(&ms, "default", &now("b", &[]), &|_| true),
+            None,
+            "unhealthy"
+        );
+        assert_eq!(
+            now_machine(&ms, "default", &now("a", &["gpu"]), &|_| true),
+            None,
+            "tags"
+        );
+        assert_eq!(
+            now_machine(&ms, "default", &now("a", &[]), &|_| false),
+            None,
+            "refused"
+        );
+        assert_eq!(
+            now_machine(&ms, "default", &now("zzz", &[]), &|_| true),
+            None
+        );
+        let unpinned = DispatchSpec {
+            machine: None,
+            ..now("a", &[])
+        };
+        assert_eq!(
+            now_machine(&ms, "default", &unpinned, &|_| true),
+            None,
+            "needs a pin"
+        );
+    }
+
+    /// A `--now` task still needs its pinned machine to be in its flock: a
+    /// flock edit between `queue_run_as` (which checked membership before
+    /// the row was inserted) and placement must not start it in a flock it
+    /// no longer belongs to (GPT review on #103, finding 2).
+    #[test]
+    fn now_machine_requires_the_pin_still_be_in_the_flock() {
+        let a = MachineView {
+            flocks: vec![seat("work", Some(1), 3)],
+            ..mv("a", 2, 3, &["fast"], true)
+        };
+        let ms = vec![a];
+        let now = DispatchSpec {
+            machine: Some("a".into()),
+            now: true,
+            ..spec()
+        };
+        assert_eq!(
+            now_machine(&ms, "work", &now, &|_| true).as_deref(),
+            Some("a"),
+            "a is in work"
+        );
+        assert_eq!(
+            now_machine(&ms, "default", &now, &|_| true),
+            None,
+            "a moved out of default, or was never in it"
         );
     }
 
@@ -1851,10 +2219,14 @@ mod tests {
                 agent_args: None,
                 model: None,
                 model_from: None,
+                fallback: vec![],
+                fallback_from: None,
+                fallback_use: None,
                 profile: profile.map(str::to_string),
                 profile_from: Some("defaults".into()),
                 timeout_from: None,
                 place_from: None,
+                lists_unapplied: None,
             })),
             ..spec()
         }
@@ -2007,7 +2379,7 @@ mod tests {
 
     /// `[agents.claude-personal] kind = "claude"` with an env: herdr starts
     /// a claude, with Claude's tool flags, in a pane that has the env, `~`
-    /// expanded against the machine's home.
+    /// expanded against the machine's home, a bare `~` too.
     fn personal() -> Agents {
         let mut agents = Agents::default();
         agents.0.insert(
@@ -2020,6 +2392,7 @@ mod tests {
                         "~/.claude-personal".to_string(),
                     ),
                     ("PLAIN".to_string(), "a~b".to_string()),
+                    ("BARE".to_string(), "~".to_string()),
                 ]
                 .into(),
                 ..Default::default()
@@ -2045,6 +2418,7 @@ mod tests {
             .find(|r| r.method == "workspace.create")
             .unwrap();
         let want = serde_json::json!({
+            "BARE": "/home/fake",
             "CLAUDE_CONFIG_DIR": "/home/fake/.claude-personal",
             "PASTOR_TASK": "t-7",
             "PLAIN": "a~b",
@@ -2381,6 +2755,179 @@ mod tests {
             .find(|r| r.method == "workspace.create" && r.params["label"] != "pastor")
             .unwrap();
         assert_eq!(req.params["cwd"], "/home/fake");
+    }
+
+    /// A waiting task goes on after its limit: with its session and the
+    /// limit's resume line when it has one, else a new session with its
+    /// prompt and the handover paragraph. Either way `waiting_until` goes.
+    #[tokio::test]
+    async fn a_waiting_task_resumes_its_session_or_starts_again_with_a_handover() {
+        let started = |fake: &FakeHerdr| {
+            let reqs = fake.requests();
+            let start = reqs
+                .iter()
+                .rev()
+                .find(|r| r.method == "agent.start")
+                .unwrap();
+            let prompt = reqs
+                .iter()
+                .rev()
+                .find(|r| r.method == "agent.prompt")
+                .unwrap();
+            (
+                start.params["args"].to_string(),
+                prompt.params["text"].as_str().unwrap().to_string(),
+            )
+        };
+        let session = "0d5bd3a4-2f35-4e1c-9f59-7c1c3a7b8e21";
+        let fake = FakeHerdr::new();
+        let mut t = task(DispatchSpec {
+            session_id: Some(session.into()),
+            ..spec()
+        });
+        t.waiting_until = Some(Utc::now());
+        resume(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let (args, prompt) = started(&fake);
+        assert!(
+            args.contains("--resume") && args.contains(session),
+            "{args}"
+        );
+        assert_eq!(prompt, crate::task::LIMIT_RESUME_PROMPT);
+        assert_eq!(t.waiting_until, None);
+        assert_eq!(t.spec.session_id.as_deref(), Some(session));
+
+        let fake = FakeHerdr::new();
+        let mut t = task(spec());
+        t.waiting_until = Some(Utc::now());
+        resume(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let (args, prompt) = started(&fake);
+        assert!(args.contains("--session-id"), "{args}");
+        assert!(prompt.starts_with("line one"), "{prompt}");
+        assert!(prompt.ends_with(crate::task::LIMIT_HANDOVER), "{prompt}");
+        assert_eq!(t.waiting_until, None);
+        assert!(t.spec.session_id.is_some(), "a new session to resume next");
+    }
+
+    /// A waiting task that moved to another model: in the same session with
+    /// the switch line, or, with none, from its prompt with the handover and
+    /// the last agent's pane. Either way the stop is taken.
+    #[tokio::test]
+    async fn a_task_moved_to_another_model_gets_its_handover() {
+        let started = |fake: &FakeHerdr| {
+            let reqs = fake.requests();
+            let find = |m: &str| reqs.iter().rev().find(|r| r.method == m).unwrap().clone();
+            (
+                find("agent.start").params["args"].to_string(),
+                find("agent.prompt").params["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            )
+        };
+        let stop = |handover| {
+            Some(Box::new(crate::task::LimitStop {
+                agent: "claude".into(),
+                model: Some("opus".into()),
+                why: "limit".into(),
+                line: "You've hit your limit".into(),
+                until: Utc::now(),
+                tail: "● Half of it is done.\n● You've hit your limit".into(),
+                then: crate::task::NextRound::Own,
+                waited: None,
+                handover: Some(handover),
+            }))
+        };
+        let session = "0d5bd3a4-2f35-4e1c-9f59-7c1c3a7b8e21";
+        let fake = FakeHerdr::new();
+        let mut t = task(DispatchSpec {
+            session_id: Some(session.into()),
+            ..spec()
+        });
+        t.spec.rounds.stop = stop(crate::task::Handover::Session);
+        t.waiting_until = Some(Utc::now());
+        resume(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let (args, prompt) = started(&fake);
+        assert!(args.contains(session), "{args}");
+        assert_eq!(
+            prompt,
+            crate::task::switch_prompt("claude (opus)", "claude")
+        );
+        assert_eq!(t.spec.rounds.stop, None);
+
+        let fake = FakeHerdr::new();
+        let mut t = task(spec());
+        t.spec.rounds.stop = stop(crate::task::Handover::PaneTail);
+        t.waiting_until = Some(Utc::now());
+        resume(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let (args, prompt) = started(&fake);
+        assert!(args.contains("--session-id"), "{args}");
+        assert!(prompt.starts_with("line one"), "{prompt}");
+        assert!(
+            prompt.ends_with(&crate::task::limit_handover(
+                "claude (opus)",
+                "● Half of it is done.\n● You've hit your limit"
+            )),
+            "{prompt}"
+        );
+        assert!(prompt.contains("git status"), "{prompt}");
+        assert_eq!(t.spec.rounds.stop, None);
+    }
+
+    /// An agent that dies at its start leaves the end of its pane on the
+    /// error, for a usage limit to be read from.
+    #[tokio::test]
+    async fn an_agent_that_exits_on_start_leaves_its_pane_tail() {
+        for listed in [false, true] {
+            let fake = FakeHerdr::new();
+            if listed {
+                fake.exit_agents_listed(true);
+            } else {
+                fake.exit_agents_on_start(true);
+            }
+            fake.set_exit_screen("You've hit your limit · resets 3am\n");
+            let mut t = task(spec());
+            let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
+                .await
+                .unwrap_err();
+            let DispatchError::Exited { message, tail } = &err else {
+                panic!("{err:?}");
+            };
+            assert!(message.contains("exited before"), "{message}");
+            assert!(tail.contains("You've hit your limit"), "{tail}");
+            assert_eq!(t.error.as_deref(), Some(message.as_str()));
+        }
+    }
+
+    /// Only a resume keeps the directory recorded on the task: a fresh
+    /// dispatch of a task with no repo asks `no_repo_dir`, whatever `cwd`
+    /// the task already carries.
+    #[tokio::test]
+    async fn a_fresh_dispatch_with_no_repo_asks_again_whatever_cwd_it_carries() {
+        let fake = FakeHerdr::new();
+        let mut t = task(DispatchSpec {
+            repo: None,
+            place: Place::Own,
+            cwd: Some("/home/fake/elsewhere".into()),
+            ..spec()
+        });
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        assert_eq!(t.spec.cwd.as_deref(), Some("/home/fake/pastor-tasks"));
+        let req = fake
+            .requests()
+            .into_iter()
+            .find(|r| r.method == "workspace.create" && r.params["label"] != "pastor")
+            .unwrap();
+        assert_eq!(req.params["cwd"], "/home/fake/pastor-tasks");
     }
 
     /// Where `~` cannot be resolved the task fails up front with a reason,
@@ -2995,5 +3542,83 @@ mod tests {
                 "{made:?}"
             );
         }
+    }
+
+    /// Only `workspace_not_found` from `pane.list` means the workspace
+    /// closed and is worth a second look; any other failure fails the
+    /// task as it is, with no second `pane.list`.
+    #[tokio::test]
+    async fn a_pane_list_failure_other_than_not_found_is_not_retried() {
+        let fake = FakeHerdr::new();
+        fake.open_user_workspace("work", None);
+        fake.set_malformed_reply("pane.list");
+        let mut t = task(DispatchSpec {
+            place: Place::Pane("work".into()),
+            ..spec()
+        });
+        let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap_err();
+        assert!(!err.to_string().contains("closed while"), "{err}");
+        let made = methods(&fake);
+        assert_eq!(
+            made.iter().filter(|m| *m == "pane.list").count(),
+            1,
+            "{made:?}"
+        );
+        assert!(!made.iter().any(|m| m == "agent.start"), "{made:?}");
+    }
+
+    /// A paused worktree task resumes in its own checkout through
+    /// `worktree.open`, never a new one. A checkout that is gone fails the
+    /// task with a reason; any other `worktree.open` failure fails it as
+    /// it is.
+    #[tokio::test]
+    async fn a_worktree_task_resumes_only_in_its_own_checkout() {
+        let worktree_task = || {
+            task(DispatchSpec {
+                worktree: true,
+                branch: Some("pastor/k1".into()),
+                ..spec()
+            })
+        };
+
+        let fake = FakeHerdr::new();
+        let mut t = worktree_task();
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        assert_eq!(t.spec.checkout.as_ref().unwrap().branch, "pastor/k1");
+        let before = methods(&fake).len();
+        resume(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let again = methods(&fake).split_off(before);
+        assert!(again.iter().any(|m| m == "worktree.open"), "{again:?}");
+        assert!(!again.iter().any(|m| m == "worktree.create"), "{again:?}");
+
+        // Gone: herdr answers `worktree_not_found`.
+        let fake = FakeHerdr::new();
+        let mut t = worktree_task();
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        t.spec.checkout.as_mut().unwrap().branch = "pastor/gone".into();
+        let err = resume(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("nowhere to resume"), "{err}");
+
+        // Any other failure is not reported as a gone checkout.
+        let fake = FakeHerdr::new();
+        let mut t = worktree_task();
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        fake.set_malformed_reply("worktree.open");
+        let err = resume(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap_err();
+        assert!(!err.to_string().contains("nowhere to resume"), "{err}");
     }
 }

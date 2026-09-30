@@ -127,6 +127,28 @@ pub(crate) fn control_path_fits(path: &Path) -> bool {
     expanded_len(path) + CONTROL_PATH_STAGING < UNIX_PATH_MAX
 }
 
+/// What to do about a socket under the state dir that does not fit.
+pub(crate) const SHORTER_STATE_DIR: &str = "Set PASTOR_STATE_DIR to something shorter.";
+
+/// A unix socket path must fit in `sun_path` with its NUL, or bind and connect
+/// fail with a bare OS error that names neither the path nor the fix. Checked
+/// first, so the error is a `config_error` that says both; `hint` names the
+/// directory to shorten.
+pub(crate) fn check_socket_path(path: &Path, hint: &str) -> anyhow::Result<()> {
+    let len = path.as_os_str().len();
+    if len < UNIX_PATH_MAX {
+        return Ok(());
+    }
+    Err(crate::cli::CliError::err(
+        "config_error",
+        format!(
+            "socket path {} is {len} bytes, too long for a unix socket (at most {}). {hint}",
+            path.display(),
+            UNIX_PATH_MAX - 1
+        ),
+    ))
+}
+
 /// The master socket lives in the ControlPath's directory; ssh creates the
 /// socket itself but not the directory, and it must not be world-readable.
 /// Every ssh that carries a ControlPath can be the one that starts the master,
@@ -252,6 +274,11 @@ mod tests {
         assert_eq!(expanded_len(Path::new("/a/b")), 4);
         assert_eq!(expanded_len(Path::new("%%")), 1);
         assert_eq!(expanded_len(Path::new("/a-%C")), 3 + EXPANDED_C);
+        // A token pastor never builds (neither `%%` nor `%C`) still counts
+        // both bytes literally: the `%` and the character after it.
+        assert_eq!(expanded_len(Path::new("/abc%x")), 6);
+        // A trailing `%` with nothing after it still counts as one byte.
+        assert_eq!(expanded_len(Path::new("/abc%")), 5);
         assert_eq!(unix_path_max(true), 108);
         assert_eq!(unix_path_max(false), 104);
         let expected = if cfg!(target_os = "linux") { 108 } else { 104 };
@@ -260,6 +287,22 @@ mod tests {
         let fits = "x".repeat(UNIX_PATH_MAX - CONTROL_PATH_STAGING - 1);
         assert!(control_path_fits(Path::new(&fits)));
         assert!(!control_path_fits(Path::new(&format!("{fits}x"))));
+    }
+
+    /// A socket path that does not fit in `sun_path` is a `config_error` that
+    /// names the path and says what to shorten, not the OS's bare refusal.
+    #[test]
+    fn check_socket_path_refuses_a_path_past_sun_path() {
+        let fits = format!("/{}", "x".repeat(UNIX_PATH_MAX - 2));
+        check_socket_path(Path::new(&fits), SHORTER_STATE_DIR).expect("fits");
+        let long = format!("{fits}x");
+        let err = check_socket_path(Path::new(&long), SHORTER_STATE_DIR).unwrap_err();
+        let e = err
+            .downcast_ref::<crate::cli::CliError>()
+            .expect("CliError");
+        assert_eq!(e.code, "config_error");
+        assert!(e.message.contains(&long), "{}", e.message);
+        assert!(e.message.contains(SHORTER_STATE_DIR), "{}", e.message);
     }
 
     proptest::proptest! {

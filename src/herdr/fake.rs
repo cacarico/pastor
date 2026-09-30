@@ -1,10 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
+// tokio's clock, so a test that pauses it moves `ready_after` and the trust
+// redraw along with the actor's own timers.
+use tokio::time::Instant;
 
 use super::{AgentInfo, AgentStatus, BoxRead, BoxWrite, Connection, Event, Request};
 
@@ -62,6 +65,9 @@ struct State {
     /// Where `requests` is written, whole, each time one is received.
     request_log: Option<std::path::PathBuf>,
     start: Option<StartBehaviour>,
+    /// What the pane of an agent that exits on start shows (`agent.read`
+    /// by pane id); see `set_exit_screen`.
+    exit_screen: Option<String>,
     protocol: u32,
     /// A method name that, once received, gets no reply at all: the connection
     /// just stops answering, simulating a wedged herdr.
@@ -87,6 +93,10 @@ struct State {
     unpushed: HashSet<String>,
     /// What `Connector::pastor_version` reports.
     pastor_version: Option<String>,
+    /// Claude sessions' usage, by (config dir, session id): what
+    /// `Connector::claude_usage` reports. `None` for the config dir is
+    /// `~/.claude`.
+    usage: HashMap<(Option<String>, String), crate::usage::TaskUsage>,
     /// What `Connector::opencode_permission_rules` reports.
     opencode_permissions: Option<bool>,
     /// Branches `Connector::restore_worktree` finds gone.
@@ -120,6 +130,11 @@ struct State {
     /// Set silently just before the next `agent.list` that comes straight
     /// after another one, within 50ms (see `set_status_between_lists`).
     status_between_lists: Option<(String, AgentStatus)>,
+    /// What happens to one pane while the next `pane.close` of another pane
+    /// is in flight (see `on_next_close_set_status`, `on_next_close_replace`):
+    /// the first entry for a pane other than the one closing runs, and the
+    /// rest are dropped with it.
+    on_close: Vec<(String, OnClose)>,
     /// When the last `agent.list` arrived.
     last_list: Option<Instant>,
     /// Everything typed into each pane, by pane id.
@@ -137,6 +152,9 @@ struct State {
     trust_screen: String,
     /// pane id -> when its trust question was answered.
     trust_answered: HashMap<String, Instant>,
+    /// The trust question reads idle and ready, not `blocked` (Codex's, to
+    /// herdr): `agent.prompt` is accepted and lost until it is answered.
+    trust_idle: bool,
     /// How many of the next `pane.list` calls find their workspace gone
     /// (see `vanish_on_pane_list`), and whether it closes for real.
     pane_list_gone: u32,
@@ -171,6 +189,12 @@ fn change_status(s: &mut State, pane_id: &str, status: AgentStatus) -> Option<Ag
         a.state_change_seq = seq;
     }
     Some(a.clone())
+}
+
+/// See `State::on_close`.
+enum OnClose {
+    Status(AgentStatus),
+    Replace(String),
 }
 
 #[derive(Clone)]
@@ -229,6 +253,20 @@ impl FakeHerdr {
     /// What the machine's own opencode config says about permission rules.
     pub fn set_opencode_permissions(&self, rules: Option<bool>) {
         self.state.lock().unwrap().opencode_permissions = rules;
+    }
+    /// Claude session `session` under `config_dir` (`None` for `~/.claude`)
+    /// used `usage`.
+    pub fn set_usage(
+        &self,
+        config_dir: Option<&str>,
+        session: &str,
+        usage: crate::usage::TaskUsage,
+    ) {
+        self.state
+            .lock()
+            .unwrap()
+            .usage
+            .insert((config_dir.map(str::to_string), session.to_string()), usage);
     }
     pub fn set_pastor_version(&self, version: Option<&str>) {
         self.state.lock().unwrap().pastor_version = version.map(str::to_string);
@@ -297,6 +335,12 @@ impl FakeHerdr {
     /// managed agent whose process exited before becoming interactive.
     pub fn exit_agents_listed(&self, yes: bool) {
         self.state.lock().unwrap().exit_listed = yes;
+    }
+    /// What the pane of each agent that exits on start shows from then on
+    /// (`exit_agents_on_start`, `exit_agents_listed`), read by its pane id:
+    /// an agent that dies on a usage limit leaves the message there.
+    pub fn set_exit_screen(&self, text: &str) {
+        self.state.lock().unwrap().exit_screen = Some(text.into());
     }
     /// The next `n` `agent.start` calls answer `agent_pane_busy`, the way
     /// herdr refuses a pane whose shell has not finished starting (t-42 and
@@ -459,12 +503,22 @@ impl FakeHerdr {
     /// pane itself, not through `pane.send_keys`: it goes idle, publishes
     /// that, and redraws for `trust_redraw` as after any trust answer.
     pub fn answer_trust_by_hand(&self, pane_id: &str) {
-        self.state
-            .lock()
-            .unwrap()
-            .trust_answered
-            .insert(pane_id.into(), Instant::now());
-        self.set_status(pane_id, AgentStatus::Idle);
+        let idle = {
+            let mut s = self.state.lock().unwrap();
+            s.trust_answered.insert(pane_id.into(), Instant::now());
+            s.trust_idle
+        };
+        // An idle trust question leaves the agent idle: nothing to publish.
+        if !idle {
+            self.set_status(pane_id, AgentStatus::Idle);
+        }
+    }
+
+    /// The trust question of agents started from now on reads idle and
+    /// ready, as herdr reads Codex's, instead of `blocked` (see
+    /// `State::trust_idle`).
+    pub fn set_trust_idle(&self, yes: bool) {
+        self.state.lock().unwrap().trust_idle = yes;
     }
 
     /// `agent.prompt` is accepted from now on, but the agent never starts
@@ -519,6 +573,32 @@ impl FakeHerdr {
     /// `reconcile_every` apart. One-shot.
     pub fn set_status_between_lists(&self, pane_id: &str, status: AgentStatus) {
         self.state.lock().unwrap().status_between_lists = Some((pane_id.into(), status));
+    }
+
+    /// The agent on `pane_id` changes to `status`, silently, while the next
+    /// `pane.close` of another pane is in flight: an agent that went back to
+    /// work after the `agent.list` that found it stopped. Given for two
+    /// panes, only one of them changes, whichever does not close first.
+    /// One-shot.
+    pub fn on_next_close_set_status(&self, pane_id: &str, status: AgentStatus) {
+        self.state
+            .lock()
+            .unwrap()
+            .on_close
+            .push((pane_id.into(), OnClose::Status(status)));
+    }
+
+    /// The agent on `pane_id` is replaced by an idle agent named `name`,
+    /// silently, while the next `pane.close` of another pane is in flight:
+    /// herdr handed the pane out again after the `agent.list` that found
+    /// its agent stopped. Given for two panes, as `on_next_close_set_status`.
+    /// One-shot.
+    pub fn on_next_close_replace(&self, pane_id: &str, name: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .on_close
+            .push((pane_id.into(), OnClose::Replace(name.into())));
     }
 
     /// Does the fake have this pane: a workspace's root pane, or one with an
@@ -965,6 +1045,11 @@ impl FakeHerdr {
                     launch_pending: false,
                     interactive_ready: true,
                 };
+                if (s.exit_listed || s.exit_on_start)
+                    && let Some(text) = s.exit_screen.clone()
+                {
+                    s.pane_text.insert(pane_id.clone(), text);
+                }
                 if s.exit_listed {
                     // The agent process died on launch, but herdr keeps the pane
                     // in `agent.list` with neither launch flag set, the way it
@@ -985,7 +1070,7 @@ impl FakeHerdr {
                 }
                 s.started.insert(pane_id.clone(), Instant::now());
                 s.agents.insert(pane_id.clone(), info.clone());
-                if s.trust_prompt.is_some() {
+                if s.trust_prompt.is_some() && !s.trust_idle {
                     // Its first screen is the trust question, which herdr
                     // reports as `blocked`.
                     change_status(&mut s, &pane_id, AgentStatus::Blocked);
@@ -1021,7 +1106,10 @@ impl FakeHerdr {
                     .trust_answered
                     .get(&found.pane_id)
                     .is_some_and(|at| at.elapsed() < s.trust_redraw);
-                if s.ignore_prompts || redrawing {
+                let at_idle_trust = s.trust_idle
+                    && s.trust_prompt.is_some()
+                    && !s.trust_answered.contains_key(&found.pane_id);
+                if s.ignore_prompts || redrawing || at_idle_trust {
                     return Ok(json!({"type": "agent_prompted", "agent": found}));
                 }
                 let info = change_status(&mut s, &found.pane_id, AgentStatus::Working)
@@ -1086,9 +1174,10 @@ impl FakeHerdr {
                     PaneInput::Keys(keys)
                 };
                 let answered = matches!(&input, PaneInput::Keys(k) if s.trust_prompt.as_ref() == Some(k))
-                    && s.agents
-                        .get(&pane_id)
-                        .is_some_and(|a| a.agent_status == AgentStatus::Blocked);
+                    && s.agents.get(&pane_id).is_some_and(|a| {
+                        a.agent_status == AgentStatus::Blocked
+                            || (s.trust_idle && !s.trust_answered.contains_key(&pane_id))
+                    });
                 s.pane_input.entry(pane_id.clone()).or_default().push(input);
                 if answered {
                     s.trust_answered.insert(pane_id.clone(), Instant::now());
@@ -1111,10 +1200,12 @@ impl FakeHerdr {
                 // Still at its trust question: blocked, never answered.
                 let at_trust = found.is_some_and(|a| {
                     s.trust_prompt.is_some()
-                        && a.agent_status == AgentStatus::Blocked
+                        && (a.agent_status == AgentStatus::Blocked || s.trust_idle)
                         && !s.trust_answered.contains_key(&a.pane_id)
                 });
-                let text = match found.and_then(|a| s.pane_text.get(&a.pane_id)) {
+                // A pane whose agent is gone is read by its id.
+                let pane = found.map_or(target, |a| a.pane_id.as_str());
+                let text = match s.pane_text.get(pane) {
                     Some(text) => text.as_str(),
                     None if at_trust && s.trust_screen.is_empty() => CLAUDE_TRUST_SCREEN,
                     None if at_trust => s.trust_screen.as_str(),
@@ -1153,6 +1244,20 @@ impl FakeHerdr {
                     return Err(("pane_not_found".into(), format!("pane {pane_id} not found")));
                 }
                 s.agents.remove(&pane_id);
+                if let Some(i) = s.on_close.iter().position(|(other, _)| *other != pane_id) {
+                    let (other, what) = std::mem::take(&mut s.on_close).swap_remove(i);
+                    match what {
+                        OnClose::Status(status) => {
+                            change_status(&mut s, &other, status);
+                        }
+                        OnClose::Replace(name) => {
+                            change_status(&mut s, &other, AgentStatus::Idle);
+                            if let Some(a) = s.agents.get_mut(&other) {
+                                a.name = Some(name);
+                            }
+                        }
+                    }
+                }
                 let left = s.panes.get_mut(&ws).map(|panes| {
                     panes.retain(|x| *x != pane_id);
                     panes.len()
@@ -1280,6 +1385,15 @@ impl super::transport::Connector for FakeHerdr {
     fn pastor_version(&self) -> super::transport::VersionFuture<'_> {
         let version = self.state.lock().unwrap().pastor_version.clone();
         Box::pin(async move { Ok(version) })
+    }
+    fn claude_usage(
+        &self,
+        config_dir: Option<&str>,
+        session: &str,
+    ) -> super::transport::UsageFuture<'_> {
+        let key = (config_dir.map(str::to_string), session.to_string());
+        let usage = self.state.lock().unwrap().usage.get(&key).cloned();
+        Box::pin(async move { Ok(usage) })
     }
 }
 

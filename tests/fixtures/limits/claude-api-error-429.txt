@@ -1,0 +1,22 @@
+#! kind: claude
+#! source: spec
+#! now: 2026-09-29T12:00:00Z
+#! limit: short
+#! model_scoped: no
+#! until: none
+> Read AGENTS.md, then fix the flaky transport test.
+
+● Read(AGENTS.md)
+  ⎿  Read 132 lines
+
+● Bash(cargo test --test transport)
+  ⎿  running 14 tests
+     test result: ok. 14 passed; 0 failed
+     … +12 lines (ctrl+o to expand)
+
+● API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your rate limit"}}
+
+──────────────────────────────────────────────────────────────────────────────
+❯ 
+──────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

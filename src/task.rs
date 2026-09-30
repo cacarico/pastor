@@ -20,6 +20,12 @@ pub enum TaskState {
     /// `low` tasks, pinned to its machine, to resume its session there
     /// (`claude --resume`) when a slot frees.
     Paused,
+    /// A Claude task whose agent stopped on a usage limit: its pane is
+    /// closed as a pause closes it, its worktree kept, and it waits pinned
+    /// to its machine until `waiting_until`, or until its limit is cleared,
+    /// to resume its session there. Not `paused`: a paused task goes first
+    /// among the `low` tasks, a waiting one starts at its time.
+    Waiting,
 }
 
 /// States whose task holds a pane on its machine. Kept next to
@@ -36,12 +42,13 @@ pub const PANE_OWNING_STATES: [TaskState; 5] = [
 /// The states a task can be in while it still needs pastor or a human:
 /// what `pastor task list` shows by default. Done, failed, stale and closed tasks
 /// are finished; they appear only with `--all` (or `--done` for done ones).
-pub const LIVE_STATES: [TaskState; 5] = [
+pub const LIVE_STATES: [TaskState; 6] = [
     TaskState::Queued,
     TaskState::Starting,
     TaskState::Running,
     TaskState::Blocked,
     TaskState::Paused,
+    TaskState::Waiting,
 ];
 
 impl TaskState {
@@ -82,6 +89,7 @@ impl TaskState {
             TaskState::Failed => "failed",
             TaskState::Closed => "closed",
             TaskState::Paused => "paused",
+            TaskState::Waiting => "waiting",
         }
     }
 }
@@ -132,6 +140,17 @@ impl Priority {
             Priority::Normal => "normal",
             Priority::High => "high",
             Priority::Critical => "critical",
+        }
+    }
+
+    /// The level a queued task ages to after `age_after`: one up, never
+    /// past `high`, so ageing never makes a task critical and lets it burst.
+    /// `None` at `high` and `critical`, which do not age.
+    pub fn aged(self) -> Option<Priority> {
+        match self {
+            Priority::Low => Some(Priority::Normal),
+            Priority::Normal => Some(Priority::High),
+            Priority::High | Priority::Critical => None,
         }
     }
 }
@@ -226,6 +245,131 @@ pub struct DispatchSpec {
     /// existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// `task run --now`: dispatch starts the task at once on its pinned
+    /// machine, past that machine's `max_agents`, `job_slots`, `burst` and
+    /// its flock's number there (`dispatch::now_machine`). Only the head
+    /// sets it, from `Run::now`; a retry drops it. Left out of the JSON when
+    /// false, so a spec from before it reads as a plain task.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub now: bool,
+    /// Whether pastor leaves the task's pane open once the task is done,
+    /// failed or stale, until someone runs `pastor task close`. Before the
+    /// task is queued, what `task run --keep-pane` or a job's `[dispatch]
+    /// keep_pane` asked for; once queued, what the first of those, the
+    /// flock and `[defaults]` said (`Defaults::resolve_keep_pane`). `None`
+    /// when no layer set it, which is no.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_pane: Option<bool>,
+    /// Where `keep_pane` came from, labelled like `AgentSource::agent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_pane_from: Option<String>,
+    /// The agents and models the task ran before this one, each round ended
+    /// by a usage limit, and the limit it waits on now, if it does.
+    #[serde(default, skip_serializing_if = "Rounds::is_empty")]
+    pub rounds: Rounds,
+}
+
+/// A task's rounds on other models (`DispatchSpec::rounds`): those that
+/// ended on a usage limit, and what the next one needs of the last.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rounds {
+    /// Rounds that ended on a limit and handed the task to another model,
+    /// the first first. The round running now is the spec's own agent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ended: Vec<AgentRound>,
+    /// The limit the task stopped on, set while it waits and taken when it
+    /// starts again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<Box<LimitStop>>,
+}
+
+impl Rounds {
+    pub fn is_empty(&self) -> bool {
+        self.ended.is_empty() && self.stop.is_none()
+    }
+}
+
+/// One round of a task on an agent and model, and why it ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRound {
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// `limit: <line>`, as the round's summary slot has it.
+    pub ended: String,
+}
+
+impl std::fmt::Display for AgentRound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", agent_and_model(&self.agent, self.model.as_deref()))
+    }
+}
+
+/// `claude-personal (sonnet)`, or the agent alone when it runs no model.
+pub fn agent_and_model(agent: &str, model: Option<&str>) -> String {
+    match model {
+        Some(m) => format!("{agent} ({m})"),
+        None => agent.to_string(),
+    }
+}
+
+/// A usage limit a task stopped on, kept with it while it waits, with what
+/// its next round needs: the model it stopped on, the limit's line, and
+/// the end of its pane for an agent that cannot resume its session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LimitStop {
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// `limit`, or `rate_limit` for short limits that counted as hard.
+    pub why: String,
+    pub line: String,
+    /// When the limit it stopped on is tried again.
+    pub until: DateTime<Utc>,
+    /// The last `[limits] handover_lines` of its pane.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tail: String,
+    /// What the dispatch pass does with it once its time has come.
+    pub then: NextRound,
+    /// Why it waits when it could have gone on under another model:
+    /// `reset in 12m, under wait_under 30m`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waited: Option<String>,
+    /// Set once the next round is on another model: how that agent learns
+    /// what the last one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handover: Option<Handover>,
+}
+
+/// Which model a limited task goes on with (`LimitStop::then`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NextRound {
+    /// The next model in its list that is free, now.
+    Switch,
+    /// Its own model, at its reset: a short wait, or no list.
+    Own,
+    /// The first model in its list that is free, at `waiting_until`.
+    First,
+}
+
+/// How the agent of a task's next round learns what the last one did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Handover {
+    /// The same Claude session, resumed under the new model.
+    Session,
+    /// The prompt again, with the end of the last agent's pane.
+    PaneTail,
+}
+
+impl Handover {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Handover::Session => "session",
+            Handover::PaneTail => "pane_tail",
+        }
+    }
 }
 
 /// The label template a task's own workspace gets when no layer sets one.
@@ -331,9 +475,6 @@ pub enum SummaryMode {
     /// Add nothing and require nothing
     Off,
 }
-
-/// The code of a `summary` that is not one of `SummaryMode`'s.
-pub const UNKNOWN_SUMMARY_MODE: &str = "unknown_summary_mode";
 
 /// The paragraph pastor adds to a task's prompt when it sends it, unless
 /// the task's `summary` is `off`. Not stored in the task's prompt.
@@ -482,7 +623,7 @@ impl From<Place> for String {
 
 /// See `DispatchSpec::agent_source`. The labels read like `machine own`,
 /// `flock personal`, `defaults`, `task run` or `job <name>`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSource {
     pub ask: crate::config::AgentChoice,
     pub agent: String,
@@ -497,6 +638,18 @@ pub struct AgentSource {
     /// Where `model` came from, labelled like `agent`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_from: Option<String>,
+    /// The `[models]` names the task may fall back to, in order, as
+    /// settled (`Models::fallback`); empty when it has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback: Vec<String>,
+    /// Where `fallback` came from, labelled like `agent`; set too when that
+    /// layer's list is `[]`, and `None` when no layer sets one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_from: Option<String>,
+    /// Set when `model` is one of `fallback`, taken because every model
+    /// before it was on an exhausted account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_use: Option<FallbackUse>,
     /// The permission profile the task runs under, whose lists are in the
     /// spec's `allow` and `deny`; `None` when no layer names one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -511,6 +664,28 @@ pub struct AgentSource {
     /// Where the spec's `place` came from, like `timeout_from`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub place_from: Option<String>,
+    /// Why the spec's `allow` and `deny` do not reach the agent, when they
+    /// do not (`Agents::lists_unapplied`), as settled on the task's agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lists_unapplied: Option<String>,
+}
+
+/// Which of its fallback models a task started on, and why not on those
+/// before it: `fallback 2 of 2; claude-personal exhausted until 03:00`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FallbackUse {
+    /// Its place in the task's fallback list, from 1.
+    pub pos: usize,
+    /// How long that list is.
+    pub of: usize,
+    /// The exhausted accounts it went past.
+    pub why: String,
+}
+
+impl std::fmt::Display for FallbackUse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "fallback {} of {}; {}", self.pos, self.of, self.why)
+    }
 }
 
 /// A worktree herdr made for a task: its branch and where it is on disk.
@@ -538,6 +713,11 @@ impl DispatchSpec {
     /// The permission profile the task runs under, if it runs one.
     pub fn profile(&self) -> Option<&str> {
         self.agent_source.as_ref()?.profile.as_deref()
+    }
+
+    /// Whether auto-close leaves the task's pane alone (`keep_pane`).
+    pub fn keeps_pane(&self) -> bool {
+        self.keep_pane == Some(true)
     }
 }
 
@@ -733,6 +913,15 @@ pub struct Task {
     /// its id unless something has moved it.
     #[serde(default)]
     pub queue_pos: i64,
+    /// The level the task had before it aged (`Store::age_queued`): set on
+    /// its first step up, kept through later ones, cleared when someone sets
+    /// its level by hand. `None` on a task that has not aged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aged_from: Option<Priority>,
+    /// When the task last aged a level; its next step is `age_after` from
+    /// this, or from when it was queued before its first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aged_at: Option<DateTime<Utc>>,
     /// What the head lets the task's agent change (`TaskRole`). `agent` on
     /// every row from before roles.
     #[serde(default)]
@@ -748,11 +937,21 @@ pub struct Task {
     /// paused itself (`Preemption`).
     #[serde(flatten, default)]
     pub pause: Preemption,
+    /// On a `waiting` task, when its usage limit resets and it goes on
+    /// (`TaskState::Waiting`). `None` on every other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_until: Option<DateTime<Utc>>,
     /// How the task's last round ended (`TaskSummary`), on a task that is
     /// done, failed or closed and has one. Not a column: the store reads it
     /// from `task_summaries` with the row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<TaskSummary>,
+    /// What the task's Claude session used, read from its session file on
+    /// its machine when a round ended (`usage::TaskUsage`). `None` for
+    /// another kind of agent, and until pastor has read it. Not a column:
+    /// the store reads it from `task_usage` with the row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::usage::TaskUsage>,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
@@ -779,6 +978,38 @@ pub fn prompt_to_send(task: &Task) -> String {
 }
 
 pub const RESUME_PROMPT: &str = "pastor paused this session for a critical task and has now resumed it; carry on where you left off.";
+
+/// What a waiting task's agent is told once its session is open again: it
+/// stopped on a usage limit, which has reset.
+pub const LIMIT_RESUME_PROMPT: &str = "pastor stopped this session on a usage limit, which has now reset, and has resumed it; carry on where you left off.";
+
+/// What the agent of a task that stopped on a 429 or 529, past its own
+/// retries, is told in its pane once pastor's backoff has passed
+/// (`[limits] rate_backoff`).
+pub const RATE_RETRY_PROMPT: &str = "pastor: the API was busy; carry on where you left off.";
+
+/// The paragraph after the prompt of a waiting task that starts again with
+/// no session to resume: it stopped on a usage limit before, and may have
+/// left work behind.
+pub const LIMIT_HANDOVER: &str = "pastor: this task started before and stopped on a usage limit before its conversation could be kept. Its checkout may already hold part of the work: look at what is there (git status, git log) before you begin, and carry on from it.";
+
+/// What the agent of a task that moved to another model in its own Claude
+/// session is told (`Handover::Session`).
+pub fn switch_prompt(from: &str, to: &str) -> String {
+    format!(
+        "pastor: you were running on {from} and hit its usage limit; you now run on {to}. Carry on where you left off."
+    )
+}
+
+/// The paragraph after the prompt of a task that moved to another agent
+/// (`Handover::PaneTail`): who started it, where to look, and the end of
+/// that agent's pane.
+pub fn limit_handover(from: &str, tail: &str) -> String {
+    format!(
+        "pastor: another agent ({from}) started this task in this worktree and stopped at its usage limit. Read `git status` and `git log` first. Its last lines were:\n\n{}",
+        tail.trim_end()
+    )
+}
 
 /// A task's part in pausing: whether it may pause a `low` task to start
 /// (`task run --preempt`, a job's `[dispatch] preempt`), and, on a task that
@@ -837,11 +1068,11 @@ impl Task {
         why_not_pausable(self, kind, now).is_none()
     }
 
-    /// The machine the task must run on: the one it is paused on, else the
-    /// one its spec pins.
+    /// The machine the task must run on: the one it is paused or waiting
+    /// on, else the one its spec pins.
     pub fn pinned_machine(&self) -> Option<&str> {
         match self.state {
-            TaskState::Paused => self.machine.as_deref(),
+            TaskState::Paused | TaskState::Waiting => self.machine.as_deref(),
             _ => self.spec.machine.as_deref(),
         }
     }
@@ -861,6 +1092,13 @@ impl Task {
     /// The `[models]` name the task runs, if it runs one.
     pub fn model(&self) -> Option<&str> {
         self.spec.agent_source.as_ref()?.model.as_deref()
+    }
+    /// The `[models]` names the task may fall back to, in order.
+    pub fn fallback(&self) -> &[String] {
+        self.spec
+            .agent_source
+            .as_ref()
+            .map_or(&[], |s| s.fallback.as_slice())
     }
     /// The permission profile the task runs under, if it runs one.
     pub fn profile(&self) -> Option<&str> {
@@ -892,6 +1130,7 @@ impl Task {
                 "model".into(),
                 self.model().map_or(Value::Null, Value::from),
             );
+            o.insert("fallback".into(), self.fallback().into());
             o.insert(
                 "profile".into(),
                 self.profile().map_or(Value::Null, Value::from),
@@ -1071,7 +1310,7 @@ fn completed_since_prompt(
 /// What starts an agent's message in its pane: Claude draws `●` (`⏺` in
 /// older releases) in the first column, and indents the rest of the message
 /// by two spaces.
-const MESSAGE_MARKERS: [char; 2] = ['●', '⏺'];
+pub(crate) const MESSAGE_MARKERS: [char; 2] = ['●', '⏺'];
 
 /// The question an agent's last message ends with, if it ends with one.
 /// herdr reports an agent that stopped to ask the same way as one that
@@ -1137,11 +1376,72 @@ pub fn background_shell_running(pane: &str) -> bool {
     })
 }
 
+/// What agy draws when it stops for a person, idle to herdr: a tool it wants
+/// to run ("Requesting permission for:", the tool on the next line) or a
+/// command to confirm ("Run this command?"). Only the last lines count, so
+/// a prompt answered long ago and still in scrollback does not.
+const PERMISSION_ASKS: [&str; 2] = ["Requesting permission for:", "Run this command?"];
+
+/// How many lines at the end of a pane `permission_question` and
+/// `tasks_running` read.
+const BOTTOM_LINES: usize = 20;
+
+/// The last `n` lines of `pane` that are not blank, trimmed.
+pub fn pane_tail(pane: &str, n: usize) -> Vec<&str> {
+    let mut tail: Vec<&str> = pane
+        .lines()
+        .rev()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .take(n)
+        .collect();
+    tail.reverse();
+    tail
+}
+
+/// The permission prompt at the bottom of a pane of an agent that draws its
+/// messages without Claude's marker (agy), if it stopped on one: the asking
+/// line, and for "Requesting permission for:" the line naming what it asks
+/// for.
+pub fn permission_question(pane: &str) -> Option<String> {
+    let tail = pane_tail(pane, BOTTOM_LINES);
+    let at = tail
+        .iter()
+        .rposition(|l| PERMISSION_ASKS.iter().any(|ask| l.contains(ask)))?;
+    let line = tail[at];
+    Some(match tail.get(at + 1) {
+        Some(next) if line.ends_with(':') => format!("{line} {next}"),
+        _ => line.to_string(),
+    })
+}
+
+/// Whether agy's footer says it still has work of its own going (`· 1 task`,
+/// `· 2 tasks`): a process it started, which it takes up again when it ends,
+/// while herdr reads the agent idle. Only the last lines are the footer.
+pub fn tasks_running(pane: &str) -> bool {
+    pane_tail(pane, 3).iter().any(|line| {
+        line.match_indices('·').any(|(at, dot)| {
+            let rest = line[at + dot.len()..].trim_start();
+            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+            let Some(after) = rest[digits..].trim_start().strip_prefix("task") else {
+                return false;
+            };
+            let after = after.strip_prefix('s').unwrap_or(after);
+            digits > 0 && !after.starts_with(char::is_alphanumeric)
+        })
+    })
+}
+
 /// Pure transition. `None` means no change. The settle window for `Done` is the
 /// caller's job: it should confirm the agent is still idle after the window.
 pub fn next_state(task: &Task, observed: &Observed) -> Option<TaskState> {
     use TaskState::*;
     if !task.state.is_open() {
+        return None;
+    }
+    // A waiting task holds no pane and no agent: nothing seen on a machine
+    // moves it. The dispatch pass resumes it (`Store::claim_paused`).
+    if task.state == Waiting {
         return None;
     }
     let to = match observed {
@@ -1343,6 +1643,7 @@ pub(crate) mod tests {
             item: Value::Null,
             prompt: "p".into(),
             spec: DispatchSpec {
+                now: false,
                 agent: "claude".into(),
                 agent_args: vec![],
                 allow: vec![],
@@ -1361,6 +1662,9 @@ pub(crate) mod tests {
                 label: Default::default(),
                 summary: Default::default(),
                 cwd: None,
+                keep_pane: None,
+                keep_pane_from: None,
+                rounds: Default::default(),
             },
             machine: Some("pi-1".into()),
             workspace_id: Some("w1".into()),
@@ -1376,7 +1680,11 @@ pub(crate) mod tests {
             priority: Default::default(),
             priority_from: None,
             queue_pos: 0,
+            aged_from: None,
+            aged_at: None,
             pause: Default::default(),
+            waiting_until: None,
+            usage: None,
             summary: None,
             created_at: now,
             started_at: Some(now),
@@ -1385,6 +1693,16 @@ pub(crate) mod tests {
             flock: None,
             role: Default::default(),
         }
+    }
+
+    /// Ageing lifts one level at a time and stops at high: it never makes
+    /// a task critical.
+    #[test]
+    fn a_level_ages_one_up_to_high() {
+        assert_eq!(Priority::Low.aged(), Some(Priority::Normal));
+        assert_eq!(Priority::Normal.aged(), Some(Priority::High));
+        assert_eq!(Priority::High.aged(), None);
+        assert_eq!(Priority::Critical.aged(), None);
     }
 
     /// A task its agent ended (`pastor task done`) stays done whatever the
@@ -1800,7 +2118,7 @@ pub(crate) mod tests {
     fn next_state_keeps_its_invariants_over_the_whole_table() {
         use TaskState::*;
         let states = [
-            Queued, Starting, Running, Blocked, Done, Stale, Failed, Closed, Paused,
+            Queued, Starting, Running, Blocked, Done, Stale, Failed, Closed, Paused, Waiting,
         ];
         let statuses = [
             AgentStatus::Idle,
@@ -1845,6 +2163,9 @@ pub(crate) mod tests {
                             t.ended, t.activity_seen, t.prompt_pending
                         );
                         assert_ne!(got, Some(state), "no-op must be None: {case}");
+                        if state == Waiting {
+                            assert_eq!(got, None, "a waiting task has no pane to see: {case}");
+                        }
                         if !state.is_open() {
                             assert_eq!(got, None, "closed states never move: {case}");
                         }
@@ -1893,7 +2214,7 @@ pub(crate) mod tests {
                 }
             }
         }
-        assert_eq!(checked, 9 * 2 * 8 * (4 + 5 * 4 * 4));
+        assert_eq!(checked, 10 * 2 * 8 * (4 + 5 * 4 * 4));
     }
 
     #[test]
@@ -1973,6 +2294,55 @@ pub(crate) mod tests {
         let pane = claude_pane("● It said 1 shell still running, now ended.");
         assert!(!background_shell_running(&pane));
         assert!(!background_shell_running("fake output\n"));
+    }
+
+    /// agy's pane when it stops on a permission prompt, and when it ends a
+    /// turn with a process of its own still going.
+    fn agy_pane(bottom: &str) -> String {
+        format!(
+            "  I ran the review and wrote the notes.\n\n{bottom}\n\n\
+             ╭────────────────────╮\n│ >                  │\n╰────────────────────╯\n\
+             \u{20}~/src/repo  gemini-3-pro\n"
+        )
+    }
+
+    #[test]
+    fn agy_permission_prompts_are_questions() {
+        let pane =
+            agy_pane("Requesting permission for:\n  run_command make deploy\n  1. Allow  2. Deny");
+        assert_eq!(
+            permission_question(&pane).as_deref(),
+            Some("Requesting permission for: run_command make deploy")
+        );
+        let pane = agy_pane("$ git push origin HEAD\nRun this command? (y/n)");
+        assert_eq!(
+            permission_question(&pane).as_deref(),
+            Some("Run this command? (y/n)")
+        );
+        assert_eq!(permission_question(&agy_pane("Pushed the branch.")), None);
+        // Far up in the scrollback: answered long ago.
+        let old = format!("Run this command?\n{}", "line\n".repeat(40));
+        assert_eq!(permission_question(&old), None);
+    }
+
+    #[test]
+    fn agy_footer_with_tasks_is_still_running() {
+        let footer = |f: &str| format!("{}{f}\n", agy_pane("Started make mutants."));
+        assert!(tasks_running(&footer(" ~/src/repo · 1 task")));
+        assert!(tasks_running(&footer(
+            " ~/src/repo · 2 tasks · gemini-3-pro"
+        )));
+        assert!(!tasks_running(&footer(" ~/src/repo · gemini-3-pro")));
+        assert!(!tasks_running(&footer(" ~/src/repo · 2 taskforces")));
+        assert!(!tasks_running(&footer(" ~/src/repo · task list")));
+        // In a message far above the footer.
+        assert!(!tasks_running(&agy_pane("Waiting · 1 task left to do")));
+    }
+
+    #[test]
+    fn a_pane_tail_is_its_last_lines_that_are_not_blank() {
+        assert_eq!(pane_tail("a\n\n  b \n\nc\n\n", 2), vec!["b", "c"]);
+        assert_eq!(pane_tail("", 3), Vec::<&str>::new());
     }
 
     /// A task marked blocked on a question moves its baseline to the idle

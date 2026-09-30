@@ -66,16 +66,16 @@ folders; the XDG variables work too. The full list is in the
 
 ## where to read next
 
-| to learn | read |
+| read | to learn |
 |---|---|
-| what the head does and keeps | [head](../../concepts/head/) |
-| how machines are reached and how much they take | [machines](../../concepts/machines/) |
-| keeping some tasks on some machines | [flocks](../../concepts/flocks/) |
-| a task's life, from queued to closed | [tasks](../../concepts/tasks/), [queue](../../concepts/queue/) |
-| work that finds itself | [jobs](../../concepts/jobs/), [connectors](../../concepts/connectors/) |
-| which agent and model a task gets | [agents and models](../../concepts/agents-and-models/) |
-| what an agent may do | [profiles and trust](../../concepts/profiles-and-trust/) |
-| agents that watch agents | [orchestrators](../../concepts/orchestrators/) |
+| [head](../../concepts/head/) | what the head does and keeps |
+| [machines](../../concepts/machines/) | how machines are reached and how much they take |
+| [flocks](../../concepts/flocks/) | keeping some tasks on some machines |
+| [tasks](../../concepts/tasks/), [queue](../../concepts/queue/) | a task's life, from queued to closed |
+| [jobs](../../concepts/jobs/), [connectors](../../concepts/connectors/) | work that finds itself |
+| [agents and models](../../concepts/agents-and-models/) | which agent and model a task gets |
+| [profiles and trust](../../concepts/profiles-and-trust/) | what an agent may do |
+| [orchestrators](../../concepts/orchestrators/) | agents that watch agents |
 
 And to lay it out on your machines:
 

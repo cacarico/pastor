@@ -84,6 +84,51 @@ default. The model's `args` go first on the agent's command line, then the
 task's `agent_args`. `--model` takes only a name; an unknown one is
 refused with `unknown_model`.
 
+`fallback = ["sonnet", "gpt"]` names, in order, the models a task may fall
+back to when its own runs out, each finding its agent on the machine as
+above. A new task whose model is on an exhausted account starts on the
+first free one, and a running task moves down it when its model hits a
+usage limit (see [usage limits](#usage-limits)). The list comes from `--fallback` or the job's `fallback`, then the
+machine, then the flock, then `[defaults]`; the first list wins whole, and
+`[]` means none. `pastor task run --no-fallback` gives one task none.
+
+## usage limits
+
+A usage limit belongs to an account. `account = "me-personal"` under an
+agent's `[agents]` table says which login it uses; every machine whose agent
+names the same account shares its limits. An agent with no account keeps a
+limit to the machine it was seen on, since the same name can be another
+login elsewhere. pastor never reads the account as a credential.
+
+The head keeps a row per exhausted account (or one model of it) until its
+reset, and a new task does not start on it: it takes the first free model
+of its `fallback` list, or stays queued, and `pastor queue` says why, like
+`waiting: me-personal exhausted until 03:00 (5-hour limit, seen by t-412)`.
+A Claude task whose agent stops on a limit (`You've hit your limit ·
+resets 3am`) goes `waiting`, not `done`: pastor closes its pane, keeps its
+worktree, and resumes its session on the same machine at the reset. An agy
+task that stops on its quota (`RESOURCE_EXHAUSTED (code 429): Individual
+quota reached. ... Resets in 4h21m30s.`) waits the same way, and since agy
+keeps no session, starts again at the reset from its prompt, with a line
+saying an earlier start may have left work in the checkout. Other kinds
+are not read for limits yet.
+`pastor task list` shows it as `waiting 03:00`. With a `fallback` list, it
+waits only for a reset within `wait_under` (30 minutes); otherwise it goes
+on under the next free model of its list in the same worktree: in the same
+Claude session when the model runs on the same login (Opus to Sonnet), else
+from its prompt with the end of the last agent's pane (Claude to opencode).
+It stays on that model; new tasks start on the first choice. Where Claude shows its
+limit picker instead, pastor picks "Stop and wait for limit to reset" by
+its text and the task waits the same way; it never picks extra usage or an
+upgrade, and a picker without "Stop and wait" is left `blocked` for you.
+
+`pastor limit list` shows the rows, and `pastor limit clear <account>`
+forgets one, which wakes the tasks waiting on it on the next pass. The
+events are `agent.exhausted`, `agent.reset`, `task.limited`,
+`task.waiting` and `task.agent_switched`, and
+[`[limits]`](../../reference/pastor-toml/#limits) sets how long a limit
+with no reset holds.
+
 ## a model of another kind
 
 A model runs only on an agent of its kind. To run an opencode model on a

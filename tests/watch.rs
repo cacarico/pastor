@@ -160,6 +160,7 @@ fn task(id: i64, state: TaskState) -> Task {
             item: serde_json::json!({"key": "k"}),
             prompt: "p".into(),
             spec: DispatchSpec {
+                now: false,
                 agent: "claude".into(),
                 agent_args: vec![],
                 allow: vec![],
@@ -178,6 +179,9 @@ fn task(id: i64, state: TaskState) -> Task {
                 label: Default::default(),
                 summary: Default::default(),
                 cwd: None,
+                keep_pane: None,
+                keep_pane_from: None,
+                rounds: Default::default(),
             },
             flock: "default".into(),
             description: None,

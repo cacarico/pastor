@@ -52,6 +52,7 @@ apart. `--label` changes that name.
 | `stale` | it ran past its timeout (2h by default), or its pull machine was lost; the agent is left running |
 | `failed` | it could not start, or the agent exited before it was done |
 | `paused` | a critical task took its slot; it resumes its session when there is room |
+| `waiting` | its agent stopped on a usage limit; it resumes its session when the limit resets, or when `pastor limit clear` clears it |
 | `closed` | finished for good; its pane is gone |
 
 `done` means the agent stopped, not that the work is right. Read what it
@@ -60,7 +61,7 @@ did.
 ## follow it
 
 ```sh
-pastor task list             # live tasks: queued, starting, running, blocked, paused
+pastor task list             # live tasks: queued, starting, running, blocked, paused, waiting
 pastor task list --all       # finished ones too
 pastor task list --wide      # adds how each ended (RESULT) and its description
 pastor task describe t-12    # one task in full: agent, model, profile and where each came from
@@ -116,7 +117,13 @@ says how hard pastor asks:
 
 pastor closes a done task's pane after 5 seconds (`close_done_after` in
 `pastor.toml`), and removes its worktree if it is clean: no uncommitted
-changes and no unpushed commits. Nothing else closes on its own.
+changes and no unpushed commits. A failed or stale task, or an orphan, loses
+its pane 5 seconds after its agent stops (`close_failed_after`), but stays
+failed for `pastor task retry`, its worktree kept. Nothing else closes on its
+own. A task run with `--keep-pane` (or `keep_pane = true` in its job, flock or
+`[defaults]`) keeps its pane and worktree whatever it ends in, until `pastor
+task close`, so you can go on talking to its agent; while it is done it holds
+no slot.
 
 ```sh
 pastor task close t-12 --remove-worktree  # close it now, worktree too

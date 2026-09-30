@@ -167,7 +167,7 @@ pub async fn reopen(
     Ok(name)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fake-herdr"))]
 mod tests {
     use super::*;
     use crate::herdr::fake::FakeHerdr;
@@ -185,6 +185,7 @@ mod tests {
             item: serde_json::Value::Null,
             prompt: "p".into(),
             spec: DispatchSpec {
+                now: false,
                 agent: agent.into(),
                 agent_args: vec![],
                 allow: vec![],
@@ -203,6 +204,9 @@ mod tests {
                 label: Default::default(),
                 summary: Default::default(),
                 cwd: None,
+                keep_pane: None,
+                keep_pane_from: None,
+                rounds: Default::default(),
             },
             machine: Some("pi-1".into()),
             workspace_id: Some("w9".into()),
@@ -220,7 +224,11 @@ mod tests {
             priority: Default::default(),
             priority_from: None,
             queue_pos: 0,
+            aged_from: None,
+            aged_at: None,
             pause: Default::default(),
+            waiting_until: None,
+            usage: None,
             summary: None,
             created_at: now,
             started_at: None,

@@ -81,15 +81,19 @@ Create a one-off task and dispatch it
 | `--agent <AGENT>` | The agent command to start, like claude or codex (default: the machine's, else its flock's, else `[defaults]`, else claude) |  |
 | `--agent-arg <ARG>` | One argument for the agent; repeat it, in order, for more. Replaces the flock's and `[defaults]` agent_args. The next word is always the value, dashes and all |  |
 | `--model <NAME>` | Run this model, a name from `[models]` in pastor.toml; its args go before the agent's (default: the flock's, else the machine's, else `[defaults] model`, else none) |  |
+| `--fallback <NAMES>` | The models the task may fall back to, in order: names from `[models]` in pastor.toml, comma separated (default: the machine's, else the flock's, else `[defaults] fallback`, else none) |  |
+| `--no-fallback` | Fall back to no other model, whatever the machine, flock or `[defaults]` say |  |
 | `--priority <LEVEL>` | Queue at this level: low, normal, high or critical; dispatch takes higher levels first (default: the flock's, else the pinned machine's, else `[defaults] priority`, else normal) |  |
 | `--preempt` | A critical task only: on a full machine, pause the newest low Claude task there (its session resumes when a slot frees) and take its slot |  |
+| `--now` | Start at once on --machine (which it needs), skipping the queue and running past that machine's max_agents, job slots, burst and flock number; meant for a person at the CLI, and refused from a task or an orchestrator as a guard against mistakes, not a boundary |  |
 | `--profile <NAME>` | Run under this permission profile, built in or from `[profiles]` in pastor.toml: a Claude agent gets its allow and deny lists and never asks (default: the flock's, else the machine's, else `[defaults] profile`, else none) |  |
 | `--worktree` | A git worktree per task, branched from --repo (so it needs --repo) |  |
 | `--branch <BRANCH>` | Branch for the worktree (needs --worktree; a plain workspace has no branch) |  |
 | `--tag <TAGS>` | Only a machine with this tag takes the task; repeat for more, and it needs them all |  |
-| `--timeout <TIMEOUT>` | Mark the task stale once it has run this long (30m, 2h; default: `[defaults]` timeout) |  |
+| `--timeout <TIMEOUT>` | Mark the task stale once it has run this long (30m, 2h; default: the flock's, else `[defaults] timeout`) |  |
 | `--label <TEMPLATE>` | Label template of the workspace pastor makes for the task, with {{ task.id }}, {{ flock }}, {{ machine }}, {{ job }} and {{ item.key }} (default: the flock's `label`, else `[defaults] label`, else {{ flock }}/{{ task.id }}). The agent stays t-N |  |
-| `--place <PLACE>` | Where the agent's pane goes: repo (under the repo it works on), own (its own workspace), pastor (the `pastor` workspace) or pane:&lt;workspace&gt; (default: `[defaults] place`, else repo) |  |
+| `--keep-pane` | Keep the agent's pane open once the task is done, failed or stale, until `pastor task close`, so you can go on talking to the agent; a kept done task holds no slot (default: the flock's `keep_pane`, else `[defaults] keep_pane`, else no) |  |
+| `--place <PLACE>` | Where the agent's pane goes: repo (under the repo it works on), own (its own workspace), pastor (the `pastor` workspace) or pane:&lt;workspace&gt; (default: the flock's, else `[defaults] place`, else repo) |  |
 | `--role <ROLE>` | What the agent may change through the head: agent (read, and end its own task) or orchestrator (also run, retry, send to and close tasks and enable and disable jobs). Only a person may start an orchestrator, never a task (one of `agent`, `orchestrator`) | `agent` |
 | `--summary <MODE>` | Ask the agent for a summary when it finishes (ask), also fail the task if it stops without one (require), or neither (off) (default: the flock's `summary`, else `[defaults] summary`, else ask) (one of `ask`, `require`, `off`) |  |
 | `--description <TEXT>` | One line on what the task is about, for `task list --wide` and `describe` (default: the prompt's first line) |  |
@@ -107,12 +111,12 @@ List live tasks across the flock; --all adds finished ones
 | `--blocked` | Only blocked tasks, needing a human |  |
 | `--done` | Only done tasks |  |
 | `--all` | Every task, finished ones too (done, failed, stale, closed) |  |
-| `-w, --wide` | Add a DESCRIPTION column, cut to the terminal's width |  |
+| `-w, --wide` | Add RESULT and DESCRIPTION columns, the second cut to the terminal's width |  |
 | `--json` | Print as a JSON array of full task records |  |
 
 ### pastor task describe
 
-One task in full: state, machine, agent, prompt, error, summary
+One task in full: state, machine, agent, the models it moved through on usage limits, prompt, error, summary
 
 | argument | does | default |
 |---|---|---|
@@ -688,6 +692,27 @@ One profile with its extends followed: the allow and deny lists it adds up to
 |---|---|---|
 | `<PROFILE>` | The profile's name, as `profile list` shows it |  |
 | `--json` | Print as a JSON object |  |
+
+## limit
+
+The accounts that ran out of usage, which no new task starts on until they reset
+
+### pastor limit list
+
+Every exhausted account: its model, when it is tried again, what ran out, who saw it
+
+| argument | does | default |
+|---|---|---|
+| `--json` | Print as a JSON array |  |
+
+### pastor limit clear
+
+Forget an account's limit, so queued and waiting tasks start on it on the next pass
+
+| argument | does | default |
+|---|---|---|
+| `<ACCOUNT>` | The account, as `limit list` shows it: an agent's `account`, or `<machine>/<agent>` |  |
+| `--model <MODEL>` | Clear only this model's limit, not the whole account's |  |
 
 ## trust
 

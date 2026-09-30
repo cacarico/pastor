@@ -126,6 +126,10 @@ pub struct MachineDescription {
     /// The machine's own `model`, after its task's flock's; `None` falls
     /// through to `[defaults]`.
     pub model: Option<String>,
+    /// The machine's own `fallback`, before its flock's; `None` falls
+    /// through to the flock's, then `[defaults]`. Missing from an older head.
+    #[serde(default)]
+    pub fallback: Option<Vec<String>>,
     /// The machine's own `agents`, the agent per kind for a model of
     /// another kind than its agent's. Missing from an older head.
     #[serde(default)]
@@ -152,6 +156,10 @@ pub struct FlockDescription {
     /// The flock's own `model`, before the machine's; `None` falls through
     /// to the machine's, then `[defaults]`.
     pub model: Option<String>,
+    /// The flock's own `fallback`, after the machine's; `None` falls
+    /// through to `[defaults]`. Missing from an older head.
+    #[serde(default)]
+    pub fallback: Option<Vec<String>>,
     /// The flock's own `agents`, as the machine's. Missing from an older
     /// head.
     #[serde(default)]
@@ -325,6 +333,7 @@ pub fn flock_description(
         allow: entry.allow,
         deny: entry.deny,
         model: entry.model,
+        fallback: entry.fallback,
         agents_by_kind: entry.agents,
         profile: entry.profile,
         timeout: entry.timeout,
@@ -333,6 +342,16 @@ pub fn flock_description(
         agents: row.agents,
         tasks,
     })
+}
+
+/// A flock's or machine's own `fallback`: its names, `none` for `[]`, or
+/// `unset` when it sets none.
+fn fallback(list: &Option<Vec<String>>, unset: &str) -> String {
+    match list.as_deref() {
+        None => unset.to_string(),
+        Some([]) => "none".to_string(),
+        Some(names) => names.join(", "),
+    }
 }
 
 /// `key: value` lines with the values in one column.
@@ -600,6 +619,10 @@ pub fn machine_text(m: &MachineDescription) -> String {
                 .clone()
                 .unwrap_or_else(|| "- (from [defaults])".into()),
         ),
+        (
+            "fallback",
+            fallback(&m.fallback, "- (from its flock or [defaults])"),
+        ),
         ("by kind", by_kind(&m.agents_by_kind, "its flock")),
         ("profile", dash(r.profile.clone())),
         ("channel", r.channel.clone()),
@@ -645,6 +668,7 @@ pub fn flock_text(f: &FlockDescription) -> String {
                 .clone()
                 .unwrap_or_else(|| "- (from the machine or [defaults])".into()),
         ),
+        ("fallback", fallback(&f.fallback, "- (from [defaults])")),
         ("by kind", by_kind(&f.agents_by_kind, "[defaults]")),
         (
             "profile",
@@ -837,6 +861,7 @@ mod tests {
             allow: vec![],
             deny: vec!["Bash(rm:*)".into()],
             model: Some("sonnet".into()),
+            fallback: None,
             agents_by_kind: Default::default(),
             profile: Some("develop".into()),
             timeout: None,
@@ -850,6 +875,20 @@ mod tests {
         assert!(text.contains("timeout:     - (from [defaults])"), "{text}");
         assert!(text.contains("place:       pastor\n"), "{text}");
         assert!(text.contains("by kind:     - (from [defaults])"), "{text}");
+        assert!(
+            text.contains("fallback:    - (from [defaults])\n"),
+            "{text}"
+        );
+        let text = flock_text(&FlockDescription {
+            fallback: Some(vec!["sonnet".into(), "gpt".into()]),
+            ..f.clone()
+        });
+        assert!(text.contains("fallback:    sonnet, gpt\n"), "{text}");
+        let text = flock_text(&FlockDescription {
+            fallback: Some(vec![]),
+            ..f.clone()
+        });
+        assert!(text.contains("fallback:    none\n"), "{text}");
         let with = FlockDescription {
             agents_by_kind: [("opencode".to_string(), "opencode".to_string())].into(),
             ..f.clone()

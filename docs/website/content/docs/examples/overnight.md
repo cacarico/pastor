@@ -58,7 +58,7 @@ task_state() {
   pastor task list --json |
     jq -r --arg d "$1" '[.[] | select(.description == $d)] | max_by(.id) | .state // empty'
 }
-live() { case "$1" in queued|starting|running|blocked|paused) return 0 ;; esac; return 1; }
+live() { case "$1" in queued|starting|running|blocked|paused|waiting) return 0 ;; esac; return 1; }
 
 # Open review threads on a PR, over every page of them.
 unresolved() {
@@ -109,7 +109,7 @@ while read -r pr sha merge review checks <&3; do
     echo "PR #$pr: approved, with unresolved review threads"
   elif [ "$merge" = CLEAN ] && [ "$merged" = no ]; then
     # One merge a round: the next one's state is stale until GitHub catches up.
-    if gh pr merge "$pr" --repo "$repo" --squash --delete-branch >&2; then
+    if gh pr merge "$pr" --repo "$repo" --merge --delete-branch >&2; then
       merged=yes
     else
       echo "PR #$pr: approved and green, but the merge was refused"

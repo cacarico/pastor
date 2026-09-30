@@ -23,8 +23,14 @@ in `pastor.toml`. With none it is `normal`.
 pastor task run "Look at the failing deploy" --repo '~/src/app' --priority high
 ```
 
-Levels do not age. A `low` task can wait for ever behind a steady stream of
-higher ones; the WAITED column is how you notice.
+A queued task that has waited `age_after` (30 minutes unless its flock or
+`[defaults]` in `pastor.toml` says otherwise; `never` turns it off) goes up
+one level, and again after each further wait, so a `low` task behind a
+steady stream of `normal` and `high` tasks still runs in the end. Ageing
+stops at `high`: it never makes a task `critical`, so a steady stream of
+`critical` tasks still goes first, and a task can wait behind it for as long
+as it keeps coming; the WAITED column is how you notice. `pastor queue`
+shows an aged task's original level, such as `high (was low)`.
 
 A level also changes room: only a `critical` task may use a machine's
 burst slot, past `max_agents` (see [machines](../machines/#slots)).
@@ -100,6 +106,30 @@ When that machine has room again, and is still in the task's flock with the
 flock under its number there, the task resumes its own Claude session.
 Only a running `low` Claude task with a recorded session is ever paused; a
 `normal` task, another agent, or a blocked or done task never is.
+
+## start it now
+
+When a task cannot wait and you know where it should go, `--now` skips the
+queue altogether:
+
+```sh
+pastor task run "Prod is down: find out why" --machine server-1 --now
+```
+
+It starts on `server-1` at once, past its `max_agents`, job slots, burst
+and its flock's number there, and pauses nothing. It needs `--machine`
+(`now_needs_machine` without it), and that machine connected
+(`machine_not_connected`). If the machine still does not take it, the task
+is closed rather than queued (`now_not_started`). While it runs it counts on
+the machine, so the queue waits until the count is back under the limits;
+`machine list` shows it as `4/3 now:t-22`, and `task list` starts its NOTE
+with `now:`.
+
+It is meant for a person: a job has no such key, a retry of the task queues
+as usual, and an agent or orchestrator gets `now_refused`. That check stops
+an agent from using `--now` by mistake; it reads a marker the caller sets
+itself, so it does not stop an agent that wants around it. See
+[profiles and trust](../profiles-and-trust/).
 
 Read on: [urgent work first](../../examples/urgent-first/) puts levels and
 preempting to work; the commands are in the

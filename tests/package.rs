@@ -121,4 +121,60 @@ fn the_published_package_leaves_fake_herdr_out() {
             .all(|f| !f.contains("fake-herdr") && !f.starts_with("tests/")),
         "{files:?}"
     );
+    // The library's half of the test double, 1800 lines nobody running
+    // pastor needs.
+    assert!(!files.contains(&"src/herdr/fake.rs"), "{files:?}");
+}
+
+/// The fake herdr builds only with the `fake-herdr` feature (or in the
+/// library's own unit tests), so a default build of the library and
+/// `cargo install` never compile it. The integration tests that run it say
+/// so too, or a plain `cargo test` would fail on a missing binary.
+#[test]
+fn the_fake_herdr_needs_its_feature() {
+    let m = manifest();
+    assert!(m["features"].get("default").is_none_or(|d| {
+        !d.as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f.as_str() == Some("fake-herdr"))
+    }));
+    assert!(m["features"].get("fake-herdr").is_some(), "{m:?}");
+    let needs = |t: &toml::Value| {
+        t.get("required-features")
+            .and_then(|r| r.as_array())
+            .is_some_and(|r| r.iter().any(|f| f.as_str() == Some("fake-herdr")))
+    };
+    let bins = m["bin"].as_array().unwrap();
+    let fake = bins
+        .iter()
+        .find(|b| b["name"].as_str() == Some("fake-herdr"))
+        .expect("a [[bin]] for fake-herdr");
+    assert!(needs(fake), "{fake:?}");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let tests = m["test"].as_array().unwrap();
+    for entry in std::fs::read_dir(root.join("tests")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        if !text.contains(concat!("CARGO_BIN_EXE_", "fake-herdr"))
+            && !text.contains(concat!("herdr::", "fake"))
+        {
+            continue;
+        }
+        let name = path.file_stem().unwrap().to_str().unwrap();
+        let declared = tests
+            .iter()
+            .find(|t| t["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("tests/{name}.rs uses the fake herdr: declare it"));
+        assert!(needs(declared), "{declared:?}");
+    }
+    let src = std::fs::read_to_string(root.join("src/herdr/mod.rs")).unwrap();
+    let src = src.replace("\r\n", "\n");
+    assert!(
+        src.contains("#[cfg(feature = \"fake-herdr\")]\npub mod fake;"),
+        "src/herdr/mod.rs"
+    );
 }

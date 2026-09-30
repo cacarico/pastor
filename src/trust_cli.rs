@@ -7,8 +7,7 @@
 use clap::Subcommand;
 
 use crate::cli::{CliError, age, request_error, table};
-use crate::config::Paths;
-use crate::ipc::{Head, IpcRequest, IpcResponse};
+use crate::ipc::{Client, Head, IpcRequest, IpcResponse};
 use crate::store::Store;
 
 #[derive(Subcommand, Debug)]
@@ -40,10 +39,11 @@ pub fn changes_fleet(cmd: &TrustCmd) -> bool {
     !matches!(cmd, TrustCmd::List { .. })
 }
 
-pub async fn run(paths: &Paths, cmd: TrustCmd, head: Head) -> anyhow::Result<()> {
+pub async fn run(client: &Client, cmd: TrustCmd, head: Head) -> anyhow::Result<()> {
     if head.is_live() {
-        return run_on_head(paths, cmd).await;
+        return run_on_head(client, cmd).await;
     }
+    let paths = &client.paths;
     paths.ensure()?;
     let store = Store::open(&paths.db_file())?;
     match cmd {
@@ -69,13 +69,13 @@ pub async fn run(paths: &Paths, cmd: TrustCmd, head: Head) -> anyhow::Result<()>
     }
 }
 
-async fn run_on_head(paths: &Paths, cmd: TrustCmd) -> anyhow::Result<()> {
+async fn run_on_head(client: &Client, cmd: TrustCmd) -> anyhow::Result<()> {
     let (req, json) = match cmd {
         TrustCmd::List { json } => (IpcRequest::TrustList, json),
         TrustCmd::Add { machine, repo } => (IpcRequest::TrustAdd { machine, repo }, false),
         TrustCmd::Remove { machine, repo } => (IpcRequest::TrustRemove { machine, repo }, false),
     };
-    match crate::ipc::request_head(paths, &req).await {
+    match crate::ipc::request_head(client, &req).await {
         Ok(IpcResponse::Trusted(list)) => print_list(&list, json),
         Ok(IpcResponse::Text(text)) => {
             println!("{text}");

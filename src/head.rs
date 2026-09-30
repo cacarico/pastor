@@ -440,6 +440,36 @@ mod tests {
         assert_eq!(load(&path).unwrap().unwrap().ssh, "user@pi-1");
     }
 
+    /// A read failure that is not "no file there" (here, a directory sitting
+    /// where client.toml should be) is a `config_error`, not a quiet `None`:
+    /// only a missing file means "no head set".
+    #[test]
+    fn a_load_error_that_is_not_a_missing_file_is_reported() {
+        let (_tmp, p) = paths();
+        let path = client_file(&p);
+        std::fs::create_dir_all(&path).unwrap();
+        let err = load(&path).unwrap_err();
+        let e = err.downcast_ref::<CliError>().unwrap();
+        assert_eq!(e.code, "config_error", "{}", e.message);
+    }
+
+    /// A read failure that is not "no file there" (here, invalid UTF-8)
+    /// stops `save` before it overwrites the file: only a missing file
+    /// means "start from nothing".
+    #[test]
+    fn a_save_read_error_that_is_not_missing_stops_before_writing() {
+        let (_tmp, p) = paths();
+        let path = client_file(&p);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, [0xFF, 0xFE, 0x00, 0xFF]).unwrap();
+        let h = HeadSetting {
+            ssh: "pi-1".into(),
+            pastor: None,
+        };
+        assert!(save(&path, Some(&h)).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), [0xFF, 0xFE, 0x00, 0xFF]);
+    }
+
     #[test]
     fn the_flag_beats_the_variable_beats_the_file() {
         let (_tmp, p) = paths();
