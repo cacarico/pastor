@@ -4278,7 +4278,7 @@ mod tests {
 
     /// `plan-format.md` documents waves alongside series: the `Order: waves`
     /// header with its wave list, the Dispatch block's `wave: W` field, the
-    /// `pastor/<name>/task-<N>` branch a multi-task wave pushes instead of
+    /// `pastor/<name>-task-<N>` branch a multi-task wave pushes instead of
     /// the plan branch, and that task's own prompt template, which pushes
     /// its branch with no rebase or retry since no sibling task can race it
     /// there.
@@ -4294,7 +4294,7 @@ mod tests {
         at("Wave 1: Tasks 1, 2");
         at("wave: W");
         at("wave: 1");
-        at("pastor/<name>/task-<N>");
+        at("pastor/<name>-task-<N>");
         let wave_task = at("### A task in a multi-task wave");
         let series_prompt_start = text.find("## Prompt file").unwrap();
         assert!(
@@ -4312,7 +4312,7 @@ mod tests {
             "{wave_prompt}"
         );
         assert!(
-            wave_prompt.contains("git push origin HEAD:pastor/<name>/task-<N>"),
+            wave_prompt.contains("git push origin HEAD:pastor/<name>-task-<N>"),
             "{wave_prompt}"
         );
         assert!(
@@ -4354,9 +4354,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("the merge task lacks {needle:?}:\n{merge}"))
         };
         let reset = at("git reset --hard origin/pastor/<name>");
-        let exists = at("origin/pastor/<name>/task-<N>` exists");
+        let exists = at("origin/pastor/<name>-task-<N>` exists");
         let not_complete = at("Wave <W>: blocked: Task <N>");
-        let merge_cmd = at("git merge --no-ff origin/pastor/<name>/task-<N>");
+        let merge_cmd = at("git merge --no-ff origin/pastor/<name>-task-<N>");
         let abort = at("git merge --abort");
         let conflict = at("Wave <W>: blocked: conflict in <paths> between Task <A> and Task <B>");
         let check_fails = at("Wave <W>: blocked: <check> fails after merge");
@@ -4366,15 +4366,32 @@ mod tests {
         assert!(reset < exists && exists < not_complete && not_complete < merge_cmd);
         assert!(merge_cmd < abort && abort < conflict && conflict < check_fails);
         assert!(check_fails < merged);
-        // Every stop records its line the same way, so the template says how
-        // once, before the steps: rebase, append, push the plan branch.
+        // A `blocked` stop records its line by rebasing onto the plan
+        // branch: nothing has been merged yet, or it just reset back to it,
+        // so there is nothing to lose. The template says that once, before
+        // the steps.
         assert!(rebase < push && push < exists);
         at("keep both sides' lines");
         at("rejected as not a fast-forward");
         at("PUSH FAILED");
         at("Do not resolve");
+        // The `merged` line instead goes on top of the wave's `--no-ff`
+        // merge commits: rebasing there would drop them.
+        let merged_push = merge.rfind("git push origin HEAD:pastor/<name>`").unwrap();
         assert!(
-            !merge.contains("git push origin HEAD:pastor/<name>/"),
+            merged < merged_push,
+            "the merged line must push after recording it"
+        );
+        assert!(
+            merge[merged..].contains("Do not rebase here"),
+            "recording `Wave <W>: merged` must not rebase away the merge commits:\n{merge}"
+        );
+        assert!(
+            !merge.contains("git push origin HEAD:pastor/<name>-task-"),
+            "the merge task pushes the plan branch only"
+        );
+        assert!(
+            !merge.contains("git push origin HEAD:pastor/<name>-m"),
             "the merge task pushes the plan branch only"
         );
         assert!(merge.contains("model: `sonnet`"), "{merge}");
@@ -4394,7 +4411,7 @@ mod tests {
         let checks = &checks[..checks[3..].find("\n## ").map_or(checks.len(), |i| i + 3)];
         for needle in [
             "share no Files path",
-            "pastor/<name>/task-<N>",
+            "pastor/<name>-task-<N>",
             "Only merge tasks and single-task waves push the plan branch",
             "has a merge task after its tasks",
             "Wave <W>: blocked",
