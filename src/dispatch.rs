@@ -608,33 +608,46 @@ async fn dispatch_steps(
     } else {
         crate::task::prompt_to_send(task)
     };
-    finish_dispatch(
+    finish_dispatch(FinishDispatch {
         conn,
         task,
         name,
-        &launch,
+        launch: &launch,
         session,
-        &pane_id,
-        &prompt,
+        pane_id: &pane_id,
+        prompt: &prompt,
         agents,
         ready_timeout,
-    )
+    })
     .await
 }
 
-/// Start the agent in its pane, wait for it to come up and give it `prompt`.
-#[allow(clippy::too_many_arguments)]
-async fn finish_dispatch(
-    conn: &dyn Connector,
-    task: &mut Task,
-    name: &str,
-    launch: &crate::config::Launch,
+/// `finish_dispatch`'s arguments, grouped.
+struct FinishDispatch<'a> {
+    conn: &'a dyn Connector,
+    task: &'a mut Task,
+    name: &'a str,
+    launch: &'a crate::config::Launch,
     session: Option<String>,
-    pane_id: &str,
-    prompt: &str,
-    agents: &Agents,
+    pane_id: &'a str,
+    prompt: &'a str,
+    agents: &'a Agents,
     ready_timeout: Duration,
-) -> Result<DispatchOutcome, DispatchError> {
+}
+
+/// Start the agent in its pane, wait for it to come up and give it `prompt`.
+async fn finish_dispatch(ask: FinishDispatch<'_>) -> Result<DispatchOutcome, DispatchError> {
+    let FinishDispatch {
+        conn,
+        task,
+        name,
+        launch,
+        session,
+        pane_id,
+        prompt,
+        agents,
+        ready_timeout,
+    } = ask;
     // herdr's `agent.start` returns as soon as it has launched the agent in the
     // pane; it never reports `agent_not_ready` (its errors are about the name,
     // the kind and the pane). Readiness shows up afterwards, in `agent.list` and

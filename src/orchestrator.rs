@@ -1631,17 +1631,17 @@ impl Runner {
         };
         let task = self
             .fleet
-            .queue_run_as(
+            .queue_run_as(crate::daemon::RunAsk {
                 prompt,
                 spec,
-                None,
-                Some(&ask),
-                None,
-                TaskRole::Orchestrator,
-                Some(description),
-                false,
-                None,
-            )
+                flock: None,
+                ask: Some(&ask),
+                priority: None,
+                role: TaskRole::Orchestrator,
+                description: Some(description),
+                preempt: false,
+                summary: None,
+            })
             .await
             .map_err(|e| match e {
                 QueueError::UnknownMachine(m) => format!("machine {m} is not in the flock"),
