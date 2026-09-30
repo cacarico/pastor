@@ -69,10 +69,20 @@ Read each prompt file as a stranger who has nothing else. Every answer must be y
 - Does it fetch and rebase onto `origin/pastor/<name>` right before the ledger commit, push with `git push origin HEAD:pastor/<name>`, retry once on a rejected push, keep both sides of a ledger conflict, and end with `DONE` as the last line?
 - Does it forbid touching the default branch, other branches and other worktrees?
 
+For a plan with `Order: waves`, also:
+
+- Does a task in a wave with two or more tasks reset to `origin/pastor/<name>`, write its ledger line on its own branch and push only `HEAD:pastor/<name>/task-<N>`, with no rebase? Only merge tasks and single-task waves push the plan branch.
+- Does each merge task check that every task branch of its wave exists and says `complete` before merging anything, and write `Wave <W>: blocked: Task <N> <why>` otherwise?
+- Does it merge the branches in plan order, keep both sides only of a ledger conflict, and on a conflict in any other file run `git merge --abort` and write `Wave <W>: blocked: conflict in <paths> ...` rather than resolve it?
+- Does it run the check on the merged result and write `Wave <W>: blocked: <check> fails after merge` rather than fix it?
+- Does it end with `Wave <W>: merged (...)` pushed to the plan branch (fetch, rebase, retry once) and `DONE`?
+
 And for the plan as a whole:
 
 - Every task has a Dispatch block with a command that `pastor task run --help` accepts.
-- Every `--branch` is `pastor/<name>-<N>`, one per task, so a checkout left from the task before never blocks the next.
+- Every `--branch` is `pastor/<name>-<N>`, one per task, so a checkout left from the task before never blocks the next. A task in a wave with two or more tasks uses `pastor/<name>/task-<N>`; a merge task uses `pastor/<name>-m<W>`.
+- Tasks in the same wave share no Files path (shared build files like `CHANGELOG.md` count), and none consumes what another in its wave produces.
+- Every wave with two or more tasks has a merge task after its tasks, with model `sonnet` and timeout `30m`.
 - No machine addresses, user names, tokens or home paths in anything committed. `--repo '~/work/app'` is fine; `~` is quoted so the local shell does not expand it.
 
 ## Red flags
