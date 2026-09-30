@@ -99,7 +99,7 @@ when:
         - "changes/**"
   - event: manual
 
-# Only the x86_64 agent matches; the arm64 one is too slow for this.
+# Heavy: runs on the x86_64 agent only; the arm64 one keeps light checks.
 labels:
   platform: linux/amd64
 
