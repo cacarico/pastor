@@ -541,8 +541,8 @@ enum Ask {
 
 /// `cli::ask` for a watcher, which also needs to tell a head that gave no
 /// answer from one that refused.
-async fn ask(paths: &Paths, req: IpcRequest) -> Result<IpcResponse, Ask> {
-    let got = crate::ipc::request_head(paths, &req).await;
+async fn ask(client: &crate::ipc::Client, req: IpcRequest) -> Result<IpcResponse, Ask> {
+    let got = crate::ipc::request_head(client, &req).await;
     let down = matches!(&got, Err(e) if !matches!(e, crate::ipc::RequestError::Refused { .. }));
     crate::cli::reply(got).map_err(|e| {
         if down {
@@ -579,10 +579,11 @@ fn print(lines: &[Line], json: bool) -> bool {
 }
 
 /// `pastor watch`.
-pub async fn cli(paths: &Paths, args: WatchArgs) -> anyhow::Result<()> {
+pub async fn cli(client: &crate::ipc::Client, args: WatchArgs) -> anyhow::Result<()> {
+    let paths = &client.paths;
     let ids = connectors(paths, &args.connectors);
     if args.now {
-        let lines = now(paths, &ids, args.all).await?;
+        let lines = now(client, &ids, args.all).await?;
         print(&lines, args.json);
         return Ok(());
     }
@@ -595,7 +596,7 @@ pub async fn cli(paths: &Paths, args: WatchArgs) -> anyhow::Result<()> {
         Cursor::load(&path)
     };
     loop {
-        let lines = step(paths, &mut cursor, &ids, args.all).await?;
+        let lines = step(client, &mut cursor, &ids, args.all).await?;
         if !print(&lines, args.json) {
             return Ok(());
         }
@@ -606,13 +607,13 @@ pub async fn cli(paths: &Paths, args: WatchArgs) -> anyhow::Result<()> {
 
 /// One look: the head's events and jobs, then the connectors.
 async fn step(
-    paths: &Paths,
+    client: &crate::ipc::Client,
     cursor: &mut Cursor,
     ids: &[String],
     all: bool,
 ) -> anyhow::Result<Vec<Line>> {
     let mut lines = Vec::new();
-    match head_lines(paths, cursor, all).await {
+    match head_lines(client, cursor, all).await {
         Ok(more) => {
             lines.extend(cursor.head(Ok(())));
             lines.extend(more);
@@ -621,7 +622,7 @@ async fn step(
         Err(Ask::Refused(code, message)) => return Err(refused(code, message)),
     }
     for id in ids {
-        let ran = run_connector(paths, id).await;
+        let ran = run_connector(&client.paths, id).await;
         lines.extend(cursor.connector(id, ran));
     }
     Ok(lines)
@@ -629,20 +630,24 @@ async fn step(
 
 /// The events since the cursor, then the jobs. A cursor that has never seen
 /// the head starts at the end of its log.
-async fn head_lines(paths: &Paths, cursor: &mut Cursor, all: bool) -> Result<Vec<Line>, Ask> {
+async fn head_lines(
+    client: &crate::ipc::Client,
+    cursor: &mut Cursor,
+    all: bool,
+) -> Result<Vec<Line>, Ask> {
     let mut lines = Vec::new();
     if cursor.seq.is_none() {
-        cursor.seq = Some(log_end(paths).await?);
+        cursor.seq = Some(log_end(client).await?);
     }
     loop {
-        let page = events(paths, cursor.seq.unwrap_or(0), PAGE).await?;
+        let page = events(client, cursor.seq.unwrap_or(0), PAGE).await?;
         let full = page.events.len() >= PAGE as usize;
         lines.extend(cursor.events(&page, all));
         if !full {
             break;
         }
     }
-    let IpcResponse::Jobs(jobs) = ask(paths, IpcRequest::JobList).await? else {
+    let IpcResponse::Jobs(jobs) = ask(client, IpcRequest::JobList).await? else {
         return Err(unexpected("job list"));
     };
     lines.extend(cursor.jobs(&jobs));
@@ -656,9 +661,9 @@ fn unexpected(what: &str) -> Ask {
     )
 }
 
-async fn events(paths: &Paths, after: u64, limit: u32) -> Result<EventsPage, Ask> {
+async fn events(client: &crate::ipc::Client, after: u64, limit: u32) -> Result<EventsPage, Ask> {
     match ask(
-        paths,
+        client,
         IpcRequest::EventsSince {
             after,
             limit,
@@ -675,10 +680,10 @@ async fn events(paths: &Paths, after: u64, limit: u32) -> Result<EventsPage, Ask
 /// The newest event number in the head's log (0 for an empty log): asked
 /// with a limit of 0, which a head that knows `EventsPage::newest` answers
 /// at once. An older head is paged through to the end.
-async fn log_end(paths: &Paths) -> Result<u64, Ask> {
+async fn log_end(client: &crate::ipc::Client) -> Result<u64, Ask> {
     let (mut after, mut limit) = (0, 0);
     loop {
-        let page = events(paths, after, limit).await?;
+        let page = events(client, after, limit).await?;
         if let Some(newest) = page.newest {
             return Ok(newest.max(after));
         }
@@ -693,7 +698,7 @@ async fn log_end(paths: &Paths) -> Result<u64, Ask> {
 }
 
 /// `--now`: what needs attention at this moment.
-async fn now(paths: &Paths, ids: &[String], all: bool) -> anyhow::Result<Vec<Line>> {
+async fn now(client: &crate::ipc::Client, ids: &[String], all: bool) -> anyhow::Result<Vec<Line>> {
     let mut lines = Vec::new();
     let states = if all {
         ATTENTION_STATES
@@ -709,10 +714,10 @@ async fn now(paths: &Paths, ids: &[String], all: bool) -> anyhow::Result<Vec<Lin
         ..TaskFilter::default()
     };
     let head = async {
-        let IpcResponse::Tasks(tasks) = ask(paths, IpcRequest::List { filter }).await? else {
+        let IpcResponse::Tasks(tasks) = ask(client, IpcRequest::List { filter }).await? else {
             return Err(unexpected("task list"));
         };
-        let IpcResponse::Jobs(jobs) = ask(paths, IpcRequest::JobList).await? else {
+        let IpcResponse::Jobs(jobs) = ask(client, IpcRequest::JobList).await? else {
             return Err(unexpected("job list"));
         };
         Ok((tasks, jobs))
@@ -726,7 +731,10 @@ async fn now(paths: &Paths, ids: &[String], all: bool) -> anyhow::Result<Vec<Lin
         Err(Ask::Refused(code, message)) => return Err(refused(code, message)),
     }
     for id in ids {
-        lines.extend(now_connector_lines(id, run_connector(paths, id).await));
+        lines.extend(now_connector_lines(
+            id,
+            run_connector(&client.paths, id).await,
+        ));
     }
     Ok(lines)
 }

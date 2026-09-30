@@ -9886,6 +9886,7 @@ mod tests {
                 agent: None,
                 priority: None,
             },
+            &crate::ipc::Caller::default(),
         )
         .await
         .unwrap();

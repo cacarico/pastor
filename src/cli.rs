@@ -1,9 +1,8 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-use crate::config::Paths;
 use crate::config::flock::{DEFAULT_FLOCK, Flock, FlockNumber};
-use crate::ipc::{IpcRequest, IpcResponse, RequestError, connect_error_means_no_daemon};
+use crate::ipc::{Client, IpcRequest, IpcResponse, RequestError, connect_error_means_no_daemon};
 use crate::machine::MachineStatus;
 use crate::scheduler::{JobRunReport, JobStatus};
 use crate::task::Task;
@@ -631,8 +630,8 @@ pub fn reply(got: Result<IpcResponse, RequestError>) -> Result<IpcResponse, CliE
 /// One request to the head, the local serve or the remote head, whichever
 /// `request_head` reaches. The error is for the caller to return, print or
 /// act on (an invalid edit reopens the editor); nothing here exits.
-pub async fn ask(paths: &Paths, req: IpcRequest) -> Result<IpcResponse, CliError> {
-    reply(crate::ipc::request_head(paths, &req).await)
+pub async fn ask(client: &Client, req: IpcRequest) -> Result<IpcResponse, CliError> {
+    reply(crate::ipc::request_head(client, &req).await)
 }
 
 /// A reply of a variant the command does not expect, as from a head of
