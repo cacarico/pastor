@@ -1,0 +1,141 @@
+# Mirrors .github/workflows/ci.yml's three jobs as three steps. No cargo
+# cache yet: the spec's shared cargo-cache PVC is a homelab chart change,
+# out of this repo's scope, so every run compiles from scratch. Steps run
+# one at a time (depends_on) so only one Rust build competes for the Pi's
+# 4 cores and 8GB at once, per the spec's caution for this phase.
+#
+# check runs as a non-root user, not the step's default root, and this is
+# not cosmetic: create_private_dir_refuses_an_unsafe_ancestor asserts that
+# a world-writable ancestor owned by someone other than the caller is
+# refused; the app code trusts a root-owned ancestor unconditionally, which
+# only ever matches when the test process itself is root. Confirmed on a
+# real run: this test (and one unrelated 120s-timeout test, likely just
+# resource contention) failed as root and passed as `builder`.
+#
+# git is installed explicitly: two herdr::transport tests shell out to a
+# real git directly (init a throwaway repo, worktree add/remove) and were
+# failing with ENOENT, not a permissions issue — this image has no git by
+# default, and nothing else in `make check` happened to need it.
+#
+# /etc/hostname is overwritten and $HOSTNAME unset before make check: the
+# Kubernetes backend names each step's pod/hostname after the step itself
+# ("check"), and tests/panes.rs's fixtures_are_scrubbed treats any word
+# matching the current hostname as a leaked fleet machine name. "check" is
+# also just an ordinary word ("make check") that shows up in a canned
+# terminal fixture, so every run failed there, deterministically, until
+# this was traced down (confirmed interactively in a debug pod, then
+# confirmed the test passes once the hostname no longer says "check").
+#
+# test-ssh: the GitHub job needs sudo to install and run its own sshd,
+# because the runner isn't root; installing openssh-server needs root
+# regardless, so that part still runs before dropping to `builder`.
+#
+# portability: needs zig and cargo-zigbuild, as .github/actions/zig
+# installs for GitHub Actions; the same pinned version and checksum,
+# aarch64 build (this cluster's only architecture). CARGO_ZIGBUILD_ZIG_PATH
+# is set as a step-level environment variable, not a shell export, because
+# a plain shell variable set in one command of this list does not survive
+# to the next command (confirmed the hard way on the governance pipeline).
+#
+# A review at 0f4e1a9 raised four points that don't hold for this setup,
+# recorded here so a future review doesn't re-raise them:
+# - test-ssh doesn't need a system sshd: tests/real_ssh.rs starts its own,
+#   with its own ed25519 host key and a config pointing at tmp-dir paths
+#   on an ephemeral port. Only the sshd/ssh-keygen binaries and the
+#   privilege-separation directory (mkdir -p /run/sshd, above) are needed.
+# - the `cd /woodpecker/src/github.com/cacarico/pastor-private` in the
+#   check step's commands is Woodpecker's own default workspace path
+#   (base /woodpecker + src/<repo-url-without-schema>), the same directory
+#   msrv and portability already run in without an explicit cd.
+# - `cargo install crate@version` is documented cargo syntax
+#   (`cargo install --help` shows `[CRATE[@<VER>]]...`), not a parse error.
+# - the official rust image chmods CARGO_HOME and RUSTUP_HOME to a+w
+#   (verified: `docker run rust:1-slim stat -c %a /usr/local/cargo` -> 777),
+#   so `su builder` can write there despite root ownership.
+when:
+  - event: pull_request
+    path:
+      include:
+        - "src/**"
+        - "tests/**"
+        - "skills/**"
+        - "README.md"
+        - "docs/manual.md"
+        - "docs/recommended-setup.md"
+        - "docs/website/content/**"
+        - ".claude-plugin/plugin.json"
+        - "contrib/systemd/**"
+        - "contrib/launchd/**"
+        - "Cargo.toml"
+        - "Cargo.lock"
+        - "Makefile"
+        - "scripts/changelog.sh"
+        - ".woodpecker/ci.yaml"
+        - "install.sh"
+  - event: push
+    branch: main
+    path:
+      include:
+        - "src/**"
+        - "tests/**"
+        - "skills/**"
+        - "README.md"
+        - "docs/manual.md"
+        - "docs/recommended-setup.md"
+        - "docs/website/content/**"
+        - ".claude-plugin/plugin.json"
+        - "contrib/systemd/**"
+        - "contrib/launchd/**"
+        - "Cargo.toml"
+        - "Cargo.lock"
+        - "Makefile"
+        - "scripts/changelog.sh"
+        - ".woodpecker/ci.yaml"
+        - "install.sh"
+        - "CHANGELOG.md"
+        - "changes/**"
+  - event: manual
+
+steps:
+  - name: check
+    image: rust:1-slim
+    environment:
+      CARGO_TERM_COLOR: always
+    commands:
+      - apt-get update -qq
+      - apt-get install -qq -y --no-install-recommends pkg-config libsqlite3-dev openssh-server make git
+      - rustup component add rustfmt clippy
+      - useradd --create-home --shell /bin/bash builder
+      - mkdir -p /run/sshd
+      - chown -R builder:builder /woodpecker
+      - echo woodpecker-ci > /etc/hostname
+      - su builder -c 'export HOME=/home/builder PATH=/usr/local/cargo/bin:/usr/local/rustup/bin:"$PATH"; unset HOSTNAME; cd /woodpecker/src/github.com/cacarico/pastor-private && make check'
+      - su builder -c 'export HOME=/home/builder PATH=/usr/local/cargo/bin:/usr/local/rustup/bin:"$PATH"; unset HOSTNAME; cd /woodpecker/src/github.com/cacarico/pastor-private && make test-machine'
+      - su builder -c 'export HOME=/home/builder PATH=/usr/local/cargo/bin:/usr/local/rustup/bin:"$PATH"; unset HOSTNAME; cd /woodpecker/src/github.com/cacarico/pastor-private && make test-ssh'
+
+  - name: msrv
+    image: rust:1.88-slim
+    depends_on: [check]
+    environment:
+      CARGO_TERM_COLOR: always
+    commands:
+      - apt-get update -qq
+      - apt-get install -qq -y --no-install-recommends pkg-config libsqlite3-dev make
+      - cargo check --locked --all-targets
+
+  - name: portability
+    image: rust:1-slim
+    depends_on: [msrv]
+    environment:
+      CARGO_TERM_COLOR: always
+      CARGO_ZIGBUILD_ZIG_PATH: /opt/zig/zig
+    commands:
+      - apt-get update -qq
+      - apt-get install -qq -y --no-install-recommends pkg-config libsqlite3-dev curl xz-utils make
+      - curl -sSfL -o /tmp/zig.tar.xz "https://ziglang.org/download/0.16.0/zig-aarch64-linux-0.16.0.tar.xz"
+      - echo "ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17  /tmp/zig.tar.xz" | sha256sum -c -
+      - mkdir -p /opt/zig
+      - tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
+      - cargo install --locked cargo-zigbuild@0.23.4
+      - rustup target add x86_64-unknown-linux-musl armv7-unknown-linux-musleabihf x86_64-unknown-freebsd
+      - make portability
