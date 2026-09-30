@@ -27,6 +27,10 @@
 # this was traced down (confirmed interactively in a debug pod, then
 # confirmed the test passes once the hostname no longer says "check").
 #
+# jq is installed explicitly too: the connector skill's worked example
+# (tests/cli connector_skill) runs a poll.sh that pipes through jq. GitHub's
+# runner image ships jq; rust:1-slim does not.
+#
 # test-ssh: the GitHub job needs sudo to install and run its own sshd,
 # because the runner isn't root; installing openssh-server needs root
 # regardless, so that part still runs before dropping to `builder`.
@@ -110,7 +114,7 @@ steps:
       CARGO_TERM_COLOR: always
     commands:
       - apt-get update -qq
-      - apt-get install -qq -y --no-install-recommends pkg-config libsqlite3-dev openssh-server make git
+      - apt-get install -qq -y --no-install-recommends pkg-config libsqlite3-dev openssh-server make git jq
       - rustup component add rustfmt clippy
       - useradd --create-home --shell /bin/bash builder
       - mkdir -p /run/sshd
