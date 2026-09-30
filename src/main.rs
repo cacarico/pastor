@@ -4660,7 +4660,7 @@ mod tests {
             names.push(name);
         }
         names.sort();
-        assert_eq!(names, ["pastor", "spec"]);
+        assert_eq!(names, ["connector", "pastor", "spec"]);
     }
 
     /// The repository installs as a Claude Code plugin named `pastor`, which
