@@ -4061,10 +4061,20 @@ need no shell quoting. `skills/spec/plan-format.md` is the layout and
 `skills/spec/example/` a whole plan. The skill plans only; it never starts a
 task.
 
+`skills/connector/SKILL.md` scaffolds a connector: it asks at most whether
+the source is polled or streamed and which secrets it needs, then writes
+`pastor-connector.toml` and a `poll.sh` or `stream.sh` from
+`skills/connector/protocol.md` (a copy of the connector section above, so
+the skill stands on its own), and tests the result with `pastor connector
+try` and `pastor tick --dry-run`. It never runs `pastor connector install`:
+that clones a pushed repository, which stays the user's own call.
+`skills/connector/example/local-files/` is a small worked connector.
+
 The repository is also a Claude Code plugin named `pastor`
 (`.claude-plugin/plugin.json`), which is how the skills other than the
-built-in one travel: installed as a plugin, the skill is `/pastor:spec`;
-linked like the one above, it is `/spec`.
+built-in one travel: installed as a plugin, they are `/pastor:spec` and
+`/pastor:connector`; linked like the one above, they are `/spec` and
+`/connector`.
 
 ## Development
 

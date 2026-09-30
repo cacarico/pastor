@@ -5,6 +5,7 @@ mod bridge;
 #[path = "../common/mod.rs"]
 mod common;
 mod completions_and_help;
+mod connector_skill;
 mod daemon_signals;
 mod describe;
 mod edit;

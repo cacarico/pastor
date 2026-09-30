@@ -301,6 +301,8 @@ every Raspberry Pi OS release.
   to use pastor, or to behave when pastor started it. `pastor --skill` prints it.
 - [Spec skill](skills/spec/SKILL.md): `/pastor:spec` turns an idea into a plan
   your machines can run, one task after another, with nobody watching.
+- [Connector skill](skills/connector/SKILL.md): `/pastor:connector`
+  scaffolds a poll or stream connector and tests it before you install it.
 - [Changelog](CHANGELOG.md).
 
 ## Contributing

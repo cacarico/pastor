@@ -1,0 +1,15 @@
+# Worked example for the connector skill: watches a directory and turns
+# every file in it into one item. No secrets, one required config key.
+id = "local-files"
+name = "Local files"
+version = "0.1.0"
+description = "Turns every file in a directory into a pastor item"
+
+[connector]
+mode = "poll"
+command = ["sh", "poll.sh"]
+timeout = "30s"
+
+[connector.config.dir]
+required = true
+description = "Directory to watch; every file in it becomes an item"
