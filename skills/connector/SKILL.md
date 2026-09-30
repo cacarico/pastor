@@ -72,17 +72,23 @@ pastor (jobs, machines, `pastor tick` beyond `--dry-run`), the `pastor` skill
      id; it prints the secrets still unset. Fill real values into
      `~/.config/pastor/connectors/<id>/.env` yourself if you are the user
      testing this by hand — the skill does not write that file.
-   - If the manifest has any `required` config, write a throwaway job file,
-     `~/.config/pastor/jobs/<id>-test.toml`, with `[connector]` naming
-     `use = "<id>"` plus that config, and a placeholder `[dispatch] prompt`.
-     Skip this when there is no required config; `try`'s own `--job` need
-     not name a file that exists.
    - `pastor connector try <id> --job <id>-test` runs the command once and
      prints its items and logs; it creates no tasks and saves no cursor.
-     Fix the script or the manifest and re-run until the items look right.
-   - `pastor tick --dry-run --job <id>-test` (needs the job file from
-     above) shows what tasks a real run would create, still writing
-     nothing.
+     `try` uses an empty config when no job file named `<id>-test` exists,
+     so write one first only if the manifest has `required` config it
+     needs to see. Fix the script or the manifest and re-run until the
+     items look right.
+   - Before `pastor tick --dry-run`, always write the throwaway job file,
+     `~/.config/pastor/jobs/<id>-test.toml`: a schedule (`every = "1h"` is
+     fine for a file you're about to delete), `[connector]` naming
+     `use = "<id>"` plus any required config, and a placeholder
+     `[dispatch] prompt`. `tick` validates a job strictly and rejects one
+     with no schedule.
+   - `pastor tick --dry-run --job <id>-test` shows what tasks a real run
+     would create, still writing nothing — but only for `mode = "poll"`.
+     For `mode = "stream"`, `pastor tick` with no daemon running reports
+     the job as failed, needing `pastor serve`, which step 6 forbids
+     starting; skip this step for a stream connector.
    - Remove the throwaway job file once you are done with it, unless the
      user wants to keep and finish it into a real job (a real `repo`,
      `prompt` and schedule).
