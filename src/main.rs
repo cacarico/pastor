@@ -989,6 +989,7 @@ async fn probe_head(
                 socket.display()
             ),
         )),
+        HeadPing::Denied => Err(pastor::cli::socket_denied(&socket)),
         HeadPing::Pong {
             version, protocol, ..
         } if need.is_some_and(|(needed, _)| protocol < needed) => {
@@ -2987,6 +2988,7 @@ async fn local_serve(paths: &Paths) -> anyhow::Result<bool> {
                 socket.display()
             ),
         )),
+        HeadPing::Denied => Err(pastor::cli::socket_denied(&socket)),
     }
 }
 
@@ -3666,17 +3668,26 @@ mod tests {
     fn a_connect_that_is_not_refused_does_not_say_the_head_is_down() {
         // probe_daemon treats these as "something may be there", so the CLI
         // must not tell the user to start a second head.
-        for kind in [
-            std::io::ErrorKind::PermissionDenied,
-            std::io::ErrorKind::Other,
+        // A permission error is most often a sandbox, and says so.
+        for (kind, want_code, want_text) in [
+            (
+                std::io::ErrorKind::PermissionDenied,
+                "socket_denied",
+                "sandboxed",
+            ),
+            (
+                std::io::ErrorKind::Other,
+                "runtime_error",
+                "could not connect",
+            ),
         ] {
             let err = std::io::Error::from(kind);
             let CliError { code, message } =
                 pastor::cli::request_error(&RequestError::Connect(err));
-            assert_eq!(code, "runtime_error");
+            assert_eq!(code, want_code);
             assert!(!message.contains("not running"), "{kind:?}: {message}");
             assert!(!message.contains("start it"), "{kind:?}: {message}");
-            assert!(message.contains("could not connect"), "{kind:?}: {message}");
+            assert!(message.contains(want_text), "{kind:?}: {message}");
         }
     }
 

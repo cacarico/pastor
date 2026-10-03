@@ -452,7 +452,8 @@ mod tests {
         let (code, message) = code_and_message(RequestError::Connect(
             std::io::ErrorKind::PermissionDenied.into(),
         ));
-        assert_eq!(code, "runtime_error");
+        assert_eq!(code, "socket_denied");
+        assert!(message.contains("sandboxed"), "{message}");
         assert!(!message.contains("not running"), "{message}");
         let (code, message) =
             code_and_message(RequestError::Exchange(anyhow::anyhow!("closed early")));

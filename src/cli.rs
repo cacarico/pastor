@@ -573,6 +573,19 @@ pub fn task_result(t: &Task) -> String {
         .map_or_else(|| "-".into(), |s| s.outcome.to_string())
 }
 
+/// The CLI error for a connect to `socket` denied for permissions
+/// (`HeadPing::Denied`). It names the sandbox because that is the usual
+/// cause, and an agent told the head is unresponsive retries forever.
+pub fn socket_denied(socket: &std::path::Path) -> anyhow::Error {
+    CliError::err(
+        "socket_denied",
+        format!(
+            "permission denied connecting to {}; is this command sandboxed? Run it outside the sandbox",
+            socket.display()
+        ),
+    )
+}
+
 /// The CLI error for a request that got no reply, the one mapper every
 /// command uses. Only a connect that was refused or found no socket means
 /// nothing is listening (`daemon_not_running`); one denied for permissions
@@ -587,6 +600,12 @@ pub fn request_error(err: &RequestError) -> CliError {
         RequestError::Connect(e) if connect_error_means_no_daemon(e) => (
             "daemon_not_running",
             format!("pastor serve is not running ({e}); start it with `pastor serve`"),
+        ),
+        RequestError::Connect(e) if e.kind() == std::io::ErrorKind::PermissionDenied => (
+            "socket_denied",
+            format!(
+                "permission denied connecting to pastor serve ({e}); is this command sandboxed? Run it outside the sandbox"
+            ),
         ),
         RequestError::Connect(e) => (
             "runtime_error",

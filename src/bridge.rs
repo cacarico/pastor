@@ -619,7 +619,7 @@ mod tests {
             .await
             .unwrap_err();
         let err = err.downcast::<CliError>().unwrap();
-        assert_eq!(err.code, "runtime_error", "{}", err.message);
+        assert_eq!(err.code, "socket_denied", "{}", err.message);
     }
 
     #[test]

@@ -3439,6 +3439,7 @@ pub async fn refuse_live_socket(socket: &std::path::Path) -> anyhow::Result<()> 
              remove the socket file by hand only if that daemon is dead",
             socket.display()
         ),
+        HeadPing::Denied => Err(crate::cli::socket_denied(socket)),
         HeadPing::NotRunning => Ok(()),
     }
 }

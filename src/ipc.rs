@@ -1445,6 +1445,10 @@ pub fn connect_error_means_no_daemon(err: &std::io::Error) -> bool {
 pub enum HeadPing {
     NotRunning,
     Unresponsive,
+    /// The connect was refused for permissions (EPERM or EACCES), most often
+    /// a sandbox around the caller. A head may well be live behind it, so it
+    /// is never taken for none; but it is not the head's fault either.
+    Denied,
     Pong {
         version: String,
         protocol: u32,
@@ -1456,6 +1460,9 @@ pub async fn ping_head(socket: &Path) -> HeadPing {
     let stream = match tokio::net::UnixStream::connect(socket).await {
         Ok(s) => s,
         Err(err) if connect_error_means_no_daemon(&err) => return HeadPing::NotRunning,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            return HeadPing::Denied;
+        }
         Err(_) => return HeadPing::Unresponsive,
     };
     match tokio::time::timeout(
@@ -1498,7 +1505,7 @@ impl Head {
 pub async fn probe_daemon(socket: &Path) -> DaemonProbe {
     match ping_head(socket).await {
         HeadPing::NotRunning => DaemonProbe::NotRunning,
-        HeadPing::Unresponsive => DaemonProbe::Unresponsive,
+        HeadPing::Unresponsive | HeadPing::Denied => DaemonProbe::Unresponsive,
         HeadPing::Pong { .. } => DaemonProbe::Running,
     }
 }
