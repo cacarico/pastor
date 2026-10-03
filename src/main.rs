@@ -61,6 +61,8 @@ enum Command {
     },
     /// The queued tasks in the order they will start, and why each waits; move one
     Queue(pastor::queue_cli::QueueArgs),
+    /// The fleet on one screen: the head, machines up and down, live tasks by state, failing jobs, exhausted accounts
+    Status(pastor::status_cli::StatusArgs),
     /// Manage the machines and which flock each is in
     Machine {
         #[command(subcommand)]
@@ -771,6 +773,7 @@ fn main() {
             Command::Trust { cmd } => pastor::trust_cli::run(&client, cmd, head).await,
             Command::Limit { cmd } => pastor::limit_cli::run(&client, cmd, head).await,
             Command::Queue(args) => pastor::queue_cli::run(&client, args, head).await,
+            Command::Status(args) => status(&client, args, head).await,
             Command::Bridge(_) => unreachable!("handled before the runtime"),
             Command::Head { cmd } => pastor::head::run(&paths, cmd, remote.as_ref()).await,
         }
@@ -1044,6 +1047,7 @@ fn head_use(command: &Command) -> Option<bool> {
         Command::Orchestrator { .. } => Some(false),
         Command::Trust { .. } | Command::Limit { .. } => Some(false),
         Command::Queue(a) => Some(a.flock.is_some()),
+        Command::Status(_) => Some(false),
         Command::Connector { cmd } => {
             (!matches!(cmd, ConnectorCmd::List { .. } | ConnectorCmd::Try { .. })).then_some(false)
         }
@@ -1092,6 +1096,7 @@ fn remote_route(command: &Command) -> RemoteRoute {
         Command::Task { .. }
         | Command::Watch(_)
         | Command::Queue(_)
+        | Command::Status(_)
         | Command::Machine { .. }
         | Command::Flock { .. }
         | Command::Trust { .. }
@@ -1810,6 +1815,50 @@ async fn machine_list(
         );
     }
     Ok(())
+}
+
+/// `pastor status`. A remote head is never absent (`probe_head`), so the
+/// probe is only ever of this machine's flock.toml.
+async fn status(
+    client: &pastor::ipc::Client,
+    a: pastor::status_cli::StatusArgs,
+    head: Head,
+) -> anyhow::Result<()> {
+    use pastor::status_cli as st;
+    let s = match head {
+        Head::Live => st::from_head(client).await?,
+        Head::Absent if !a.probe => return Err(st::not_running()),
+        Head::Absent => {
+            let paths = &client.paths;
+            let f = Flock::load(&paths.flock_file())?;
+            let config = PastorConfig::load(&paths.config_file())?;
+            let store = open_store(paths)?;
+            let mut rows = Vec::new();
+            for m in &f.machines {
+                rows.push(probe_machine(m, &f, &config, paths, &store).await?);
+            }
+            let filter = TaskFilter {
+                job: None,
+                flock: None,
+                machine: None,
+                states: Some(LIVE_STATES.to_vec()),
+            };
+            let mut sched = standalone(paths)?;
+            sched.reload();
+            st::Status {
+                head: st::HeadSummary {
+                    running: false,
+                    at: "here".into(),
+                    version: None,
+                },
+                machines: st::machines(&rows),
+                tasks: st::tasks(&store.list_tasks(&filter)?),
+                jobs: st::jobs(&sched.statuses(chrono::Utc::now())),
+                limits: Some(store.limits()?),
+            }
+        }
+    };
+    st::print(&s, a.json)
 }
 
 /// The states `pastor task list` selects, `None` meaning all of them. `--blocked`

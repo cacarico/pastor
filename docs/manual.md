@@ -397,7 +397,7 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `not_pull_machine` | a pull machine request from a machine that is not one |
 | `not_queued` | `task priority` or `queue move` of a task that is not waiting in the queue |
 | `not_retryable` | `task retry` of a task in a state that cannot be retried |
-| `not_running` | `serve stop` or `serve status` with no serve running here |
+| `not_running` | `serve stop` or `serve status` with no serve running here; `status` with no head and no `--probe` |
 | `not_trusted` | `trust remove` of a repo that is not trusted on that machine |
 | `nothing_to_send` | `task send` with no text, `--key` or `--trust` |
 | `now_needs_machine` | `task run --now` with no `--machine` |
@@ -2324,6 +2324,31 @@ torn write, a hand edit) are skipped.
 
 A client can also read the log through the head by number; the request is
 under [Internals](#internals).
+
+## Status
+
+`pastor status` puts the fleet on one screen: which head answered and its
+version, how many machines can take work and which cannot (with their
+channel), the live tasks by state, the enabled jobs and those whose last run
+failed or whose file does not load, and the accounts out of usage.
+
+```text
+head      user@pi-1 (0.9.0)
+machines  3 up, 1 down (pi-3: reconnecting)
+tasks     1 blocked, 2 running, 3 queued
+jobs      6 enabled of 7, 1 failing (nightly)
+limits    claude until 14:00
+```
+
+It asks the head with the requests `machine list`, `task list`, `job list`
+and `limit list` already send, so any head answers it; one that predates
+usage limits shows `-` on that line (`null` in `--json`). With no head it
+fails with `not_running`, since a summary of stale files would read as the
+fleet's state. `--probe` takes that on: it probes each machine in flock.toml
+over ssh, as `machine list` does without a head, and reads tasks, jobs and
+limits from the files and store here. `--json` prints the same parts as one
+object: `head`, `machines` (`total`, `up`, `down`), `tasks` (a count for
+every live state), `jobs` (`total`, `enabled`, `failing`) and `limits`.
 
 ## Watch
 

@@ -64,6 +64,9 @@ _pastor() {
             pastor,setup)
                 cmd="pastor__subcmd__setup"
                 ;;
+            pastor,status)
+                cmd="pastor__subcmd__status"
+                ;;
             pastor,task)
                 cmd="pastor__subcmd__task"
                 ;;
@@ -285,6 +288,9 @@ _pastor() {
                 ;;
             pastor__subcmd__help,setup)
                 cmd="pastor__subcmd__help__subcmd__setup"
+                ;;
+            pastor__subcmd__help,status)
+                cmd="pastor__subcmd__help__subcmd__status"
                 ;;
             pastor__subcmd__help,task)
                 cmd="pastor__subcmd__help__subcmd__task"
@@ -833,7 +839,7 @@ _pastor() {
 
     case "${cmd}" in
         pastor)
-            opts="-h -V --skill --head --help --version serve task queue machine flock tick job orchestrator config completions events watch setup connector profile limit trust bridge head help"
+            opts="-h -V --skill --head --help --version serve task queue status machine flock tick job orchestrator config completions events watch setup connector profile limit trust bridge head help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1849,7 +1855,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__help)
-            opts="serve task queue machine flock tick job orchestrator config completions events watch setup connector profile limit trust bridge head help"
+            opts="serve task queue status machine flock tick job orchestrator config completions events watch setup connector profile limit trust bridge head help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2803,6 +2809,20 @@ _pastor() {
         pastor__subcmd__help__subcmd__setup__subcmd__systemd)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__help__subcmd__status)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -4479,6 +4499,24 @@ _pastor() {
         pastor__subcmd__setup__subcmd__systemd)
             opts="-y -h --herdr --enable --start --now --stop --yes --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --head)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__status)
+            opts="-h --probe --json --head --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi

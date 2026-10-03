@@ -231,6 +231,15 @@ Put a queued task elsewhere in the queue; it takes the level of where it lands
 | `--to <N>` | At this position, as `pastor queue` numbers it (1 is first) |  |
 | `--json` | Print as a JSON object |  |
 
+## status
+
+The fleet on one screen: the head, machines up and down, live tasks by state, failing jobs, exhausted accounts
+
+| argument | does | default |
+|---|---|---|
+| `--probe` | With no head running, probe each machine over ssh and read tasks, jobs and limits from the files and store here, instead of failing |  |
+| `--json` | Print as a JSON object |  |
+
 ## machine
 
 Manage the machines and which flock each is in
