@@ -606,6 +606,19 @@ scrollback where an earlier trust prompt can linger above a later dialog. An
 agent with no marker (`trust_marker = ""`, or one that is not Claude and
 sets none) gets the keys without the check.
 
+On a pull machine the head never reads the pane, so the machine's own serve
+does all of this, with the same rules: while one of its tasks has a repo and
+is queued, or blocked during startup with no keys sent yet, it asks the head
+for the trust saved for that machine (only that machine's pairs, never
+another's), keeps a copy in `shepherd.db`, and its actor presses the trust
+keys of the pull machine's own `pastor.toml` once per task while the pane
+shows its `trust_marker`. Its next report carries the keys and the head emits
+`task.trusted` with them. `task send --trust` cannot reach a pull machine's
+task (`pull_machine_task`), so its repos are saved with `pastor trust add
+<machine> <repo>` on the head; a pair added while a task is blocked is
+picked up at the serve's next tick. A head older than IPC protocol 31 is not
+asked, and the pull machine's tasks wait at the prompt for a person.
+
 Either way the task's prompt goes in once, `settle` after the trust keys:
 Claude redraws for a moment after the dialog and loses what is typed then,
 though herdr takes it. A prompt answered by a person at the pane waits the
@@ -2266,8 +2279,8 @@ A record, which is also what connector event hooks get on stdin:
   `task.rate_limited` (a 429 or 529 it retries in its pane; see Usage
   limits),
   `task.input` (`pastor task send`, or pastor at Claude's limit picker),
-  `task.trusted` (the head answered a
-  trust prompt), `job.failed`, `connector.finish_failed` (a connector's
+  `task.trusted` (pastor answered a trust prompt: the head, or a pull
+  machine's serve), `job.failed`, `connector.finish_failed` (a connector's
   `[finish]` command failed), `machine.connected`, `machine.lost`,
   `agent.exhausted` and `agent.reset` (see Usage limits), and
   `orchestrator.started|skipped|held|quota|failed|restarted|stopping|stopped`
@@ -3475,8 +3488,9 @@ the head hands it, on this machine's herdr. It has no queue and never reads
   was wiped) logs a `head_events_reset` warning and moves to the head's end;
   no hook fires for the records already there.
 - Its database is `shepherd.db` in the state dir: the jobs' state and seen
-  keys, the event cursor, and the rows of the tasks it runs. `pastor.db` is
-  left alone.
+  keys, the event cursor, the rows of the tasks it runs, and on a pull
+  machine a copy of the trust the head saved for it. `pastor.db` is left
+  alone.
 - On `pastor.sock` it answers `ping` (with `role: "shepherd"`), `tick` and
   `job list|run|reload` for its own jobs; anything else is
   `shepherd_unsupported`. The CLI's `job` commands ask it for this machine's
@@ -3526,6 +3540,11 @@ runs no actor for it; `machine list` shows its HOST as `pull`.
   is `1` or `true` in the serve's environment.
 - `[shepherd] machine` is its name in the head's flock.toml, the hostname
   when unset.
+- Saved trust (`pastor trust add <machine> <repo>` on the head) applies to
+  a pull machine's tasks as to any other's: its serve fetches the pairs saved
+  for it, answers the trust prompt and reports it, and the head emits
+  `task.trusted`, by the rules given with `task send --trust` under How it
+  works. It never gets another machine's pairs.
 - A pull machine that sends neither a claim nor a report for
   `pull_lost_after` (head's pastor.toml, default `10m`) is lost, and its
   `starting` and `running` tasks go stale, as for any lost machine. The
@@ -3898,7 +3917,7 @@ sends nothing.
 ~/.config/pastor/orchestrators/<name>.toml one orchestrator per file (and an optional .env for its scripts)
 ~/.config/pastor/client.toml      this CLI's `[head]`, from `pastor head set`
 ~/.local/state/pastor/pastor.db   tasks, summaries, seen keys, job state, trusted repos, the last event seq
-~/.local/state/pastor/shepherd.db  a headless serve's job state, seen keys and head event cursor
+~/.local/state/pastor/shepherd.db  a headless serve's job state, seen keys, head event cursor, its pull machine's trusted repos
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/fleet.lock  held by a fleet edit with no head, and by `pastor serve` while it starts
 ~/.local/state/pastor/events.jsonl events log (and events.jsonl.1, the previous one)
@@ -4242,9 +4261,13 @@ limit of 0 asks only where the log ends), and `gap: true` when records after
 hooks, read the head's events with it.
 
 A pull machine's headless serve asks for work with `task_claim` and sends
-every change back as `task_report`. `edit` and `job enable|disable` with a
-head running fetch the head's file with `FileGet` and send it back with
-`FilePut`.
+every change back as `task_report`. It asks for the folder trust saved for
+it with `{"op":"pull_trust","machine":M}`, which answers only `M`'s pairs
+and refuses a machine that is not a pull machine as `task_claim` does, and
+a `task_report` carries `trusted`, the keys its actor pressed at the task's
+trust prompt, until one reaches the head. `edit` and `job enable|disable`
+with a head running fetch the head's file with `FileGet` and send it back
+with `FilePut`.
 
 ### Protocol numbers
 
@@ -4265,6 +4288,7 @@ A CLI refuses a head below the IPC protocol a request needs
 | `orchestrator start` and `stop` | 25 |
 | a flock's share and max in flock.toml | 26 |
 | `task run --fallback` or `--no-fallback`, and a job with `fallback` | 27 |
+| `pull_trust`, and a `task_report` with `trusted` | 31 |
 
 `task run --description`, `flock add --description` and `machine add
 --description` need a head of 0.7.0 or later.
