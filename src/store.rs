@@ -1812,6 +1812,25 @@ impl Store {
         })
     }
 
+    /// Replace every saved trust with `list`, in one transaction: a
+    /// headless serve's copy of what the head saved for its own machine
+    /// (`IpcRequest::PullTrust`), which nothing else writes there.
+    pub fn replace_trusted_repos(&self, list: &[TrustedRepo]) -> anyhow::Result<()> {
+        blocking(|| {
+            let mut conn = self.conn.lock().recover();
+            let tx = conn.transaction()?;
+            tx.execute("DELETE FROM trusted_repos", [])?;
+            for t in list {
+                tx.execute(
+                    "INSERT OR IGNORE INTO trusted_repos (machine, repo, trusted_at) VALUES (?1, ?2, ?3)",
+                    params![t.machine, t.repo, t.trusted_at.to_rfc3339()],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     /// Keep `limit`, replacing any row of the same account and model: a
     /// later limit on the same key is the one that holds.
     pub fn record_limit(&self, limit: &AccountLimit) -> anyhow::Result<()> {
@@ -3601,6 +3620,30 @@ mod tests {
         assert!(s.untrust("m", "~/src/app").unwrap());
         assert!(!s.untrust("m", "~/src/app").unwrap());
         assert!(!s.is_trusted("m", "~/src/app").unwrap());
+    }
+
+    /// A headless serve's copy of its trust is replaced whole: what the
+    /// head no longer lists is gone, and the head's times are kept.
+    #[test]
+    fn trusted_repos_are_replaced_whole() {
+        let s = Store::open_in_memory().unwrap();
+        s.trust_repo("laptop", "~/work/old").unwrap();
+        let at = DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let saved = |repo: &str| TrustedRepo {
+            machine: "laptop".into(),
+            repo: repo.into(),
+            trusted_at: at,
+        };
+        s.replace_trusted_repos(&[saved("~/work/app"), saved("~/work/lib")])
+            .unwrap();
+        assert!(!s.is_trusted("laptop", "~/work/old").unwrap());
+        let list = s.trusted_repos().unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(list.iter().all(|t| t.trusted_at == at), "{list:?}");
+        s.replace_trusted_repos(&[]).unwrap();
+        assert!(s.trusted_repos().unwrap().is_empty());
     }
 
     #[test]

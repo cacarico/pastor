@@ -445,6 +445,16 @@ pub struct RunAsk<'a> {
     pub summary: Option<crate::task::SummaryMode>,
 }
 
+/// `Fleet::report`'s arguments, grouped: what a pull machine's
+/// `IpcRequest::TaskReport` says of one task.
+pub struct PullReport {
+    pub state: TaskState,
+    pub pane: Option<String>,
+    pub detail: Option<String>,
+    pub limit: Option<crate::limit::Limit>,
+    pub trusted: Option<Vec<String>>,
+}
+
 /// `Fleet::pausable_for`'s arguments, grouped.
 struct PausableFor<'a> {
     views: &'a [MachineView],
@@ -2398,23 +2408,52 @@ impl Fleet {
         Ok(claimed)
     }
 
+    /// `PullTrust`: the folder trust saved for pull machine `machine`, and
+    /// only its own, so its actor answers its tasks' trust prompts as the
+    /// head's actor answers another machine's (`Actor::auto_trust`).
+    pub fn pull_trust(&self, machine: &str) -> anyhow::Result<Vec<crate::store::TrustedRepo>> {
+        self.pull_handle(machine)?;
+        Ok(self
+            .store
+            .trusted_repos()?
+            .into_iter()
+            .filter(|t| t.machine == machine)
+            .collect())
+    }
+
     /// `TaskReport`: what pull machine `machine` saw become of task `id`,
     /// written on the row with the event its own actor would have emitted.
     /// A closed or failed row stays as it is, a stale one stays stale while
     /// its agent works (as `task::next_state` keeps it), and one `task done`
     /// ended stays done until its pane closes; each answers the row as it
-    /// is.
-    pub async fn report(
-        &self,
-        machine: &str,
-        id: i64,
-        state: TaskState,
-        pane: Option<String>,
-        detail: Option<String>,
-        limit: Option<crate::limit::Limit>,
-    ) -> anyhow::Result<Task> {
+    /// is. Trust keys the machine pressed (`PullReport::trusted`) are
+    /// `task.trusted` once per task, after a `task.blocked` the same report
+    /// brings and before any other state's event, as the actor emits them.
+    pub async fn report(&self, machine: &str, id: i64, report: PullReport) -> anyhow::Result<Task> {
+        let PullReport {
+            state,
+            pane,
+            detail,
+            limit,
+            trusted,
+        } = report;
         let handle = self.pull_handle(machine)?;
         self.heard(&handle);
+        // Once per task, as `Actor::auto_trust` claims it, so a report sent
+        // again (after a restart of the serve, say) is not a second event.
+        let trust = |task: &Task| -> anyhow::Result<()> {
+            if let Some(keys) = &trusted
+                && self.store.claim_trust_sent(task.id)?
+            {
+                self.emit(
+                    "task.trusted",
+                    machine,
+                    Some(task),
+                    Some(serde_json::json!({ "keys": keys })),
+                );
+            }
+            Ok(())
+        };
         // The head owns the limits: one a pull machine read goes in the
         // table as one this head read would, keyed by the machine it ran on.
         if let Some(limit) = &limit
@@ -2462,6 +2501,7 @@ impl Fleet {
                         .as_ref()
                         .is_none_or(|p| task.pane_id.as_ref() == Some(p))
             {
+                trust(&task)?;
                 return Ok(task);
             }
             task.state = state;
@@ -2485,12 +2525,18 @@ impl Fleet {
                 Err(err) if err.downcast_ref::<crate::store::Conflict>().is_some() => continue,
                 Err(err) => return Err(err),
             }
+            if state != TaskState::Blocked {
+                trust(&task)?;
+            }
             if from != state {
                 let question = (state == TaskState::Blocked)
                     .then(|| detail.as_deref()?.strip_prefix("agent asked: "))
                     .flatten()
                     .map(|q| serde_json::json!({ "question": q }));
                 self.emit(&format!("task.{state}"), machine, Some(&task), question);
+            }
+            if state == TaskState::Blocked {
+                trust(&task)?;
             }
             self.count_pull(&handle);
             return Ok(task);
@@ -4263,12 +4309,27 @@ impl Daemon {
                 pane,
                 detail,
                 limit,
+                trusted,
             } => match self
                 .fleet
-                .report(&machine, id, state, pane, detail, limit)
+                .report(
+                    &machine,
+                    id,
+                    PullReport {
+                        state,
+                        pane,
+                        detail,
+                        limit,
+                        trusted,
+                    },
+                )
                 .await
             {
                 Ok(task) => IpcResponse::Task(task),
+                Err(err) => cli_error(err),
+            },
+            IpcRequest::PullTrust { machine } => match self.fleet.pull_trust(&machine) {
+                Ok(list) => IpcResponse::Trusted(list),
                 Err(err) => cli_error(err),
             },
             IpcRequest::OrchestratorList => {
@@ -5481,6 +5542,7 @@ mod tests {
             pane: Some("p-9".into()),
             detail: detail.map(str::to_string),
             limit: None,
+            trusted: None,
         }
     }
 
@@ -5650,6 +5712,75 @@ mod tests {
         assert_eq!(closed.state, TaskState::Closed);
         d.handle(report("laptop", &t, TaskState::Done, None)).await;
         assert_eq!(state_of(&d, &t), TaskState::Closed, "closed stays closed");
+    }
+
+    /// A pull machine is handed the folder trust saved for it and nobody
+    /// else's; a machine the head reaches itself, or one it does not know,
+    /// is refused as a claim would be.
+    #[tokio::test]
+    async fn a_pull_machine_gets_only_its_own_saved_trust() {
+        let (d, _tmp) = pull_daemon(2).await;
+        d.store().trust_repo("laptop", "~/work/app").unwrap();
+        d.store().trust_repo("a", "~/work/app").unwrap();
+        d.store().trust_repo("a", "~/work/lib").unwrap();
+        let ask = |machine: &str| IpcRequest::PullTrust {
+            machine: machine.into(),
+        };
+        let IpcResponse::Trusted(list) = d.handle(ask("laptop")).await else {
+            panic!()
+        };
+        let got: Vec<(String, String)> = list.into_iter().map(|t| (t.machine, t.repo)).collect();
+        assert_eq!(got, [("laptop".to_string(), "~/work/app".to_string())]);
+        assert_eq!(error_code(d.handle(ask("a")).await), "not_pull_machine");
+        assert_eq!(error_code(d.handle(ask("nope")).await), "unknown_machine");
+    }
+
+    /// The trust keys a pull machine pressed become `task.trusted`, with
+    /// the keys, once per task: after the `task.blocked` the same report
+    /// brings, before a `task.running`, and never again for a report sent
+    /// twice.
+    #[tokio::test]
+    async fn a_pull_machine_s_trust_answer_is_task_trusted_once() {
+        let (d, _tmp) = pull_daemon(3).await;
+        let t1 = queued(&d, "p1", Some("laptop")).await;
+        let t2 = queued(&d, "p2", Some("laptop")).await;
+        claim(&d, 2, false).await;
+        let keys = vec!["Down".to_string(), "Enter".to_string()];
+        let trusted = |t: &Task, state| {
+            let mut req = report("laptop", t, state, None);
+            if let IpcRequest::TaskReport { trusted, .. } = &mut req {
+                *trusted = Some(keys.clone());
+            }
+            req
+        };
+        let mut rx = d.subscribe();
+        let detail = |rx: &mut broadcast::Receiver<PastorEvent>| {
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .map(|e| (e.kind, e.task_id, e.detail))
+                .collect::<Vec<_>>()
+        };
+        d.handle(trusted(&t1, TaskState::Blocked)).await;
+        d.handle(trusted(&t1, TaskState::Blocked)).await;
+        d.handle(trusted(&t1, TaskState::Running)).await;
+        d.handle(trusted(&t2, TaskState::Running)).await;
+        let with_keys = Some(serde_json::json!({ "keys": keys }));
+        assert_eq!(
+            detail(&mut rx),
+            [
+                ("task.blocked".to_string(), Some(t1.id), None),
+                ("task.trusted".to_string(), Some(t1.id), with_keys.clone()),
+                ("task.running".to_string(), Some(t1.id), None),
+                ("task.trusted".to_string(), Some(t2.id), with_keys),
+                ("task.running".to_string(), Some(t2.id), None),
+            ]
+        );
+        assert!(d.store().trust_sent(t1.id).unwrap());
+        // A report without keys says nothing of trust.
+        let t3 = queued(&d, "p3", Some("laptop")).await;
+        claim(&d, 1, false).await;
+        d.handle(report("laptop", &t3, TaskState::Blocked, None))
+            .await;
+        assert!(!d.store().trust_sent(t3.id).unwrap());
     }
 
     /// A task on a pull machine that requires a summary is held to it as
