@@ -2443,7 +2443,7 @@ impl Fleet {
         // again (after a restart of the serve, say) is not a second event.
         let trust = |task: &Task| -> anyhow::Result<()> {
             if let Some(keys) = &trusted
-                && self.store.claim_trust_sent(task.id)?
+                && self.store.claim_trust_sent(task.id, keys)?
             {
                 self.emit(
                     "task.trusted",

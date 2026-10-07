@@ -4305,8 +4305,9 @@ not answer is refused whether flocks are in play or not
 
 ### The store
 
-`pastor.db` is at schema 16. Its tasks table has, among others, `retry_of`,
-`flock`, `trust_sent`, `activity_seen`, `ended`, `priority`,
+`pastor.db` is at schema 17. Its tasks table has, among others, `retry_of`,
+`flock`, `trust_sent`, `trust_keys` (the keys sent with it, since schema
+17), `activity_seen`, `ended`, `priority`,
 `priority_from`, `queue_pos`, `aged_from`, `aged_at` (since schema 14),
 `role`, `description` (since schema 11), `preempt`, `paused_at`,
 `paused_for`, `resumed_at` and `waiting_until` (schema 15). Summaries are in

@@ -507,8 +507,11 @@ impl Puller {
             if !all && self.sent.get(&t.id) == Some(&now) {
                 continue;
             }
+            // The keys as pressed, kept with the flag: after a restart the
+            // config may name others, or none. The head emits once whatever
+            // a restart sends again.
             let trusted = (trust_sent && !self.sent.get(&t.id).is_some_and(|r| r.3))
-                .then(|| self.settings.agents.trust_keys(&t.spec.agent))
+                .then(|| self.store.trust_keys(t.id).ok().flatten())
                 .flatten();
             let req = |trusted: Option<Vec<String>>| IpcRequest::TaskReport {
                 machine: self.machine.clone(),
@@ -1303,12 +1306,80 @@ mod tests {
 
         // Keys pressed all the same (a copy from a newer head before the
         // old one came back): the report goes without them.
-        assert!(store.claim_trust_sent(t.id).unwrap());
+        assert!(
+            store
+                .claim_trust_sent(t.id, &["Down".into(), "Enter".into()])
+                .unwrap()
+        );
         let mut events = head.subscribe();
         p.report(true).await;
         assert_eq!(p.sent.get(&t.id).map(|r| r.3), Some(true), "delivered");
         assert!(!head.store().trust_sent(t.id).unwrap());
         assert!(!std::iter::from_fn(|| events.try_recv().ok()).any(|e| e.kind == "task.trusted"));
+    }
+
+    /// Trust keys pressed before a restart of the serve go to the head as
+    /// they were pressed, even when the config now names other keys or
+    /// none, and the head emits `task.trusted` once however many restarts
+    /// report them.
+    #[tokio::test]
+    async fn trust_keys_pressed_before_a_restart_are_reported_as_pressed_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (head, ask) = pull_head(tmp.path()).await;
+        let t = run_in(&head, Some("laptop"), Some("~/work/app")).await;
+        let IpcResponse::Tasks(claimed) = head
+            .handle(IpcRequest::TaskClaim {
+                machine: "laptop".into(),
+                free_slots: 1,
+                flock_work: false,
+            })
+            .await
+        else {
+            panic!()
+        };
+        // What the serve before the restart left: the task blocked on its
+        // prompt, the keys pressed, no report of them yet.
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut row = store.adopt_claimed(&claimed[0]).unwrap();
+        row.state = TaskState::Blocked;
+        row.pane_id = Some("p-1".into());
+        row.prompt_pending = true;
+        store.update_task(&mut row).unwrap();
+        let pressed = vec!["Down".to_string(), "Enter".to_string()];
+        assert!(store.claim_trust_sent(t.id, &pressed).unwrap());
+        let with_keys = |keys: Vec<String>| {
+            let mut agents = crate::config::Agents::default();
+            agents.0.insert(
+                "claude".into(),
+                crate::config::AgentDef {
+                    trust_keys: Some(keys),
+                    ..Default::default()
+                },
+            );
+            MachineSettings { agents, ..fast() }
+        };
+        let mut events = head.subscribe();
+        // Restarted with the trust keys removed, then with others.
+        for settings in [with_keys(vec![]), with_keys(vec!["Escape".into()])] {
+            let mut p = Puller::new(
+                "laptop".into(),
+                false,
+                Arc::new(crate::herdr::fake::FakeHerdr::new()),
+                settings,
+                store.clone(),
+                ask.clone(),
+            );
+            p.report(true).await;
+            assert_eq!(p.sent.get(&t.id).map(|r| r.3), Some(true), "delivered");
+        }
+        let trusted: Vec<PastorEvent> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter(|e| e.kind == "task.trusted")
+            .collect();
+        assert_eq!(trusted.len(), 1, "{trusted:?}");
+        assert_eq!(
+            trusted[0].detail,
+            Some(serde_json::json!({ "keys": pressed }))
+        );
     }
 
     /// A machine the head does not have as a pull machine never starts an

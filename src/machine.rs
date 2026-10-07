@@ -2105,7 +2105,7 @@ impl Actor {
         if input.trust {
             self.trust_answered.insert(task.id, Instant::now());
             // The prompt is answered: saved trust must not answer it again.
-            if let Err(err) = self.store.claim_trust_sent(task.id) {
+            if let Err(err) = self.store.claim_trust_sent(task.id, &keys) {
                 return (Err(err), false);
             }
             if let Some(repo) = &task.spec.repo
@@ -4683,7 +4683,7 @@ impl Actor {
                 .await
                 .map_err(|_| TimedOut("pane.send_keys", timeout))??;
             self.trust_answered.insert(task.id, Instant::now());
-            if !self.store.claim_trust_sent(task.id)? {
+            if !self.store.claim_trust_sent(task.id, &keys)? {
                 continue;
             }
             tracing::info!(machine = %self.name, task = %task.display_id(), repo, "answered the trust prompt of a trusted repo");
@@ -8369,7 +8369,7 @@ mod tests {
                 "{err:#}"
             );
             // Not claimed: the first claim still wins.
-            assert!(store.claim_trust_sent(t.id).unwrap());
+            assert!(store.claim_trust_sent(t.id, &["Enter".into()]).unwrap());
         }
         assert!(calls(&fake, "pane.send_keys").is_empty());
         assert!(store.trusted_repos().unwrap().is_empty());
