@@ -342,8 +342,8 @@ impl Puller {
     /// the block; the actor looked at that task when it blocked, so a copy
     /// that changed sends it `auto_trust` now rather than leaving it to its
     /// next reconcile). A head that refuses (one too old for `PullTrust`,
-    /// say) leaves nothing here to answer with; an unreachable one leaves
-    /// the last copy.
+    /// say) leaves nothing here to answer with; one that cannot be reached
+    /// or does not answer leaves the last copy.
     async fn fetch_trust(&mut self) {
         let tasks: Vec<Task> = self
             .tasks()
@@ -377,8 +377,15 @@ impl Puller {
                 let Some(e) = err.downcast_ref::<CliError>() else {
                     return;
                 };
-                // An unreachable head is `Follower`'s to report.
-                if matches!(e.code.as_str(), "head_unreachable" | "no_head") {
+                // Only a head that refuses this machine takes its trust
+                // away. Anything else failed on the way (unreachable, a
+                // timeout, a dropped bridge, a head restarting) and keeps
+                // the last copy; an unreachable head is `Follower`'s to
+                // report.
+                if !matches!(
+                    e.code.as_str(),
+                    "head_too_old" | "not_pull_machine" | "unknown_machine"
+                ) {
                     return;
                 }
                 if self.trust_refused.as_deref() != Some(e.code.as_str()) {
@@ -1316,6 +1323,99 @@ mod tests {
         assert_eq!(p.sent.get(&t.id).map(|r| r.3), Some(true), "delivered");
         assert!(!head.store().trust_sent(t.id).unwrap());
         assert!(!std::iter::from_fn(|| events.try_recv().ok()).any(|e| e.kind == "task.trusted"));
+    }
+
+    /// A `PullTrust` that fails on the way (a timeout, a dropped bridge, a
+    /// head mid-restart) keeps the last copy, so the trust prompt is still
+    /// answered; only a head that refuses the machine clears it.
+    #[tokio::test]
+    async fn a_failed_trust_fetch_keeps_the_last_copy_a_refusal_clears_it() {
+        for code in ["timeout", "runtime_error", "daemon_not_running"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (head, ask) = pull_head(tmp.path()).await;
+            head.store().trust_repo("laptop", "~/work/app").unwrap();
+            let fails = Arc::new(Mutex::new(code));
+            let failing = fails.clone();
+            let flaky: Ask = Arc::new(move |req| {
+                let (ask, code) = (ask.clone(), *failing.lock().unwrap());
+                Box::pin(async move {
+                    if let IpcRequest::PullTrust { .. } = req {
+                        return Err(CliError::err(code, "on the way"));
+                    }
+                    ask(req).await
+                })
+            });
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            // The copy an earlier fetch left.
+            store
+                .replace_trusted_repos(&[crate::store::TrustedRepo {
+                    machine: "laptop".into(),
+                    repo: "~/work/app".into(),
+                    trusted_at: chrono::Utc::now(),
+                }])
+                .unwrap();
+            let t = run_in(&head, Some("laptop"), Some("~/work/app")).await;
+            let fake = crate::herdr::fake::FakeHerdr::new();
+            fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
+            let mut p = Puller::new(
+                "laptop".into(),
+                false,
+                Arc::new(fake.clone()),
+                fast(),
+                store.clone(),
+                flaky,
+            );
+            head_reaches(&mut p, &head, &t, TaskState::Running).await;
+            assert_eq!(
+                trust_here(&store),
+                [("laptop".to_string(), "~/work/app".to_string())],
+                "{code}"
+            );
+            assert_eq!(p.trust_refused, None, "{code}");
+
+            // Refused now: nothing left to answer with.
+            *fails.lock().unwrap() = "not_pull_machine";
+            let t2 = run_in(&head, Some("laptop"), Some("~/work/app")).await;
+            head_reaches(&mut p, &head, &t2, TaskState::Blocked).await;
+            assert!(trust_here(&store).is_empty(), "{code}");
+            assert_eq!(p.trust_refused.as_deref(), Some("not_pull_machine"));
+        }
+    }
+
+    /// `pastor trust remove` on the head reaches the pull machine at its
+    /// next fetch: a later task of that repo is left blocked for a person.
+    #[tokio::test]
+    async fn trust_removed_on_the_head_is_removed_here() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (head, ask) = pull_head(tmp.path()).await;
+        head.store().trust_repo("laptop", "~/work/app").unwrap();
+        let t = run_in(&head, Some("laptop"), Some("~/work/app")).await;
+        let fake = crate::herdr::fake::FakeHerdr::new();
+        fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut p = Puller::new(
+            "laptop".into(),
+            false,
+            Arc::new(fake.clone()),
+            fast(),
+            store.clone(),
+            ask,
+        );
+        head_reaches(&mut p, &head, &t, TaskState::Running).await;
+        assert_eq!(trust_here(&store).len(), 1);
+
+        assert!(head.store().untrust("laptop", "~/work/app").unwrap());
+        let t2 = run_in(&head, Some("laptop"), Some("~/work/app")).await;
+        head_reaches(&mut p, &head, &t2, TaskState::Blocked).await;
+        assert!(trust_here(&store).is_empty(), "{:?}", trust_here(&store));
+        let pane = head
+            .store()
+            .get_task(t2.id)
+            .unwrap()
+            .unwrap()
+            .pane_id
+            .unwrap();
+        assert!(keys_sent(&fake, &pane).is_empty());
     }
 
     /// Trust keys pressed before a restart of the serve go to the head as
