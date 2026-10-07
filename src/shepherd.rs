@@ -339,18 +339,24 @@ impl Puller {
     /// need it: one with a repo that is queued (before its dispatch, so the
     /// answer after it is immediate, as on the head) or blocked during its
     /// startup with no trust keys sent yet (a `trust add` on the head after
-    /// the block). A head that refuses (one too old for `PullTrust`, say)
-    /// leaves nothing here to answer with; an unreachable one leaves the
-    /// last copy.
+    /// the block; the actor looked at that task when it blocked, so a copy
+    /// that changed sends it `auto_trust` now rather than leaving it to its
+    /// next reconcile). A head that refuses (one too old for `PullTrust`,
+    /// say) leaves nothing here to answer with; an unreachable one leaves
+    /// the last copy.
     async fn fetch_trust(&mut self) {
-        let wants = self.tasks().iter().any(|t| {
-            t.spec.repo.is_some()
-                && (t.state == TaskState::Queued
-                    || t.state == TaskState::Blocked
-                        && t.prompt_pending
-                        && !self.store.trust_sent(t.id).unwrap_or(true))
+        let tasks: Vec<Task> = self
+            .tasks()
+            .into_iter()
+            .filter(|t| t.spec.repo.is_some())
+            .collect();
+        let queued = tasks.iter().any(|t| t.state == TaskState::Queued);
+        let blocked = tasks.iter().any(|t| {
+            t.state == TaskState::Blocked
+                && t.prompt_pending
+                && !self.store.trust_sent(t.id).unwrap_or(true)
         });
-        if !wants {
+        if !queued && !blocked {
             return;
         }
         let req = IpcRequest::PullTrust {
@@ -392,8 +398,23 @@ impl Puller {
             .into_iter()
             .filter(|t| t.machine == self.machine)
             .collect();
+        let pairs = |list: &[crate::store::TrustedRepo]| -> HashSet<(String, String)> {
+            list.iter()
+                .map(|t| (t.machine.clone(), t.repo.clone()))
+                .collect()
+        };
+        let before = self.store.trusted_repos().map(|l| pairs(&l));
         if let Err(err) = self.store.replace_trusted_repos(&mine) {
             tracing::error!(%err, "keep the head's saved trust");
+            return;
+        }
+        if blocked && before.is_ok_and(|b| b != pairs(&mine)) {
+            let actor = self.actor();
+            tokio::spawn(async move {
+                if let Err(err) = actor.auto_trust().await {
+                    tracing::warn!(err = %format!("{err:#}"), "auto trust after a trust fetch");
+                }
+            });
         }
     }
 
@@ -1175,7 +1196,9 @@ mod tests {
 
     /// A task of a repo saved only for another machine is left blocked on
     /// its trust prompt, for a person: nothing is pressed and the head
-    /// emits no `task.trusted`.
+    /// emits no `task.trusted`. Once the repo is saved for this machine,
+    /// the next pass answers it, without waiting for the actor's
+    /// reconcile (an hour here).
     #[tokio::test]
     async fn a_pull_machine_leaves_a_repo_not_saved_for_it_blocked() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1190,7 +1213,10 @@ mod tests {
             "laptop".into(),
             false,
             Arc::new(fake.clone()),
-            fast(),
+            MachineSettings {
+                reconcile_every: Duration::from_secs(3600),
+                ..fast()
+            },
             store.clone(),
             ask,
         );
@@ -1218,7 +1244,7 @@ mod tests {
         );
 
         // Saved on the head now: the next pass brings it, and the actor
-        // answers the prompt at its next look.
+        // answers the prompt at once.
         head.store().trust_repo("laptop", "~/work/app").unwrap();
         head_reaches(&mut p, &head, &t, TaskState::Running).await;
         assert_eq!(keys_sent(&fake, &pane), [vec!["Down", "Enter"]]);
