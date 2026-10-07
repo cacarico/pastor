@@ -16,7 +16,7 @@ use crate::task::{
     TaskSummary,
 };
 
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 
 /// The tables schema 2 added: created on a fresh database and by the v1
 /// migration.
@@ -419,6 +419,7 @@ impl Store {
                         retry_of INTEGER,
                         flock TEXT,
                         trust_sent INTEGER NOT NULL DEFAULT 0,
+                        trust_keys TEXT,
                         activity_seen INTEGER NOT NULL DEFAULT 0,
                         ended INTEGER NOT NULL DEFAULT 0,
                         priority TEXT NOT NULL DEFAULT 'normal',
@@ -567,6 +568,12 @@ impl Store {
                 // before.
                 if v < 16 {
                     tx.execute_batch(V16_TABLES)?;
+                }
+                // The keys sent with `trust_sent` (`claim_trust_sent`), so a
+                // pull machine reports the keys it pressed whatever its
+                // config says after a restart. Older rows record none.
+                if v < 17 {
+                    add_column(&tx, "trust_keys", "trust_keys TEXT")?;
                 }
                 tx.execute(
                     "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
@@ -1998,18 +2005,38 @@ impl Store {
         })
     }
 
-    /// Mark task `id` as having had its trust keys sent. True only for the
-    /// call that set it, so the keys go to a task once, across restarts.
-    /// `update_task` never writes the column, so no stale copy resets it.
-    pub fn claim_trust_sent(&self, id: i64) -> anyhow::Result<bool> {
+    /// Mark task `id` as having had its trust keys sent, and keep `keys`,
+    /// the keys that went. True only for the call that set it, so the keys
+    /// go to a task once, across restarts. `update_task` never writes the
+    /// columns, so no stale copy resets them.
+    pub fn claim_trust_sent(&self, id: i64, keys: &[String]) -> anyhow::Result<bool> {
+        let keys = serde_json::to_string(keys)?;
         blocking(|| {
             let conn = self.conn.lock().recover();
             let n = conn.execute(
-                "UPDATE tasks SET trust_sent = 1 WHERE id = ?1 AND trust_sent = 0",
-                params![id],
+                "UPDATE tasks SET trust_sent = 1, trust_keys = ?2 WHERE id = ?1 AND trust_sent = 0",
+                params![id, keys],
             )?;
             Ok(n == 1)
         })
+    }
+
+    /// The keys `claim_trust_sent` kept for task `id`; `None` for no such
+    /// row, no keys sent, or a claim from before schema 17.
+    pub fn trust_keys(&self, id: i64) -> anyhow::Result<Option<Vec<String>>> {
+        let keys: Option<String> = blocking(|| {
+            let conn = self.conn.lock().recover();
+            Ok::<_, anyhow::Error>(
+                conn.query_row(
+                    "SELECT trust_keys FROM tasks WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten(),
+            )
+        })?;
+        Ok(keys.map(|k| serde_json::from_str(&k)).transpose()?)
     }
 
     /// Record `key` as seen for `job` without a task row here: a headless
@@ -2692,8 +2719,35 @@ mod tests {
             );
         }
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.meta("schema_version").unwrap().unwrap(), "16");
+        assert_eq!(
+            s.meta("schema_version").unwrap().unwrap(),
+            SCHEMA_VERSION.to_string()
+        );
         assert_eq!(s.get_task(1).unwrap().unwrap().usage, None);
+    }
+
+    /// A v16 database keeps no trust keys; opening it adds the column, a
+    /// claim from before reads as none, and a new claim keeps its keys.
+    #[test]
+    fn a_v16_database_gains_trust_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.insert_task(new_task("run")).unwrap();
+            s.insert_task(new_task("run")).unwrap();
+            s.execute_raw(
+                "ALTER TABLE tasks DROP COLUMN trust_keys;
+                 UPDATE tasks SET trust_sent = 1 WHERE id = 1;
+                 UPDATE meta SET value = '16' WHERE key = 'schema_version'",
+            );
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.meta("schema_version").unwrap().unwrap(), "17");
+        assert!(s.trust_sent(1).unwrap());
+        assert_eq!(s.trust_keys(1).unwrap(), None);
+        assert!(s.claim_trust_sent(2, &["Enter".into()]).unwrap());
+        assert_eq!(s.trust_keys(2).unwrap(), Some(vec!["Enter".to_string()]));
     }
 
     /// A round that ends with no summary keeps the pane's last lines, and
@@ -3650,15 +3704,23 @@ mod tests {
     fn trust_is_sent_to_a_task_once() {
         let s = Store::open_in_memory().unwrap();
         let t = s.insert_task(new_task("run")).unwrap();
+        let keys = vec!["Down".to_string(), "Enter".to_string()];
         assert!(!s.trust_sent(t.id).unwrap());
-        assert!(s.claim_trust_sent(t.id).unwrap());
+        assert_eq!(s.trust_keys(t.id).unwrap(), None);
+        assert!(s.claim_trust_sent(t.id, &keys).unwrap());
         assert!(s.trust_sent(t.id).unwrap());
-        assert!(!s.claim_trust_sent(t.id).unwrap());
+        assert!(!s.claim_trust_sent(t.id, &["Enter".into()]).unwrap());
+        assert_eq!(
+            s.trust_keys(t.id).unwrap(),
+            Some(keys.clone()),
+            "the first claim's"
+        );
         // A write of the row from a copy read before does not reset it.
         let mut copy = s.get_task(t.id).unwrap().unwrap();
         copy.error = Some("x".into());
         s.update_task(&mut copy).unwrap();
-        assert!(!s.claim_trust_sent(t.id).unwrap());
+        assert!(!s.claim_trust_sent(t.id, &keys).unwrap());
+        assert_eq!(s.trust_keys(t.id).unwrap(), Some(keys));
     }
 
     /// A v4 database predates saved trust; opening it adds the table and
@@ -3682,7 +3744,7 @@ mod tests {
             SCHEMA_VERSION.to_string()
         );
         assert!(s.trust_repo("m", "/r").unwrap());
-        assert!(s.claim_trust_sent(1).unwrap());
+        assert!(s.claim_trust_sent(1, &["Enter".into()]).unwrap());
     }
 
     /// A v5 database keeps no `activity_seen`; opening it adds the column,
@@ -4399,6 +4461,7 @@ mod tests {
                  ALTER TABLE tasks DROP COLUMN retry_of;
                  ALTER TABLE tasks DROP COLUMN flock;
                  ALTER TABLE tasks DROP COLUMN trust_sent;
+                 ALTER TABLE tasks DROP COLUMN trust_keys;
                  ALTER TABLE tasks DROP COLUMN activity_seen;
                  ALTER TABLE tasks DROP COLUMN ended;
                  ALTER TABLE tasks DROP COLUMN priority;
@@ -4420,7 +4483,7 @@ mod tests {
                  DROP TABLE task_usage;
                  UPDATE meta SET value = '1' WHERE key = 'schema_version';
                  CREATE TRIGGER no_bump BEFORE UPDATE ON meta
-                   WHEN NEW.value = '16' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+                   WHEN NEW.value = '17' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
             );
         }
         assert!(Store::open(&path).is_err());
@@ -4445,6 +4508,7 @@ mod tests {
                 || c == "retry_of"
                 || c == "flock"
                 || c == "trust_sent"
+                || c == "trust_keys"
                 || c == "activity_seen"
                 || c == "ended"
                 || c == "priority"

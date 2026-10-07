@@ -8,3 +8,6 @@
   stayed `blocked` until someone pressed the keys on the machine. IPC
   protocol 31 (`pull_trust`, and `trusted` on a `task_report`); a pull
   machine whose head is older leaves the prompt for a person, as before.
+  Store schema 17: a task keeps the trust keys sent to it (`trust_keys`),
+  so a pull machine reports the keys it pressed even after a restart with
+  other keys in its config.
