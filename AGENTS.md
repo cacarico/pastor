@@ -241,10 +241,10 @@ Still open as of the last review; none of them blocks normal use.
 ~/.config/pastor/jobs/<name>.toml one job per file
 ~/.config/pastor/orchestrators/<name>.toml one orchestrator per file (kind scheduled or session)
 ~/.config/pastor/client.toml      [head]: a head on another machine (`pastor head`)
-~/.local/state/pastor/pastor.db   tasks (schema 16), token usage, seen keys, usage limits, event seq, job state (SQLite)
+~/.local/state/pastor/pastor.db   tasks (schema 17), token usage, seen keys, usage limits, event seq, job state (SQLite)
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/fleet.lock  offline fleet edits and a starting `pastor serve` take turns on it
-~/.local/state/pastor/shepherd.db a headless serve's job state, seen keys, head event cursor
+~/.local/state/pastor/shepherd.db a headless serve's job state, seen keys, head event cursor, its pull machine's trusted repos
 ~/.local/state/pastor/events.jsonl events log, rotated to events.jsonl.1
 ~/.local/state/pastor/watch/<name>.json `pastor watch` cursors
 ~/.local/state/pastor/serve.log   background `pastor serve` log, rotated at 10 MB, 3 kept

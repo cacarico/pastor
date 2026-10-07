@@ -10,7 +10,10 @@
 //! also asks for tasks (`IpcRequest::TaskClaim`) and runs them with the same
 //! machine actor the head runs for a local machine, on this machine's herdr;
 //! every change the actor sees goes back as `IpcRequest::TaskReport`
-//! (`Puller`).
+//! (`Puller`). The folder trust the head saved for this machine comes with
+//! `IpcRequest::PullTrust` into this store's `trusted_repos`, where the
+//! actor's saved-trust check reads it, and each trust answer goes back on
+//! the task's report.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -221,8 +224,9 @@ fn shepherd_connector(config: &PastorConfig) -> Arc<dyn Connector> {
     })
 }
 
-/// What was last told to the head about a task: its state, pane and note.
-type Reported = (TaskState, Option<String>, Option<String>);
+/// What was last told to the head about a task: its state, pane, note, and
+/// whether its trust answer went with it.
+type Reported = (TaskState, Option<String>, Option<String>, bool);
 
 /// Runs the tasks the head gives this machine as a pull machine: claims
 /// them each tick, starts each with the machine actor, and reports every
@@ -248,6 +252,8 @@ struct Puller {
     dispatching: Arc<std::sync::Mutex<HashSet<i64>>>,
     /// The code of the last claim the head refused, so it is logged once.
     refused: Option<String>,
+    /// The code of the last `PullTrust` the head refused, likewise.
+    trust_refused: Option<String>,
 }
 
 impl Puller {
@@ -273,6 +279,7 @@ impl Puller {
             sent: HashMap::new(),
             dispatching: Default::default(),
             refused: None,
+            trust_refused: None,
         }
     }
 
@@ -315,14 +322,100 @@ impl Puller {
             .clone()
     }
 
-    /// One tick: report every task, claim, and start what is queued here.
+    /// One tick: report every task, claim, fetch the saved trust, and start
+    /// what is queued here.
     async fn pass(&mut self) {
         if self.actor.is_none() && !self.tasks().is_empty() {
             self.actor();
         }
         self.report(true).await;
         self.claim().await;
+        self.fetch_trust().await;
         self.start_queued();
+    }
+
+    /// Copy the folder trust the head saved for this machine into this
+    /// store, where the actor's `auto_trust` reads it, while a task here may
+    /// need it: one with a repo that is queued (before its dispatch, so the
+    /// answer after it is immediate, as on the head) or blocked during its
+    /// startup with no trust keys sent yet (a `trust add` on the head after
+    /// the block; the actor looked at that task when it blocked, so a copy
+    /// that changed sends it `auto_trust` now rather than leaving it to its
+    /// next reconcile). A head that refuses (one too old for `PullTrust`,
+    /// say) leaves nothing here to answer with; an unreachable one leaves
+    /// the last copy.
+    async fn fetch_trust(&mut self) {
+        let tasks: Vec<Task> = self
+            .tasks()
+            .into_iter()
+            .filter(|t| t.spec.repo.is_some())
+            .collect();
+        let queued = tasks.iter().any(|t| t.state == TaskState::Queued);
+        let blocked = tasks.iter().any(|t| {
+            t.state == TaskState::Blocked
+                && t.prompt_pending
+                && !self.store.trust_sent(t.id).unwrap_or(true)
+        });
+        if !queued && !blocked {
+            return;
+        }
+        let req = IpcRequest::PullTrust {
+            machine: self.machine.clone(),
+        };
+        let list = match (self.ask)(req).await {
+            Ok(IpcResponse::Trusted(list)) => {
+                if self.trust_refused.take().is_some() {
+                    tracing::info!(machine = %self.machine, "the head gives this machine its saved trust again");
+                }
+                list
+            }
+            Ok(other) => {
+                tracing::warn!(?other, "the head answered PullTrust with something else");
+                return;
+            }
+            Err(err) => {
+                let Some(e) = err.downcast_ref::<CliError>() else {
+                    return;
+                };
+                // An unreachable head is `Follower`'s to report.
+                if matches!(e.code.as_str(), "head_unreachable" | "no_head") {
+                    return;
+                }
+                if self.trust_refused.as_deref() != Some(e.code.as_str()) {
+                    tracing::info!(
+                        machine = %self.machine,
+                        code = %e.code,
+                        "the head gives this machine no saved trust; its tasks' trust prompts wait for a person: {}",
+                        e.message
+                    );
+                    self.trust_refused = Some(e.code.clone());
+                }
+                Vec::new()
+            }
+        };
+        // Only this machine's, whatever the head sent.
+        let mine: Vec<_> = list
+            .into_iter()
+            .filter(|t| t.machine == self.machine)
+            .collect();
+        let pairs = |list: &[crate::store::TrustedRepo]| -> HashSet<(String, String)> {
+            list.iter()
+                .map(|t| (t.machine.clone(), t.repo.clone()))
+                .collect()
+        };
+        let before = self.store.trusted_repos().map(|l| pairs(&l));
+        if let Err(err) = self.store.replace_trusted_repos(&mine) {
+            tracing::error!(%err, "keep the head's saved trust");
+            return;
+        }
+        if blocked && before.is_ok_and(|b| b != pairs(&mine)) {
+            let actor = self.actor();
+            tokio::spawn(async move {
+                if let Err(err) = actor.auto_trust().await {
+                    tracing::warn!(err = %format!("{err:#}"), "auto trust after a trust fetch");
+                }
+            });
+        }
     }
 
     /// Ask the head for tasks and keep each as a queued row here.
@@ -401,16 +494,26 @@ impl Puller {
     /// pane here. A row the head has closed is closed here too; a closed or
     /// failed one the head has heard of is forgotten here. Stops at the
     /// first report that does not reach the head, to try again next tick.
+    /// The trust keys the actor pressed for a task go with its reports
+    /// until one reaches the head, which emits `task.trusted` once; a head
+    /// too old for them gets the report without.
     async fn report(&mut self, all: bool) {
         for t in self.tasks() {
             if t.state == TaskState::Queued {
                 continue;
             }
-            let now: Reported = (t.state, t.pane_id.clone(), t.error.clone());
+            let trust_sent = self.store.trust_sent(t.id).unwrap_or(false);
+            let now: Reported = (t.state, t.pane_id.clone(), t.error.clone(), trust_sent);
             if !all && self.sent.get(&t.id) == Some(&now) {
                 continue;
             }
-            let req = IpcRequest::TaskReport {
+            // The keys as pressed, kept with the flag: after a restart the
+            // config may name others, or none. The head emits once whatever
+            // a restart sends again.
+            let trusted = (trust_sent && !self.sent.get(&t.id).is_some_and(|r| r.3))
+                .then(|| self.store.trust_keys(t.id).ok().flatten())
+                .flatten();
+            let req = |trusted: Option<Vec<String>>| IpcRequest::TaskReport {
                 machine: self.machine.clone(),
                 id: t.id,
                 state: t.state,
@@ -418,8 +521,18 @@ impl Puller {
                 detail: t.error.clone(),
                 // Nothing here reads a limit from a pane yet.
                 limit: None,
+                trusted,
             };
-            let head_row = match (self.ask)(req).await {
+            let mut answer = (self.ask)(req(trusted.clone())).await;
+            if trusted.is_some()
+                && let Err(err) = &answer
+                && err
+                    .downcast_ref::<CliError>()
+                    .is_some_and(|e| e.code == "head_too_old")
+            {
+                answer = (self.ask)(req(None)).await;
+            }
+            let head_row = match answer {
                 Ok(IpcResponse::Task(row)) => row,
                 Ok(other) => {
                     tracing::warn!(?other, "the head answered TaskReport with something else");
@@ -870,6 +983,11 @@ mod tests {
     }
 
     async fn run_pinned(head: &Daemon, machine: Option<&str>) -> Task {
+        run_in(head, machine, None).await
+    }
+
+    /// `run_pinned`, in `repo` when given.
+    async fn run_in(head: &Daemon, machine: Option<&str>, repo: Option<&str>) -> Task {
         let req = IpcRequest::Run {
             now: false,
             preempt: false,
@@ -880,7 +998,7 @@ mod tests {
                 agent_args: vec![],
                 allow: vec![],
                 deny: vec![],
-                repo: None,
+                repo: repo.map(str::to_string),
                 worktree: false,
                 branch: None,
                 machine: machine.map(str::to_string),
@@ -997,6 +1115,271 @@ mod tests {
 
         p.flock_work = true;
         head_reaches(&mut p, &head, &loose, TaskState::Running).await;
+    }
+
+    /// The keys pressed on `pane`, each send as one list.
+    fn keys_sent(fake: &crate::herdr::fake::FakeHerdr, pane: &str) -> Vec<Vec<String>> {
+        fake.pane_input(pane)
+            .into_iter()
+            .filter_map(|i| match i {
+                crate::herdr::fake::PaneInput::Keys(k) => Some(k),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The saved (machine, repo) pairs a pull machine's store holds.
+    fn trust_here(store: &Store) -> Vec<(String, String)> {
+        store
+            .trusted_repos()
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.machine, t.repo))
+            .collect()
+    }
+
+    /// A task of a repo the head saved as trusted on this pull machine
+    /// blocks on its folder-trust prompt and is answered here, once, as
+    /// the head answers another machine's: the head emits `task.trusted`
+    /// with the keys, then the task runs. Another machine's saved trust
+    /// never reaches this one.
+    #[tokio::test]
+    async fn a_pull_machine_answers_the_trust_prompt_of_a_repo_saved_for_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (head, ask) = pull_head(tmp.path()).await;
+        head.store().trust_repo("laptop", "~/work/app").unwrap();
+        head.store().trust_repo("pi-2", "~/work/lib").unwrap();
+        let mut events = head.subscribe();
+        let t = run_in(&head, Some("laptop"), Some("~/work/app")).await;
+        let fake = crate::herdr::fake::FakeHerdr::new();
+        fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut p = Puller::new(
+            "laptop".into(),
+            false,
+            Arc::new(fake.clone()),
+            fast(),
+            store.clone(),
+            ask,
+        );
+        head_reaches(&mut p, &head, &t, TaskState::Running).await;
+        assert_eq!(
+            trust_here(&store),
+            [("laptop".to_string(), "~/work/app".to_string())],
+            "only this machine's"
+        );
+        // Some passes later, still once.
+        for _ in 0..3 {
+            let _ = tokio::time::timeout(Duration::from_millis(100), p.changed()).await;
+            p.pass().await;
+        }
+        let pane = head
+            .store()
+            .get_task(t.id)
+            .unwrap()
+            .unwrap()
+            .pane_id
+            .unwrap();
+        assert_eq!(keys_sent(&fake, &pane), [vec!["Down", "Enter"]]);
+        let evs: Vec<PastorEvent> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter(|e| e.task_id == Some(t.id))
+            .collect();
+        let kinds: Vec<&str> = evs.iter().map(|e| e.kind.as_str()).collect();
+        let trusted: Vec<&PastorEvent> = evs.iter().filter(|e| e.kind == "task.trusted").collect();
+        assert_eq!(trusted.len(), 1, "{kinds:?}");
+        assert_eq!(trusted[0].machine.as_deref(), Some("laptop"));
+        assert_eq!(
+            trusted[0].detail,
+            Some(serde_json::json!({"keys": ["Down", "Enter"]}))
+        );
+        let at = |k: &str| kinds.iter().position(|x| *x == k).unwrap();
+        assert!(at("task.trusted") < at("task.running"), "{kinds:?}");
+        assert!(head.store().trust_sent(t.id).unwrap());
+    }
+
+    /// A task of a repo saved only for another machine is left blocked on
+    /// its trust prompt, for a person: nothing is pressed and the head
+    /// emits no `task.trusted`. Once the repo is saved for this machine,
+    /// the next pass answers it, without waiting for the actor's
+    /// reconcile (an hour here).
+    #[tokio::test]
+    async fn a_pull_machine_leaves_a_repo_not_saved_for_it_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (head, ask) = pull_head(tmp.path()).await;
+        head.store().trust_repo("pi-2", "~/work/app").unwrap();
+        let mut events = head.subscribe();
+        let t = run_in(&head, Some("laptop"), Some("~/work/app")).await;
+        let fake = crate::herdr::fake::FakeHerdr::new();
+        fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut p = Puller::new(
+            "laptop".into(),
+            false,
+            Arc::new(fake.clone()),
+            MachineSettings {
+                reconcile_every: Duration::from_secs(3600),
+                ..fast()
+            },
+            store.clone(),
+            ask,
+        );
+        head_reaches(&mut p, &head, &t, TaskState::Blocked).await;
+        for _ in 0..3 {
+            let _ = tokio::time::timeout(Duration::from_millis(100), p.changed()).await;
+            p.pass().await;
+        }
+        assert_eq!(
+            head.store().get_task(t.id).unwrap().unwrap().state,
+            TaskState::Blocked
+        );
+        assert!(trust_here(&store).is_empty(), "{:?}", trust_here(&store));
+        let pane = head
+            .store()
+            .get_task(t.id)
+            .unwrap()
+            .unwrap()
+            .pane_id
+            .unwrap();
+        assert!(keys_sent(&fake, &pane).is_empty());
+        assert!(
+            !std::iter::from_fn(|| events.try_recv().ok()).any(|e| e.kind == "task.trusted"),
+            "no trust answer"
+        );
+
+        // Saved on the head now: the next pass brings it, and the actor
+        // answers the prompt at once.
+        head.store().trust_repo("laptop", "~/work/app").unwrap();
+        head_reaches(&mut p, &head, &t, TaskState::Running).await;
+        assert_eq!(keys_sent(&fake, &pane), [vec!["Down", "Enter"]]);
+    }
+
+    /// A head from before saved trust on pull machines (`PULL_TRUST_PROTOCOL`)
+    /// is not asked for it (`head_too_old` before the send), so nothing here
+    /// answers a trust prompt; the tasks still run and report. A trust
+    /// answer that reaches its report anyway goes without the keys, rather
+    /// than holding every report back.
+    #[tokio::test]
+    async fn a_head_that_predates_pull_trust_still_gets_the_reports() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (head, ask) = pull_head(tmp.path()).await;
+        head.store().trust_repo("laptop", "~/work/app").unwrap();
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = seen.clone();
+        let old: Ask = Arc::new(move |req| {
+            let (ask, log) = (ask.clone(), log.clone());
+            Box::pin(async move {
+                let op = serde_json::to_value(&req).unwrap()["op"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                log.lock().unwrap().push(op);
+                if let IpcRequest::Ping = req {
+                    return Ok(IpcResponse::Pong {
+                        version: "0.9.0".into(),
+                        protocol: crate::ipc::PULL_TRUST_PROTOCOL - 1,
+                        role: None,
+                    });
+                }
+                ask(req).await
+            })
+        });
+        let t = run_in(&head, Some("laptop"), Some("~/work/app")).await;
+        let fake = crate::herdr::fake::FakeHerdr::new();
+        fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut p = Puller::new(
+            "laptop".into(),
+            false,
+            Arc::new(fake.clone()),
+            fast(),
+            store.clone(),
+            gated(old),
+        );
+        head_reaches(&mut p, &head, &t, TaskState::Blocked).await;
+        assert_eq!(p.trust_refused.as_deref(), Some("head_too_old"));
+        assert!(trust_here(&store).is_empty());
+        assert!(
+            !seen.lock().unwrap().iter().any(|op| op == "pull_trust"),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+
+        // Keys pressed all the same (a copy from a newer head before the
+        // old one came back): the report goes without them.
+        assert!(
+            store
+                .claim_trust_sent(t.id, &["Down".into(), "Enter".into()])
+                .unwrap()
+        );
+        let mut events = head.subscribe();
+        p.report(true).await;
+        assert_eq!(p.sent.get(&t.id).map(|r| r.3), Some(true), "delivered");
+        assert!(!head.store().trust_sent(t.id).unwrap());
+        assert!(!std::iter::from_fn(|| events.try_recv().ok()).any(|e| e.kind == "task.trusted"));
+    }
+
+    /// Trust keys pressed before a restart of the serve go to the head as
+    /// they were pressed, even when the config now names other keys or
+    /// none, and the head emits `task.trusted` once however many restarts
+    /// report them.
+    #[tokio::test]
+    async fn trust_keys_pressed_before_a_restart_are_reported_as_pressed_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (head, ask) = pull_head(tmp.path()).await;
+        let t = run_in(&head, Some("laptop"), Some("~/work/app")).await;
+        let IpcResponse::Tasks(claimed) = head
+            .handle(IpcRequest::TaskClaim {
+                machine: "laptop".into(),
+                free_slots: 1,
+                flock_work: false,
+            })
+            .await
+        else {
+            panic!()
+        };
+        // What the serve before the restart left: the task blocked on its
+        // prompt, the keys pressed, no report of them yet.
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut row = store.adopt_claimed(&claimed[0]).unwrap();
+        row.state = TaskState::Blocked;
+        row.pane_id = Some("p-1".into());
+        row.prompt_pending = true;
+        store.update_task(&mut row).unwrap();
+        let pressed = vec!["Down".to_string(), "Enter".to_string()];
+        assert!(store.claim_trust_sent(t.id, &pressed).unwrap());
+        let with_keys = |keys: Vec<String>| {
+            let mut agents = crate::config::Agents::default();
+            agents.0.insert(
+                "claude".into(),
+                crate::config::AgentDef {
+                    trust_keys: Some(keys),
+                    ..Default::default()
+                },
+            );
+            MachineSettings { agents, ..fast() }
+        };
+        let mut events = head.subscribe();
+        // Restarted with the trust keys removed, then with others.
+        for settings in [with_keys(vec![]), with_keys(vec!["Escape".into()])] {
+            let mut p = Puller::new(
+                "laptop".into(),
+                false,
+                Arc::new(crate::herdr::fake::FakeHerdr::new()),
+                settings,
+                store.clone(),
+                ask.clone(),
+            );
+            p.report(true).await;
+            assert_eq!(p.sent.get(&t.id).map(|r| r.3), Some(true), "delivered");
+        }
+        let trusted: Vec<PastorEvent> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter(|e| e.kind == "task.trusted")
+            .collect();
+        assert_eq!(trusted.len(), 1, "{trusted:?}");
+        assert_eq!(
+            trusted[0].detail,
+            Some(serde_json::json!({ "keys": pressed }))
+        );
     }
 
     /// A machine the head does not have as a pull machine never starts an

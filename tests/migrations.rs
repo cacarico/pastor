@@ -894,8 +894,112 @@ CREATE TABLE IF NOT EXISTS limits (
 );
 INSERT INTO meta (key, value) VALUES ('schema_version', '15');";
 
-const OLD: [&str; 15] = [
-    V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15,
+/// Schema 16: `src/store.rs` at 2bf116472e94 (v0.9.0).
+const V16: &str = "
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS tasks (
+    id INTEGER PRIMARY KEY,
+    job TEXT NOT NULL,
+    item TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    spec TEXT NOT NULL,
+    machine TEXT,
+    workspace_id TEXT,
+    pane_id TEXT,
+    agent_name TEXT,
+    state TEXT NOT NULL,
+    error TEXT,
+    last_completion_seq INTEGER,
+    prompt_pending INTEGER NOT NULL DEFAULT 0,
+    retry_of INTEGER,
+    flock TEXT,
+    trust_sent INTEGER NOT NULL DEFAULT 0,
+    activity_seen INTEGER NOT NULL DEFAULT 0,
+    ended INTEGER NOT NULL DEFAULT 0,
+    priority TEXT NOT NULL DEFAULT 'normal',
+    priority_from TEXT,
+    queue_pos INTEGER,
+    aged_from TEXT,
+    aged_at TEXT,
+    role TEXT NOT NULL DEFAULT 'agent',
+    description TEXT,
+    preempt INTEGER NOT NULL DEFAULT 0,
+    paused_at TEXT,
+    paused_for INTEGER,
+    resumed_at TEXT,
+    waiting_until TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS tasks_state ON tasks(state);
+CREATE INDEX IF NOT EXISTS tasks_machine ON tasks(machine);
+CREATE TABLE IF NOT EXISTS seen (
+    job TEXT NOT NULL,
+    key TEXT NOT NULL,
+    task_id INTEGER,
+    seen_at TEXT NOT NULL,
+    PRIMARY KEY (job, key)
+);
+CREATE TABLE IF NOT EXISTS job_state (
+    name TEXT PRIMARY KEY,
+    last_run_at TEXT,
+    last_ok_at TEXT,
+    last_result TEXT,
+    last_error TEXT,
+    cursor TEXT,
+    failures INTEGER NOT NULL DEFAULT 0,
+    backoff_until TEXT
+);
+CREATE TABLE IF NOT EXISTS trusted_repos (
+    machine TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    trusted_at TEXT NOT NULL,
+    PRIMARY KEY (machine, repo)
+);
+CREATE TABLE IF NOT EXISTS event_seq (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    last INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO event_seq (id, last) VALUES (1, 0);
+CREATE TABLE IF NOT EXISTS task_summaries (
+    task_id INTEGER NOT NULL,
+    round INTEGER NOT NULL,
+    outcome TEXT NOT NULL,
+    text TEXT NOT NULL,
+    source TEXT NOT NULL,
+    at TEXT NOT NULL,
+    PRIMARY KEY (task_id, round)
+);
+CREATE TABLE IF NOT EXISTS limits (
+    account TEXT NOT NULL,
+    model TEXT NOT NULL DEFAULT '',
+    hard INTEGER NOT NULL,
+    no_credit INTEGER NOT NULL DEFAULT 0,
+    until TEXT,
+    retry_at TEXT NOT NULL,
+    line TEXT NOT NULL,
+    task_id INTEGER,
+    machine TEXT,
+    agent TEXT,
+    seen_at TEXT NOT NULL,
+    PRIMARY KEY (account, model)
+);
+CREATE TABLE IF NOT EXISTS task_usage (
+    task_id INTEGER PRIMARY KEY,
+    model TEXT,
+    api_calls INTEGER NOT NULL,
+    input INTEGER NOT NULL,
+    cache_write INTEGER NOT NULL,
+    cache_read INTEGER NOT NULL,
+    output INTEGER NOT NULL,
+    read_at TEXT NOT NULL
+);
+INSERT INTO meta (key, value) VALUES ('schema_version', '16');";
+
+const OLD: [&str; 16] = [
+    V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16,
 ];
 
 /// Everything about a database's shape and contents that a migration could
@@ -1002,7 +1106,7 @@ fn rows(path: &Path) -> BTreeMap<String, Vec<Vec<Value>>> {
 /// Each column a migration adds to `tasks`: the schema that added it, a
 /// value unlike its default for a database that already had it, and the
 /// raw value the migration should leave in the row of one that did not.
-const ADDED: [(usize, &str, &str, &str); 18] = [
+const ADDED: [(usize, &str, &str, &str); 19] = [
     (2, "prompt_pending", "1", "0"),
     (3, "retry_of", "5", "NULL"),
     (4, "flock", "'home'", "NULL"),
@@ -1022,6 +1126,7 @@ const ADDED: [(usize, &str, &str, &str); 18] = [
     (14, "aged_from", "'low'", "NULL"),
     (14, "aged_at", "'2026-09-01T10:30:00+00:00'", "NULL"),
     (15, "waiting_until", "\'2026-09-01T12:00:00+00:00\'", "NULL"),
+    (17, "trust_keys", "'[\"Enter\"]'", "NULL"),
 ];
 
 /// A database at schema `v`, as that pastor would have left it, holding
@@ -1063,7 +1168,7 @@ fn every_old_schema_migrates_to_the_fresh_one() {
     drop(Store::open(&fresh).unwrap());
     let want = shape(&fresh);
     assert_eq!(
-        want.schema_version, "16",
+        want.schema_version, "17",
         "update this test for the new schema"
     );
 

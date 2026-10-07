@@ -441,6 +441,12 @@ pub enum MachineCommand {
         task_id: i64,
         reply: oneshot::Sender<anyhow::Result<Task>>,
     },
+    /// Run the saved-trust check (`auto_trust`) now rather than at the next
+    /// reconcile: the trust a pull machine's serve keeps for it changed
+    /// while a task was already blocked on its prompt (`shepherd::Puller`).
+    AutoTrust {
+        reply: oneshot::Sender<anyhow::Result<()>>,
+    },
 }
 
 /// A `task run --now` dispatch, sent on the actor's urgent channel
@@ -732,6 +738,12 @@ impl MachineHandle {
         let (reply, rx) = oneshot::channel();
         self.request(MachineCommand::Resume { task_id, reply }, rx)
             .await
+    }
+
+    /// See `MachineCommand::AutoTrust`.
+    pub async fn auto_trust(&self) -> anyhow::Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.request(MachineCommand::AutoTrust { reply }, rx).await
     }
 
     /// Send `cmd` and wait for its reply, or fail with `ActorStopped` once
@@ -1553,6 +1565,7 @@ impl Actor {
                     Some(MachineCommand::End { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
                     Some(MachineCommand::Pause { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
                     Some(MachineCommand::Resume { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
+                    Some(MachineCommand::AutoTrust { reply }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
                 },
             }
         }
@@ -1935,6 +1948,16 @@ impl Actor {
                     (false, false) => CommandOutcome::Nothing,
                 }
             }
+            MachineCommand::AutoTrust { reply } => {
+                let result = self.auto_trust().await;
+                let dead = matches!(&result, Err(err) if is_outage(err));
+                let _ = reply.send(result);
+                if dead {
+                    CommandOutcome::Reconnect
+                } else {
+                    CommandOutcome::Nothing
+                }
+            }
             MachineCommand::Read {
                 task_id,
                 lines,
@@ -2082,7 +2105,7 @@ impl Actor {
         if input.trust {
             self.trust_answered.insert(task.id, Instant::now());
             // The prompt is answered: saved trust must not answer it again.
-            if let Err(err) = self.store.claim_trust_sent(task.id) {
+            if let Err(err) = self.store.claim_trust_sent(task.id, &keys) {
                 return (Err(err), false);
             }
             if let Some(repo) = &task.spec.repo
@@ -4660,7 +4683,7 @@ impl Actor {
                 .await
                 .map_err(|_| TimedOut("pane.send_keys", timeout))??;
             self.trust_answered.insert(task.id, Instant::now());
-            if !self.store.claim_trust_sent(task.id)? {
+            if !self.store.claim_trust_sent(task.id, &keys)? {
                 continue;
             }
             tracing::info!(machine = %self.name, task = %task.display_id(), repo, "answered the trust prompt of a trusted repo");
@@ -8346,7 +8369,7 @@ mod tests {
                 "{err:#}"
             );
             // Not claimed: the first claim still wins.
-            assert!(store.claim_trust_sent(t.id).unwrap());
+            assert!(store.claim_trust_sent(t.id, &["Enter".into()]).unwrap());
         }
         assert!(calls(&fake, "pane.send_keys").is_empty());
         assert!(store.trusted_repos().unwrap().is_empty());

@@ -39,8 +39,9 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 /// --now` (`Run::now`, `MachineStatus::now`). 29: keeping a task's pane
 /// (`DispatchSpec::keep_pane`, a job's `[dispatch] keep_pane`,
 /// `FlockEntry::keep_pane`). 30: usage limits (`LimitList`, `LimitClear`,
-/// `TaskReport::limit`).
-pub const IPC_PROTOCOL: u32 = 30;
+/// `TaskReport::limit`). 31: saved trust on pull machines (`PullTrust`,
+/// `TaskReport::trusted`).
+pub const IPC_PROTOCOL: u32 = 31;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -214,6 +215,11 @@ pub const FALLBACK_PROTOCOL: u32 = 27;
 /// one refuses the first two as unreadable and drops the third.
 pub const LIMIT_PROTOCOL: u32 = 30;
 
+/// The first protocol whose head hands a pull machine the folder trust
+/// saved for it (`PullTrust`) and records `TaskReport::trusted`. An older
+/// one refuses the first as unreadable and drops the second.
+pub const PULL_TRUST_PROTOCOL: u32 = 31;
+
 /// The first protocol whose head honours `Run::priority` and knows
 /// `TaskPriority`. An older one would queue the task at its own level
 /// without a word, or refuse the request as unreadable.
@@ -331,6 +337,9 @@ const ORCHESTRATOR: &str = "predates orchestrator files, and would refuse the re
 const SESSION: &str = "predates session orchestrators, and would refuse the request";
 const LIMITS: &str = "predates usage limits, and would refuse the request";
 const REPORT_LIMIT: &str = "predates usage limits, and would drop the limit the report carries";
+const PULL_TRUST: &str = "predates saved trust on pull machines, and would refuse the request";
+const REPORT_TRUSTED: &str =
+    "predates saved trust on pull machines, and would drop the trust answer the report carries";
 
 /// How long a head's `Pong` settles the protocol check before it is asked
 /// again: a long-lived sender (a headless serve) sees a restarted head
@@ -729,6 +738,20 @@ pub enum IpcRequest {
         /// names on that machine (`Fleet::report`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<crate::limit::Limit>,
+        /// The trust keys the pull machine pressed at the task's
+        /// folder-trust prompt, for a (machine, repo) the head saved
+        /// (`PullTrust`); the head emits `task.trusted` with them, once per
+        /// task.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trusted: Option<Vec<String>>,
+    },
+    /// A pull machine's serve asks for the folder trust saved for it: the
+    /// repos `trust add` saved on `machine`, and no other machine's, so its
+    /// actor answers their tasks' trust prompts as the head's would.
+    /// Refused as `TaskClaim` is for a machine that is not a pull machine.
+    /// Answers `Trusted`.
+    PullTrust {
+        machine: String,
     },
     /// Every usage limit the head keeps. Answers `Limits`.
     LimitList,
@@ -978,12 +1001,16 @@ impl IpcRequest {
             | R::FlockDescribe { .. }
             | R::MachineDescribe { .. } => need.at(HEAD_READS_PROTOCOL, HEAD_READS),
             R::TaskClaim { .. } => need.at(PULL_PROTOCOL, PULL),
-            R::TaskReport { limit, .. } => {
+            R::TaskReport { limit, trusted, .. } => {
                 need.at(PULL_PROTOCOL, PULL);
                 if limit.is_some() {
                     need.at(LIMIT_PROTOCOL, REPORT_LIMIT);
                 }
+                if trusted.is_some() {
+                    need.at(PULL_TRUST_PROTOCOL, REPORT_TRUSTED);
+                }
             }
+            R::PullTrust { .. } => need.at(PULL_TRUST_PROTOCOL, PULL_TRUST),
             R::LimitList | R::LimitClear { .. } => need.at(LIMIT_PROTOCOL, LIMITS),
             R::OrchestratorStart { .. } | R::OrchestratorStop { .. } => {
                 need.at(SESSION_PROTOCOL, SESSION);
@@ -1012,6 +1039,7 @@ impl IpcRequest {
             | IpcRequest::JobList
             | IpcRequest::EventsSince { .. }
             | IpcRequest::TrustList
+            | IpcRequest::PullTrust { .. }
             | IpcRequest::FlockDescribe { .. }
             | IpcRequest::MachineDescribe { .. }
             | IpcRequest::OrchestratorList
@@ -1746,6 +1774,19 @@ mod tests {
                 pane: Some("p1".into()),
                 detail: Some("agent asked: go on?".into()),
                 limit: None,
+                trusted: None,
+            },
+            IpcRequest::TaskReport {
+                machine: "laptop".into(),
+                id: 4,
+                state: crate::task::TaskState::Blocked,
+                pane: Some("p1".into()),
+                detail: None,
+                limit: None,
+                trusted: Some(vec!["Down".into(), "Enter".into()]),
+            },
+            IpcRequest::PullTrust {
+                machine: "laptop".into(),
             },
         ] {
             let json = serde_json::to_string(&req).unwrap();
@@ -1786,6 +1827,9 @@ mod tests {
             },
             IpcRequest::JobDescribe { name: "j".into() },
             IpcRequest::TrustList,
+            IpcRequest::PullTrust {
+                machine: "laptop".into(),
+            },
             IpcRequest::FlockDescribe { name: "f".into() },
             IpcRequest::MachineDescribe { name: "m".into() },
             IpcRequest::Queue {
@@ -2247,6 +2291,18 @@ mod tests {
                 "pull machines",
             ),
             (
+                req(serde_json::json!({"op": "pull_trust", "machine": "m"})),
+                PULL_TRUST_PROTOCOL,
+                "saved trust on pull machines",
+            ),
+            (
+                req(
+                    serde_json::json!({"op": "task_report", "machine": "m", "id": 1, "state": "running", "trusted": ["Enter"]}),
+                ),
+                PULL_TRUST_PROTOCOL,
+                "trust answer",
+            ),
+            (
                 req(serde_json::json!({"op": "flock_join", "flock": "f", "machine": "m"})),
                 JOIN_PROTOCOL,
                 "flock join",
@@ -2324,6 +2380,7 @@ mod tests {
             SESSION_PROTOCOL,
             FALLBACK_PROTOCOL,
             KEEP_PANE_PROTOCOL,
+            PULL_TRUST_PROTOCOL,
         ] {
             assert!(covered.contains(&p), "no request needs protocol {p}");
         }
