@@ -209,6 +209,7 @@ notification. Writing one takes a manifest and a script in any language. See
 
 | To... | Run |
 |---|---|
+| see the fleet at a glance | `pastor status` |
 | see your machines | `pastor machine list`, `pastor machine describe pi-1` |
 | start one task | `pastor task run "..." --repo DIR [--worktree] [--machine M]` |
 | follow tasks | `pastor task list`, `pastor task describe t-3`, `pastor events --follow` |

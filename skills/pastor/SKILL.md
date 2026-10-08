@@ -276,6 +276,8 @@ timeout 60 pastor events --follow   # --follow never returns on its own; always 
 
 On the head's machine it reads the log file, so it works with the head down; with a remote head set it asks the head.
 
+For where things stand in one screen, run `pastor status` (`--json` for an object; `--probe` when no head runs): the head, machines up and down, live tasks by state, failing jobs and exhausted accounts.
+
 To wait on the fleet rather than read its history, use `pastor watch`: one line per change to act on (`TASK t-12 failed ...`, `JOB nightly failing: ...`, `HEAD down: ...`, and the lines of connectors with a `[watch]` command).
 
 ```bash

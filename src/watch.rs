@@ -341,7 +341,7 @@ impl Cursor {
 }
 
 /// The reason a job counts as failing: its last run failed.
-fn failing(j: &JobStatus) -> Option<String> {
+pub(crate) fn failing(j: &JobStatus) -> Option<String> {
     j.last_result
         .as_deref()
         .filter(|r| r.starts_with("failed"))

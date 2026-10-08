@@ -19,5 +19,6 @@ mod remote_head;
 mod role_guards;
 mod setup;
 mod spec_skill;
+mod status;
 mod task;
 mod trust;
