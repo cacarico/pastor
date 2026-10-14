@@ -139,17 +139,18 @@ struct State {
     last_list: Option<Instant>,
     /// Everything typed into each pane, by pane id.
     pane_input: HashMap<String, Vec<PaneInput>>,
-    /// A started agent sits `blocked` on its folder-trust question until
-    /// `pane.send_keys` sends exactly these keys (see `set_trust_prompt`).
-    trust_prompt: Option<Vec<String>>,
+    /// Startup dialogs agents started from now on stop at, in order: the
+    /// screen `agent.read` shows and the keys `pane.send_keys` must send
+    /// exactly to answer it (see `set_startup_dialogs`, `set_trust_prompt`).
+    /// Empty: none.
+    dialogs: Vec<(String, Vec<String>)>,
+    /// pane id -> how many of `dialogs` it has answered.
+    dialogs_done: HashMap<String, usize>,
     /// How long after its trust question is answered an agent still redraws:
     /// `agent.prompt` is accepted in that window but the text is lost, as
     /// Claude loses input typed while it replaces the dialog with its prompt
     /// box. herdr already reports it idle and ready by then. Zero by default.
     trust_redraw: Duration,
-    /// What `agent.read` shows for an agent still at its trust question
-    /// (see `set_trust_screen`); Claude's folder-trust dialog by default.
-    trust_screen: String,
     /// pane id -> when its trust question was answered.
     trust_answered: HashMap<String, Instant>,
     /// The trust question reads idle and ready, not `blocked` (Codex's, to
@@ -159,6 +160,14 @@ struct State {
     /// (see `vanish_on_pane_list`), and whether it closes for real.
     pane_list_gone: u32,
     pane_list_closes: bool,
+}
+
+impl State {
+    /// The startup dialog `pane` is at, if it still has one.
+    fn dialog_at(&self, pane: &str) -> Option<&(String, Vec<String>)> {
+        let done = self.dialogs_done.get(pane).copied().unwrap_or(0);
+        self.dialogs.get(done)
+    }
 }
 
 /// herdr 0.9.1 derives `agent_status` from a detected state (idle, working,
@@ -479,18 +488,28 @@ impl FakeHerdr {
             .unwrap_or_default()
     }
 
-    /// Agents started from now on stop at a folder-trust question: `blocked`
-    /// until `pane.send_keys` sends exactly `keys` to their pane, then idle
-    /// and ready, as Claude is once its trust dialog is answered. `None`
-    /// turns it off.
-    pub fn set_trust_prompt(&self, keys: Option<Vec<String>>) {
-        self.state.lock().unwrap().trust_prompt = keys;
+    /// Agents started from now on stop at each of `dialogs` in turn,
+    /// `blocked`, with its screen on `agent.read`, until `pane.send_keys`
+    /// sends exactly its keys; after the last they are idle and ready, as
+    /// Claude is once its startup dialogs are answered. Empty turns it off.
+    pub fn set_startup_dialogs(&self, dialogs: Vec<(String, Vec<String>)>) {
+        self.state.lock().unwrap().dialogs = dialogs;
     }
 
-    /// What `agent.read` answers for an agent still at its trust question,
-    /// instead of Claude's folder-trust dialog.
+    /// One startup dialog, Claude's folder-trust question, answered by
+    /// `keys` (see `set_startup_dialogs`). `None` turns it off.
+    pub fn set_trust_prompt(&self, keys: Option<Vec<String>>) {
+        self.state.lock().unwrap().dialogs = keys
+            .map(|k| vec![(CLAUDE_TRUST_SCREEN.to_string(), k)])
+            .unwrap_or_default();
+    }
+
+    /// What `agent.read` answers for an agent still at its first startup
+    /// dialog, instead of Claude's folder-trust dialog.
     pub fn set_trust_screen(&self, text: &str) {
-        self.state.lock().unwrap().trust_screen = text.into();
+        if let Some(first) = self.state.lock().unwrap().dialogs.first_mut() {
+            first.0 = text.into();
+        }
     }
 
     /// Prompts sent within `d` of the trust answer are accepted and lost (see
@@ -505,6 +524,8 @@ impl FakeHerdr {
     pub fn answer_trust_by_hand(&self, pane_id: &str) {
         let idle = {
             let mut s = self.state.lock().unwrap();
+            let all = s.dialogs.len();
+            s.dialogs_done.insert(pane_id.into(), all);
             s.trust_answered.insert(pane_id.into(), Instant::now());
             s.trust_idle
         };
@@ -1070,7 +1091,7 @@ impl FakeHerdr {
                 }
                 s.started.insert(pane_id.clone(), Instant::now());
                 s.agents.insert(pane_id.clone(), info.clone());
-                if s.trust_prompt.is_some() && !s.trust_idle {
+                if !s.dialogs.is_empty() && !s.trust_idle {
                     // Its first screen is the trust question, which herdr
                     // reports as `blocked`.
                     change_status(&mut s, &pane_id, AgentStatus::Blocked);
@@ -1106,9 +1127,7 @@ impl FakeHerdr {
                     .trust_answered
                     .get(&found.pane_id)
                     .is_some_and(|at| at.elapsed() < s.trust_redraw);
-                let at_idle_trust = s.trust_idle
-                    && s.trust_prompt.is_some()
-                    && !s.trust_answered.contains_key(&found.pane_id);
+                let at_idle_trust = s.trust_idle && s.dialog_at(&found.pane_id).is_some();
                 if s.ignore_prompts || redrawing || at_idle_trust {
                     return Ok(json!({"type": "agent_prompted", "agent": found}));
                 }
@@ -1173,13 +1192,17 @@ impl FakeHerdr {
                     }
                     PaneInput::Keys(keys)
                 };
-                let answered = matches!(&input, PaneInput::Keys(k) if s.trust_prompt.as_ref() == Some(k))
-                    && s.agents.get(&pane_id).is_some_and(|a| {
-                        a.agent_status == AgentStatus::Blocked
-                            || (s.trust_idle && !s.trust_answered.contains_key(&pane_id))
-                    });
+                let answered = matches!(&input, PaneInput::Keys(k) if s.dialog_at(&pane_id).is_some_and(|(_, keys)| keys == k))
+                    && s.agents
+                        .get(&pane_id)
+                        .is_some_and(|a| a.agent_status == AgentStatus::Blocked || s.trust_idle);
                 s.pane_input.entry(pane_id.clone()).or_default().push(input);
                 if answered {
+                    *s.dialogs_done.entry(pane_id.clone()).or_default() += 1;
+                }
+                // The next dialog replaces this one with no change of state
+                // herdr would report; the last answer leaves the agent idle.
+                if answered && s.dialog_at(&pane_id).is_none() {
                     s.trust_answered.insert(pane_id.clone(), Instant::now());
                     change_status(&mut s, &pane_id, AgentStatus::Idle);
                     let ws = pane_id.split(':').next().unwrap_or("w1").to_string();
@@ -1198,18 +1221,17 @@ impl FakeHerdr {
                     .values()
                     .find(|a| a.name.as_deref() == Some(target) || a.pane_id == target);
                 // Still at its trust question: blocked, never answered.
-                let at_trust = found.is_some_and(|a| {
-                    s.trust_prompt.is_some()
-                        && (a.agent_status == AgentStatus::Blocked || s.trust_idle)
-                        && !s.trust_answered.contains_key(&a.pane_id)
+                let dialog = found.and_then(|a| {
+                    (a.agent_status == AgentStatus::Blocked || s.trust_idle)
+                        .then(|| s.dialog_at(&a.pane_id))
+                        .flatten()
                 });
                 // A pane whose agent is gone is read by its id.
                 let pane = found.map_or(target, |a| a.pane_id.as_str());
-                let text = match s.pane_text.get(pane) {
-                    Some(text) => text.as_str(),
-                    None if at_trust && s.trust_screen.is_empty() => CLAUDE_TRUST_SCREEN,
-                    None if at_trust => s.trust_screen.as_str(),
-                    None => "fake output\n",
+                let text = match (s.pane_text.get(pane), dialog) {
+                    (Some(text), _) => text.as_str(),
+                    (None, Some((screen, _))) => screen.as_str(),
+                    (None, None) => "fake output\n",
                 };
                 Ok(json!({"type": "pane_read", "read": {"text": text}}))
             }
@@ -1968,5 +1990,59 @@ mod tests {
             fake.agent_list().await.unwrap()[0].agent_status,
             AgentStatus::Working
         );
+    }
+
+    /// Two startup dialogs: the agent stays blocked through the first
+    /// answer, shows the second screen, and is idle after the second.
+    #[tokio::test]
+    async fn startup_dialogs_are_answered_in_turn() {
+        let fake = FakeHerdr::new();
+        fake.set_startup_dialogs(vec![
+            (
+                "first\n❯ 1. No\n  2. Yes\n".into(),
+                vec!["Down".into(), "Enter".into()],
+            ),
+            (
+                "second\n❯ 1. Go\n  2. Not now\n".into(),
+                vec!["Down".into(), "Enter".into()],
+            ),
+        ]);
+        let created = fake
+            .workspace_create(None, "x", &Default::default())
+            .await
+            .unwrap();
+        let pane = created.root_pane.pane_id;
+        fake.agent_start("t-1", "claude", &pane, &[]).await.unwrap();
+        assert_eq!(
+            fake.agent_list().await.unwrap()[0].agent_status,
+            AgentStatus::Blocked
+        );
+        assert!(
+            fake.agent_read("t-1", 100)
+                .await
+                .unwrap()
+                .starts_with("first")
+        );
+        fake.pane_send_keys(&pane, &["Down".into(), "Enter".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.agent_list().await.unwrap()[0].agent_status,
+            AgentStatus::Blocked
+        );
+        assert!(
+            fake.agent_read("t-1", 100)
+                .await
+                .unwrap()
+                .starts_with("second")
+        );
+        fake.pane_send_keys(&pane, &["Down".into(), "Enter".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.agent_list().await.unwrap()[0].agent_status,
+            AgentStatus::Idle
+        );
+        assert_eq!(fake.agent_read("t-1", 100).await.unwrap(), "fake output\n");
     }
 }
