@@ -142,15 +142,15 @@ smoke: ## opt-in test against a real herdr: make smoke SESSION=default
 
 # Needs a running head that runs this pastor, and the machines named in its
 # flock.toml; see scripts/smoke-profiles.sh. Starts real agents on them.
-smoke-profiles: ## live review task per agent: make smoke-profiles REPO='~/src/x' CLAUDE=m1 OPENCODE=m2
-	REPO="$(REPO)" CLAUDE="$(CLAUDE)" OPENCODE="$(OPENCODE)" scripts/smoke-profiles.sh
+smoke-profiles: ## live review task per agent: make smoke-profiles REPO='~/src/x' CLAUDE=m1 OPENCODE=m2 AGY=m3
+	REPO="$(REPO)" CLAUDE="$(CLAUDE)" OPENCODE="$(OPENCODE)" AGY="$(AGY)" scripts/smoke-profiles.sh
 
 # Checks the tag out in a scratch worktree under $TMPDIR, builds it there and
 # runs make smoke (and make smoke-profiles with PROFILES=1, which needs the
 # head on the tag); prints a Markdown block for the release card. LABEL names
 # the machine in it; see scripts/smoke-rc.sh.
 smoke-rc: ## smoke a release candidate: make smoke-rc TAG=v0.9.0-rc.1 SESSION=default LABEL=arm64
-	PROFILES="$(PROFILES)" REPO="$(REPO)" CLAUDE="$(CLAUDE)" OPENCODE="$(OPENCODE)" \
+	PROFILES="$(PROFILES)" REPO="$(REPO)" CLAUDE="$(CLAUDE)" OPENCODE="$(OPENCODE)" AGY="$(AGY)" \
 	  scripts/smoke-rc.sh "$(TAG)" "$(or $(SESSION),default)" "$(LABEL)"
 
 install: ## install pastor into ~/.cargo/bin, with bash and fish completions
