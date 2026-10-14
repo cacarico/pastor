@@ -16,7 +16,7 @@ use crate::task::{
     TaskSummary,
 };
 
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 
 /// The tables schema 2 added: created on a fresh database and by the v1
 /// migration.
@@ -46,6 +46,17 @@ const V5_TABLES: &str = "CREATE TABLE IF NOT EXISTS trusted_repos (
         repo TEXT NOT NULL,
         trusted_at TEXT NOT NULL,
         PRIMARY KEY (machine, repo)
+     );";
+
+/// Schema 18: the startup dialogs pastor answered for each task, so a
+/// dialog is pressed once per task across restarts. `trust` rows are
+/// kept here and in `tasks.trust_sent`, which pull machines report.
+const V18_TABLES: &str = "CREATE TABLE IF NOT EXISTS answered_dialogs (
+        task_id INTEGER NOT NULL,
+        dialog TEXT NOT NULL,
+        keys TEXT NOT NULL,
+        at TEXT NOT NULL,
+        PRIMARY KEY (task_id, dialog)
      );";
 
 /// Schema 8: the last sequence number given to an event record
@@ -448,6 +459,7 @@ impl Store {
                 tx.execute_batch(V13_TABLES)?;
                 tx.execute_batch(V15_TABLES)?;
                 tx.execute_batch(V16_TABLES)?;
+                tx.execute_batch(V18_TABLES)?;
                 tx.execute(
                     "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)",
                     params![SCHEMA_VERSION.to_string()],
@@ -462,6 +474,7 @@ impl Store {
                 tx.execute_batch(V13_TABLES)?;
                 tx.execute_batch(V15_TABLES)?;
                 tx.execute_batch(V16_TABLES)?;
+                tx.execute_batch(V18_TABLES)?;
             }
             Some(v) if v < SCHEMA_VERSION => {
                 // One `if v < N` block per migration. The job tables go in
@@ -575,6 +588,17 @@ impl Store {
                 if v < 17 {
                     add_column(&tx, "trust_keys", "trust_keys TEXT")?;
                 }
+                // The dialogs answered per task (`claim_answered`). A row
+                // already past its trust prompt is recorded as such, so
+                // the upgrade does not press it again.
+                if v < 18 {
+                    tx.execute_batch(V18_TABLES)?;
+                    tx.execute(
+                        "INSERT OR IGNORE INTO answered_dialogs (task_id, dialog, keys, at)
+                         SELECT id, 'trust', COALESCE(trust_keys, '[]'), ?1 FROM tasks WHERE trust_sent = 1",
+                        params![Utc::now().to_rfc3339()],
+                    )?;
+                }
                 tx.execute(
                     "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
                     params![SCHEMA_VERSION.to_string()],
@@ -671,6 +695,10 @@ impl Store {
             let tx = conn.transaction()?;
             tx.execute("DELETE FROM task_summaries WHERE task_id = ?1", params![id])?;
             tx.execute("DELETE FROM task_usage WHERE task_id = ?1", params![id])?;
+            tx.execute(
+                "DELETE FROM answered_dialogs WHERE task_id = ?1",
+                params![id],
+            )?;
             tx.execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
             tx.commit()?;
             Ok(())
@@ -1215,6 +1243,10 @@ impl Store {
             )?;
             tx.execute(
                 "DELETE FROM task_summaries WHERE task_id NOT IN (SELECT id FROM tasks)",
+                [],
+            )?;
+            tx.execute(
+                "DELETE FROM answered_dialogs WHERE task_id NOT IN (SELECT id FROM tasks)",
                 [],
             )?;
             tx.execute(
@@ -2021,6 +2053,34 @@ impl Store {
         })
     }
 
+    /// Record that `dialog` was answered for task `id` with `keys`. True
+    /// only for the first call per (task, dialog), so a dialog is pressed
+    /// once per task across restarts.
+    pub fn claim_answered(&self, id: i64, dialog: &str, keys: &[String]) -> anyhow::Result<bool> {
+        let keys = serde_json::to_string(keys)?;
+        let at = Utc::now().to_rfc3339();
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let n = conn.execute(
+                "INSERT OR IGNORE INTO answered_dialogs (task_id, dialog, keys, at) VALUES (?1, ?2, ?3, ?4)",
+                params![id, dialog, keys, at],
+            )?;
+            Ok(n == 1)
+        })
+    }
+
+    /// Whether `dialog` was answered for task `id`.
+    pub fn answered(&self, id: i64, dialog: &str) -> anyhow::Result<bool> {
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            Ok(conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM answered_dialogs WHERE task_id = ?1 AND dialog = ?2)",
+                params![id, dialog],
+                |r| r.get(0),
+            )?)
+        })
+    }
+
     /// The keys `claim_trust_sent` kept for task `id`; `None` for no such
     /// row, no keys sent, or a claim from before schema 17.
     pub fn trust_keys(&self, id: i64) -> anyhow::Result<Option<Vec<String>>> {
@@ -2636,6 +2696,52 @@ mod tests {
         assert_eq!(s.end_round(1, Some("done")).unwrap().round, 1);
     }
 
+    #[test]
+    fn a_dialog_is_claimed_once_per_task() {
+        let s = Store::open_in_memory().unwrap();
+        let t = s.insert_task(new_task("run")).unwrap();
+        assert!(!s.answered(t.id, "fullscreen").unwrap());
+        assert!(
+            s.claim_answered(t.id, "fullscreen", &["Down".into(), "Enter".into()])
+                .unwrap()
+        );
+        assert!(
+            !s.claim_answered(t.id, "fullscreen", &["Enter".into()])
+                .unwrap()
+        );
+        assert!(s.answered(t.id, "fullscreen").unwrap());
+        assert!(!s.answered(t.id, "trust").unwrap());
+        assert!(s.claim_answered(t.id, "trust", &["Enter".into()]).unwrap());
+        s.forget_task(t.id).unwrap();
+        assert!(!s.answered(t.id, "trust").unwrap(), "gone with the row");
+    }
+
+    /// A database from schema 17 with trust_sent set: the upgrade records
+    /// the trust dialog as answered, so it is not pressed again.
+    #[test]
+    fn a_v17_database_keeps_its_trust_answered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        {
+            let s = Store::open(&path).unwrap();
+            let t = s.insert_task(new_task("run")).unwrap();
+            s.claim_trust_sent(t.id, &["Down".into(), "Enter".into()])
+                .unwrap();
+            s.insert_task(new_task("run")).unwrap();
+            s.execute_raw(
+                "DROP TABLE answered_dialogs;
+                 UPDATE meta SET value = '17' WHERE key = 'schema_version'",
+            );
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.meta("schema_version").unwrap().unwrap(),
+            SCHEMA_VERSION.to_string()
+        );
+        assert!(s.answered(1, "trust").unwrap());
+        assert!(!s.answered(2, "trust").unwrap());
+    }
+
     /// Each round of a task gets its own row, numbered from 1; a done,
     /// failed or closed task is read with its last round's, a live one with
     /// none.
@@ -2743,7 +2849,10 @@ mod tests {
             );
         }
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.meta("schema_version").unwrap().unwrap(), "17");
+        assert_eq!(
+            s.meta("schema_version").unwrap().unwrap(),
+            SCHEMA_VERSION.to_string()
+        );
         assert!(s.trust_sent(1).unwrap());
         assert_eq!(s.trust_keys(1).unwrap(), None);
         assert!(s.claim_trust_sent(2, &["Enter".into()]).unwrap());
@@ -2881,6 +2990,7 @@ mod tests {
         assert_eq!(
             table_names(&path),
             vec![
+                "answered_dialogs",
                 "event_seq",
                 "limits",
                 "meta",
@@ -2894,6 +3004,7 @@ mod tests {
         assert_eq!(
             table_names(&path),
             vec![
+                "answered_dialogs",
                 "event_seq",
                 "job_state",
                 "limits",
@@ -2937,6 +3048,7 @@ mod tests {
         assert_eq!(
             table_names(&fresh),
             vec![
+                "answered_dialogs",
                 "event_seq",
                 "job_state",
                 "limits",
@@ -4481,9 +4593,10 @@ mod tests {
                  DROP TABLE task_summaries;
                  DROP TABLE limits;
                  DROP TABLE task_usage;
+                 DROP TABLE answered_dialogs;
                  UPDATE meta SET value = '1' WHERE key = 'schema_version';
                  CREATE TRIGGER no_bump BEFORE UPDATE ON meta
-                   WHEN NEW.value = '17' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+                   WHEN NEW.value = '18' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
             );
         }
         assert!(Store::open(&path).is_err());
