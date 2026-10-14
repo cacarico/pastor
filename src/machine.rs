@@ -482,6 +482,10 @@ pub struct SendInput {
     /// the task's (machine, repo) as trusted. Never with text or keys.
     #[serde(default)]
     pub trust: bool,
+    /// Answer the picker on screen by the text of one of its options:
+    /// arrows to it, then Enter. Never with text, keys or trust.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pick: Option<String>,
 }
 
 impl SendInput {
@@ -492,7 +496,7 @@ impl SendInput {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.text.is_none() && self.keys.is_empty() && !self.trust
+        self.text.is_none() && self.keys.is_empty() && !self.trust && self.pick.is_none()
     }
 
     /// What `task.input` records: the key names and the length of the text,
@@ -505,6 +509,9 @@ impl SendInput {
         let keys = self.key_sequence();
         if !keys.is_empty() {
             d.insert("keys".into(), keys.into());
+            if let Some(p) = &self.pick {
+                d.insert("pick".into(), p.clone().into());
+            }
         }
         d.into()
     }
@@ -2030,7 +2037,7 @@ impl Actor {
         if input.is_empty() {
             let err = SendRefused {
                 code: "nothing_to_send",
-                message: "give text, --key or --trust".into(),
+                message: "give text, --key, --trust or --pick".into(),
             };
             return (Err(err.into()), false);
         }
@@ -2060,6 +2067,44 @@ impl Actor {
                 return (Err(err.into()), false);
             };
             let detail = serde_json::json!({"keys": keys, "trust": true});
+            (None, keys, detail)
+        } else if let Some(want) = &input.pick {
+            let timeout = self.settings.request_timeout;
+            let target = task.agent_name.as_deref().unwrap_or(&pane);
+            let screen =
+                match tokio::time::timeout(timeout, self.connector.agent_read(target, 100)).await {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(err)) => {
+                        let dead = err.is_transport();
+                        return (Err(err.into()), dead);
+                    }
+                    Err(_) => return (Err(TimedOut("agent.read", timeout).into()), true),
+                };
+            let Some(found) = crate::picker::at_bottom(&screen) else {
+                let tail: Vec<&str> = screen.lines().rev().take(5).collect();
+                let tail: Vec<&str> = tail.into_iter().rev().collect();
+                let err = SendRefused {
+                    code: "no_picker",
+                    message: format!(
+                        "{} shows no picker at the bottom of its pane:\n{}",
+                        task.display_id(),
+                        tail.join("\n")
+                    ),
+                };
+                return (Err(err.into()), false);
+            };
+            let Some(keys) = found.picker.keys_to(want) else {
+                let err = SendRefused {
+                    code: "no_such_option",
+                    message: format!(
+                        "{} shows no option matching {want:?}; the picker has {}",
+                        task.display_id(),
+                        found.picker.listed()
+                    ),
+                };
+                return (Err(err.into()), false);
+            };
+            let detail = serde_json::json!({"keys": keys, "pick": want});
             (None, keys, detail)
         } else {
             // Text that reopens a done task is new work, a new round: it
@@ -8603,7 +8648,9 @@ mod tests {
         let t = h.dispatch(worktree_task(&store).id).await.unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(calls(&fake, "pane.send_keys").len(), 1);
-        h.shutdown().await;
+        // Its agent is still up, so the shutdown reports that; the actor is
+        // gone either way.
+        let _ = h.shutdown().await;
         let (_h2, _e2) = connected(&fake, &store).await;
         tokio::time::sleep(Duration::from_millis(800)).await;
         assert_eq!(
@@ -8612,6 +8659,70 @@ mod tests {
             "claimed in the store"
         );
         assert_eq!(state_of(&store, t.id), TaskState::Blocked);
+    }
+
+    fn pick(what: &str) -> SendInput {
+        SendInput {
+            pick: Some(what.into()),
+            ..Default::default()
+        }
+    }
+
+    /// `--pick` reads the picker and presses the arrows to the option, then
+    /// Enter; it saves no trust.
+    #[tokio::test(start_paused = true)]
+    async fn send_pick_arrows_to_the_option_and_confirms() {
+        let fake = FakeHerdr::new();
+        fake.set_startup_dialogs(vec![(BYPASS_SCREEN.into(), keys(&DOWN_ENTER))]);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = connected(&fake, &store).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        assert_eq!(t.state, TaskState::Blocked);
+        h.send(t.id, pick("yes, i accept")).await.unwrap();
+        assert_eq!(
+            fake.pane_input(t.pane_id.as_deref().unwrap()),
+            [PaneInput::Keys(keys(&DOWN_ENTER))]
+        );
+        let evs = input_events(&mut events);
+        assert_eq!(
+            evs[0].detail,
+            Some(serde_json::json!({"keys": ["Down", "Enter"], "pick": "yes, i accept"}))
+        );
+        assert!(
+            !store.is_trusted("m", "/r").unwrap(),
+            "--pick never saves trust"
+        );
+    }
+
+    const BYPASS_SCREEN: &str = "WARNING: Claude Code running in Bypass Permissions mode\n\n\u{276f} 1. No, exit\n  2. Yes, I accept\n\nEnter to confirm \u{b7} Esc to cancel\n";
+
+    /// On a dialog pastor does not answer itself (the bypass warning).
+    #[tokio::test(start_paused = true)]
+    async fn send_pick_refuses_without_a_picker_or_the_option() {
+        let fake = FakeHerdr::new();
+        fake.set_startup_dialogs(vec![(BYPASS_SCREEN.into(), keys(&["Enter"]))]);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _e) = connected(&fake, &store).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        let err = h.send(t.id, pick("upgrade")).await.unwrap_err();
+        let r = err.downcast_ref::<SendRefused>().unwrap();
+        assert_eq!(r.code, "no_such_option");
+        assert!(
+            r.message.contains("1. No, exit, 2. Yes, I accept"),
+            "{}",
+            r.message
+        );
+        // Answered by hand: the pane shows no picker now.
+        fake.pane_send_keys(t.pane_id.as_deref().unwrap(), &keys(&["Enter"]))
+            .await
+            .unwrap();
+        let err = h.send(t.id, pick("Not now")).await.unwrap_err();
+        assert_eq!(err.downcast_ref::<SendRefused>().unwrap().code, "no_picker");
+        assert_eq!(
+            calls(&fake, "pane.send_keys").len(),
+            1,
+            "only the hand answer"
+        );
     }
 
     fn trusted_events(events: &mut broadcast::Receiver<PastorEvent>) -> Vec<PastorEvent> {
