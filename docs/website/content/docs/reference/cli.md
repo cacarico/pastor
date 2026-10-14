@@ -195,6 +195,7 @@ Type text or press keys in a live task's agent, to answer what it is waiting on
 | `--key <KEY>` | A named key to press after the text (Enter, Down, esc, ctrl+c); repeat for more, in order |  |
 | `--no-enter` | Type the text without pressing Enter after it |  |
 | `--trust` | Accept the agent's folder-trust prompt with its trust keys, and trust the task's repo on its machine from now on |  |
+| `--pick <OPTION>` | Answer the picker on screen by the text of one of its options (case does not matter): the arrows to it, then Enter |  |
 | `--json` | Print as a JSON object |  |
 
 ### pastor task done
