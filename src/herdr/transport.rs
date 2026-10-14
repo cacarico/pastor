@@ -416,6 +416,12 @@ pub trait Connector: Send + Sync {
     fn opencode_permission_rules(&self) -> DirFuture<'_> {
         Box::pin(async { Ok(None) })
     }
+    /// What agy's settings on the machine say, as `config::agy::RULES_COMMAND`
+    /// prints it, for `config::agy::parse_denies`. `None` when the machine
+    /// takes no shell command.
+    fn agy_rules(&self) -> VersionFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
     /// The version of pastor installed on the machine, for `machine list`: a
     /// fleet runs whatever each machine last installed, and a skill or CLI
     /// that an agent there calls is that version's. `None` when there is no
@@ -467,6 +473,9 @@ impl Connector for Endpoint {
     }
     fn opencode_permission_rules(&self) -> DirFuture<'_> {
         Box::pin(opencode_permission_rules(self))
+    }
+    fn agy_rules(&self) -> VersionFuture<'_> {
+        Box::pin(agy_rules(self))
     }
     fn pastor_version(&self) -> VersionFuture<'_> {
         Box::pin(pastor_version(self))
@@ -614,6 +623,17 @@ async fn opencode_permission_rules(ep: &Endpoint) -> Result<Option<bool>, Connec
     match probe(ep, command).await? {
         // The same one-word answer as the repo check.
         Some(p) => remote_dir_answer(&p.target, &p.out),
+        None => Ok(None),
+    }
+}
+
+async fn agy_rules(ep: &Endpoint) -> Result<Option<String>, ConnectError> {
+    let command = crate::config::agy::RULES_COMMAND.to_string();
+    match probe(ep, command).await? {
+        Some(p) => {
+            reached(&p.target, &p.out)?;
+            Ok(Some(String::from_utf8_lossy(&p.out.stdout).into_owned()))
+        }
         None => Ok(None),
     }
 }
@@ -1369,6 +1389,54 @@ mod tests {
             argv: vec!["true".into()],
         };
         assert_eq!(command.opencode_permission_rules().await.unwrap(), None);
+    }
+
+    /// `agy_rules` prints agy's settings from the machine's `HOME`, and a
+    /// command machine answers nothing. The local half runs in a child with
+    /// its own `HOME`, as the opencode test does.
+    #[tokio::test]
+    async fn agy_rules_per_endpoint() {
+        const CHILD: &str = "PASTOR_TEST_AGY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let local = Endpoint::Local {
+                session: "s".into(),
+            };
+            let out = local.agy_rules().await.unwrap().unwrap();
+            assert_eq!(
+                crate::config::agy::parse_denies(&out).unwrap(),
+                vec!["command(sudo)"]
+            );
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let cli = home.path().join(".gemini/antigravity-cli");
+        std::fs::create_dir_all(&cli).unwrap();
+        std::fs::write(
+            cli.join("settings.json"),
+            r#"{"permissions":{"deny":["command(sudo)"]}}"#,
+        )
+        .unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "herdr::transport::tests::agy_rules_per_endpoint",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(stdout.contains("1 passed"), "{stdout}");
+        let command = Endpoint::Command {
+            argv: vec!["true".into()],
+        };
+        assert_eq!(command.agy_rules().await.unwrap(), None);
     }
 
     /// Only ssh failing to reach the machine is an error. rc-file noise comes

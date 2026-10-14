@@ -99,6 +99,8 @@ struct State {
     usage: HashMap<(Option<String>, String), crate::usage::TaskUsage>,
     /// What `Connector::opencode_permission_rules` reports.
     opencode_permissions: Option<bool>,
+    /// What `Connector::agy_rules` reports.
+    agy_rules: Option<String>,
     /// Branches `Connector::restore_worktree` finds gone.
     gone_branches: HashSet<String>,
     /// Every `Connector::restore_worktree` call, as (repo, path, branch).
@@ -236,6 +238,12 @@ impl FakeHerdr {
                 home: Some("/home/fake".into()),
                 pastor_version: Some("fake".into()),
                 opencode_permissions: Some(false),
+                agy_rules: Some(crate::config::agy::fake_output(&[
+                    "write_file(*)",
+                    "command(git push)",
+                    "command(rm -rf)",
+                    "command(sudo)",
+                ])),
                 ..Default::default()
             })),
             events,
@@ -253,6 +261,11 @@ impl FakeHerdr {
     /// What the machine's own opencode config says about permission rules.
     pub fn set_opencode_permissions(&self, rules: Option<bool>) {
         self.state.lock().unwrap().opencode_permissions = rules;
+    }
+    /// What agy's settings on the machine say (`config::agy::fake_output`);
+    /// `None` for a machine that takes no shell command.
+    pub fn set_agy_rules(&self, output: Option<String>) {
+        self.state.lock().unwrap().agy_rules = output;
     }
     /// Claude session `session` under `config_dir` (`None` for `~/.claude`)
     /// used `usage`.
@@ -1381,6 +1394,10 @@ impl super::transport::Connector for FakeHerdr {
     fn opencode_permission_rules(&self) -> super::transport::DirFuture<'_> {
         let rules = self.state.lock().unwrap().opencode_permissions;
         Box::pin(async move { Ok(rules) })
+    }
+    fn agy_rules(&self) -> super::transport::VersionFuture<'_> {
+        let out = self.state.lock().unwrap().agy_rules.clone();
+        Box::pin(async move { Ok(out) })
     }
     fn pastor_version(&self) -> super::transport::VersionFuture<'_> {
         let version = self.state.lock().unwrap().pastor_version.clone();

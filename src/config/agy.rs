@@ -178,6 +178,69 @@ pub fn not_denied_by(task_deny: &[String], own_deny: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// The marker line before each file the probe prints, and the last line.
+const MARKER: &str = "==== ";
+const END: &str = "end";
+
+/// The shell command that prints agy's global settings and shared config
+/// when they exist, each after a `==== <path>` line, then `==== end` so a
+/// cut-off answer can be told from one with no files. Project files under
+/// `~/.gemini/config/projects/` are left out: agy applies only the one
+/// matching its active workspace, which pastor cannot tell. Each file is
+/// cut at 30000 bytes, so two stay under the probe's 64 KiB limit and the
+/// probe never fails as a transport error over a fat file: a cut file is
+/// not JSON, and fails the task on the safe side.
+pub const RULES_COMMAND: &str = r#"for f in "$HOME/.gemini/antigravity-cli/settings.json" "$HOME/.gemini/config/config.json"; do if [ -f "$f" ]; then printf '==== %s\n' "$f"; head -c 30000 "$f"; printf '\n'; fi; done; printf '==== end\n'"#;
+
+/// The `permissions.deny` strings of every file in the probe's `output`,
+/// in file order, or the path of the first file that is not JSON. Lines
+/// before the first marker are rc-file noise and skipped; an output not
+/// ending in `==== end` was cut off and is an error. A `permissions` that
+/// is not an object, a `deny` that is not an array, and an entry that is
+/// not a string add nothing.
+pub fn parse_denies(output: &str) -> Result<Vec<String>, String> {
+    let mut sections: Vec<(&str, String)> = Vec::new();
+    let mut ended = false;
+    for line in output.lines() {
+        if let Some(path) = line.strip_prefix(MARKER) {
+            if path == END {
+                ended = true;
+                break;
+            }
+            sections.push((path, String::new()));
+        } else if let Some((_, body)) = sections.last_mut() {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    if !ended {
+        return Err("the answer is incomplete: it does not end with `==== end`".into());
+    }
+    let mut denies = Vec::new();
+    for (path, body) in sections {
+        let json: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| format!("{path} is not JSON ({e})"))?;
+        if let Some(list) = json
+            .get("permissions")
+            .and_then(|p| p.get("deny"))
+            .and_then(|d| d.as_array())
+        {
+            denies.extend(list.iter().filter_map(|v| v.as_str()).map(str::to_string));
+        }
+    }
+    Ok(denies)
+}
+
+/// What the probe prints on a machine whose global settings deny `denies`,
+/// for the fake herdr and tests.
+#[cfg(any(test, feature = "fake-herdr"))]
+pub fn fake_output(denies: &[&str]) -> String {
+    format!(
+        "{MARKER}/home/fake/.gemini/antigravity-cli/settings.json\n{}\n{MARKER}{END}\n",
+        serde_json::json!({ "permissions": { "deny": denies } })
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,6 +422,96 @@ mod tests {
         fn prop_covers_never_panics(a in ".*", b in ".*") {
             covers(&a, &b);
         }
+    }
+
+    /// The probe's output: the files that exist, each after a `==== <path>`
+    /// line, then `==== end`. Only `permissions.deny` strings at the top
+    /// level count; noise before the first marker is ssh rc-file output.
+    #[test]
+    fn parse_denies_reads_the_deny_lists_of_the_files_printed() {
+        let out = "welcome to pi\n\
+==== /home/user/.gemini/antigravity-cli/settings.json\n\
+{\"agentMode\": \"accept-edits\", \"permissions\": {\"allow\": [\"command(git)\"], \"deny\": [\"command(sudo)\", 7, \"write_file(*)\"], \"ask\": [\"command(git push)\"]}}\n\
+==== /home/user/.gemini/config/config.json\n\
+{\"plugins\": {}}\n\
+==== end\n";
+        assert_eq!(
+            parse_denies(out).unwrap(),
+            vec!["command(sudo)", "write_file(*)"]
+        );
+        assert_eq!(parse_denies("==== end\n").unwrap(), Vec::<String>::new());
+        assert_eq!(
+            parse_denies(
+                "==== /home/user/.gemini/config/config.json\n{\"permissions\": {\"deny\": \"command(sudo)\"}}\n==== end\n"
+            )
+            .unwrap(),
+            Vec::<String>::new()
+        );
+        let broken = parse_denies(
+            "==== /home/user/.gemini/config/config.json\n{\"permissions\": \n==== end\n",
+        )
+        .unwrap_err();
+        assert!(broken.contains("config.json"), "{broken}");
+        let cut = parse_denies("==== /home/user/.gemini/config/config.json\n{}\n").unwrap_err();
+        assert!(cut.contains("incomplete"), "{cut}");
+        assert!(parse_denies("").unwrap_err().contains("incomplete"));
+    }
+
+    /// The command prints exactly that, from a `HOME` with one, both or no
+    /// files, and cuts a fat file, which then is not JSON: refused, never
+    /// a transport error.
+    #[test]
+    fn the_rules_command_prints_the_files_that_exist() {
+        let home = tempfile::tempdir().unwrap();
+        let run = || {
+            let out = std::process::Command::new("sh")
+                .args(["-c", RULES_COMMAND])
+                .env("HOME", home.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            String::from_utf8(out.stdout).unwrap()
+        };
+        assert_eq!(run(), "==== end\n");
+        let cli = home.path().join(".gemini/antigravity-cli");
+        std::fs::create_dir_all(&cli).unwrap();
+        std::fs::write(
+            cli.join("settings.json"),
+            r#"{"permissions":{"deny":["command(sudo)"]}}"#,
+        )
+        .unwrap();
+        let out = run();
+        assert_eq!(parse_denies(&out).unwrap(), vec!["command(sudo)"]);
+        assert!(
+            out.starts_with(&format!(
+                "==== {}/.gemini/antigravity-cli/settings.json\n",
+                home.path().display()
+            )),
+            "{out}"
+        );
+        let shared = home.path().join(".gemini/config");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(
+            shared.join("config.json"),
+            "{\"permissions\":{\"deny\":[\"write_file(*)\"]}}",
+        )
+        .unwrap();
+        assert_eq!(
+            parse_denies(&run()).unwrap(),
+            vec!["command(sudo)", "write_file(*)"]
+        );
+        assert_eq!(
+            parse_denies(&fake_output(&["command(sudo)"])).unwrap(),
+            vec!["command(sudo)"]
+        );
+        let fat = format!(
+            "{{\"pad\": \"{}\", \"permissions\": {{\"deny\": [\"command(sudo)\"]}}}}",
+            "x".repeat(40_000)
+        );
+        std::fs::write(cli.join("settings.json"), fat).unwrap();
+        let out = run();
+        assert!(out.len() < 64 * 1024, "{}", out.len());
+        assert!(parse_denies(&out).unwrap_err().contains("settings.json"));
     }
 
     proptest::proptest! {
