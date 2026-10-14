@@ -31,11 +31,18 @@ pub struct Found {
 /// message has no cursor, so it is not one.
 pub fn at_bottom(text: &str) -> Option<Found> {
     let text = text.replace('\u{a0}', " ");
-    // Empty lines stay, as "", so a plain-option block has its bounds.
+    // Empty lines stay, as "", so a plain-option block has its bounds; a
+    // rule or the edge of a box bounds it the same way.
     let lines: Vec<&str> = text
         .lines()
         .map(unboxed)
-        .filter(|l| !crate::limit::is_rule(l) && !is_box_edge(l))
+        .map(|l| {
+            if crate::limit::is_rule(l) || is_box_edge(l) {
+                ""
+            } else {
+                l
+            }
+        })
         .collect();
     let full: Vec<&str> = lines.iter().copied().filter(|l| !l.is_empty()).collect();
     let mut end = full.len();
@@ -130,10 +137,14 @@ fn numbered(lines: &[&str], end: usize) -> Option<Found> {
 
 impl Picker {
     /// Arrows from the cursor to the first option containing `want` (case
-    /// ignored), then Enter. `None` when no option does; then nothing
-    /// should be pressed.
+    /// ignored), then Enter. `None` when no option does, or `want` is
+    /// blank (every option contains nothing); then nothing should be
+    /// pressed.
     pub fn keys_to(&self, want: &str) -> Option<Vec<String>> {
-        let want = want.to_ascii_lowercase();
+        let want = want.trim().to_ascii_lowercase();
+        if want.is_empty() {
+            return None;
+        }
         let at = self
             .options
             .iter()
@@ -170,7 +181,7 @@ fn unboxed(line: &str) -> &str {
 }
 
 /// The top or bottom of a box: `╭────╮`.
-fn is_box_edge(line: &str) -> bool {
+pub fn is_box_edge(line: &str) -> bool {
     line.chars().count() >= 3
         && line
             .chars()
@@ -233,6 +244,23 @@ mod tests {
         // box, not a picker.
         let no_hints = "\u{276f} Explain this codebase\n  and stop\n";
         assert!(at_bottom(no_hints).is_none());
+    }
+
+    /// A rule or box edge right above the options bounds the block as a
+    /// blank line does: the prose over it is not an option.
+    #[test]
+    fn a_rule_above_plain_options_bounds_them() {
+        let screen = "Make auto mode your default?\n\u{2500}\u{2500}\u{2500}\u{2500}\n\u{276f} Yes\n  No, keep default\n\nEnter to confirm \u{b7} Esc to cancel\n";
+        let f = at_bottom(screen).unwrap();
+        assert_eq!(f.picker.options, ["Yes", "No, keep default"]);
+        assert_eq!(f.above, ["Make auto mode your default?"]);
+    }
+
+    #[test]
+    fn a_blank_pick_matches_nothing() {
+        let p = at_bottom(RENDERER).unwrap().picker;
+        assert_eq!(p.keys_to(""), None);
+        assert_eq!(p.keys_to("  "), None);
     }
 
     #[test]

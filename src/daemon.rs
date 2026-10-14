@@ -2445,6 +2445,9 @@ impl Fleet {
             if let Some(keys) = &trusted
                 && self.store.claim_trust_sent(task.id, keys)?
             {
+                // The actor claims both for its own tasks: the two tables
+                // agree on a pull machine's task too.
+                self.store.claim_answered(task.id, "trust", keys)?;
                 self.emit(
                     "task.trusted",
                     machine,
@@ -5781,6 +5784,10 @@ mod tests {
             ]
         );
         assert!(d.store().trust_sent(t1.id).unwrap());
+        assert!(
+            d.store().answered(t1.id, "trust").unwrap(),
+            "claimed as the actor claims it, so the two tables agree"
+        );
         // A report without keys says nothing of trust.
         let t3 = queued(&d, "p3", Some("laptop")).await;
         claim(&d, 1, false).await;

@@ -4641,7 +4641,8 @@ mod tests {
                 && !tables.contains(&"event_seq".to_string())
                 && !tables.contains(&"task_summaries".to_string())
                 && !tables.contains(&"limits".to_string())
-                && !tables.contains(&"task_usage".to_string()),
+                && !tables.contains(&"task_usage".to_string())
+                && !tables.contains(&"answered_dialogs".to_string()),
             "rolled back: {tables:?}"
         );
     }

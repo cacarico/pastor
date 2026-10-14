@@ -1203,6 +1203,15 @@ const CLAUDE_DIALOGS: [(&str, &str, &str); 4] = [
     ),
 ];
 
+/// The names of the dialogs built in for agents of `kind`.
+fn builtin_dialog_names(kind: &str) -> Vec<&'static str> {
+    if kind == "claude" {
+        CLAUDE_DIALOGS.iter().map(|(n, _, _)| *n).collect()
+    } else {
+        Vec::new()
+    }
+}
+
 /// How a dialog is answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Answer {
@@ -1314,12 +1323,24 @@ fn bottom_prompt(screen: &str) -> String {
     {
         start = start.max(prev + 1);
     }
-    // The hints of an earlier dialog: a hint line with something below it.
-    let last_text = lines.iter().rposition(|l| !l.trim().is_empty());
-    if let Some(end) = last_text
-        && let Some(hint) = lines[..end]
-            .iter()
-            .rposition(|l| crate::picker::is_key_hint(l))
+    // The hints of an earlier dialog: a hint line above the last dialog's
+    // own footer, which is up to two hint lines (one may wrap in a narrow
+    // pane) and whatever Claude draws under them: blank lines, a rule, the
+    // bottom of a box.
+    let trailing = |line: &str| {
+        line.trim().is_empty() || crate::limit::is_rule(line) || crate::picker::is_box_edge(line)
+    };
+    let mut end = lines.len();
+    while end > 0 && trailing(lines[end - 1]) {
+        end -= 1;
+    }
+    let footer = end;
+    while end > 0 && crate::picker::is_key_hint(lines[end - 1]) && footer - end < 2 {
+        end -= 1;
+    }
+    if let Some(hint) = lines[..end]
+        .iter()
+        .rposition(|l| crate::picker::is_key_hint(l))
     {
         start = start.max(hint + 1);
     }
@@ -2238,12 +2259,20 @@ impl PastorConfig {
                 if !seen.insert(d.name.as_str()) {
                     anyhow::bail!("{at}: {} is named twice", d.name);
                 }
-                if d.marker.trim().is_empty() {
-                    anyhow::bail!("{at}.{}: marker must not be empty", d.name);
-                }
                 let picks = d.pick.as_deref().is_some_and(|p| !p.trim().is_empty());
                 if picks && d.keys.as_ref().is_some_and(|k| !k.is_empty()) {
                     anyhow::bail!("{at}.{}: pick or keys, not both", d.name);
+                }
+                // A row with no answer removes a built-in, and needs no
+                // marker for that; it has nothing to do with any other name.
+                let removes = d.answer().is_none();
+                if removes
+                    && !builtin_dialog_names(cfg.agents.kind(name)).contains(&d.name.as_str())
+                {
+                    anyhow::bail!("{at}.{}: needs pick or keys", d.name);
+                }
+                if !removes && d.marker.trim().is_empty() {
+                    anyhow::bail!("{at}.{}: marker must not be empty", d.name);
                 }
                 if d.keys.iter().flatten().any(|k| k.trim().is_empty()) {
                     anyhow::bail!("{at}.{}: a key name must not be empty", d.name);
@@ -4287,7 +4316,7 @@ mod tests {
         std::fs::write(
             &path,
             "[[agents.claude.dialogs]]\nname = \"fullscreen\"\nmarker = \"fullscreen renderer\"\npick = \"Yes, try it\"\n\
-             [[agents.claude.dialogs]]\nname = \"auto-mode-setup\"\nmarker = \"x\"\npick = \"\"\n\
+             [[agents.claude.dialogs]]\nname = \"auto-mode-setup\"\npick = \"\"\n\
              [[agents.claude.dialogs]]\nname = \"bypass\"\nmarker = \"Bypass Permissions mode\"\nkeys = [\"Down\", \"Enter\"]\n\
              [[agents.agy.dialogs]]\nname = \"welcome\"\nmarker = \"Welcome\"\nkeys = [\"Enter\"]\n",
         )
@@ -4338,6 +4367,14 @@ mod tests {
             (
                 "[[agents.claude.dialogs]]\nname = \"\"\nmarker = \"m\"\npick = \"p\"\n",
                 "name must not be empty",
+            ),
+            (
+                "[[agents.claude.dialogs]]\nname = \"x\"\nmarker = \"m\"\n",
+                "needs pick or keys",
+            ),
+            (
+                "[[agents.agy.dialogs]]\nname = \"fullscreen\"\npick = \"\"\n",
+                "needs pick or keys",
             ),
             (
                 "[[agents.claude.dialogs]]\nname = \"x\"\nmarker = \"m\"\npick = \"p\"\n[[agents.claude.dialogs]]\nname = \"x\"\nmarker = \"m\"\npick = \"p\"\n",
@@ -4401,6 +4438,29 @@ mod tests {
         assert!(shows_trust_marker(trust, marker));
         assert!(!shows_trust_marker(&format!("{trust}\n{offer}"), marker));
         assert!(shows_trust_marker(&format!("{offer}\n{trust}"), marker));
+    }
+
+    /// The current dialog's own footer: two hint lines, one wrapped by a
+    /// narrow pane, or a box edge or rule under it. None of these is the
+    /// footer of an earlier dialog, so nothing above them is cut.
+    #[test]
+    fn the_current_dialog_s_own_hints_do_not_cut_it() {
+        let marker = "Yes, I trust this folder";
+        let body = "Quick safety check: Is this a project you trust?\n\n \u{276f} No, exit\n   Yes, I trust this folder\n\n";
+        for footer in [
+            " \u{2191}/\u{2193} to navigate\n Enter to confirm \u{b7} Esc to cancel\n",
+            " Enter to confirm \u{b7}\n Esc to cancel\n",
+            " Enter to confirm \u{b7} Esc to cancel\n\u{2570}\u{2500}\u{2500}\u{2500}\u{256f}\n",
+            " Enter to confirm \u{b7} Esc to cancel\n\u{2500}\u{2500}\u{2500}\u{2500}\n\n",
+        ] {
+            let screen = format!("{body}{footer}");
+            assert!(shows_trust_marker(&screen, marker), "{footer:?}");
+            let offer = "  Try the new fullscreen renderer?\n\n  \u{276f} 1. Yes, try it\n    2. Not now\n\n  Enter to confirm \u{b7} Esc to cancel\n";
+            assert!(
+                !shows_trust_marker(&format!("{screen}\n{offer}"), marker),
+                "{footer:?}: an earlier dialog's footer still cuts"
+            );
+        }
     }
 
     #[test]

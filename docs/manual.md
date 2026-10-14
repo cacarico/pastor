@@ -606,7 +606,9 @@ blocks, after each answer's settle window, and at each reconcile, and the
 first of its agent's startup dialogs that shows in the prompt at the bottom
 of the pane, and was not answered for that task, is answered: the head presses the
 dialog's keys, once per task and dialog, and emits `task.answered` with the
-dialog's name and the keys. The trust dialog is the first row, known by its
+dialog's name and the keys. Inside an answer's settle window the pane is
+not read again, whoever answered: pastor, or a person with `pastor task
+send` (`--pick`, `--key`, `--trust` or text) or at the pane itself. The trust dialog is the first row, known by its
 `trust_marker` (Claude's is built in as its "Yes, I trust this folder"
 option); it is pressed only for a saved repo, and emits `task.trusted` as
 before. Claude's other dialogs are built in, in its 2.1 wording, each
@@ -1324,8 +1326,9 @@ works](#how-it-works)).
 table per dialog: `name`, `marker` (text only that dialog shows) and `pick`
 (the text of the option to choose) or `keys` (named keys, pressed as they
 are). A row named as one of the kind's built-ins replaces it; a row with
-`pick = ""` and no `keys` removes it. The trust dialog is set with
-`trust_keys` and `trust_marker`, never here. Claude's built-ins are
+`pick = ""` and no `keys` removes it, and needs no `marker`. Any other row
+needs its `marker` and one of `pick` and `keys` (`needs pick or keys`). The
+trust dialog is set with `trust_keys` and `trust_marker`, never here. Claude's built-ins are
 `fullscreen`, `auto-mode-default`, `auto-mode-setup` and `effort-default`
 (see [How it works](#how-it-works)).
 
