@@ -4499,12 +4499,18 @@ impl Daemon {
     /// machine has left the flock, has no agent to type into.
     async fn send(&self, id: i64, input: SendInput) -> IpcResponse {
         if input.is_empty() {
-            return IpcResponse::error("nothing_to_send", "give text, --key or --trust");
+            return IpcResponse::error("nothing_to_send", "give text, --key, --trust or --pick");
         }
         if input.trust && (input.text.is_some() || !input.keys.is_empty()) {
             return IpcResponse::error(
                 "usage_error",
                 "--trust sends the agent's own keys; give no text or --key with it",
+            );
+        }
+        if input.pick.is_some() && (input.text.is_some() || !input.keys.is_empty() || input.trust) {
+            return IpcResponse::error(
+                "usage_error",
+                "--pick answers the picker on screen; give no text, --key or --trust with it",
             );
         }
         let task = match self.store.get_task(id) {
@@ -11667,6 +11673,18 @@ mod tests {
             })
             .await;
         assert_eq!(error_code(resp), "nothing_to_send");
+        // --pick with text or --key is a usage error, like --trust.
+        let resp = d
+            .handle(IpcRequest::TaskSend {
+                id: t.id,
+                input: crate::machine::SendInput {
+                    pick: Some("No".into()),
+                    keys: vec!["esc".into()],
+                    ..Default::default()
+                },
+            })
+            .await;
+        assert_eq!(error_code(resp), "usage_error");
         let resp = d
             .handle(IpcRequest::TaskSend {
                 id: t.id,
