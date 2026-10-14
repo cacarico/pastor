@@ -340,6 +340,9 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `agent_pane_busy` | herdr kept saying the agent's pane was busy after pastor's retries |
 | `agent_refused` | a task or an orchestrator's script asks for a fleet change agents may not make |
 | `agent_tools_unsupported` | the task has tool lists and its agent has no setting to pass them |
+| `agy_deny_unsupported` | a profiled agy task denies a pattern agy has no rule for |
+| `agy_permissions_missing` | a profiled agy task on a machine whose agy settings do not deny what the profile denies, or cannot be read |
+| `agy_profile_mismatch` | a profiled agy task on a machine whose own profile does not deny everything the task's does |
 | `already_seen` | a job's key was queued before and its task row is gone |
 | `branch_gone` | reopening a closed task: its worktree and its branch are both gone |
 | `close_failed` | `task close` could not close one or more of the tasks |
