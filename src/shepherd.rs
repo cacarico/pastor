@@ -335,12 +335,12 @@ impl Puller {
     }
 
     /// Copy the folder trust the head saved for this machine into this
-    /// store, where the actor's `auto_trust` reads it, while a task here may
+    /// store, where the actor's `auto_answer` reads it, while a task here may
     /// need it: one with a repo that is queued (before its dispatch, so the
     /// answer after it is immediate, as on the head) or blocked during its
     /// startup with no trust keys sent yet (a `trust add` on the head after
     /// the block; the actor looked at that task when it blocked, so a copy
-    /// that changed sends it `auto_trust` now rather than leaving it to its
+    /// that changed sends it `auto_answer` now rather than leaving it to its
     /// next reconcile). A head that refuses (one too old for `PullTrust`,
     /// say) leaves nothing here to answer with; one that cannot be reached
     /// or does not answer leaves the last copy.

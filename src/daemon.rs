@@ -2410,7 +2410,7 @@ impl Fleet {
 
     /// `PullTrust`: the folder trust saved for pull machine `machine`, and
     /// only its own, so its actor answers its tasks' trust prompts as the
-    /// head's actor answers another machine's (`Actor::auto_trust`).
+    /// head's actor answers another machine's (`Actor::auto_answer`).
     pub fn pull_trust(&self, machine: &str) -> anyhow::Result<Vec<crate::store::TrustedRepo>> {
         self.pull_handle(machine)?;
         Ok(self
@@ -2439,7 +2439,7 @@ impl Fleet {
         } = report;
         let handle = self.pull_handle(machine)?;
         self.heard(&handle);
-        // Once per task, as `Actor::auto_trust` claims it, so a report sent
+        // Once per task, as `Actor::auto_answer` claims it, so a report sent
         // again (after a restart of the serve, say) is not a second event.
         let trust = |task: &Task| -> anyhow::Result<()> {
             if let Some(keys) = &trusted

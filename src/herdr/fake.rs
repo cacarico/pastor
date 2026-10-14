@@ -220,7 +220,7 @@ pub struct FakeHerdr {
 }
 
 /// Claude Code's folder-trust dialog as a pane shows it (2.1).
-const CLAUDE_TRUST_SCREEN: &str = "Accessing workspace:\n\n/r\n\nQuick safety check: Is this a project you created or one you trust?\n\n\u{276f} 1. No, exit\n  2. Yes, I trust this folder\n\nEnter to confirm \u{b7} Esc to cancel\n";
+pub const CLAUDE_TRUST_SCREEN: &str = "Accessing workspace:\n\n/r\n\nQuick safety check: Is this a project you created or one you trust?\n\n\u{276f} 1. No, exit\n  2. Yes, I trust this folder\n\nEnter to confirm \u{b7} Esc to cancel\n";
 
 #[derive(Default)]
 struct Wedge {
