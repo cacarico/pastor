@@ -1,3 +1,4 @@
+pub mod agy;
 pub mod flock;
 pub mod job;
 pub mod opencode;
@@ -1420,6 +1421,15 @@ impl Agents {
     pub fn opencode_profile(&self, spec: &crate::task::DispatchSpec) -> bool {
         spec.profile().is_some()
             && self.kind(&spec.agent) == opencode::KIND
+            && !self.own_permissions(&spec.agent)
+    }
+
+    /// Does `spec` run an agy agent under a permission profile, with no
+    /// `own_permissions`? Its rules are then agy's settings on the machine,
+    /// which the agy provisioner (`provision::agy`) keeps up.
+    pub fn agy_profile(&self, spec: &crate::task::DispatchSpec) -> bool {
+        spec.profile().is_some()
+            && self.kind(&spec.agent) == agy::KIND
             && !self.own_permissions(&spec.agent)
     }
 

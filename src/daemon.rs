@@ -1089,7 +1089,7 @@ impl Fleet {
         }
         let mut plan: Vec<Step> = Vec::new();
         for m in &flock.machines {
-            let want = (actor_config(m), actor_settings(m, settings));
+            let want = (actor_config(m), self.settings_of(m, settings));
             plan.push(match old.iter().position(|o| o.handle.name == m.name) {
                 Some(i) if !old[i].shutting_down && old[i].spawned_from.as_ref() == Some(&want) => {
                     Step::Keep(old.remove(i))
@@ -1200,8 +1200,34 @@ impl Fleet {
         m
     }
 
+    /// The settings `m`'s actor runs with: `actor_settings`, and the deny
+    /// list of its own profile (`own_deny`).
+    fn settings_of(&self, m: &MachineConfig, settings: &MachineSettings) -> MachineSettings {
+        MachineSettings {
+            own_deny: self.own_deny(m),
+            ..actor_settings(m, settings)
+        }
+    }
+
+    /// The deny list of `m`'s own profile, from the flock and `pastor.toml`
+    /// as last applied: its `[[machine]]` profile, else its primary flock's,
+    /// else `[defaults]` (`own_profile`). Empty with no profile, or one
+    /// that no longer resolves (`check_config` refuses that file anyway).
+    pub fn own_deny(&self, m: &MachineConfig) -> Vec<String> {
+        let flock = self.flock().primary_flock(m).to_string();
+        let Some(name) = self.own_profile(&flock, Some(&m.name)) else {
+            return vec![];
+        };
+        self.profiles
+            .read()
+            .recover()
+            .resolve(&name)
+            .map(|p| p.deny)
+            .unwrap_or_default()
+    }
+
     fn spawn(&self, spawner: &Spawner, m: &MachineConfig, settings: &MachineSettings) -> Member {
-        let settings = &actor_settings(m, settings);
+        let settings = &self.settings_of(m, settings);
         if m.pull {
             // Heard from as of now: a head that starts gives the machine
             // `pull_lost_after` to claim before its tasks go stale.
@@ -5142,6 +5168,49 @@ mod tests {
         assert!(fleet.get("b").is_none());
         assert_eq!(fleet.get("a").unwrap().max_agents, 3);
         assert_eq!(fleet.flock(), flock_of(&[("a", 3)]));
+    }
+
+    /// A machine's actor gets the deny list of its own profile: its
+    /// `[[machine]]` one, else its flock's, else `[defaults]`. A change of
+    /// that profile replaces the actor, as an `[agents]` edit does.
+    #[tokio::test]
+    async fn a_machines_own_profile_reaches_its_actor() {
+        let (fleet, _store) = managed(&[]);
+        let profiles = crate::config::profile::Profiles::default();
+        let deny = |name: &str| profiles.resolve(name).unwrap().deny;
+        let mut config = PastorConfig::default();
+        config.defaults.profile = Some("develop".into());
+        let mut flock = flock_of(&[("a", 2), ("b", 2), ("c", 2)]);
+        flock.machines[0].profile = Some("review".into());
+        flock.machines[1].flock = Some("ro".into());
+        flock.flocks.push(crate::config::flock::FlockEntry {
+            name: "ro".into(),
+            profile: Some("unrestricted".into()),
+            ..Default::default()
+        });
+        fleet.set_config(&config);
+        fleet.apply_flock(&flock, &fast()).await;
+        let spawned = |name: &str| {
+            fleet
+                .members
+                .read()
+                .recover()
+                .iter()
+                .find(|m| m.handle.name == name)
+                .and_then(|m| m.spawned_from.clone())
+                .unwrap()
+                .1
+                .own_deny
+        };
+        assert_eq!(spawned("a"), deny("review"));
+        assert!(spawned("b").is_empty(), "the flock's unrestricted");
+        assert_eq!(spawned("c"), deny("develop"));
+
+        config.defaults.profile = Some("review".into());
+        fleet.set_config(&config);
+        let d = fleet.apply_flock(&flock, &fast()).await;
+        assert_eq!(d.retargeted, vec!["c".to_string()]);
+        assert_eq!(spawned("c"), deny("review"));
     }
 
     /// Review Focus 2: an editor re-save, or `machine add other`, must not

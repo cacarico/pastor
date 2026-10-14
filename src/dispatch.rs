@@ -314,7 +314,36 @@ pub async fn dispatch(
     head: Option<&str>,
     ready_timeout: Duration,
 ) -> Result<DispatchOutcome, DispatchError> {
-    start(conn, task, agents, head, ready_timeout, false).await
+    dispatch_with(
+        conn,
+        task,
+        agents,
+        head,
+        ready_timeout,
+        Provision::default(),
+    )
+    .await
+}
+
+/// What a machine's provisioners make sure of before a launch there
+/// (`provision`): the machine's own permission profile's deny list, which
+/// the agy provisioner writes into agy's settings for an agy task under a
+/// profile. The default asks for nothing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Provision<'a> {
+    pub own_deny: &'a [String],
+}
+
+/// `dispatch` on a machine whose provisioners want `provision`.
+pub async fn dispatch_with(
+    conn: &dyn Connector,
+    task: &mut Task,
+    agents: &Agents,
+    head: Option<&str>,
+    ready_timeout: Duration,
+    provision: Provision<'_>,
+) -> Result<DispatchOutcome, DispatchError> {
+    start(conn, task, agents, head, ready_timeout, false, provision).await
 }
 
 /// `dispatch` for a paused task (`TaskState::Paused`): the same steps, but
@@ -331,7 +360,27 @@ pub async fn resume(
     head: Option<&str>,
     ready_timeout: Duration,
 ) -> Result<DispatchOutcome, DispatchError> {
-    start(conn, task, agents, head, ready_timeout, true).await
+    resume_with(
+        conn,
+        task,
+        agents,
+        head,
+        ready_timeout,
+        Provision::default(),
+    )
+    .await
+}
+
+/// `resume` on a machine whose provisioners want `provision`.
+pub async fn resume_with(
+    conn: &dyn Connector,
+    task: &mut Task,
+    agents: &Agents,
+    head: Option<&str>,
+    ready_timeout: Duration,
+    provision: Provision<'_>,
+) -> Result<DispatchOutcome, DispatchError> {
+    start(conn, task, agents, head, ready_timeout, true, provision).await
 }
 
 async fn start(
@@ -341,6 +390,7 @@ async fn start(
     head: Option<&str>,
     ready_timeout: Duration,
     resume: bool,
+    provision: Provision<'_>,
 ) -> Result<DispatchOutcome, DispatchError> {
     let name = Task::agent_name_for(task.id);
     task.agent_name = Some(name.clone());
@@ -349,7 +399,17 @@ async fn start(
     task.prompt_pending = false;
     task.activity_seen = false;
 
-    let result = dispatch_steps(conn, task, &name, agents, head, ready_timeout, resume).await;
+    let result = dispatch_steps(
+        conn,
+        task,
+        &name,
+        agents,
+        head,
+        ready_timeout,
+        resume,
+        provision,
+    )
+    .await;
     match &result {
         Ok(DispatchOutcome::Running) => {
             task.state = TaskState::Running;
@@ -372,6 +432,7 @@ async fn start(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_steps(
     conn: &dyn Connector,
     task: &mut Task,
@@ -380,6 +441,7 @@ async fn dispatch_steps(
     head: Option<&str>,
     ready_timeout: Duration,
     resume: bool,
+    provision: Provision<'_>,
 ) -> Result<DispatchOutcome, DispatchError> {
     let spec = task.spec.clone();
     // A waiting task goes on after a usage limit (`TaskState::Waiting`): with
@@ -398,6 +460,22 @@ async fn dispatch_steps(
         let from = crate::task::agent_and_model(&s.agent, s.model.as_deref());
         (from, s.tail.clone())
     });
+    // agy reads its permission rules only from its settings on the machine,
+    // and can write back a copy from before pastor's edit at any time, so
+    // the agy provisioner makes them deny what the machine's own profile
+    // denies before every launch, not once. First, so what checks those
+    // rules next reads them as written.
+    if agents.agy_profile(&spec) {
+        let machine = task.machine.as_deref().unwrap_or("this machine");
+        crate::provision::agy::reconcile(conn, provision.own_deny, machine)
+            .await
+            .map_err(|e| match e {
+                crate::provision::agy::ReconcileError::Transport(e) => CallError::from(e).into(),
+                crate::provision::agy::ReconcileError::Refused(message) => {
+                    DispatchError::Task(message)
+                }
+            })?;
+    }
     // Before anything is made on the machine: a task whose agent cannot take
     // its tool lists (an `[agents]` edit since it was queued) leaves nothing
     // behind.
@@ -2229,6 +2307,197 @@ mod tests {
                 lists_unapplied: None,
             })),
             ..spec()
+        }
+    }
+
+    fn agy_under(profile: Option<&str>) -> DispatchSpec {
+        DispatchSpec {
+            agent: "agy".into(),
+            ..opencode_under(profile)
+        }
+    }
+
+    fn develop_deny() -> Vec<String> {
+        crate::config::profile::Profiles::default()
+            .resolve("develop")
+            .unwrap()
+            .deny
+    }
+
+    /// Dispatch `t` on `fake` whose machine's own profile denies `own_deny`;
+    /// the error, if any.
+    async fn dispatch_agy(fake: &FakeHerdr, t: &mut Task, own_deny: &[String]) -> Option<String> {
+        dispatch_with(
+            fake,
+            t,
+            &Agents::default(),
+            None,
+            READY,
+            Provision { own_deny },
+        )
+        .await
+        .err()
+        .map(|e| e.to_string())
+    }
+
+    fn agy_deny(fake: &FakeHerdr) -> serde_json::Value {
+        let content = fake.agy_settings_now().unwrap().content.unwrap();
+        serde_json::from_str::<serde_json::Value>(&content).unwrap()["permissions"]["deny"].clone()
+    }
+
+    /// Before a profiled agy launch, agy's settings get the deny rules of the
+    /// machine's own profile (here `develop`), not the task's (`review`'s
+    /// `write_file(*)` would stop every edit on the machine). Whatever comes
+    /// after is not the provisioner's: the settings never refuse it.
+    #[tokio::test]
+    async fn a_profiled_agy_task_writes_the_machines_own_rules_first() {
+        let fake = FakeHerdr::new();
+        let mut t = task(agy_under(Some("review")));
+        let err = dispatch_agy(&fake, &mut t, &develop_deny()).await;
+        assert!(
+            !err.unwrap_or_default().contains("agy_permissions_missing"),
+            "the provisioner refused"
+        );
+        assert_eq!(
+            agy_deny(&fake),
+            serde_json::json!([
+                "command(rm -rf)",
+                "command(sudo)",
+                "command(git push --force)"
+            ])
+        );
+        assert_eq!(fake.agy_writes().len(), 1);
+        // Covered now: the next launch writes nothing.
+        let mut t = task(agy_under(Some("review")));
+        dispatch_agy(&fake, &mut t, &develop_deny()).await;
+        assert_eq!(fake.agy_writes().len(), 1);
+    }
+
+    /// The owner's file keeps its rules first and its other keys; a rule it
+    /// already covers is not added again.
+    #[tokio::test]
+    async fn the_owners_agy_settings_keep_their_rules() {
+        let fake = FakeHerdr::new();
+        fake.set_agy_settings(Some(crate::provision::agy::AgySettings {
+            content: Some(
+                r#"{"theme":"dark","permissions":{"allow":["command(ls)"],"deny":["command(sudo)"]}}"#.into(),
+            ),
+            link: false,
+        }));
+        let mut t = task(agy_under(Some("develop")));
+        dispatch_agy(&fake, &mut t, &develop_deny()).await;
+        assert_eq!(
+            agy_deny(&fake),
+            serde_json::json!([
+                "command(sudo)",
+                "command(rm -rf)",
+                "command(git push --force)"
+            ])
+        );
+        let content = fake.agy_settings_now().unwrap().content.unwrap();
+        assert!(content.find("theme").unwrap() < content.find("permissions").unwrap());
+        assert!(content.contains("command(ls)"), "{content}");
+    }
+
+    /// A machine whose agy settings cannot be read (a `command` machine) or
+    /// parsed, or are a symlink that needs rules, refuses the task before
+    /// anything is made there, with the rules to add by hand.
+    #[tokio::test]
+    async fn agy_settings_pastor_cannot_write_refuse_the_task() {
+        let refused = async |settings| {
+            let fake = FakeHerdr::new();
+            fake.set_agy_settings(settings);
+            let mut t = task(agy_under(Some("develop")));
+            let err = dispatch_agy(&fake, &mut t, &develop_deny()).await.unwrap();
+            assert!(err.contains("agy_permissions_missing"), "{err}");
+            assert!(err.contains("command(sudo)"), "{err}");
+            assert!(err.contains("pi-1"), "{err}");
+            assert!(
+                err.contains("~/.gemini/antigravity-cli/settings.json"),
+                "{err}"
+            );
+            assert_eq!(t.state, TaskState::Failed);
+            assert!(fake.requests().iter().all(|r| r.method != "agent.start"));
+            assert!(fake.agy_writes().is_empty());
+            err
+        };
+        let err = refused(None).await;
+        assert!(err.contains("cannot read"), "{err}");
+        let err = refused(Some(crate::provision::agy::AgySettings {
+            content: Some("{ not json".into()),
+            link: false,
+        }))
+        .await;
+        assert!(err.contains("not JSON"), "{err}");
+        let err = refused(Some(crate::provision::agy::AgySettings {
+            content: Some("{}".into()),
+            link: true,
+        }))
+        .await;
+        assert!(err.contains("symlink"), "{err}");
+        // A symlink that already denies everything is fine as it is.
+        let fake = FakeHerdr::new();
+        fake.set_agy_settings(Some(crate::provision::agy::AgySettings {
+            content: Some(r#"{"permissions":{"deny":["command(*)"]}}"#.into()),
+            link: true,
+        }));
+        let mut t = task(agy_under(Some("develop")));
+        let err = dispatch_agy(&fake, &mut t, &develop_deny()).await;
+        assert!(!err.unwrap_or_default().contains("agy_permissions_missing"));
+    }
+
+    /// agy saving between pastor's read and write is read again and merged
+    /// once; twice in a row refuses the task.
+    #[tokio::test]
+    async fn an_agy_save_during_the_write_is_merged_once() {
+        let fake = FakeHerdr::new();
+        fake.agy_saves_before_write(Some(r#"{"model":"x"}"#));
+        let mut t = task(agy_under(Some("develop")));
+        dispatch_agy(&fake, &mut t, &develop_deny()).await;
+        let content = fake.agy_settings_now().unwrap().content.unwrap();
+        assert!(content.contains("\"model\": \"x\""), "{content}");
+        assert_eq!(agy_deny(&fake).as_array().unwrap().len(), 3);
+
+        let fake = FakeHerdr::new();
+        fake.agy_saves_before_write(Some("{}"));
+        fake.agy_saves_before_write(Some(r#"{"a":1}"#));
+        let mut t = task(agy_under(Some("develop")));
+        let err = dispatch_agy(&fake, &mut t, &develop_deny()).await.unwrap();
+        assert!(err.contains("agy_permissions_missing"), "{err}");
+        assert!(err.contains("kept saving"), "{err}");
+    }
+
+    /// Nothing is read for a task that is not agy under a profile, for an
+    /// agent with `own_permissions`, or where the machine's own profile
+    /// denies nothing: a `command` machine does not refuse them.
+    #[tokio::test]
+    async fn the_agy_provisioner_leaves_other_tasks_alone() {
+        let own = develop_deny();
+        let mut claude = agy_under(Some("develop"));
+        claude.agent = "claude".into();
+        let own_permissions: Agents = toml::from_str("[agy]\nown_permissions = true\n").unwrap();
+        for (spec, agents, own) in [
+            (claude, Agents::default(), own.clone()),
+            (agy_under(None), Agents::default(), own.clone()),
+            (agy_under(Some("develop")), own_permissions, own.clone()),
+            (agy_under(Some("develop")), Agents::default(), vec![]),
+        ] {
+            let fake = FakeHerdr::new();
+            fake.set_agy_settings(None);
+            let mut t = task(spec);
+            let err = dispatch_with(
+                &fake,
+                &mut t,
+                &agents,
+                None,
+                READY,
+                Provision { own_deny: &own },
+            )
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+            assert!(!err.contains("agy_permissions_missing"), "{err}");
         }
     }
 

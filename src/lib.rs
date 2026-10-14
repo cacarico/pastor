@@ -20,6 +20,7 @@ pub mod machine;
 pub mod orchestrator;
 pub mod orchestrator_cli;
 pub mod profile_cli;
+pub mod provision;
 pub mod queue;
 pub mod queue_cli;
 pub mod reopen;

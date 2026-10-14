@@ -354,6 +354,22 @@ pub type DirFuture<'a> =
 pub type VersionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Option<String>, ConnectError>> + Send + 'a>>;
 
+pub type AgySettingsFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<Option<crate::provision::agy::AgySettings>, ConnectError>>
+            + Send
+            + 'a,
+    >,
+>;
+
+pub type AgyWriteFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<Option<crate::provision::agy::AgyWrite>, ConnectError>>
+            + Send
+            + 'a,
+    >,
+>;
+
 pub type UsageFuture<'a> = Pin<
     Box<dyn Future<Output = Result<Option<crate::usage::TaskUsage>, ConnectError>> + Send + 'a>,
 >;
@@ -416,6 +432,19 @@ pub trait Connector: Send + Sync {
     fn opencode_permission_rules(&self) -> DirFuture<'_> {
         Box::pin(async { Ok(None) })
     }
+    /// agy's global settings file on the machine
+    /// (`provision::agy::SETTINGS_FILE`), for the agy provisioner. `None`
+    /// when it cannot be known.
+    fn agy_settings(&self) -> AgySettingsFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
+    /// Put `new` in place of agy's global settings file on the machine when
+    /// it still holds `expected` (`None`: there is still no file), atomically
+    /// (`provision::agy::write_command`). `None` when it cannot be done or
+    /// known.
+    fn write_agy_settings(&self, _expected: Option<&str>, _new: &str) -> AgyWriteFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
     /// The version of pastor installed on the machine, for `machine list`: a
     /// fleet runs whatever each machine last installed, and a skill or CLI
     /// that an agent there calls is that version's. `None` when there is no
@@ -467,6 +496,13 @@ impl Connector for Endpoint {
     }
     fn opencode_permission_rules(&self) -> DirFuture<'_> {
         Box::pin(opencode_permission_rules(self))
+    }
+    fn agy_settings(&self) -> AgySettingsFuture<'_> {
+        Box::pin(agy_settings(self))
+    }
+    fn write_agy_settings(&self, expected: Option<&str>, new: &str) -> AgyWriteFuture<'_> {
+        let command = crate::provision::agy::write_command(expected, new);
+        Box::pin(async move { write_agy_settings(self, command).await })
     }
     fn pastor_version(&self) -> VersionFuture<'_> {
         Box::pin(pastor_version(self))
@@ -616,6 +652,42 @@ async fn opencode_permission_rules(ep: &Endpoint) -> Result<Option<bool>, Connec
         Some(p) => remote_dir_answer(&p.target, &p.out),
         None => Ok(None),
     }
+}
+
+/// Reads agy's global settings through `probe`, on a local machine too.
+/// Only ssh failing to reach the machine is an error; an answer pastor
+/// cannot read is unknown.
+async fn agy_settings(
+    ep: &Endpoint,
+) -> Result<Option<crate::provision::agy::AgySettings>, ConnectError> {
+    let Some(p) = probe(ep, crate::provision::agy::read_command()).await? else {
+        return Ok(None);
+    };
+    reached(&p.target, &p.out)?;
+    let raw = String::from_utf8_lossy(&p.out.stdout);
+    match crate::provision::agy::parse_read(&raw) {
+        Ok(read) if p.out.status.success() => Ok(Some(read)),
+        Ok(_) | Err(_) => {
+            tracing::warn!(target = %p.target, status = %p.out.status, stderr = %String::from_utf8_lossy(&p.out.stderr).trim(), "could not read agy's settings");
+            Ok(None)
+        }
+    }
+}
+
+async fn write_agy_settings(
+    ep: &Endpoint,
+    command: String,
+) -> Result<Option<crate::provision::agy::AgyWrite>, ConnectError> {
+    let Some(p) = probe(ep, command).await? else {
+        return Ok(None);
+    };
+    reached(&p.target, &p.out)?;
+    let answer = crate::provision::agy::parse_write(&String::from_utf8_lossy(&p.out.stdout));
+    if answer.is_none() || !p.out.status.success() {
+        tracing::warn!(target = %p.target, status = %p.out.status, stderr = %String::from_utf8_lossy(&p.out.stderr).trim(), "could not write agy's settings");
+        return Ok(None);
+    }
+    Ok(answer)
 }
 
 async fn pastor_version(ep: &Endpoint) -> Result<Option<String>, ConnectError> {
@@ -1369,6 +1441,72 @@ mod tests {
             argv: vec!["true".into()],
         };
         assert_eq!(command.opencode_permission_rules().await.unwrap(), None);
+    }
+
+    /// agy's settings are read and written under the machine's `HOME` on a
+    /// local endpoint (run in a child process with a temp `HOME`), and are
+    /// unknown on a command one.
+    #[tokio::test]
+    async fn agy_settings_per_endpoint() {
+        use crate::provision::agy::{AgySettings, AgyWrite};
+        const CHILD: &str = "PASTOR_TEST_AGY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let local = Endpoint::Local {
+                session: "s".into(),
+            };
+            let none = AgySettings {
+                content: None,
+                link: false,
+            };
+            assert_eq!(local.agy_settings().await.unwrap(), Some(none));
+            assert_eq!(
+                local.write_agy_settings(None, "{}\n").await.unwrap(),
+                Some(AgyWrite::Written)
+            );
+            assert_eq!(
+                local
+                    .agy_settings()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .content
+                    .as_deref(),
+                Some("{}\n")
+            );
+            assert_eq!(
+                local.write_agy_settings(None, "{}\n").await.unwrap(),
+                Some(AgyWrite::Changed)
+            );
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "herdr::transport::tests::agy_settings_per_endpoint",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(stdout.contains("1 passed"), "{stdout}");
+        assert!(
+            home.path()
+                .join(".gemini/antigravity-cli/settings.json")
+                .is_file()
+        );
+        let command = Endpoint::Command {
+            argv: vec!["true".into()],
+        };
+        assert_eq!(command.agy_settings().await.unwrap(), None);
+        assert_eq!(command.write_agy_settings(None, "{}").await.unwrap(), None);
     }
 
     /// Only ssh failing to reach the machine is an error. rc-file noise comes

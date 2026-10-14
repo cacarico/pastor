@@ -233,6 +233,15 @@ Still open as of the last review; none of them blocks normal use.
   commands, MCP servers, not only permissions); only `AGENTS.md` or
   `CLAUDE.md` are passed back as instructions.
 
+- The agy provisioner (`src/provision/agy.rs`) runs only just before a
+  profiled agy launch, not at `machine add` or on reconcile, so a machine's
+  agy settings match its own profile only from its first such task on. It
+  never removes a rule, so a machine whose own profile narrows keeps the
+  old denies until someone removes them by hand. agy can write back a copy
+  of its settings between pastor's write and its start; nothing makes agy
+  reload. A pull machine, and a headless serve's own machines, provision
+  from that serve's `pastor.toml`, not the head's profiles.
+
 ## Where things live
 
 ```

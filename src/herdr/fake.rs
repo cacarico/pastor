@@ -99,6 +99,15 @@ struct State {
     usage: HashMap<(Option<String>, String), crate::usage::TaskUsage>,
     /// What `Connector::opencode_permission_rules` reports.
     opencode_permissions: Option<bool>,
+    /// agy's settings file, as `Connector::agy_settings` reads it and
+    /// `Connector::write_agy_settings` writes it; `None` like a `command`
+    /// machine.
+    agy_settings: Option<crate::provision::agy::AgySettings>,
+    /// What agy saves over the file just before each of the next writes,
+    /// in order: a write then finds the file changed.
+    agy_saves: std::collections::VecDeque<Option<String>>,
+    /// Every content `Connector::write_agy_settings` put in place.
+    agy_writes: Vec<String>,
     /// Branches `Connector::restore_worktree` finds gone.
     gone_branches: HashSet<String>,
     /// Every `Connector::restore_worktree` call, as (repo, path, branch).
@@ -236,6 +245,10 @@ impl FakeHerdr {
                 home: Some("/home/fake".into()),
                 pastor_version: Some("fake".into()),
                 opencode_permissions: Some(false),
+                agy_settings: Some(crate::provision::agy::AgySettings {
+                    content: None,
+                    link: false,
+                }),
                 ..Default::default()
             })),
             events,
@@ -253,6 +266,27 @@ impl FakeHerdr {
     /// What the machine's own opencode config says about permission rules.
     pub fn set_opencode_permissions(&self, rules: Option<bool>) {
         self.state.lock().unwrap().opencode_permissions = rules;
+    }
+    /// agy's settings file on the machine; `None` like a `command` machine.
+    pub fn set_agy_settings(&self, settings: Option<crate::provision::agy::AgySettings>) {
+        self.state.lock().unwrap().agy_settings = settings;
+    }
+    /// agy's settings file as it now is.
+    pub fn agy_settings_now(&self) -> Option<crate::provision::agy::AgySettings> {
+        self.state.lock().unwrap().agy_settings.clone()
+    }
+    /// agy saves `content` (`None`: removes the file) just before the next
+    /// write that has no save queued yet.
+    pub fn agy_saves_before_write(&self, content: Option<&str>) {
+        self.state
+            .lock()
+            .unwrap()
+            .agy_saves
+            .push_back(content.map(str::to_string));
+    }
+    /// Every content pastor wrote into agy's settings, in order.
+    pub fn agy_writes(&self) -> Vec<String> {
+        self.state.lock().unwrap().agy_writes.clone()
     }
     /// Claude session `session` under `config_dir` (`None` for `~/.claude`)
     /// used `usage`.
@@ -1381,6 +1415,37 @@ impl super::transport::Connector for FakeHerdr {
     fn opencode_permission_rules(&self) -> super::transport::DirFuture<'_> {
         let rules = self.state.lock().unwrap().opencode_permissions;
         Box::pin(async move { Ok(rules) })
+    }
+    fn agy_settings(&self) -> super::transport::AgySettingsFuture<'_> {
+        let settings = self.state.lock().unwrap().agy_settings.clone();
+        Box::pin(async move { Ok(settings) })
+    }
+    fn write_agy_settings(
+        &self,
+        expected: Option<&str>,
+        new: &str,
+    ) -> super::transport::AgyWriteFuture<'_> {
+        use crate::provision::agy::AgyWrite;
+        let mut st = self.state.lock().unwrap();
+        let saved = st.agy_saves.pop_front();
+        let answer = match st.agy_settings.as_mut() {
+            None => None,
+            Some(file) => {
+                if let Some(saved) = saved {
+                    file.content = saved;
+                }
+                if file.link {
+                    Some(AgyWrite::Link)
+                } else if file.content.as_deref() != expected {
+                    Some(AgyWrite::Changed)
+                } else {
+                    file.content = Some(new.to_string());
+                    st.agy_writes.push(new.to_string());
+                    Some(AgyWrite::Written)
+                }
+            }
+        };
+        Box::pin(async move { Ok(answer) })
     }
     fn pastor_version(&self) -> super::transport::VersionFuture<'_> {
         let version = self.state.lock().unwrap().pastor_version.clone();
