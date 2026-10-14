@@ -383,7 +383,9 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `no_agent` | `task attach` to a task that has no agent yet |
 | `no_head` | the bridge found no `pastor serve` on its machine |
 | `no_machine` | the task is not on any machine |
+| `no_picker` | `task send --pick` to a task whose pane shows no picker at its bottom |
 | `no_session` | reopening a closed task with no session to resume |
+| `no_such_option` | `task send --pick` with text no option of the picker contains; the message lists them |
 | `no_terminal` | `task attach` to a task on a command machine |
 | `no_trust_keys` | `task send --trust` and the agent has no `trust_keys` |
 | `no_worktree` | `task close --remove-worktree` of a task with no worktree |
@@ -399,7 +401,7 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `not_retryable` | `task retry` of a task in a state that cannot be retried |
 | `not_running` | `serve stop` or `serve status` with no serve running here; `status` with no head and no `--probe` |
 | `not_trusted` | `trust remove` of a repo that is not trusted on that machine |
-| `nothing_to_send` | `task send` with no text, `--key` or `--trust` |
+| `nothing_to_send` | `task send` with no text, `--key`, `--trust` or `--pick` |
 | `now_needs_machine` | `task run --now` with no `--machine` |
 | `now_not_started` | `task run --now` could not start the task at once; it is closed, not left queued |
 | `now_refused` | `task run --now` from an agent or an orchestrator's script; a guard against mistakes, not a boundary (see [Starting a task now](#starting-a-task-now)) |
@@ -573,7 +575,13 @@ No reminder is sent first.
 (starting, running, blocked, or done with its pane still open) and presses
 Enter; `--no-enter` leaves Enter out, and each `--key K` presses one named
 key after the text, in order (`--key esc`, `--key Down --key Enter`; herdr's
-key names). It goes through the head to the task's machine; anything else
+key names). `--pick OPTION` answers the picker on screen by the text of one
+of its options, case ignored: the head reads the pane, presses the arrows
+to the first option containing the text, then Enter, and records the keys
+and the text on `task.input`. It answers `no_picker` when the bottom of the
+pane shows none, and `no_such_option`, naming the options, when none
+matches; like `--key`, it takes any task with a live pane and saves
+nothing. It goes through the head to the task's machine; anything else
 answers `task_not_live`. Each send is a `task.input` event recording the key
 names and the length of the text, never the text, which may be a secret.
 `--json` prints the head's answer as `{"message": "..."}`.
@@ -593,27 +601,46 @@ startup prompt; any other task answers `not_at_trust_prompt`, and nothing is
 sent or saved. An agent without trust keys answers `no_trust_keys`, and a
 task without `--repo` gets the keys but nothing is saved.
 
-From then on, when a task of a saved repo is blocked during startup on that
-machine, the head reads its pane and, if it shows the agent's trust prompt,
-presses the trust keys itself, once per task, and emits `task.trusted`; a
-task still blocked after that is left for a human. The prompt is known by
-its `trust_marker` (Claude's is built in as its "Yes, I trust this folder"
-option), so a task blocked on another dialog the same keys would accept,
-such as Claude's bypass-permissions warning, is left for a human too. The
-marker must be in the prompt at the bottom of the pane (after the last
-output, and after any menu above the last one), since the read includes
-scrollback where an earlier trust prompt can linger above a later dialog. An
-agent with no marker (`trust_marker = ""`, or one that is not Claude and
-sets none) gets the keys without the check.
+From then on, a task blocked while it starts has its pane read when it
+blocks, after each answer's settle window, and at each reconcile, and the
+first of its agent's startup dialogs that shows in the prompt at the bottom
+of the pane, and was not answered for that task, is answered: the head presses the
+dialog's keys, once per task and dialog, and emits `task.answered` with the
+dialog's name and the keys. Inside an answer's settle window the pane is
+not read again, whoever answered: pastor, or a person with `pastor task
+send` (`--pick`, `--key`, `--trust` or text) or at the pane itself. The trust dialog is the first row, known by its
+`trust_marker` (Claude's is built in as its "Yes, I trust this folder"
+option); it is pressed only for a saved repo, and emits `task.trusted` as
+before. Claude's other dialogs are built in, in its 2.1 wording, each
+answered with the option that keeps things as they are: the fullscreen
+renderer offer (`Not now`), the auto-mode default nudge (`No, keep ...`),
+the auto-mode setup offer (`Don't show again`) and the default-effort switch
+(`No, keep ...`). Its bypass-permissions warning is not: accepting it is
+yours to do, with `pastor task send t-N --pick "Yes, I accept"`. One dialog
+is answered per settle window, so a chain of them on a new machine takes a
+few windows. A task blocked on a dialog no row matches, or still blocked
+after its rows, waits for a person. The marker must be in the prompt at the
+bottom of the pane (after the last output, and after any menu above the
+last one, and after the key hints of any dialog above the last thing on
+screen), since the read includes scrollback where an earlier dialog can
+linger above a later one. The trust row with no marker (`trust_marker =
+""`, or an agent that is not Claude and sets none) is pressed without the
+check. `[[agents.<name>.dialogs]]` in pastor.toml adds a dialog or changes
+a built-in (see [Agent definitions](#agent-definitions)).
+
+The fullscreen offer rarely shows at all: every Claude task's pane gets
+`CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1`, which keeps Claude on its classic
+renderer, the one with the scrollback pastor reads, and turns the offer
+off. `env` in `[agents.<name>]` overrides it.
 
 On a pull machine the head never reads the pane, so the machine's own serve
 does all of this, with the same rules: while one of its tasks has a repo and
 is queued, or blocked during startup with no keys sent yet, it asks the head
 for the trust saved for that machine (only that machine's pairs, never
-another's), keeps a copy in `shepherd.db`, and its actor presses the trust
-keys of the pull machine's own `pastor.toml` once per task while the pane
-shows its `trust_marker`. Its next report carries the keys and the head emits
-`task.trusted` with them. `task send --trust` cannot reach a pull machine's
+another's), keeps a copy in `shepherd.db`, and its actor answers the
+dialogs of the pull machine's own `pastor.toml` as the head would, once per
+task and dialog. Its next report carries the trust keys and the head emits
+`task.trusted` with them; its `task.answered` events are only logged there. `task send --trust` cannot reach a pull machine's
 task (`pull_machine_task`), so its repos are saved with `pastor trust add
 <machine> <repo>` on the head; a pair added while a task is blocked is
 picked up at the serve's next tick. A head older than IPC protocol 31 is not
@@ -840,7 +867,7 @@ failing.
 
 |                      | claude                                                                                                                    | agy                                                                                                            | codex                                                                                                                                    | opencode                                                                                                                    |
 | -------------------- | -------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
-| **Trust**            | herdr reads its folder-trust dialog `blocked`; pastor sends the held prompt once it clears. Built-in `trust_marker` and `trust_keys`, so `pastor task send t-N --trust` answers it and saves the repo | no dialog pastor knows | herdr reads its dialog idle and ready, not blocked; pastor holds the prompt until someone answers by hand (`Do you trust the contents of this directory`). No built-in `trust_keys`, so `--trust` needs one set in `[agents.<name>]` (`no_trust_keys` otherwise) | no dialog pastor knows |
+| **Trust**            | herdr reads its folder-trust dialog `blocked`; pastor sends the held prompt once it clears. Built-in `trust_marker` and `trust_keys`, so `pastor task send t-N --trust` answers it and saves the repo; its other startup dialogs are built in too (`task.answered`) | no dialog pastor knows | herdr reads its dialog idle and ready, not blocked; pastor holds the prompt until someone answers by hand (`Do you trust the contents of this directory`). No built-in `trust_keys`, so `--trust` needs one set in `[agents.<name>]` (`no_trust_keys` otherwise) | no dialog pastor knows |
 | **Profile**          | `--permission-mode dontAsk`, plus the tool flags                                                                          | its own permission mode, unless `own_permissions = true` (then no flags or mode; its own settings must cover the profile) | `--ask-for-approval never --sandbox workspace-write` (`danger-full-access` under `unrestricted`); no per-command flag, so the sandbox stands in for the lists | `OPENCODE_PERMISSION` in its pane's env instead of flags (deny-first, `unrestricted` allow-first); a machine or repo config with its own permission rules fails the task (`opencode_permissions_conflict`) |
 | **Lists** (no profile) | built-in `--allowedTools`/`--disallowedTools`                                                                           | needs `allow_flag`/`deny_flag` in `[agents.<name>]`, else a list refuses the task (`agent_tools_unsupported`)     | same as agy                                                                                                                                 | same as agy                                                                                                                     |
 | **Session**          | `--session-id` at launch, recorded; a pause, wait or model move resumes it with `claude --resume <session>`               | none recorded                                                                                                     | none recorded                                                                                                                               | none recorded                                                                                                                   |
@@ -1291,7 +1318,27 @@ starts with `~/` is expanded against the home of the machine the task runs
 on, as `--repo` is; a `command` machine cannot report a home, so give those
 absolute paths. Keys must be variable names (letters, digits and `_`, not
 starting with a digit). pastor sets the env on the task's pane, worktree
-tasks included (see [Internals](#internals)).
+tasks included (see [Internals](#internals)). A `claude` kind gets
+`CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1` under its own `env` (see [How it
+works](#how-it-works)).
+
+`[[agents.<name>.dialogs]]` lists startup dialogs beyond the trust one, one
+table per dialog: `name`, `marker` (text only that dialog shows) and `pick`
+(the text of the option to choose) or `keys` (named keys, pressed as they
+are). A row named as one of the kind's built-ins replaces it; a row with
+`pick = ""` and no `keys` removes it, and needs no `marker`. Any other row
+needs its `marker` and one of `pick` and `keys` (`needs pick or keys`). The
+trust dialog is set with `trust_keys` and `trust_marker`, never here. Claude's built-ins are
+`fullscreen`, `auto-mode-default`, `auto-mode-setup` and `effort-default`
+(see [How it works](#how-it-works)).
+
+```toml
+# fragment of pastor.toml: accept Claude's bypass warning on this head's tasks
+[[agents.claude.dialogs]]
+name = "bypass"
+marker = "Bypass Permissions mode"
+pick = "Yes, I accept"
+```
 
 The head checks a task's agent against pastor.toml when it queues it (for a
 task that is not pinned, the agent each machine of its flock would run), and
@@ -2280,7 +2327,8 @@ A record, which is also what connector event hooks get on stdin:
   limits),
   `task.input` (`pastor task send`, or pastor at Claude's limit picker),
   `task.trusted` (pastor answered a trust prompt: the head, or a pull
-  machine's serve), `job.failed`, `connector.finish_failed` (a connector's
+  machine's serve), `task.answered` (the head answered another of the
+  agent's startup dialogs), `job.failed`, `connector.finish_failed` (a connector's
   `[finish]` command failed), `machine.connected`, `machine.lost`,
   `agent.exhausted` and `agent.reset` (see Usage limits), and
   `orchestrator.started|skipped|held|quota|failed|restarted|stopping|stopped`
@@ -2303,11 +2351,13 @@ A record, which is also what connector event hooks get on stdin:
   A task's machine is `task.machine`.
 - `detail`: only on events that carry more, and absent otherwise. On
   `task.input`, `keys` (the key names pressed, Enter included), `text_len`
-  (the length of any text), `trust` (sent by `--trust`),
+  (the length of any text), `trust` (sent by `--trust`), `pick` (the
+  option text given to `--pick`),
   `limit_picker` (pastor answered Claude's limit picker) and `rate_retry`
   (pastor retried a short limit); on `task.rate_limited`, `line`, `attempt`
   and `retry_at`; on
-  `task.trusted`, `keys`; on a `task.blocked` for an agent that ended its
+  `task.trusted`, `keys`; on `task.answered`, `dialog` and `keys`; on a
+  `task.blocked` for an agent that ended its
   turn on a question, `question`; on `connector.finish_failed`, `connector`
   (its id) and `reason` (why: the exit status and stderr tail, or a timeout);
   on `orchestrator.*`, `orchestrator` (its name) and: `lines` (a count: how
@@ -4003,6 +4053,10 @@ allow_flag = "--allowedTools"    # the flag before each allow pattern
 deny_flag = "--disallowedTools"  # the flag before each deny pattern
 # own_permissions = false       # true: its own settings hold its permissions; a profiled task gets no flags
 # account = "me-personal"       # a label: machines naming it share its usage limits; unset: none
+[[agents.claude.dialogs]]        # a startup dialog beyond trust; a built-in's name replaces it
+name = "bypass"                  # its name, in task.answered
+marker = "Bypass Permissions mode"  # text only that dialog shows
+pick = "Yes, I accept"           # the option to choose by its text; or keys = ["Down", "Enter"]
 [models.sonnet]              # one table per model; none are built in
 kind = "claude"                  # the herdr agent kind that runs it (required)
 args = ["--model", "claude-sonnet-5"]  # put before agent_args (required, may be [])

@@ -270,6 +270,10 @@ machine names.
   --role orchestrator`, or one an orchestrator file starts) and its scripts
   may also run, retry, send to and close tasks, enable or disable a job and
   keep a handover note. No task can start one.
+- **Claude's startup dialogs are answered for you.** Folder trust once a
+  repo is saved, and the one-time offers Claude shows on a new machine; the
+  bypass warning and permission prompts stay yours (`pastor task send
+  --pick`).
 - **Permission prompts stay on unless you pick a profile.** pastor passes
   the allow and deny lists you set. A profile (`review`, `develop`,
   `unrestricted`) turns Claude's prompts off and refuses what its lists

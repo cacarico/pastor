@@ -567,7 +567,7 @@ fn claude_limit(text: &str, now: DateTime<Utc>) -> Option<Limit> {
 
 /// A row of box-drawing dashes, as Claude draws above and under its input
 /// box.
-fn is_rule(line: &str) -> bool {
+pub(crate) fn is_rule(line: &str) -> bool {
     let line = line.trim();
     line.chars().count() >= 3 && line.chars().all(|c| matches!(c, '─' | '━' | '╌' | '═'))
 }
@@ -694,30 +694,21 @@ impl LimitPicker {
     /// `Enter`. `None` when the picker has no such option; then nothing
     /// should be pressed.
     pub fn stop_keys(&self) -> Option<Vec<String>> {
-        let want = STOP_AND_WAIT.to_ascii_lowercase();
-        let at = self
-            .options
-            .iter()
-            .position(|o| o.to_ascii_lowercase().starts_with(&want))?;
-        let (key, n) = if at >= self.selected {
-            ("Down", at - self.selected)
-        } else {
-            ("Up", self.selected - at)
-        };
-        let mut keys = vec![key.to_string(); n];
-        keys.push("Enter".into());
-        Some(keys)
+        self.picker().keys_to(STOP_AND_WAIT)
     }
 
     /// `1. Upgrade your plan, 2. Use extra usage`: the options, for an
     /// error that says what the picker offered.
     pub fn listed(&self) -> String {
-        self.options
-            .iter()
-            .enumerate()
-            .map(|(i, o)| format!("{}. {o}", i + 1))
-            .collect::<Vec<_>>()
-            .join(", ")
+        self.picker().listed()
+    }
+
+    fn picker(&self) -> crate::picker::Picker {
+        crate::picker::Picker {
+            options: self.options.clone(),
+            selected: self.selected,
+            numbered: true,
+        }
     }
 }
 
@@ -739,41 +730,18 @@ pub fn limit_picker(kind: &str, text: &str, now: DateTime<Utc>) -> Option<LimitP
 }
 
 fn claude_picker(text: &str, now: DateTime<Utc>) -> Option<LimitPicker> {
-    let text = text.replace('\u{a0}', " ");
-    let lines: Vec<&str> = text
-        .lines()
-        .map(unboxed)
-        .filter(|l| !l.is_empty() && !is_rule(l) && !is_box_edge(l))
-        .collect();
-    let mut end = lines.len();
-    // The key hints under the options.
-    while end > 0 && is_key_hint(lines[end - 1]) && lines.len() - end < 2 {
-        end -= 1;
-    }
-    let mut options = Vec::new();
-    let mut selected = None;
-    let mut start = end;
-    while start > 0 {
-        let Some((cursor, number, option)) = picker_option(lines[start - 1]) else {
-            break;
-        };
-        if cursor {
-            if selected.is_some() {
-                return None;
-            }
-            selected = Some(start - 1);
-        }
-        options.push((number, option));
-        start -= 1;
-    }
-    options.reverse();
-    let numbered = options.iter().enumerate().all(|(i, (n, _))| *n == i + 1);
-    if options.len() < 2 || !numbered {
+    let found = crate::picker::at_bottom(text)?;
+    if !found.picker.numbered {
         return None;
     }
-    let selected = selected? - start;
-    let options: Vec<String> = options.into_iter().map(|(_, o)| o.to_string()).collect();
-    let above: Vec<&str> = lines[..start].iter().rev().take(4).copied().collect();
+    let options = found.picker.options;
+    let above: Vec<&str> = found
+        .above
+        .iter()
+        .rev()
+        .take(4)
+        .map(String::as_str)
+        .collect();
     let message = above.iter().find_map(|l| {
         let said = l
             .trim_start_matches(MESSAGE_MARKERS)
@@ -803,47 +771,9 @@ fn claude_picker(text: &str, now: DateTime<Utc>) -> Option<LimitPicker> {
     });
     Some(LimitPicker {
         options,
-        selected,
+        selected: found.picker.selected,
         limit,
     })
-}
-
-/// `line` without the sides of a box Claude draws around a dialog, and
-/// without its indent.
-fn unboxed(line: &str) -> &str {
-    line.trim()
-        .trim_start_matches('│')
-        .trim_end_matches('│')
-        .trim()
-}
-
-/// The top or bottom of a box: `╭────╮`.
-fn is_box_edge(line: &str) -> bool {
-    line.chars().count() >= 3
-        && line
-            .chars()
-            .all(|c| matches!(c, '─' | '╭' | '╮' | '╰' | '╯' | '┌' | '┐' | '└' | '┘'))
-}
-
-/// A line of key hints under a picker: `Enter to confirm · Esc to cancel`.
-fn is_key_hint(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    ["to confirm", "to cancel", "to select", "to navigate"]
-        .iter()
-        .any(|h| lower.contains(h))
-}
-
-/// An option of a picker: `❯ 1. Stop and wait for limit to reset` or
-/// `2. Upgrade your plan`, as (under the cursor, number, text).
-fn picker_option(line: &str) -> Option<(bool, usize, &str)> {
-    let (cursor, rest) = match line.strip_prefix(['❯', '>']) {
-        Some(rest) => (true, rest.trim_start()),
-        None => (false, line),
-    };
-    let digits = rest.find(|c: char| !c.is_ascii_digit())?;
-    let number = rest[..digits].parse().ok()?;
-    let option = rest[digits..].strip_prefix(". ")?.trim();
-    (!option.is_empty()).then_some((cursor, number, option))
 }
 
 /// When the limit `text` tells of resets, if it says: a unix time after

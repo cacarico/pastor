@@ -333,8 +333,8 @@ pub struct MachineSettings {
     /// after each reconcile (`reconcile_every` connected, `poll_every`
     /// polling), so the real interval rounds up to that tick.
     pub version_every: Duration,
-    /// `[agents]` in `pastor.toml`: the keys that answer each agent's
-    /// folder-trust prompt.
+    /// `[agents]` in `pastor.toml`: the startup dialogs each agent may
+    /// show and how they are answered (`Agents::dialogs`).
     pub agents: crate::config::Agents,
     /// `head_address` in `pastor.toml`, for a machine other than the head's
     /// own (`daemon::actor_settings`): its agents get it as `ipc::HEAD_ENV`.
@@ -482,6 +482,10 @@ pub struct SendInput {
     /// the task's (machine, repo) as trusted. Never with text or keys.
     #[serde(default)]
     pub trust: bool,
+    /// Answer the picker on screen by the text of one of its options:
+    /// arrows to it, then Enter. Never with text, keys or trust.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pick: Option<String>,
 }
 
 impl SendInput {
@@ -492,11 +496,15 @@ impl SendInput {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.text.is_none() && self.keys.is_empty() && !self.trust
+        self.text.is_none()
+            && self.keys.is_empty()
+            && !self.trust
+            && self.pick.as_deref().is_none_or(|p| p.trim().is_empty())
     }
 
-    /// What `task.input` records: the key names and the length of the text,
-    /// never the text, which may hold a secret.
+    /// What `task.input` records for text and keys: the key names and the
+    /// length of the text, never the text, which may hold a secret. A pick
+    /// is recorded by `run_send`, with the keys it worked out.
     pub fn detail(&self) -> serde_json::Value {
         let mut d = serde_json::Map::new();
         if let Some(text) = &self.text {
@@ -904,7 +912,7 @@ pub fn spawn_machine(
         rx,
         now_rx: Some(now_rx),
         pending_done: HashMap::new(),
-        trust_answered: HashMap::new(),
+        dialog_answered: HashMap::new(),
         unseen_prompt: HashMap::new(),
         idle_agents: HashSet::new(),
         picker_read: HashSet::new(),
@@ -998,7 +1006,7 @@ struct Actor {
     /// although herdr accepts it; the pending prompt waits `settle` from here
     /// (`deliver_pending_prompt`, `deliver_held_prompts`). Kept in memory
     /// only: an actor started later comes well after the redraw.
-    trust_answered: HashMap<i64, Instant>,
+    dialog_answered: HashMap<i64, Instant>,
     /// task id -> how often its prompt was sent again, for a task whose
     /// agent this actor gave its prompt (dispatch or a pending delivery) and
     /// has not seen `working` or `blocked` since. An agent still idle a
@@ -1864,7 +1872,7 @@ impl Actor {
                 let (result, mut dead, nows) = self.run_dispatch(task_id, false).await;
                 dead |= nows.dead;
                 if (matches!(&result, Ok(t) if t.state == TaskState::Blocked) || nows.blocked)
-                    && let Err(err) = self.auto_trust().await
+                    && let Err(err) = self.auto_answer().await
                 {
                     tracing::warn!(machine = %self.name, "auto trust after dispatch: {err:#}");
                     dead |= is_outage(&err);
@@ -1934,7 +1942,7 @@ impl Actor {
                 let (result, mut dead, nows) = self.run_dispatch(task_id, true).await;
                 dead |= nows.dead;
                 if nows.blocked
-                    && let Err(err) = self.auto_trust().await
+                    && let Err(err) = self.auto_answer().await
                 {
                     tracing::warn!(machine = %self.name, "auto trust after dispatch: {err:#}");
                     dead |= is_outage(&err);
@@ -1949,7 +1957,7 @@ impl Actor {
                 }
             }
             MachineCommand::AutoTrust { reply } => {
-                let result = self.auto_trust().await;
+                let result = self.auto_answer().await;
                 let dead = matches!(&result, Err(err) if is_outage(err));
                 let _ = reply.send(result);
                 if dead {
@@ -2030,7 +2038,7 @@ impl Actor {
         if input.is_empty() {
             let err = SendRefused {
                 code: "nothing_to_send",
-                message: "give text, --key or --trust".into(),
+                message: "give text, --key, --trust or --pick".into(),
             };
             return (Err(err.into()), false);
         }
@@ -2060,6 +2068,44 @@ impl Actor {
                 return (Err(err.into()), false);
             };
             let detail = serde_json::json!({"keys": keys, "trust": true});
+            (None, keys, detail)
+        } else if let Some(want) = &input.pick {
+            let timeout = self.settings.request_timeout;
+            let target = task.agent_name.as_deref().unwrap_or(&pane);
+            let screen =
+                match tokio::time::timeout(timeout, self.connector.agent_read(target, 100)).await {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(err)) => {
+                        let dead = err.is_transport();
+                        return (Err(err.into()), dead);
+                    }
+                    Err(_) => return (Err(TimedOut("agent.read", timeout).into()), true),
+                };
+            let Some(found) = crate::picker::at_bottom(&screen) else {
+                let tail: Vec<&str> = screen.lines().rev().take(5).collect();
+                let tail: Vec<&str> = tail.into_iter().rev().collect();
+                let err = SendRefused {
+                    code: "no_picker",
+                    message: format!(
+                        "{} shows no picker at the bottom of its pane:\n{}",
+                        task.display_id(),
+                        tail.join("\n")
+                    ),
+                };
+                return (Err(err.into()), false);
+            };
+            let Some(keys) = found.picker.keys_to(want) else {
+                let err = SendRefused {
+                    code: "no_such_option",
+                    message: format!(
+                        "{} shows no option matching {want:?}; the picker has {}",
+                        task.display_id(),
+                        found.picker.listed()
+                    ),
+                };
+                return (Err(err.into()), false);
+            };
+            let detail = serde_json::json!({"keys": keys, "pick": want});
             (None, keys, detail)
         } else {
             // Text that reopens a done task is new work, a new round: it
@@ -2102,10 +2148,19 @@ impl Actor {
         if task.state == TaskState::Done {
             return (self.reopen(task), false);
         }
+        // Input into a startup dialog, by whichever flag: the agent redraws,
+        // and what follows may be another dialog, which herdr does not
+        // report as a change, so the window's tick looks (`auto_answer`).
+        if task.state == TaskState::Blocked && task.prompt_pending {
+            self.dialog_answered.insert(task.id, Instant::now());
+        }
         if input.trust {
-            self.trust_answered.insert(task.id, Instant::now());
             // The prompt is answered: saved trust must not answer it again.
-            if let Err(err) = self.store.claim_trust_sent(task.id, &keys) {
+            if let Err(err) = self
+                .store
+                .claim_trust_sent(task.id, &keys)
+                .and_then(|_| self.store.claim_answered(task.id, "trust", &keys))
+            {
                 return (Err(err), false);
             }
             if let Some(repo) = &task.spec.repo
@@ -3504,7 +3559,7 @@ impl Actor {
             }
         ) {
             self.answer_limit_picker(id).await?;
-            self.auto_trust().await?;
+            self.auto_answer().await?;
         }
         Ok(())
     }
@@ -3524,20 +3579,20 @@ impl Actor {
         if matches!(status, AgentStatus::Blocked | AgentStatus::Unknown) {
             return Ok(false);
         }
-        match self.trust_answered.get(&task.id) {
+        match self.dialog_answered.get(&task.id) {
             Some(at) if at.elapsed() < self.settings.settle => {
                 // Still redrawing after its trust dialog: the settle tick
                 // sends it (`deliver_held_prompts`).
                 return Ok(true);
             }
             Some(_) => {
-                self.trust_answered.remove(&task.id);
+                self.dialog_answered.remove(&task.id);
             }
             None if task.state == TaskState::Blocked => {
                 // Out of its startup block with no answer from pastor: a
                 // person answered it at the pane, just now. The agent redraws
                 // as after any trust answer, so the prompt waits out `settle`.
-                self.trust_answered.insert(task.id, Instant::now());
+                self.dialog_answered.insert(task.id, Instant::now());
                 return Ok(true);
             }
             None => {}
@@ -3557,7 +3612,7 @@ impl Actor {
                 .map_err(|_| TimedOut("agent.read", timeout))?
             {
                 Ok(screen) if crate::config::shows_startup_question(&screen, &hold) => {
-                    self.trust_answered.remove(&task.id);
+                    self.dialog_answered.remove(&task.id);
                     return Ok(true);
                 }
                 Ok(_) => {}
@@ -3648,7 +3703,7 @@ impl Actor {
     /// an empty input until it gets its prompt.
     async fn deliver_held_prompts(&mut self) -> anyhow::Result<()> {
         let due: Vec<i64> = self
-            .trust_answered
+            .dialog_answered
             .iter()
             .filter(|(_, at)| at.elapsed() >= self.settings.settle)
             .map(|(id, _)| *id)
@@ -3660,6 +3715,7 @@ impl Actor {
         let agents = tokio::time::timeout(timeout, self.connector.agent_list())
             .await
             .map_err(|_| TimedOut("agent.list", timeout))??;
+        let mut blocked_again = false;
         for id in due {
             let found = self
                 .store
@@ -3673,13 +3729,24 @@ impl Actor {
                         .find(|a| Some(&a.pane_id) == t.pane_id.as_ref())?;
                     Some((t, agent.agent_status))
                 });
+            blocked_again |= found
+                .as_ref()
+                .is_some_and(|(_, status)| *status == AgentStatus::Blocked);
             if let Some((task, status)) = found {
                 // Its entry is still there and due, so the prompt goes in now
                 // rather than being held again as a fresh answer.
                 self.deliver_pending_prompt(task, status).await?;
             }
             // Sent, or blocked again: leaving the block next starts a new hold.
-            self.trust_answered.remove(&id);
+            self.dialog_answered.remove(&id);
+        }
+        if blocked_again {
+            // The next dialog of a chain: herdr reports no change when one
+            // form replaces another, so without this read the task would
+            // wait for the next reconcile. Once, after every due entry is
+            // gone: the pass covers every task, and a hold it starts for a
+            // task later in `due` must not be dropped by that task's turn.
+            self.auto_answer().await?;
         }
         Ok(())
     }
@@ -4561,7 +4628,7 @@ impl Actor {
         for id in blocked {
             self.answer_limit_picker(id).await?;
         }
-        self.auto_trust().await?;
+        self.auto_answer().await?;
         Ok(adopted)
     }
 
@@ -4637,61 +4704,111 @@ impl Actor {
         self.wait_on_limit(task, &picker.limit, false, &text).await
     }
 
-    /// Answer the folder-trust prompt of every task blocked during startup
-    /// (`Blocked` with its prompt still pending) whose (machine, repo) is
-    /// saved as trusted: send its agent's trust keys once and emit
-    /// `task.trusted`. When the agent has a `trust_marker` (Claude's is
-    /// built in), the pane is read first and the keys go only while it
-    /// shows the marker; a task blocked on any other dialog is left alone,
-    /// and is looked at again next reconcile. `claim_trust_sent`, after herdr accepted the keys,
-    /// makes it once per task, across restarts, whether or not the keys
-    /// answered the prompt: a task still blocked afterwards is left for a
-    /// human. A send that fails claims nothing, so a later reconcile tries
-    /// again; the actor is the only writer of the flag for its tasks, so
-    /// checking before the send and claiming after it cannot race. The
-    /// pending prompt goes in
-    /// when the agent reports it is no longer blocked
-    /// (`deliver_pending_prompt`).
-    async fn auto_trust(&mut self) -> anyhow::Result<()> {
+    /// Answer the startup dialog of every task blocked while starting
+    /// (`Blocked` with its prompt pending): read its pane once, take the
+    /// first of its agent's dialogs (`Agents::dialogs`) whose marker shows
+    /// in the bottom prompt, skip it if this task was already answered for
+    /// it or it needs a saved trust the task's repo lacks, press its keys,
+    /// and record the answer (`claim_answered`, once per task and dialog
+    /// across restarts). One dialog per pass: the next reconcile or status
+    /// reads the pane again and finds what follows. The trust row also
+    /// claims `trust_sent` and emits `task.trusted`, as before, so pull
+    /// machines and hooks see no change; every other row emits
+    /// `task.answered`. A send that fails claims nothing, so a later pass
+    /// tries again; the actor is the only writer of the claims for its
+    /// tasks, so checking before the send and claiming after it cannot
+    /// race. A `pick` not on screen presses nothing. A task no row matches,
+    /// or still blocked after its rows, waits for a person. The pending
+    /// prompt goes in when the agent reports it is no longer blocked
+    /// (`deliver_pending_prompt`). A task inside its settle window after
+    /// an answer (its own, or a person's) is not read: Claude is still
+    /// replacing the dialog, and the window's tick reads it next.
+    async fn auto_answer(&mut self) -> anyhow::Result<()> {
         for task in self.store.tasks_on_machine(&self.name)? {
             if task.state != TaskState::Blocked || !task.prompt_pending {
                 continue;
             }
-            let (Some(pane), Some(repo)) = (&task.pane_id, &task.spec.repo) else {
+            if self
+                .dialog_answered
+                .get(&task.id)
+                .is_some_and(|at| at.elapsed() < self.settings.settle)
+            {
                 continue;
-            };
-            let Some(keys) = self.settings.agents.trust_keys(&task.spec.agent) else {
-                continue;
-            };
-            if self.store.trust_sent(task.id)? || !self.store.is_trusted(&self.name, repo)? {
+            }
+            let Some(pane) = &task.pane_id else { continue };
+            let dialogs = self.settings.agents.dialogs(&task.spec.agent);
+            if dialogs.is_empty() {
                 continue;
             }
             let timeout = self.settings.request_timeout;
-            // The keys answer whatever dialog is up, so they go only while the
-            // pane shows the trust prompt; anything else waits for a human.
-            if let Some(marker) = self.settings.agents.trust_marker(&task.spec.agent) {
-                let target = task.agent_name.as_deref().unwrap_or(pane);
-                let screen = tokio::time::timeout(timeout, self.connector.agent_read(target, 100))
-                    .await
-                    .map_err(|_| TimedOut("agent.read", timeout))??;
-                if !crate::config::shows_trust_marker(&screen, &marker) {
-                    tracing::debug!(machine = %self.name, task = %task.display_id(), "blocked, but not on the trust prompt; left for a human");
+            let target = task.agent_name.as_deref().unwrap_or(pane);
+            let screen = tokio::time::timeout(timeout, self.connector.agent_read(target, 100))
+                .await
+                .map_err(|_| TimedOut("agent.read", timeout))??;
+            // The first row that shows, was not answered for this task, and
+            // applies: a row with no marker (trust without one) shows on
+            // every screen, and an earlier dialog's text can linger in the
+            // read, so a row that is done or does not apply must not hide
+            // the ones after it.
+            let repo = task.spec.repo.as_deref();
+            let mut dialog = None;
+            for d in &dialogs {
+                let shows = d
+                    .marker
+                    .as_deref()
+                    .is_none_or(|m| crate::config::shows_trust_marker(&screen, m));
+                if !shows || self.store.answered(task.id, &d.name)? {
                     continue;
                 }
+                let trusted = match repo {
+                    Some(r) => self.store.is_trusted(&self.name, r)?,
+                    None => false,
+                };
+                if d.needs_trust && !trusted {
+                    continue;
+                }
+                dialog = Some(d);
+                break;
             }
+            let Some(dialog) = dialog else {
+                tracing::debug!(machine = %self.name, task = %task.display_id(), "blocked on a dialog pastor does not know, or one that waits for a person");
+                continue;
+            };
+            let keys = match &dialog.answer {
+                crate::config::Answer::Keys(keys) => keys.clone(),
+                crate::config::Answer::Pick(want) => {
+                    let found =
+                        crate::picker::at_bottom(&screen).and_then(|f| f.picker.keys_to(want));
+                    let Some(keys) = found else {
+                        tracing::warn!(machine = %self.name, task = %task.display_id(), dialog = %dialog.name, pick = %want, "the dialog shows no such option; left for a person");
+                        continue;
+                    };
+                    keys
+                }
+            };
             tokio::time::timeout(timeout, self.connector.pane_send_keys(pane, &keys))
                 .await
                 .map_err(|_| TimedOut("pane.send_keys", timeout))??;
-            self.trust_answered.insert(task.id, Instant::now());
-            if !self.store.claim_trust_sent(task.id, &keys)? {
+            self.dialog_answered.insert(task.id, Instant::now());
+            if !self.store.claim_answered(task.id, &dialog.name, &keys)? {
                 continue;
             }
-            tracing::info!(machine = %self.name, task = %task.display_id(), repo, "answered the trust prompt of a trusted repo");
-            self.emit_with(
-                "task.trusted",
-                Some(task.id),
-                Some(serde_json::json!({"keys": keys})),
-            );
+            if dialog.needs_trust {
+                self.store.claim_trust_sent(task.id, &keys)?;
+                tracing::info!(machine = %self.name, task = %task.display_id(), repo = repo.unwrap_or(""), "answered the trust prompt of a trusted repo");
+                self.emit_with(
+                    "task.trusted",
+                    Some(task.id),
+                    Some(serde_json::json!({"keys": keys})),
+                );
+            } else {
+                tracing::info!(machine = %self.name, task = %task.display_id(), dialog = %dialog.name, "answered a startup dialog");
+                self.emit_with(
+                    "task.answered",
+                    Some(task.id),
+                    Some(serde_json::json!({"dialog": dialog.name, "keys": keys})),
+                );
+            }
         }
         Ok(())
     }
@@ -8401,6 +8518,434 @@ mod tests {
         h.send(bare.id, trust()).await.unwrap();
         assert_eq!(calls(&fake, "pane.send_keys").len(), 1);
         assert!(store.trusted_repos().unwrap().is_empty());
+    }
+
+    fn answered_events(events: &mut broadcast::Receiver<PastorEvent>) -> Vec<PastorEvent> {
+        let mut out = vec![];
+        while let Ok(ev) = events.try_recv() {
+            if ev.kind == "task.answered" {
+                out.push(ev);
+            }
+        }
+        out
+    }
+
+    /// The kinds of every event so far, in order, with `task.*` only.
+    fn task_event_kinds(events: &mut broadcast::Receiver<PastorEvent>) -> Vec<String> {
+        let mut out = vec![];
+        while let Ok(ev) = events.try_recv() {
+            if ev.kind.starts_with("task.") {
+                out.push(ev.kind);
+            }
+        }
+        out
+    }
+
+    async fn connected_with(
+        fake: &FakeHerdr,
+        store: &Arc<Store>,
+        settings: MachineSettings,
+    ) -> (MachineHandle, broadcast::Receiver<PastorEvent>) {
+        let (h, events) = spawn_with_settings(fake, store, settings);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        (h, events)
+    }
+
+    const AUTO_SCREEN: &str = "Make auto mode your default permission mode?\n\n ❯ Yes, set auto mode as my default permission mode\n   No, keep default\n\n Enter to confirm · Esc to cancel\n";
+    const RENDERER_SCREEN: &str = "  Try the new fullscreen renderer?\n\n  ❯ 1. Yes, try it\n    2. Not now\n\n  Enter to confirm · Esc to cancel\n";
+    const DOWN_ENTER: [&str; 2] = ["Down", "Enter"];
+
+    fn keys(keys: &[&str]) -> Vec<String> {
+        keys.iter().map(|k| k.to_string()).collect()
+    }
+
+    /// Trust, then the auto-mode nudge: each answered once, in order, and
+    /// the prompt goes in after the second.
+    #[tokio::test(start_paused = true)]
+    async fn a_chain_of_startup_dialogs_is_answered_one_per_settle() {
+        let fake = FakeHerdr::new();
+        fake.set_startup_dialogs(vec![
+            (
+                crate::herdr::fake::CLAUDE_TRUST_SCREEN.into(),
+                keys(&DOWN_ENTER),
+            ),
+            (AUTO_SCREEN.into(), keys(&DOWN_ENTER)),
+        ]);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store.trust_repo("m", "/r").unwrap();
+        let (h, mut events) = connected(&fake, &store).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        wait_for("the task to run", || {
+            state_of(&store, t.id) == TaskState::Running
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            fake.pane_input(t.pane_id.as_deref().unwrap()),
+            [
+                PaneInput::Keys(keys(&DOWN_ENTER)),
+                PaneInput::Keys(keys(&DOWN_ENTER)),
+            ]
+        );
+        let mut evs = vec![];
+        while let Ok(ev) = events.try_recv() {
+            if ev.kind == "task.trusted" || ev.kind == "task.answered" {
+                evs.push(ev);
+            }
+        }
+        let kinds: Vec<&str> = evs.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(kinds, ["task.trusted", "task.answered"]);
+        assert_eq!(
+            evs[1].detail,
+            Some(serde_json::json!({"dialog": "auto-mode-default", "keys": ["Down", "Enter"]}))
+        );
+        assert!(store.answered(t.id, "auto-mode-default").unwrap());
+        assert!(store.answered(t.id, "trust").unwrap());
+    }
+
+    /// A dialog after trust whose row the user removed is left for a
+    /// person; trust's keys are not pressed again.
+    #[tokio::test(start_paused = true)]
+    async fn a_removed_dialog_is_left_for_a_person() {
+        let fake = FakeHerdr::new();
+        fake.set_startup_dialogs(vec![
+            (
+                crate::herdr::fake::CLAUDE_TRUST_SCREEN.into(),
+                keys(&DOWN_ENTER),
+            ),
+            (RENDERER_SCREEN.into(), keys(&DOWN_ENTER)),
+        ]);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store.trust_repo("m", "/r").unwrap();
+        let mut settings = settings();
+        settings.agents = toml::from_str(
+            "[claude]\n[[claude.dialogs]]\nname = \"fullscreen\"\nmarker = \"x\"\npick = \"\"\n",
+        )
+        .unwrap();
+        let (h, mut events) = connected_with(&fake, &store, settings).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Blocked);
+        assert_eq!(
+            fake.pane_input(t.pane_id.as_deref().unwrap()),
+            [PaneInput::Keys(keys(&DOWN_ENTER))]
+        );
+        assert!(answered_events(&mut events).is_empty());
+    }
+
+    /// A pick whose option is not on screen presses nothing and claims
+    /// nothing, so a later screen with the option is still answered.
+    #[tokio::test(start_paused = true)]
+    async fn a_pick_not_in_the_picker_is_not_pressed() {
+        let fake = FakeHerdr::new();
+        fake.set_startup_dialogs(vec![(
+            "  Try the new fullscreen renderer?\n\n  ❯ 1. Yes, try it\n    2. Later\n\n  Enter to confirm · Esc to cancel\n".into(),
+            keys(&DOWN_ENTER),
+        )]);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Blocked);
+        assert!(calls(&fake, "pane.send_keys").is_empty());
+        assert!(!store.answered(t.id, "fullscreen").unwrap());
+    }
+
+    /// An untrusted repo skips the trust row but not the rows after it: a
+    /// task that starts on the renderer offer is answered.
+    #[tokio::test(start_paused = true)]
+    async fn rows_after_trust_do_not_need_saved_trust() {
+        let fake = FakeHerdr::new();
+        fake.set_startup_dialogs(vec![(RENDERER_SCREEN.into(), keys(&DOWN_ENTER))]);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = connected(&fake, &store).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        wait_for("the task to run", || {
+            state_of(&store, t.id) == TaskState::Running
+        })
+        .await;
+        let kinds = task_event_kinds(&mut events);
+        assert!(!kinds.iter().any(|k| k == "task.trusted"), "{kinds:?}");
+        assert_eq!(
+            kinds.iter().filter(|k| *k == "task.answered").count(),
+            1,
+            "{kinds:?}"
+        );
+    }
+
+    /// Restarted actor, same store: an answered dialog is not pressed again.
+    #[tokio::test(start_paused = true)]
+    async fn an_answered_dialog_is_not_pressed_again_after_a_restart() {
+        let fake = FakeHerdr::new();
+        // Keys that do not answer it: the agent stays blocked.
+        fake.set_startup_dialogs(vec![(RENDERER_SCREEN.into(), keys(&["Enter"]))]);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _e) = connected(&fake, &store).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(calls(&fake, "pane.send_keys").len(), 1);
+        // Its agent is still up, so the shutdown reports that; the actor is
+        // gone either way.
+        let _ = h.shutdown().await;
+        let (_h2, _e2) = connected(&fake, &store).await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(
+            calls(&fake, "pane.send_keys").len(),
+            1,
+            "claimed in the store"
+        );
+        assert_eq!(state_of(&store, t.id), TaskState::Blocked);
+    }
+
+    fn pick(what: &str) -> SendInput {
+        SendInput {
+            pick: Some(what.into()),
+            ..Default::default()
+        }
+    }
+
+    /// `--pick` reads the picker and presses the arrows to the option, then
+    /// Enter; it saves no trust.
+    #[tokio::test(start_paused = true)]
+    async fn send_pick_arrows_to_the_option_and_confirms() {
+        let fake = FakeHerdr::new();
+        fake.set_startup_dialogs(vec![(BYPASS_SCREEN.into(), keys(&DOWN_ENTER))]);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = connected(&fake, &store).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        assert_eq!(t.state, TaskState::Blocked);
+        h.send(t.id, pick("yes, i accept")).await.unwrap();
+        assert_eq!(
+            fake.pane_input(t.pane_id.as_deref().unwrap()),
+            [PaneInput::Keys(keys(&DOWN_ENTER))]
+        );
+        let evs = input_events(&mut events);
+        assert_eq!(
+            evs[0].detail,
+            Some(serde_json::json!({"keys": ["Down", "Enter"], "pick": "yes, i accept"}))
+        );
+        assert!(
+            !store.is_trusted("m", "/r").unwrap(),
+            "--pick never saves trust"
+        );
+    }
+
+    const BYPASS_SCREEN: &str = "WARNING: Claude Code running in Bypass Permissions mode\n\n\u{276f} 1. No, exit\n  2. Yes, I accept\n\nEnter to confirm \u{b7} Esc to cancel\n";
+
+    /// On a dialog pastor does not answer itself (the bypass warning).
+    #[tokio::test(start_paused = true)]
+    async fn send_pick_refuses_without_a_picker_or_the_option() {
+        let fake = FakeHerdr::new();
+        fake.set_startup_dialogs(vec![(BYPASS_SCREEN.into(), keys(&["Enter"]))]);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _e) = connected(&fake, &store).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        let err = h.send(t.id, pick("upgrade")).await.unwrap_err();
+        let r = err.downcast_ref::<SendRefused>().unwrap();
+        assert_eq!(r.code, "no_such_option");
+        assert!(
+            r.message.contains("1. No, exit, 2. Yes, I accept"),
+            "{}",
+            r.message
+        );
+        // Answered by hand: the pane shows no picker now.
+        fake.pane_send_keys(t.pane_id.as_deref().unwrap(), &keys(&["Enter"]))
+            .await
+            .unwrap();
+        let err = h.send(t.id, pick("Not now")).await.unwrap_err();
+        assert_eq!(err.downcast_ref::<SendRefused>().unwrap().code, "no_picker");
+        assert_eq!(
+            calls(&fake, "pane.send_keys").len(),
+            1,
+            "only the hand answer"
+        );
+    }
+
+    /// The trust dialog as 2.1.295 draws it: options without numbers.
+    const TRUST_SCREEN: &str = "Quick safety check: Is this a project you created or one you trust?\n\n \u{276f} No, exit\n   Yes, I trust this folder\n\n Enter to confirm \u{b7} Esc to cancel\n";
+
+    /// A trust row with no marker matches any screen; once it is answered
+    /// the rows after it are still tried, so the chain goes on.
+    #[tokio::test(start_paused = true)]
+    async fn an_answered_row_does_not_stop_the_rows_after_it() {
+        let fake = FakeHerdr::new();
+        fake.set_startup_dialogs(vec![
+            (TRUST_SCREEN.into(), keys(&DOWN_ENTER)),
+            (RENDERER_SCREEN.into(), keys(&DOWN_ENTER)),
+        ]);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store.trust_repo("m", "/r").unwrap();
+        let mut settings = settings();
+        settings.agents = toml::from_str("[claude]\ntrust_marker = \"\"\n").unwrap();
+        let (h, _e) = connected_with(&fake, &store, settings).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        wait_for("the task to run", || {
+            state_of(&store, t.id) == TaskState::Running
+        })
+        .await;
+        assert!(store.answered(t.id, "trust").unwrap());
+        assert!(store.answered(t.id, "fullscreen").unwrap());
+    }
+
+    /// An untrusted repo's trust dialog, answered by a person, can leave
+    /// its text above the next dialog in the pane read; the trust row does
+    /// not apply, and the renderer row after it is still answered.
+    #[tokio::test(start_paused = true)]
+    async fn a_lingering_trust_dialog_does_not_hide_the_next_one() {
+        let fake = FakeHerdr::new();
+        fake.set_startup_dialogs(vec![
+            (TRUST_SCREEN.into(), keys(&DOWN_ENTER)),
+            (
+                format!("{TRUST_SCREEN}\n{RENDERER_SCREEN}"),
+                keys(&DOWN_ENTER),
+            ),
+        ]);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _e) = connected(&fake, &store).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            state_of(&store, t.id),
+            TaskState::Blocked,
+            "untrusted: left alone"
+        );
+        assert!(calls(&fake, "pane.send_keys").is_empty());
+        // A person answers trust at the pane.
+        fake.pane_send_keys(t.pane_id.as_deref().unwrap(), &keys(&DOWN_ENTER))
+            .await
+            .unwrap();
+        wait_for("the task to run", || {
+            state_of(&store, t.id) == TaskState::Running
+        })
+        .await;
+        assert!(!store.answered(t.id, "trust").unwrap());
+        assert!(store.answered(t.id, "fullscreen").unwrap());
+    }
+
+    /// herdr reports no change when one dialog replaces another, so the
+    /// next dialog is answered after the settle window, not at the next
+    /// reconcile, which is far off here.
+    #[tokio::test(start_paused = true)]
+    async fn the_next_dialog_is_answered_after_the_settle_window() {
+        let fake = FakeHerdr::new();
+        fake.set_startup_dialogs(vec![
+            (
+                crate::herdr::fake::CLAUDE_TRUST_SCREEN.into(),
+                keys(&DOWN_ENTER),
+            ),
+            (AUTO_SCREEN.into(), keys(&DOWN_ENTER)),
+            (RENDERER_SCREEN.into(), keys(&DOWN_ENTER)),
+        ]);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store.trust_repo("m", "/r").unwrap();
+        let settings = MachineSettings {
+            reconcile_every: Duration::from_secs(60),
+            poll_every: Duration::from_secs(60),
+            ..settings()
+        };
+        let (h, _e) = connected_with(&fake, &store, settings).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+        assert_eq!(calls(&fake, "pane.send_keys").len(), 3);
+    }
+
+    /// Two tasks whose holds come due in the same settle tick, each on a
+    /// chain, while Claude takes a moment to replace one dialog with the
+    /// next. Answering the first task's next dialog must not drop the hold
+    /// the second task just got for its own, or that task's third dialog
+    /// waits for a reconcile. Dispatched a redraw apart so their holds are
+    /// never in lockstep.
+    #[tokio::test(start_paused = true)]
+    async fn two_tasks_due_in_one_settle_tick_each_get_their_next_dialog() {
+        let fake = FakeHerdr::new();
+        fake.set_startup_dialogs(vec![
+            (
+                crate::herdr::fake::CLAUDE_TRUST_SCREEN.into(),
+                keys(&DOWN_ENTER),
+            ),
+            (AUTO_SCREEN.into(), keys(&DOWN_ENTER)),
+            (RENDERER_SCREEN.into(), keys(&DOWN_ENTER)),
+        ]);
+        fake.set_trust_redraw(Duration::from_millis(50));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store.trust_repo("m", "/r").unwrap();
+        let settings = MachineSettings {
+            reconcile_every: Duration::from_secs(60),
+            poll_every: Duration::from_secs(60),
+            ..settings()
+        };
+        let (h, _e) = connected_with(&fake, &store, settings).await;
+        let t1 = h.dispatch(worktree_task(&store).id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let t2 = h.dispatch(worktree_task(&store).id).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(state_of(&store, t1.id), TaskState::Running);
+        assert_eq!(state_of(&store, t2.id), TaskState::Running);
+        assert_eq!(calls(&fake, "pane.send_keys").len(), 6);
+    }
+
+    /// A dialog is answered once per settle window, as the manual says:
+    /// a status event or reconcile inside the window reads nothing, and
+    /// the hold's own tick finds the next dialog.
+    #[tokio::test(start_paused = true)]
+    async fn a_task_in_its_settle_window_is_not_read_again() {
+        let fake = FakeHerdr::new();
+        fake.set_startup_dialogs(vec![
+            (
+                crate::herdr::fake::CLAUDE_TRUST_SCREEN.into(),
+                keys(&DOWN_ENTER),
+            ),
+            (AUTO_SCREEN.into(), keys(&DOWN_ENTER)),
+        ]);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store.trust_repo("m", "/r").unwrap();
+        let settings = MachineSettings {
+            reconcile_every: Duration::from_secs(60),
+            poll_every: Duration::from_secs(60),
+            ..settings()
+        };
+        let (h, _e) = connected_with(&fake, &store, settings).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        assert_eq!(calls(&fake, "pane.send_keys").len(), 1);
+        // A reconcile right after the answer (`auto_trust` runs the pass).
+        h.auto_trust().await.unwrap();
+        assert_eq!(
+            calls(&fake, "pane.send_keys").len(),
+            1,
+            "the next dialog waits for the settle window"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+        assert_eq!(calls(&fake, "pane.send_keys").len(), 2);
+    }
+
+    /// A person answers a dialog pastor leaves alone (the bypass warning)
+    /// with `--pick`; the dialog after it is pastor's to answer, and it is,
+    /// after the settle window, with no reconcile in between.
+    #[tokio::test(start_paused = true)]
+    async fn a_dialog_after_a_person_s_pick_is_answered_after_the_settle_window() {
+        let fake = FakeHerdr::new();
+        fake.set_startup_dialogs(vec![
+            (BYPASS_SCREEN.into(), keys(&DOWN_ENTER)),
+            (RENDERER_SCREEN.into(), keys(&DOWN_ENTER)),
+        ]);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let settings = MachineSettings {
+            reconcile_every: Duration::from_secs(60),
+            poll_every: Duration::from_secs(60),
+            ..settings()
+        };
+        let (h, _e) = connected_with(&fake, &store, settings).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        assert_eq!(state_of(&store, t.id), TaskState::Blocked);
+        h.send(t.id, pick("Yes, I accept")).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+        assert_eq!(calls(&fake, "pane.send_keys").len(), 2);
     }
 
     fn trusted_events(events: &mut broadcast::Receiver<PastorEvent>) -> Vec<PastorEvent> {

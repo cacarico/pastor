@@ -2410,7 +2410,7 @@ impl Fleet {
 
     /// `PullTrust`: the folder trust saved for pull machine `machine`, and
     /// only its own, so its actor answers its tasks' trust prompts as the
-    /// head's actor answers another machine's (`Actor::auto_trust`).
+    /// head's actor answers another machine's (`Actor::auto_answer`).
     pub fn pull_trust(&self, machine: &str) -> anyhow::Result<Vec<crate::store::TrustedRepo>> {
         self.pull_handle(machine)?;
         Ok(self
@@ -2439,12 +2439,15 @@ impl Fleet {
         } = report;
         let handle = self.pull_handle(machine)?;
         self.heard(&handle);
-        // Once per task, as `Actor::auto_trust` claims it, so a report sent
+        // Once per task, as `Actor::auto_answer` claims it, so a report sent
         // again (after a restart of the serve, say) is not a second event.
         let trust = |task: &Task| -> anyhow::Result<()> {
             if let Some(keys) = &trusted
                 && self.store.claim_trust_sent(task.id, keys)?
             {
+                // The actor claims both for its own tasks: the two tables
+                // agree on a pull machine's task too.
+                self.store.claim_answered(task.id, "trust", keys)?;
                 self.emit(
                     "task.trusted",
                     machine,
@@ -4498,13 +4501,19 @@ impl Daemon {
     /// row again and types into the pane. A task on no machine, or one whose
     /// machine has left the flock, has no agent to type into.
     async fn send(&self, id: i64, input: SendInput) -> IpcResponse {
-        if input.is_empty() {
-            return IpcResponse::error("nothing_to_send", "give text, --key or --trust");
+        if input.is_empty() || input.pick.as_deref().is_some_and(|p| p.trim().is_empty()) {
+            return IpcResponse::error("nothing_to_send", "give text, --key, --trust or --pick");
         }
         if input.trust && (input.text.is_some() || !input.keys.is_empty()) {
             return IpcResponse::error(
                 "usage_error",
                 "--trust sends the agent's own keys; give no text or --key with it",
+            );
+        }
+        if input.pick.is_some() && (input.text.is_some() || !input.keys.is_empty() || input.trust) {
+            return IpcResponse::error(
+                "usage_error",
+                "--pick answers the picker on screen; give no text, --key or --trust with it",
             );
         }
         let task = match self.store.get_task(id) {
@@ -5775,6 +5784,10 @@ mod tests {
             ]
         );
         assert!(d.store().trust_sent(t1.id).unwrap());
+        assert!(
+            d.store().answered(t1.id, "trust").unwrap(),
+            "claimed as the actor claims it, so the two tables agree"
+        );
         // A report without keys says nothing of trust.
         let t3 = queued(&d, "p3", Some("laptop")).await;
         claim(&d, 1, false).await;
@@ -11664,6 +11677,29 @@ mod tests {
             .handle(IpcRequest::TaskSend {
                 id: t.id,
                 input: crate::machine::SendInput::default(),
+            })
+            .await;
+        assert_eq!(error_code(resp), "nothing_to_send");
+        // --pick with text or --key is a usage error, like --trust.
+        let resp = d
+            .handle(IpcRequest::TaskSend {
+                id: t.id,
+                input: crate::machine::SendInput {
+                    pick: Some("No".into()),
+                    keys: vec!["esc".into()],
+                    ..Default::default()
+                },
+            })
+            .await;
+        assert_eq!(error_code(resp), "usage_error");
+        // An empty --pick would match every option; it is nothing to send.
+        let resp = d
+            .handle(IpcRequest::TaskSend {
+                id: t.id,
+                input: crate::machine::SendInput {
+                    pick: Some("  ".into()),
+                    ..Default::default()
+                },
             })
             .await;
         assert_eq!(error_code(resp), "nothing_to_send");

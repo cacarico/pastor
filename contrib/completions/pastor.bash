@@ -5017,13 +5017,17 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__task__subcmd__send)
-            opts="-h --key --no-enter --trust --json --head --help"
+            opts="-h --key --no-enter --trust --pick --json --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
                 --key)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --pick)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

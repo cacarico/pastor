@@ -136,8 +136,12 @@ fn an_agent_definition_reaches_herdr_as_its_kind_and_env() {
         .unwrap();
     assert_eq!(
         ws["params"]["env"],
-        serde_json::json!({"CLAUDE_CONFIG_DIR": "/srv/claude-personal", "PASTOR_TASK": "t-1"}),
-        "{ws}"
+        serde_json::json!({
+            "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN": "1",
+            "CLAUDE_CONFIG_DIR": "/srv/claude-personal",
+            "PASTOR_TASK": "t-1",
+        }),
+        "its env, and the claude kind's classic renderer: {ws}"
     );
     let out = env.cmd(&["task", "describe", "t-1"]);
     let text = String::from_utf8_lossy(&out.stdout);
