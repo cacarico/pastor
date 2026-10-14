@@ -844,7 +844,7 @@ failing.
 |                      | claude                                                                                                                    | agy                                                                                                            | codex                                                                                                                                    | opencode                                                                                                                    |
 | -------------------- | -------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
 | **Trust**            | herdr reads its folder-trust dialog `blocked`; pastor sends the held prompt once it clears. Built-in `trust_marker` and `trust_keys`, so `pastor task send t-N --trust` answers it and saves the repo | no dialog pastor knows | herdr reads its dialog idle and ready, not blocked; pastor holds the prompt until someone answers by hand (`Do you trust the contents of this directory`). No built-in `trust_keys`, so `--trust` needs one set in `[agents.<name>]` (`no_trust_keys` otherwise) | no dialog pastor knows |
-| **Profile**          | `--permission-mode dontAsk`, plus the tool flags                                                                          | its own permission mode, unless `own_permissions = true` (then no flags or mode; its own settings must cover the profile) | `--ask-for-approval never --sandbox workspace-write` (`danger-full-access` under `unrestricted`); no per-command flag, so the sandbox stands in for the lists | `OPENCODE_PERMISSION` in its pane's env instead of flags (deny-first, `unrestricted` allow-first); a machine or repo config with its own permission rules fails the task (`opencode_permissions_conflict`) |
+| **Profile**          | `--permission-mode dontAsk`, plus the tool flags                                                                          | `--dangerously-skip-permissions --mode accept-edits`, so it never asks; its settings on the machine must deny what the profile denies, checked before launch (`agy_permissions_missing`), and an agy machine runs one profile, its own (`agy_profile_mismatch`); a shell command can still write, so `review` is not a read-only checkout. `own_permissions = true` adds and checks nothing | `--ask-for-approval never --sandbox workspace-write` (`danger-full-access` under `unrestricted`); no per-command flag, so the sandbox stands in for the lists | `OPENCODE_PERMISSION` in its pane's env instead of flags (deny-first, `unrestricted` allow-first); a machine or repo config with its own permission rules fails the task (`opencode_permissions_conflict`) |
 | **Lists** (no profile) | built-in `--allowedTools`/`--disallowedTools`                                                                           | needs `allow_flag`/`deny_flag` in `[agents.<name>]`, else a list refuses the task (`agent_tools_unsupported`)     | same as agy                                                                                                                                 | same as agy                                                                                                                     |
 | **Session**          | `--session-id` at launch, recorded; a pause, wait or model move resumes it with `claude --resume <session>`               | none recorded                                                                                                     | none recorded                                                                                                                               | none recorded                                                                                                                   |
 | **Pause** (`--preempt`) | the only kind eligible: `running`, `low`, a recorded session, not ended, not resumed in the last 10 minutes            | never                                                                                                             | never                                                                                                                                       | never                                                                                                                           |
@@ -859,6 +859,10 @@ lists](#tool-allow-and-deny-lists) for profile and lists, [Usage
 limits](#usage-limits) for session, limits and prompt delivery,
 [Pausing a low task](#pausing-a-low-task) for pause, and [Reopening a
 finished task](#reopening-a-finished-task) for attach.
+
+A `kind` that is none of these four gets the lists through its `allow_flag`
+and `deny_flag` and no never-ask mode, and refuses a list without them
+(`agent_tools_unsupported`).
 
 ## Flocks
 
@@ -2113,8 +2117,68 @@ its agent args; the profile does not turn it on.
 An agent of any other kind gets the lists through its `allow_flag` and
 `deny_flag`, as any list, and keeps its own permission mode.
 
-An agent whose permissions are in its own settings on the machine, such as
-agy with an allow list in its settings, says so with `own_permissions`:
+An agy agent (kind `agy`, the Antigravity CLI) takes no policy at launch:
+its rules live in its settings on the machine, `permissions.allow`,
+`permissions.deny` and `permissions.ask` in `~/.gemini/antigravity-cli/settings.json`
+and in the config it shares with the desktop app,
+`~/.gemini/config/config.json`, and nothing on its command line or in its
+environment carries rules. So a task under a profile starts with
+`--dangerously-skip-permissions --mode accept-edits` after its args, which
+approves every `ask` and skips the diff review before a file write; a
+`deny` still holds under them. Before it makes anything on the machine,
+pastor reads those two files there and checks that each pattern the task
+denies is covered by a deny: `Edit`, `Write` and `NotebookEdit` need
+`write_file(*)`, `Bash(git push:*)` needs `command(git push)` (a prefix by
+words, so `command(git)` covers it too), `Read(~/.ssh/**)` needs
+`read_file(~/.ssh)`, `WebFetch` needs `read_url(*)`, and `mcp__a__b` needs
+`mcp(a/b)`; the action's `*` covers all of it, and a `read_file` deny of a
+path covers a `write_file` of it. A `regex:` rule, an `ask` and an `allow`
+cover nothing. What is missing fails the task before it starts
+(`agy_permissions_missing` in its `error`), with the rules to add, one per
+line. So does a machine whose files pastor cannot read, or that takes no
+shell command (a `command` machine): unlike opencode's check, this one never
+goes ahead, since going ahead would be the skip flag with nothing verified
+behind it. A pattern agy has no rule for (`Glob`, `Grep`, `WebSearch`,
+`Task`, an unknown tool) is refused when the task is queued
+(`agy_deny_unsupported`). agy's project files under
+`~/.gemini/config/projects/` are not read: agy applies only the one for
+its active workspace, which pastor cannot tell, so a deny there does not
+count.
+
+What the profile allows is not passed: agy has no allow list to take, and
+under the flag everything its settings do not deny runs, a shell command
+that writes a file included. A `review` task on agy therefore never asks,
+never uses an edit tool, never runs `git push`, `rm -rf` or `sudo`; it is
+not a read-only checkout, as a Codex one under `review` is not either.
+`pastor task describe` shows the lists with `(agy takes no lists: the deny
+was checked against its settings on the machine, the allow is not passed)`
+after them. Agent args that set `--mode` or `--dangerously-skip-permissions`
+are refused while a profile applies (`profile_args_conflict`).
+
+Those rules are one file per machine, so an agy machine runs one profile at
+a time: `review` needs `write_file(*)` denied, which stops every edit there,
+the owner's own agy sessions included. Give each agy machine its profile in
+its `[[machine]]` entry (or its flock's, or `[defaults]`), write that
+profile's rules into its agy settings, and run its tasks under that
+profile. A task that asks for a profile the machine's own does not cover
+(the task denies a pattern the machine's profile does not) is refused when
+pinned there (`agy_profile_mismatch`), and skips that machine when not; a
+machine with no own profile is tried, and the check above decides. For the
+built-in `review` the deny list on the machine needs at least:
+
+```json
+{
+  "permissions": {
+    "deny": ["write_file(*)", "command(git push)", "command(rm -rf)", "command(sudo)"]
+  }
+}
+```
+
+and `develop` the last three without `write_file(*)`. Writing them is a
+hand step today; the provisioner work takes it over.
+
+An agent whose permissions pastor should leave alone says so with
+`own_permissions`:
 
 ```toml
 # pastor.toml
@@ -2124,20 +2188,17 @@ own_permissions = true
 ```
 
 A task of that agent under a profile starts with its args alone: pastor
-adds no permission flag and no mode, and the profile's lists are not passed.
-The agent's own settings on the machine decide what it may run, so they
-must hold at least what the profile would: pastor cannot check them.
-`pastor task describe` shows the lists with `(not applied: agent
-agy-builder's permissions are in its own settings on the machine)` after
-them. Without `own_permissions`, such a task is refused before it starts
-(`agent_tools_unsupported`), and the message names the field. The field
-cannot stand beside an `allow_flag` or `deny_flag`, and without a profile
-the lists still need flags. The unrestricted rule below holds for it as for
-any agent. To give it to some machines only, define it under its own name
-and name it on those machines (`agent = "agy-builder"`, or `agents = { agy
-= "agy-builder" }` for a model of kind agy). An older pastor refuses a
-pastor.toml with the key, so set it only once every machine runs a release
-that has it.
+adds no permission flag and no mode, runs no check, and the profile's lists
+are not passed. The agent's own settings on the machine decide what it may
+run, so they must hold at least what the profile would, and agy with it
+asks before whatever they do not allow. `pastor task describe` shows the
+lists with `(not applied: agent agy-builder's permissions are in its own
+settings on the machine)` after them. The field cannot stand beside an
+`allow_flag` or `deny_flag`, and without a profile the lists still need
+flags. The unrestricted rule below holds for it as for any agent. To give
+it to some machines only, define it under its own name and name it on those
+machines (`agent = "agy-builder"`, or `agents = { agy = "agy-builder" }`
+for a model of kind agy).
 
 Patterns are passed as written. Claude reads a `~/` path in a pattern
 (`Read(~/.ssh/**)`) as the home of the machine it runs on, so pastor does not
@@ -4004,7 +4065,7 @@ trust_keys = ["Down", "Enter"]   # accept its folder-trust prompt; [] for none
 trust_marker = "Yes, I trust this folder"  # saved trust presses them only while the pane shows this
 allow_flag = "--allowedTools"    # the flag before each allow pattern
 deny_flag = "--disallowedTools"  # the flag before each deny pattern
-# own_permissions = false       # true: its own settings hold its permissions; a profiled task gets no flags
+# own_permissions = false       # true: its own settings hold its permissions; a profiled task gets no flags and no check
 # account = "me-personal"       # a label: machines naming it share its usage limits; unset: none
 [models.sonnet]              # one table per model; none are built in
 kind = "claude"                  # the herdr agent kind that runs it (required)
@@ -4133,7 +4194,7 @@ make test             # unit tests plus an end-to-end run against fake-herdr
 make test-machine     # the machine actor tests on their own
 make portability      # cargo check for the musl and FreeBSD targets; needs cargo-zigbuild, zig and the Rust targets
 make smoke SESSION=s  # opt-in test against a real herdr running session s on this host
-make smoke-profiles REPO='~/src/app' CLAUDE=pi-1 OPENCODE=pi-2  # a live review task per agent through the head
+make smoke-profiles REPO='~/src/app' CLAUDE=pi-1 OPENCODE=pi-2 AGY=pi-3  # a live review task per agent through the head
 make smoke-rc TAG=v1.2.0-rc.1 LABEL=arm64  # make smoke against a tag, in a scratch worktree, as a Markdown report
 make build            # debug build of both binaries; cargo run --bin pastor -- --help works from there
 ```
@@ -4157,9 +4218,11 @@ pastor serve --foreground            # its log in this terminal; ctrl-c stops it
 ```
 
 `make smoke-profiles` starts real agents: through the running head, a task
-under the `review` profile for each agent named (`CLAUDE` and `OPENCODE` take
-a machine from flock.toml, `CLAUDE_AGENT` and `OPENCODE_AGENT` another agent
-of that kind), in the checkout `REPO` on that machine. Each is asked to read,
+under the `review` profile for each agent named (`CLAUDE`, `OPENCODE` and
+`AGY` take a machine from flock.toml, `CLAUDE_AGENT`, `OPENCODE_AGENT` and
+`AGY_AGENT` another agent of that kind; the agy machine's own profile must
+be `review`, with its rules in agy's settings there), in the checkout
+`REPO` on that machine. Each is asked to read,
 then to write a file it must be refused, and passes when it ends `done`
 without ever going `blocked`. It prints the end of each pane, to paste in a
 pull request, and closes the tasks. The head must run the pastor under test,
