@@ -1122,6 +1122,11 @@ pub struct AgentDef {
     /// trust presses the keys without reading the pane.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trust_marker: Option<String>,
+    /// Startup dialogs beyond the trust one, `[[agents.<name>.dialogs]]`:
+    /// a row named as a built-in replaces it; one with an empty `pick` and
+    /// no `keys` removes it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dialogs: Vec<DialogDef>,
     /// The flag that hands the agent one pattern of an `allow` list, put
     /// before each pattern. Unset keeps the built-in (`--allowedTools` for
     /// claude); an agent with none refuses tasks that carry an allow list.
@@ -1166,6 +1171,92 @@ const CLAUDE_TRUST_KEYS: [&str; 2] = ["Down", "Enter"];
 /// warning also opens on "No, exit" with a yes below, so the same keys would
 /// accept that; saved trust presses them only while this is on screen.
 const CLAUDE_TRUST_MARKER: &str = "Yes, I trust this folder";
+
+/// Env every Claude task's pane gets, under the definition's own `env`:
+/// the classic renderer. Claude 2.1's fullscreen renderer draws on the
+/// alternate screen with no scrollback, which pastor's pane reads need,
+/// and its startup offer ("Try the new fullscreen renderer?") is gated off
+/// by this variable (checked in 2.1.295).
+pub const CLAUDE_CLASSIC_RENDERER_ENV: (&str, &str) = ("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN", "1");
+
+/// Claude's other startup dialogs (2.1.295 wording), each answered with
+/// the option that keeps things as they are, as (name, marker, pick). The
+/// fullscreen row is a fallback for a pane whose env lost
+/// `CLAUDE_CLASSIC_RENDERER_ENV`. The bypass-permissions warning is not
+/// here: accepting it is a person's call.
+const CLAUDE_DIALOGS: [(&str, &str, &str); 4] = [
+    ("fullscreen", "Try the new fullscreen renderer?", "Not now"),
+    (
+        "auto-mode-default",
+        "Make auto mode your default permission mode?",
+        "No, keep",
+    ),
+    (
+        "auto-mode-setup",
+        "Teach auto mode about your environment?",
+        "Don't show again",
+    ),
+    (
+        "effort-default",
+        "Switch your default effort to",
+        "No, keep",
+    ),
+];
+
+/// How a dialog is answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answer {
+    /// Arrow to the option whose text contains this, then Enter.
+    Pick(String),
+    /// These keys, as they are.
+    Keys(Vec<String>),
+}
+
+/// A startup dialog an agent may show, and its answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dialog {
+    pub name: String,
+    /// Text only this dialog shows, in the pane's bottom prompt. `None`
+    /// (trust with `trust_marker = ""`) matches any screen.
+    pub marker: Option<String>,
+    pub answer: Answer,
+    /// Pressed only when the task's (machine, repo) is saved as trusted.
+    pub needs_trust: bool,
+}
+
+/// A `[[agents.<name>.dialogs]]` row.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DialogDef {
+    pub name: String,
+    pub marker: String,
+    /// The option to pick by its text. Empty with no `keys`: the dialog is
+    /// removed (a built-in of this name is dropped).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pick: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keys: Option<Vec<String>>,
+}
+
+impl DialogDef {
+    /// `None` removes a dialog of this name.
+    fn answer(&self) -> Option<Answer> {
+        match (&self.pick, &self.keys) {
+            (_, Some(keys)) if !keys.is_empty() => Some(Answer::Keys(keys.clone())),
+            (Some(pick), _) if !pick.trim().is_empty() => Some(Answer::Pick(pick.clone())),
+            _ => None,
+        }
+    }
+
+    fn dialog(&self, answer: Answer) -> Dialog {
+        Dialog {
+            name: self.name.clone(),
+            marker: Some(self.marker.clone()),
+            answer,
+            needs_trust: false,
+        }
+    }
+}
 
 /// Text Codex's folder-trust dialog shows, in its newer and older wording.
 /// herdr reads Codex at that dialog idle and ready, not blocked, so a prompt
@@ -1314,6 +1405,56 @@ impl Agents {
         (!marker.trim().is_empty()).then_some(marker)
     }
 
+    /// The startup dialogs `agent` may show, in the order they are tried:
+    /// the trust dialog (from `trust_keys` and `trust_marker`; absent when
+    /// the agent has no trust keys), the built-ins of its kind as its own
+    /// rows replace or remove them, then its other rows.
+    pub fn dialogs(&self, agent: &str) -> Vec<Dialog> {
+        let mut out = Vec::new();
+        if let Some(keys) = self.trust_keys(agent) {
+            out.push(Dialog {
+                name: "trust".into(),
+                marker: self.trust_marker(agent),
+                answer: Answer::Keys(keys),
+                needs_trust: true,
+            });
+        }
+        let own = self
+            .0
+            .get(agent)
+            .map(|d| d.dialogs.as_slice())
+            .unwrap_or(&[]);
+        let builtin: &[(&str, &str, &str)] = if self.kind(agent) == "claude" {
+            &CLAUDE_DIALOGS
+        } else {
+            &[]
+        };
+        for (name, marker, pick) in builtin {
+            match own.iter().find(|d| d.name == *name) {
+                Some(row) => {
+                    if let Some(answer) = row.answer() {
+                        out.push(row.dialog(answer));
+                    }
+                }
+                None => out.push(Dialog {
+                    name: (*name).into(),
+                    marker: Some((*marker).into()),
+                    answer: Answer::Pick((*pick).into()),
+                    needs_trust: false,
+                }),
+            }
+        }
+        for row in own
+            .iter()
+            .filter(|d| !builtin.iter().any(|(n, _, _)| *n == d.name))
+        {
+            if let Some(answer) = row.answer() {
+                out.push(row.dialog(answer));
+            }
+        }
+        out
+    }
+
     /// What shows that `agent` sits at a startup question herdr reads idle
     /// and ready, so its prompt waits (`shows_startup_question`): its own
     /// `trust_marker`, and Codex's dialog for the `codex` kind. None for
@@ -1361,6 +1502,10 @@ impl Agents {
             .get(&spec.agent)
             .map(|d| d.env.clone())
             .unwrap_or_default();
+        if self.kind(&spec.agent) == "claude" {
+            let (key, value) = CLAUDE_CLASSIC_RENDERER_ENV;
+            env.entry(key.into()).or_insert_with(|| value.into());
+        }
         if self.opencode_profile(spec) {
             for key in opencode::CONFIG_ENV {
                 env.insert(key.into(), String::new());
@@ -2068,6 +2213,29 @@ impl PastorConfig {
                     "{}: agents.{name}.trust_keys: a key name must not be empty",
                     path.display()
                 );
+            }
+            let mut seen = std::collections::HashSet::new();
+            for d in &def.dialogs {
+                let at = format!("{}: agents.{name}.dialogs", path.display());
+                if d.name.trim().is_empty() {
+                    anyhow::bail!("{at}: name must not be empty");
+                }
+                if d.name == "trust" {
+                    anyhow::bail!("{at}: use trust_keys and trust_marker for the trust dialog");
+                }
+                if !seen.insert(d.name.as_str()) {
+                    anyhow::bail!("{at}: {} is named twice", d.name);
+                }
+                if d.marker.trim().is_empty() {
+                    anyhow::bail!("{at}.{}: marker must not be empty", d.name);
+                }
+                let picks = d.pick.as_deref().is_some_and(|p| !p.trim().is_empty());
+                if picks && d.keys.as_ref().is_some_and(|k| !k.is_empty()) {
+                    anyhow::bail!("{at}.{}: pick or keys, not both", d.name);
+                }
+                if d.keys.iter().flatten().any(|k| k.trim().is_empty()) {
+                    anyhow::bail!("{at}.{}: a key name must not be empty", d.name);
+                }
             }
         }
         for (name, def) in &cfg.models.0 {
@@ -4044,6 +4212,171 @@ mod tests {
             vec!["Trust this workspace?"]
         );
         assert!(cfg.agents.startup_markers("claude").is_empty());
+    }
+
+    #[test]
+    fn claude_has_built_in_dialogs_trust_first() {
+        let cfg = PastorConfig::default();
+        let d = cfg.agents.dialogs("claude");
+        let names: Vec<&str> = d.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "trust",
+                "fullscreen",
+                "auto-mode-default",
+                "auto-mode-setup",
+                "effort-default"
+            ]
+        );
+        assert!(d[0].needs_trust && !d[1].needs_trust);
+        assert_eq!(
+            d[0].answer,
+            Answer::Keys(vec!["Down".into(), "Enter".into()])
+        );
+        assert_eq!(d[0].marker.as_deref(), Some("Yes, I trust this folder"));
+        assert_eq!(d[1].answer, Answer::Pick("Not now".into()));
+        assert_eq!(
+            d[2].marker.as_deref(),
+            Some("Make auto mode your default permission mode?")
+        );
+        assert_eq!(d[2].answer, Answer::Pick("No, keep".into()));
+        assert!(cfg.agents.dialogs("codex").is_empty());
+        assert!(cfg.agents.dialogs("agy").is_empty());
+    }
+
+    #[test]
+    fn trust_settings_shape_the_trust_dialog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(
+            &path,
+            "[agents.claude]\ntrust_marker = \"\"\n[agents.mine]\nkind = \"claude\"\ntrust_keys = []\n",
+        )
+        .unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        let claude = cfg.agents.dialogs("claude");
+        assert_eq!(claude[0].name, "trust");
+        assert_eq!(
+            claude[0].marker, None,
+            "empty marker: pressed without reading"
+        );
+        let mine = cfg.agents.dialogs("mine");
+        assert_eq!(
+            mine[0].name, "fullscreen",
+            "no trust keys: no trust row, the rest stay"
+        );
+    }
+
+    #[test]
+    fn dialog_rows_replace_remove_and_add() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(
+            &path,
+            "[[agents.claude.dialogs]]\nname = \"fullscreen\"\nmarker = \"fullscreen renderer\"\npick = \"Yes, try it\"\n\
+             [[agents.claude.dialogs]]\nname = \"auto-mode-setup\"\nmarker = \"x\"\npick = \"\"\n\
+             [[agents.claude.dialogs]]\nname = \"bypass\"\nmarker = \"Bypass Permissions mode\"\nkeys = [\"Down\", \"Enter\"]\n\
+             [[agents.agy.dialogs]]\nname = \"welcome\"\nmarker = \"Welcome\"\nkeys = [\"Enter\"]\n",
+        )
+        .unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        let d = cfg.agents.dialogs("claude");
+        let names: Vec<&str> = d.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "trust",
+                "fullscreen",
+                "auto-mode-default",
+                "effort-default",
+                "bypass"
+            ]
+        );
+        assert_eq!(d[1].marker.as_deref(), Some("fullscreen renderer"));
+        assert_eq!(d[1].answer, Answer::Pick("Yes, try it".into()));
+        assert_eq!(
+            d[4].answer,
+            Answer::Keys(vec!["Down".into(), "Enter".into()])
+        );
+        assert_eq!(cfg.agents.dialogs("agy").len(), 1);
+    }
+
+    #[test]
+    fn dialog_rows_are_checked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        for (body, want) in [
+            (
+                "[[agents.claude.dialogs]]\nname = \"trust\"\nmarker = \"m\"\npick = \"p\"\n",
+                "use trust_keys and trust_marker",
+            ),
+            (
+                "[[agents.claude.dialogs]]\nname = \"x\"\nmarker = \"\"\npick = \"p\"\n",
+                "marker must not be empty",
+            ),
+            (
+                "[[agents.claude.dialogs]]\nname = \"x\"\nmarker = \"m\"\npick = \"p\"\nkeys = [\"Enter\"]\n",
+                "pick or keys, not both",
+            ),
+            (
+                "[[agents.claude.dialogs]]\nname = \"x\"\nmarker = \"m\"\nkeys = [\"\"]\n",
+                "key name must not be empty",
+            ),
+            (
+                "[[agents.claude.dialogs]]\nname = \"\"\nmarker = \"m\"\npick = \"p\"\n",
+                "name must not be empty",
+            ),
+            (
+                "[[agents.claude.dialogs]]\nname = \"x\"\nmarker = \"m\"\npick = \"p\"\n[[agents.claude.dialogs]]\nname = \"x\"\nmarker = \"m\"\npick = \"p\"\n",
+                "named twice",
+            ),
+        ] {
+            std::fs::write(&path, body).unwrap();
+            let err = PastorConfig::load(&path).unwrap_err().to_string();
+            assert!(err.contains(want), "{body}: {err}");
+        }
+    }
+
+    /// Claude 2.1's fullscreen renderer has no scrollback to read, and its
+    /// startup offer is gated off by the same variable, so every Claude
+    /// pane gets it under the definition's own env.
+    #[test]
+    fn claude_starts_on_the_classic_renderer_unless_env_says_otherwise() {
+        let key = "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN";
+        let spec = spec_with("claude", &[], &[]);
+        let launch = Agents::default().launch(&spec).unwrap();
+        assert_eq!(launch.env.get(key).map(String::as_str), Some("1"));
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(
+            &path,
+            "[agents.claude]\nenv = { CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN = \"\" }\n[agents.mine]\nkind = \"claude\"\n",
+        )
+        .unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        assert_eq!(
+            cfg.agents
+                .launch(&spec)
+                .unwrap()
+                .env
+                .get(key)
+                .map(String::as_str),
+            Some("")
+        );
+        let mine = spec_with("mine", &[], &[]);
+        assert_eq!(
+            cfg.agents
+                .launch(&mine)
+                .unwrap()
+                .env
+                .get(key)
+                .map(String::as_str),
+            Some("1"),
+            "the kind's default"
+        );
+        let codex = spec_with("codex", &[], &[]);
+        assert!(cfg.agents.launch(&codex).unwrap().env.is_empty());
     }
 
     #[test]
