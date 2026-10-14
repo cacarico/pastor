@@ -1,3 +1,4 @@
+pub mod agy;
 pub mod flock;
 pub mod job;
 pub mod opencode;
