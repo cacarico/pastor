@@ -505,6 +505,13 @@ Append to the `tests` module of `src/config/agy.rs`:
         std::fs::write(shared.join("config.json"), "{\"permissions\":{\"deny\":[\"write_file(*)\"]}}").unwrap();
         assert_eq!(parse_denies(&run()).unwrap(), vec!["command(sudo)", "write_file(*)"]);
         assert_eq!(parse_denies(&fake_output(&["command(sudo)"])).unwrap(), vec!["command(sudo)"]);
+        // A fat file is cut, and a cut file is not JSON: refused, never a
+        // transport error.
+        let fat = format!("{{\"pad\": \"{}\", \"permissions\": {{\"deny\": [\"command(sudo)\"]}}}}", "x".repeat(40_000));
+        std::fs::write(cli.join("settings.json"), fat).unwrap();
+        let out = run();
+        assert!(out.len() < 64 * 1024, "{}", out.len());
+        assert!(parse_denies(&out).unwrap_err().contains("settings.json"));
     }
 ```
 
@@ -526,9 +533,11 @@ const END: &str = "end";
 /// when they exist, each after a `==== <path>` line, then `==== end` so a
 /// cut-off answer can be told from one with no files. Project files under
 /// `~/.gemini/config/projects/` are left out: agy applies only the one
-/// matching its active workspace, which pastor cannot tell. Two files stay
-/// under the probe's size limit; a larger one fails the task.
-pub const RULES_COMMAND: &str = r#"for f in "$HOME/.gemini/antigravity-cli/settings.json" "$HOME/.gemini/config/config.json"; do if [ -f "$f" ]; then printf '==== %s\n' "$f"; cat "$f"; printf '\n'; fi; done; printf '==== end\n'"#;
+/// matching its active workspace, which pastor cannot tell. Each file is
+/// cut at 30000 bytes, so two stay under the probe's 64 KiB limit and the
+/// probe never fails as a transport error over a fat file: a cut file is
+/// not JSON, and fails the task on the safe side.
+pub const RULES_COMMAND: &str = r#"for f in "$HOME/.gemini/antigravity-cli/settings.json" "$HOME/.gemini/config/config.json"; do if [ -f "$f" ]; then printf '==== %s\n' "$f"; head -c 30000 "$f"; printf '\n'; fi; done; printf '==== end\n'"#;
 
 /// The `permissions.deny` strings of every file in the probe's `output`,
 /// in file order, or the path of the first file that is not JSON. Lines
@@ -1201,7 +1210,7 @@ Replace `an_agy_task_under_a_profile_needs_its_own_permissions` in `src/daemon.r
     }
 ```
 
-If a task's state after a failed dispatch is read differently in neighbouring tests (some poll the store, some read the response), copy what `a_profile_removed_while_queued_holds_the_task` does: `d.store.get_task(t.id)`. If the dispatch happens asynchronously after `handle` returns, add `d.fleet().dispatch_queued().await;` before reading the store, as that test does. The `develop` profile denies `Bash(rm -rf:*)`, `Bash(sudo:*)`, `Bash(git push --force:*)` (no `Edit`), so the missing list is `command(rm -rf)` and `command(git push --force)`.
+`Daemon::handle(IpcRequest::Run)` calls `dispatch_queued_for` before it returns, so a failed dispatch is in the store by then. The `develop` profile denies `Bash(rm -rf:*)`, `Bash(sudo:*)`, `Bash(git push --force:*)` (no `Edit`), so the missing list is `command(rm -rf)` and `command(git push --force)`.
 
 - [ ] **Step 6: Run the daemon suite to green, then the whole gate**
 
@@ -1257,7 +1266,7 @@ smoke-profiles: ## live review task per agent: make smoke-profiles REPO='~/src/x
 	REPO="$(REPO)" CLAUDE="$(CLAUDE)" OPENCODE="$(OPENCODE)" AGY="$(AGY)" scripts/smoke-profiles.sh
 ```
 
-and the `smoke-rc` recipe's environment line to pass `AGY="$(AGY)"` too. Check `scripts/smoke-rc.sh` for where it forwards `OPENCODE` and forward `AGY` the same way.
+and the `smoke-rc` recipe's environment line (Makefile:153) to pass `AGY="$(AGY)"` too. In `scripts/smoke-rc.sh:146`, where it forwards `OPENCODE="${OPENCODE:-}"`, forward `AGY="${AGY:-}"` the same way.
 
 - [ ] **Step 3: Check the script parses and the no-arg path**
 
