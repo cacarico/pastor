@@ -153,6 +153,10 @@ struct State {
     trust_redraw: Duration,
     /// pane id -> when its trust question was answered.
     trust_answered: HashMap<String, Instant>,
+    /// pane id -> when its latest startup dialog was answered: for
+    /// `trust_redraw` `agent.read` still shows that dialog, as Claude takes
+    /// a moment to replace one dialog with the next.
+    dialog_answered: HashMap<String, Instant>,
     /// The trust question reads idle and ready, not `blocked` (Codex's, to
     /// herdr): `agent.prompt` is accepted and lost until it is answered.
     trust_idle: bool,
@@ -513,7 +517,8 @@ impl FakeHerdr {
     }
 
     /// Prompts sent within `d` of the trust answer are accepted and lost (see
-    /// `State::trust_redraw`).
+    /// `State::trust_redraw`), and `agent.read` within `d` of any dialog's
+    /// answer still shows that dialog (see `State::dialog_answered`).
     pub fn set_trust_redraw(&self, d: Duration) {
         self.state.lock().unwrap().trust_redraw = d;
     }
@@ -1199,6 +1204,7 @@ impl FakeHerdr {
                 s.pane_input.entry(pane_id.clone()).or_default().push(input);
                 if answered {
                     *s.dialogs_done.entry(pane_id.clone()).or_default() += 1;
+                    s.dialog_answered.insert(pane_id.clone(), Instant::now());
                 }
                 // The next dialog replaces this one with no change of state
                 // herdr would report; the last answer leaves the agent idle.
@@ -1220,8 +1226,18 @@ impl FakeHerdr {
                     .agents
                     .values()
                     .find(|a| a.name.as_deref() == Some(target) || a.pane_id == target);
-                // Still at its trust question: blocked, never answered.
+                // Still at its trust question: blocked, never answered. For
+                // `trust_redraw` after an answer the dialog just answered is
+                // still on screen, whatever follows it.
                 let dialog = found.and_then(|a| {
+                    let redrawing = s
+                        .dialog_answered
+                        .get(&a.pane_id)
+                        .is_some_and(|at| at.elapsed() < s.trust_redraw);
+                    let done = s.dialogs_done.get(&a.pane_id).copied().unwrap_or(0);
+                    if redrawing && done > 0 {
+                        return s.dialogs.get(done - 1);
+                    }
                     (a.agent_status == AgentStatus::Blocked || s.trust_idle)
                         .then(|| s.dialog_at(&a.pane_id))
                         .flatten()

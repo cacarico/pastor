@@ -15,3 +15,6 @@
   so Claude 2.1 stays on the classic renderer pastor can read and never
   offers the fullscreen one; `env` in `[agents.<name>]` overrides it.
 - Schema 18: `answered_dialogs` records the dialogs answered per task.
+- Any `pastor task send` into a task blocked while it starts holds its
+  prompt for a settle window, as `--trust` did, so the dialog that may
+  follow a person's answer is found without waiting for a reconcile.

@@ -496,11 +496,15 @@ impl SendInput {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.text.is_none() && self.keys.is_empty() && !self.trust && self.pick.is_none()
+        self.text.is_none()
+            && self.keys.is_empty()
+            && !self.trust
+            && self.pick.as_deref().is_none_or(|p| p.trim().is_empty())
     }
 
-    /// What `task.input` records: the key names and the length of the text,
-    /// never the text, which may hold a secret.
+    /// What `task.input` records for text and keys: the key names and the
+    /// length of the text, never the text, which may hold a secret. A pick
+    /// is recorded by `run_send`, with the keys it worked out.
     pub fn detail(&self) -> serde_json::Value {
         let mut d = serde_json::Map::new();
         if let Some(text) = &self.text {
@@ -509,9 +513,6 @@ impl SendInput {
         let keys = self.key_sequence();
         if !keys.is_empty() {
             d.insert("keys".into(), keys.into());
-            if let Some(p) = &self.pick {
-                d.insert("pick".into(), p.clone().into());
-            }
         }
         d.into()
     }
@@ -2147,8 +2148,13 @@ impl Actor {
         if task.state == TaskState::Done {
             return (self.reopen(task), false);
         }
-        if input.trust {
+        // Input into a startup dialog, by whichever flag: the agent redraws,
+        // and what follows may be another dialog, which herdr does not
+        // report as a change, so the window's tick looks (`auto_answer`).
+        if task.state == TaskState::Blocked && task.prompt_pending {
             self.dialog_answered.insert(task.id, Instant::now());
+        }
+        if input.trust {
             // The prompt is answered: saved trust must not answer it again.
             if let Err(err) = self
                 .store
@@ -3709,6 +3715,7 @@ impl Actor {
         let agents = tokio::time::timeout(timeout, self.connector.agent_list())
             .await
             .map_err(|_| TimedOut("agent.list", timeout))??;
+        let mut blocked_again = false;
         for id in due {
             let found = self
                 .store
@@ -3722,7 +3729,7 @@ impl Actor {
                         .find(|a| Some(&a.pane_id) == t.pane_id.as_ref())?;
                     Some((t, agent.agent_status))
                 });
-            let blocked_again = found
+            blocked_again |= found
                 .as_ref()
                 .is_some_and(|(_, status)| *status == AgentStatus::Blocked);
             if let Some((task, status)) = found {
@@ -3732,12 +3739,14 @@ impl Actor {
             }
             // Sent, or blocked again: leaving the block next starts a new hold.
             self.dialog_answered.remove(&id);
-            if blocked_again {
-                // The next dialog of a chain: herdr reports no change when
-                // one form replaces another, so without this read the task
-                // would wait for the next reconcile.
-                self.auto_answer().await?;
-            }
+        }
+        if blocked_again {
+            // The next dialog of a chain: herdr reports no change when one
+            // form replaces another, so without this read the task would
+            // wait for the next reconcile. Once, after every due entry is
+            // gone: the pass covers every task, and a hold it starts for a
+            // task later in `due` must not be dropped by that task's turn.
+            self.auto_answer().await?;
         }
         Ok(())
     }
@@ -4711,10 +4720,19 @@ impl Actor {
     /// race. A `pick` not on screen presses nothing. A task no row matches,
     /// or still blocked after its rows, waits for a person. The pending
     /// prompt goes in when the agent reports it is no longer blocked
-    /// (`deliver_pending_prompt`).
+    /// (`deliver_pending_prompt`). A task inside its settle window after
+    /// an answer (its own, or a person's) is not read: Claude is still
+    /// replacing the dialog, and the window's tick reads it next.
     async fn auto_answer(&mut self) -> anyhow::Result<()> {
         for task in self.store.tasks_on_machine(&self.name)? {
             if task.state != TaskState::Blocked || !task.prompt_pending {
+                continue;
+            }
+            if self
+                .dialog_answered
+                .get(&task.id)
+                .is_some_and(|at| at.elapsed() < self.settings.settle)
+            {
                 continue;
             }
             let Some(pane) = &task.pane_id else { continue };
@@ -8833,6 +8851,101 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert_eq!(state_of(&store, t.id), TaskState::Running);
         assert_eq!(calls(&fake, "pane.send_keys").len(), 3);
+    }
+
+    /// Two tasks whose holds come due in the same settle tick, each on a
+    /// chain, while Claude takes a moment to replace one dialog with the
+    /// next. Answering the first task's next dialog must not drop the hold
+    /// the second task just got for its own, or that task's third dialog
+    /// waits for a reconcile. Dispatched a redraw apart so their holds are
+    /// never in lockstep.
+    #[tokio::test(start_paused = true)]
+    async fn two_tasks_due_in_one_settle_tick_each_get_their_next_dialog() {
+        let fake = FakeHerdr::new();
+        fake.set_startup_dialogs(vec![
+            (
+                crate::herdr::fake::CLAUDE_TRUST_SCREEN.into(),
+                keys(&DOWN_ENTER),
+            ),
+            (AUTO_SCREEN.into(), keys(&DOWN_ENTER)),
+            (RENDERER_SCREEN.into(), keys(&DOWN_ENTER)),
+        ]);
+        fake.set_trust_redraw(Duration::from_millis(50));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store.trust_repo("m", "/r").unwrap();
+        let settings = MachineSettings {
+            reconcile_every: Duration::from_secs(60),
+            poll_every: Duration::from_secs(60),
+            ..settings()
+        };
+        let (h, _e) = connected_with(&fake, &store, settings).await;
+        let t1 = h.dispatch(worktree_task(&store).id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let t2 = h.dispatch(worktree_task(&store).id).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(state_of(&store, t1.id), TaskState::Running);
+        assert_eq!(state_of(&store, t2.id), TaskState::Running);
+        assert_eq!(calls(&fake, "pane.send_keys").len(), 6);
+    }
+
+    /// A dialog is answered once per settle window, as the manual says:
+    /// a status event or reconcile inside the window reads nothing, and
+    /// the hold's own tick finds the next dialog.
+    #[tokio::test(start_paused = true)]
+    async fn a_task_in_its_settle_window_is_not_read_again() {
+        let fake = FakeHerdr::new();
+        fake.set_startup_dialogs(vec![
+            (
+                crate::herdr::fake::CLAUDE_TRUST_SCREEN.into(),
+                keys(&DOWN_ENTER),
+            ),
+            (AUTO_SCREEN.into(), keys(&DOWN_ENTER)),
+        ]);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store.trust_repo("m", "/r").unwrap();
+        let settings = MachineSettings {
+            reconcile_every: Duration::from_secs(60),
+            poll_every: Duration::from_secs(60),
+            ..settings()
+        };
+        let (h, _e) = connected_with(&fake, &store, settings).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        assert_eq!(calls(&fake, "pane.send_keys").len(), 1);
+        // A reconcile right after the answer (`auto_trust` runs the pass).
+        h.auto_trust().await.unwrap();
+        assert_eq!(
+            calls(&fake, "pane.send_keys").len(),
+            1,
+            "the next dialog waits for the settle window"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+        assert_eq!(calls(&fake, "pane.send_keys").len(), 2);
+    }
+
+    /// A person answers a dialog pastor leaves alone (the bypass warning)
+    /// with `--pick`; the dialog after it is pastor's to answer, and it is,
+    /// after the settle window, with no reconcile in between.
+    #[tokio::test(start_paused = true)]
+    async fn a_dialog_after_a_person_s_pick_is_answered_after_the_settle_window() {
+        let fake = FakeHerdr::new();
+        fake.set_startup_dialogs(vec![
+            (BYPASS_SCREEN.into(), keys(&DOWN_ENTER)),
+            (RENDERER_SCREEN.into(), keys(&DOWN_ENTER)),
+        ]);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let settings = MachineSettings {
+            reconcile_every: Duration::from_secs(60),
+            poll_every: Duration::from_secs(60),
+            ..settings()
+        };
+        let (h, _e) = connected_with(&fake, &store, settings).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        assert_eq!(state_of(&store, t.id), TaskState::Blocked);
+        h.send(t.id, pick("Yes, I accept")).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+        assert_eq!(calls(&fake, "pane.send_keys").len(), 2);
     }
 
     fn trusted_events(events: &mut broadcast::Receiver<PastorEvent>) -> Vec<PastorEvent> {
