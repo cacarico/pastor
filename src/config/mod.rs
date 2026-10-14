@@ -1131,10 +1131,12 @@ pub struct AgentDef {
     /// Like `allow_flag`, for `deny` (`--disallowedTools` for claude).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deny_flag: Option<String>,
-    /// The agent's permissions are in its own settings on the machine (agy's
-    /// allow list), so a task under a profile starts with no permission
-    /// mode and no tool flags, its lists not passed (`lists_unapplied`).
-    /// Without it, an agent with no flags refuses a profiled task.
+    /// The agent's permissions are in its own settings on the machine, for
+    /// an agent whose kind pastor cannot drive or an agy owner who manages
+    /// the file by hand: a task under a profile starts with no permission
+    /// mode and no tool flags, its lists not passed and nothing checked
+    /// (`lists_unapplied`). Without it, an agent of a kind with no profile
+    /// path and no flags refuses a profiled task.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub own_permissions: bool,
     /// The account the agent is logged in to, as a label: every machine
@@ -1398,6 +1400,13 @@ impl Agents {
                 )
             });
         }
+        if self.agy_profile(spec) {
+            return (!spec.allow.is_empty() || !spec.deny.is_empty()).then(|| {
+                "agy takes no lists: the deny was checked against its settings on the machine, \
+                 the allow is not passed"
+                    .to_string()
+            });
+        }
         if self.kind(&spec.agent) != "codex" {
             return None;
         }
@@ -1424,6 +1433,15 @@ impl Agents {
             && !self.own_permissions(&spec.agent)
     }
 
+    /// Does `spec` run an agy agent under a permission profile? It then
+    /// starts with `agy::NO_ASK` and dispatch checks its settings on the
+    /// machine (`config::agy`).
+    pub fn agy_profile(&self, spec: &crate::task::DispatchSpec) -> bool {
+        spec.profile().is_some()
+            && self.kind(&spec.agent) == agy::KIND
+            && !self.own_permissions(&spec.agent)
+    }
+
     /// Are `agent`'s permissions in its own settings (`own_permissions`)?
     fn own_permissions(&self, agent: &str) -> bool {
         self.0.get(agent).is_some_and(|d| d.own_permissions)
@@ -1436,8 +1454,11 @@ impl Agents {
     /// and pattern of each `allow`, then of each `deny`; an opencode agent
     /// under a profile gets no tool flags, its lists going in `launch`'s
     /// env, and a Codex one skips a list it has no flag for
-    /// (`lists_unapplied`); an agent with `own_permissions` under a profile
-    /// gets its args alone. Refused when a list is not empty
+    /// (`lists_unapplied`); an agy agent under a profile gets
+    /// `--dangerously-skip-permissions --mode accept-edits` and no tool
+    /// flags (`config::agy`), and is refused a deny pattern agy has no rule
+    /// for (`agy_deny_unsupported`); an agent with `own_permissions` under a
+    /// profile gets its args alone. Refused when a list is not empty
     /// and the agent has no flag for it (`agent_tools_unsupported`):
     /// dropping a deny list without a word would be worse than not
     /// starting. Refused too when a profile applies and the args already
@@ -1452,6 +1473,31 @@ impl Agents {
         let mut args = spec.agent_args.clone();
         // Its own settings hold (`lists_unapplied`).
         if spec.profile().is_some() && self.own_permissions(&spec.agent) {
+            return Ok(args);
+        }
+        if let Some(profile) = spec.profile()
+            && self.agy_profile(spec)
+        {
+            if let Some(arg) = args.iter().find(|a| agy::is_permission_arg(a)) {
+                return Err(AgentRefusal {
+                    code: PROFILE_ARGS_CONFLICT,
+                    message: format!(
+                        "task runs under profile {profile}, and agent {}'s args set {arg}; \
+                         drop it from agent_args or the model's args, or run without a profile",
+                        spec.agent
+                    ),
+                });
+            }
+            if let Some(p) = spec.deny.iter().find(|p| agy::required_rule(p).is_none()) {
+                return Err(AgentRefusal {
+                    code: agy::AGY_DENY_UNSUPPORTED,
+                    message: format!(
+                        "task runs under profile {profile} and denies {p}, which agy has no rule for; \
+                         drop it from the profile or the task's deny list, or run without a profile"
+                    ),
+                });
+            }
+            args.extend(agy::NO_ASK.map(str::to_string));
             return Ok(args);
         }
         if let Some(profile) = spec.profile()
@@ -1592,7 +1638,8 @@ pub const AGENT_KIND_MISSING: &str = "agent_kind_missing";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRefusal {
     /// `unknown_model`, `model_kind_mismatch`, `agent_tools_unsupported`,
-    /// `unknown_profile`, `profile_not_allowed` or `profile_args_conflict`.
+    /// `unknown_profile`, `profile_not_allowed`, `profile_args_conflict`,
+    /// `agy_deny_unsupported` or `agy_profile_mismatch`.
     pub code: &'static str,
     pub message: String,
 }
@@ -3745,11 +3792,100 @@ mod tests {
         assert!(Agents::default().launch(&spec).unwrap().env.is_empty());
     }
 
+    /// An agy agent under a profile starts with the two flags that stop it
+    /// asking and no tool flags, even with `allow_flag`/`deny_flag` set;
+    /// `task describe` says the lists are not passed. Args that pick its
+    /// mode are refused, as is a deny pattern agy has no rule for. With
+    /// `own_permissions` nothing is added, and without a profile the lists
+    /// still need flags.
+    #[test]
+    fn an_agy_agent_under_a_profile_starts_with_the_skip_flag_and_accept_edits() {
+        let mut spec = spec_with("agy", &["Read"], &["Edit", "Bash(sudo:*)"]);
+        spec.agent_source = Some(Box::new(crate::task::AgentSource {
+            agent: "defaults".into(),
+            profile: Some("review".into()),
+            profile_from: Some("defaults".into()),
+            ..Default::default()
+        }));
+        let agents = Agents::default();
+        assert!(agents.agy_profile(&spec));
+        let launch = agents.launch(&spec).unwrap();
+        assert_eq!(launch.kind, "agy");
+        assert_eq!(
+            launch.args,
+            vec![
+                "--model",
+                "m",
+                "--dangerously-skip-permissions",
+                "--mode",
+                "accept-edits"
+            ]
+        );
+        assert!(launch.env.is_empty());
+        let why = agents.lists_unapplied(&spec).unwrap();
+        assert!(why.contains("deny was checked"), "{why}");
+        assert!(why.contains("allow is not passed"), "{why}");
+
+        // Flags in its definition are not used under a profile.
+        let flagged: Agents =
+            toml::from_str("[agy]\nallow_flag = \"--allow\"\ndeny_flag = \"--deny\"\n").unwrap();
+        assert_eq!(flagged.launch(&spec).unwrap().args, launch.args);
+
+        for arg in ["--mode", "--mode=plan", "--dangerously-skip-permissions"] {
+            let mut s = spec.clone();
+            s.agent_args.push(arg.into());
+            let err = agents.launch(&s).unwrap_err();
+            assert_eq!(err.code, PROFILE_ARGS_CONFLICT, "{arg}");
+            assert!(err.message.contains(arg), "{err}");
+        }
+        let mut s = spec.clone();
+        s.agent_args.push("--sandbox".into());
+        assert!(agents.launch(&s).is_ok());
+
+        let mut s = spec.clone();
+        s.deny.push("WebSearch".into());
+        let err = agents.launch(&s).unwrap_err();
+        assert_eq!(err.code, agy::AGY_DENY_UNSUPPORTED);
+        assert!(err.message.contains("WebSearch"), "{err}");
+
+        let own: Agents = toml::from_str("[agy]\nown_permissions = true\n").unwrap();
+        assert!(!own.agy_profile(&spec));
+        assert_eq!(own.launch(&spec).unwrap().args, vec!["--model", "m"]);
+
+        // A definition of kind agy under another name.
+        let mine: Agents = toml::from_str("[agy-review]\nkind = \"agy\"\n").unwrap();
+        spec.agent = "agy-review".into();
+        assert!(mine.agy_profile(&spec));
+        assert_eq!(mine.launch(&spec).unwrap().args, launch.args);
+
+        // Without a profile: no flags added, and the lists need flags.
+        spec.agent_source = None;
+        assert!(!mine.agy_profile(&spec));
+        assert_eq!(
+            mine.launch(&spec).unwrap_err().code,
+            "agent_tools_unsupported"
+        );
+        assert_eq!(mine.lists_unapplied(&spec), None);
+        spec.agent = "agy".into();
+        assert_eq!(
+            flagged.launch(&spec).unwrap().args,
+            vec![
+                "--model",
+                "m",
+                "--allow",
+                "Read",
+                "--deny",
+                "Edit",
+                "--deny",
+                "Bash(sudo:*)"
+            ]
+        );
+    }
+
     /// An agent whose permissions are in its own settings on the machine
-    /// (`own_permissions`, agy's allow list) starts under a profile with
-    /// its args alone: no mode, no tool flags, its lists not passed, and
-    /// `task describe` says why. Without the field it is refused, and the
-    /// message names the field.
+    /// (`own_permissions`) starts under a profile with its args alone: no
+    /// mode, no tool flags, its lists not passed, and `task describe` says
+    /// why.
     #[test]
     fn an_agent_with_its_own_permissions_starts_under_a_profile_without_flags() {
         let mut spec = spec_with("agy", &["Edit"], &["Bash(sudo:*)"]);
@@ -3759,11 +3895,6 @@ mod tests {
             profile_from: Some("defaults".into()),
             ..Default::default()
         }));
-
-        let err = Agents::default().launch(&spec).unwrap_err();
-        assert_eq!(err.code, "agent_tools_unsupported");
-        assert!(err.message.contains("own_permissions"), "{err}");
-        assert_eq!(Agents::default().lists_unapplied(&spec), None);
 
         let agents: Agents = toml::from_str("[agy]\nown_permissions = true\n").unwrap();
         let launch = agents.launch(&spec).unwrap();
