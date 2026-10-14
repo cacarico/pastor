@@ -78,9 +78,10 @@ existing pastor.toml changes meaning.
 Config adds `[[agents.<name>.dialogs]]`, one table per row, with `name`,
 `marker`, and `pick` or `keys`. A row whose `name` is a built-in's replaces
 it; `pick = ""` with no `keys` (or `keys = []`) removes it. `needs_trust`
-is accepted and defaults to false; `trust` cannot be redefined this way,
-since `trust_keys` and `trust_marker` own it (`agents.<name>.dialogs: use
-trust_keys and trust_marker for the trust dialog` on load). Validation
+is not a config key: only the `trust` row has it, and `trust` cannot be
+redefined this way, since `trust_keys` and `trust_marker` own it
+(`agents.<name>.dialogs: use trust_keys and trust_marker for the trust
+dialog` on load). Validation
 mirrors `trust_keys`: no empty key names, a non-empty `marker`, `pick` and
 `keys` not both set. Definitions of other kinds (`codex`, `agy`) have no
 built-in rows; their `[[dialogs]]` are read the same way. Codex's trust
@@ -105,7 +106,7 @@ pending and a pane:
    default`). A `pick` whose option is not in the picker is not pressed;
    the task is left for a person and the reason is logged once.
 5. Record (task, dialog, keys) in the store, so a restart does not press
-   twice (`answered_dialogs` table, schema 17; `trust_sent` and
+   twice (`answered_dialogs` table, schema 18; `trust_sent` and
    `trust_keys` are kept and written for the `trust` row as today, so the
    pull-machine report path is unchanged).
 6. Emit `task.answered` with `{dialog, keys}`. The `trust` row emits
@@ -179,7 +180,7 @@ before trusting it, as `AGENTS.md` asks for dispatch changes.
 - `README.md`: one line under trust.
 - `skills/pastor/SKILL.md`: `--pick`, the blocked-after-start note.
 - `AGENTS.md`: the herdr fact that `live_blocked_form` reads every
-  confirm/cancel form blocked, and the schema bump to 17.
+  confirm/cancel form blocked, and the schema bump to 18.
 - `changes/feat-claude-dialogs.md`.
 
 ## Out of scope
