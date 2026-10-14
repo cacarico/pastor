@@ -601,9 +601,10 @@ startup prompt; any other task answers `not_at_trust_prompt`, and nothing is
 sent or saved. An agent without trust keys answers `no_trust_keys`, and a
 task without `--repo` gets the keys but nothing is saved.
 
-From then on, a task blocked while it starts has its pane read at each
-reconcile, and the first of its agent's startup dialogs whose marker shows
-in the prompt at the bottom of the pane is answered: the head presses the
+From then on, a task blocked while it starts has its pane read when it
+blocks, after each answer's settle window, and at each reconcile, and the
+first of its agent's startup dialogs that shows in the prompt at the bottom
+of the pane, and was not answered for that task, is answered: the head presses the
 dialog's keys, once per task and dialog, and emits `task.answered` with the
 dialog's name and the keys. The trust dialog is the first row, known by its
 `trust_marker` (Claude's is built in as its "Yes, I trust this folder"
@@ -618,7 +619,8 @@ is answered per settle window, so a chain of them on a new machine takes a
 few windows. A task blocked on a dialog no row matches, or still blocked
 after its rows, waits for a person. The marker must be in the prompt at the
 bottom of the pane (after the last output, and after any menu above the
-last one), since the read includes scrollback where an earlier dialog can
+last one, and after the key hints of any dialog above the last thing on
+screen), since the read includes scrollback where an earlier dialog can
 linger above a later one. The trust row with no marker (`trust_marker =
 ""`, or an agent that is not Claude and sets none) is pressed without the
 check. `[[agents.<name>.dialogs]]` in pastor.toml adds a dialog or changes

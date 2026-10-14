@@ -4498,7 +4498,7 @@ impl Daemon {
     /// row again and types into the pane. A task on no machine, or one whose
     /// machine has left the flock, has no agent to type into.
     async fn send(&self, id: i64, input: SendInput) -> IpcResponse {
-        if input.is_empty() {
+        if input.is_empty() || input.pick.as_deref().is_some_and(|p| p.trim().is_empty()) {
             return IpcResponse::error("nothing_to_send", "give text, --key, --trust or --pick");
         }
         if input.trust && (input.text.is_some() || !input.keys.is_empty()) {
@@ -11685,6 +11685,17 @@ mod tests {
             })
             .await;
         assert_eq!(error_code(resp), "usage_error");
+        // An empty --pick would match every option; it is nothing to send.
+        let resp = d
+            .handle(IpcRequest::TaskSend {
+                id: t.id,
+                input: crate::machine::SendInput {
+                    pick: Some("  ".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        assert_eq!(error_code(resp), "nothing_to_send");
         let resp = d
             .handle(IpcRequest::TaskSend {
                 id: t.id,

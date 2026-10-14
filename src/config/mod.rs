@@ -1288,9 +1288,12 @@ pub fn shows_startup_question(screen: &str, markers: &[String]) -> bool {
 }
 
 /// The trailing lines of `screen` that make up the prompt at its bottom:
-/// those after the last output (a `●` or `⏺` message) and, when there is a
-/// menu, after the last option of any menu above the last one (a menu starts
-/// at an option numbered 1). The whole screen when neither is there.
+/// those after the last output (a `●` or `⏺` message), after the last
+/// option of any menu above the last one (a menu starts at an option
+/// numbered 1), and after the key hints (`Enter to confirm · Esc to
+/// cancel`) of any dialog above the last thing on screen, since Claude 2.1
+/// draws most of its dialogs without numbers. The whole screen when none
+/// of those is there.
 fn bottom_prompt(screen: &str) -> String {
     let lines: Vec<&str> = screen.lines().collect();
     let option = |line: &str| -> Option<u32> {
@@ -1310,6 +1313,15 @@ fn bottom_prompt(screen: &str) -> String {
         && let Some(prev) = lines[..menu].iter().rposition(|l| option(l).is_some())
     {
         start = start.max(prev + 1);
+    }
+    // The hints of an earlier dialog: a hint line with something below it.
+    let last_text = lines.iter().rposition(|l| !l.trim().is_empty());
+    if let Some(end) = last_text
+        && let Some(hint) = lines[..end]
+            .iter()
+            .rposition(|l| crate::picker::is_key_hint(l))
+    {
+        start = start.max(hint + 1);
     }
     lines[start.min(lines.len())..].join("\n")
 }
@@ -4377,6 +4389,18 @@ mod tests {
         );
         let codex = spec_with("codex", &[], &[]);
         assert!(cfg.agents.launch(&codex).unwrap().env.is_empty());
+    }
+
+    /// Claude 2.1 draws its startup dialogs without numbers, so an earlier
+    /// one in scrollback is cut off at its key hints, not at a menu.
+    #[test]
+    fn an_earlier_unnumbered_dialog_is_cut_at_its_key_hints() {
+        let marker = "Yes, I trust this folder";
+        let trust = "Quick safety check: Is this a project you trust?\n\n \u{276f} No, exit\n   Yes, I trust this folder\n\n Enter to confirm \u{b7} Esc to cancel\n";
+        let offer = "  Try the new fullscreen renderer?\n\n  \u{276f} 1. Yes, try it\n    2. Not now\n\n  Enter to confirm \u{b7} Esc to cancel\n";
+        assert!(shows_trust_marker(trust, marker));
+        assert!(!shows_trust_marker(&format!("{trust}\n{offer}"), marker));
+        assert!(shows_trust_marker(&format!("{offer}\n{trust}"), marker));
     }
 
     #[test]

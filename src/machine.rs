@@ -3722,6 +3722,9 @@ impl Actor {
                         .find(|a| Some(&a.pane_id) == t.pane_id.as_ref())?;
                     Some((t, agent.agent_status))
                 });
+            let blocked_again = found
+                .as_ref()
+                .is_some_and(|(_, status)| *status == AgentStatus::Blocked);
             if let Some((task, status)) = found {
                 // Its entry is still there and due, so the prompt goes in now
                 // rather than being held again as a fresh answer.
@@ -3729,6 +3732,12 @@ impl Actor {
             }
             // Sent, or blocked again: leaving the block next starts a new hold.
             self.dialog_answered.remove(&id);
+            if blocked_again {
+                // The next dialog of a chain: herdr reports no change when
+                // one form replaces another, so without this read the task
+                // would wait for the next reconcile.
+                self.auto_answer().await?;
+            }
         }
         Ok(())
     }
@@ -4718,23 +4727,35 @@ impl Actor {
             let screen = tokio::time::timeout(timeout, self.connector.agent_read(target, 100))
                 .await
                 .map_err(|_| TimedOut("agent.read", timeout))??;
-            let Some(dialog) = dialogs.iter().find(|d| {
-                d.marker
+            // The first row that shows, was not answered for this task, and
+            // applies: a row with no marker (trust without one) shows on
+            // every screen, and an earlier dialog's text can linger in the
+            // read, so a row that is done or does not apply must not hide
+            // the ones after it.
+            let repo = task.spec.repo.as_deref();
+            let mut dialog = None;
+            for d in &dialogs {
+                let shows = d
+                    .marker
                     .as_deref()
-                    .is_none_or(|m| crate::config::shows_trust_marker(&screen, m))
-            }) else {
-                tracing::debug!(machine = %self.name, task = %task.display_id(), "blocked on a dialog pastor does not know; left for a person");
+                    .is_none_or(|m| crate::config::shows_trust_marker(&screen, m));
+                if !shows || self.store.answered(task.id, &d.name)? {
+                    continue;
+                }
+                let trusted = match repo {
+                    Some(r) => self.store.is_trusted(&self.name, r)?,
+                    None => false,
+                };
+                if d.needs_trust && !trusted {
+                    continue;
+                }
+                dialog = Some(d);
+                break;
+            }
+            let Some(dialog) = dialog else {
+                tracing::debug!(machine = %self.name, task = %task.display_id(), "blocked on a dialog pastor does not know, or one that waits for a person");
                 continue;
             };
-            if self.store.answered(task.id, &dialog.name)? {
-                continue;
-            }
-            let repo = task.spec.repo.as_deref();
-            if dialog.needs_trust
-                && !repo.is_some_and(|r| self.store.is_trusted(&self.name, r).unwrap_or(false))
-            {
-                continue;
-            }
             let keys = match &dialog.answer {
                 crate::config::Answer::Keys(keys) => keys.clone(),
                 crate::config::Answer::Pick(want) => {
@@ -8723,6 +8744,95 @@ mod tests {
             1,
             "only the hand answer"
         );
+    }
+
+    /// The trust dialog as 2.1.295 draws it: options without numbers.
+    const TRUST_SCREEN: &str = "Quick safety check: Is this a project you created or one you trust?\n\n \u{276f} No, exit\n   Yes, I trust this folder\n\n Enter to confirm \u{b7} Esc to cancel\n";
+
+    /// A trust row with no marker matches any screen; once it is answered
+    /// the rows after it are still tried, so the chain goes on.
+    #[tokio::test(start_paused = true)]
+    async fn an_answered_row_does_not_stop_the_rows_after_it() {
+        let fake = FakeHerdr::new();
+        fake.set_startup_dialogs(vec![
+            (TRUST_SCREEN.into(), keys(&DOWN_ENTER)),
+            (RENDERER_SCREEN.into(), keys(&DOWN_ENTER)),
+        ]);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store.trust_repo("m", "/r").unwrap();
+        let mut settings = settings();
+        settings.agents = toml::from_str("[claude]\ntrust_marker = \"\"\n").unwrap();
+        let (h, _e) = connected_with(&fake, &store, settings).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        wait_for("the task to run", || {
+            state_of(&store, t.id) == TaskState::Running
+        })
+        .await;
+        assert!(store.answered(t.id, "trust").unwrap());
+        assert!(store.answered(t.id, "fullscreen").unwrap());
+    }
+
+    /// An untrusted repo's trust dialog, answered by a person, can leave
+    /// its text above the next dialog in the pane read; the trust row does
+    /// not apply, and the renderer row after it is still answered.
+    #[tokio::test(start_paused = true)]
+    async fn a_lingering_trust_dialog_does_not_hide_the_next_one() {
+        let fake = FakeHerdr::new();
+        fake.set_startup_dialogs(vec![
+            (TRUST_SCREEN.into(), keys(&DOWN_ENTER)),
+            (
+                format!("{TRUST_SCREEN}\n{RENDERER_SCREEN}"),
+                keys(&DOWN_ENTER),
+            ),
+        ]);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _e) = connected(&fake, &store).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            state_of(&store, t.id),
+            TaskState::Blocked,
+            "untrusted: left alone"
+        );
+        assert!(calls(&fake, "pane.send_keys").is_empty());
+        // A person answers trust at the pane.
+        fake.pane_send_keys(t.pane_id.as_deref().unwrap(), &keys(&DOWN_ENTER))
+            .await
+            .unwrap();
+        wait_for("the task to run", || {
+            state_of(&store, t.id) == TaskState::Running
+        })
+        .await;
+        assert!(!store.answered(t.id, "trust").unwrap());
+        assert!(store.answered(t.id, "fullscreen").unwrap());
+    }
+
+    /// herdr reports no change when one dialog replaces another, so the
+    /// next dialog is answered after the settle window, not at the next
+    /// reconcile, which is far off here.
+    #[tokio::test(start_paused = true)]
+    async fn the_next_dialog_is_answered_after_the_settle_window() {
+        let fake = FakeHerdr::new();
+        fake.set_startup_dialogs(vec![
+            (
+                crate::herdr::fake::CLAUDE_TRUST_SCREEN.into(),
+                keys(&DOWN_ENTER),
+            ),
+            (AUTO_SCREEN.into(), keys(&DOWN_ENTER)),
+            (RENDERER_SCREEN.into(), keys(&DOWN_ENTER)),
+        ]);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store.trust_repo("m", "/r").unwrap();
+        let settings = MachineSettings {
+            reconcile_every: Duration::from_secs(60),
+            poll_every: Duration::from_secs(60),
+            ..settings()
+        };
+        let (h, _e) = connected_with(&fake, &store, settings).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+        assert_eq!(calls(&fake, "pane.send_keys").len(), 3);
     }
 
     fn trusted_events(events: &mut broadcast::Receiver<PastorEvent>) -> Vec<PastorEvent> {
