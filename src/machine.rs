@@ -265,6 +265,13 @@ pub struct MachineStatus {
     /// it answers, and from a head that predates the field.
     #[serde(default)]
     pub pastor_read_at: Option<DateTime<Utc>>,
+    /// What the machine has free (`Connector::room`), read at each connect
+    /// and again every `MachineSettings::room_every` while connected or
+    /// polling. `None` until the first probe, and for a machine that cannot
+    /// say (a `command` machine). Defaulted so a CLI can still read a head
+    /// that predates the field.
+    #[serde(default)]
+    pub room: Option<Room>,
     pub protocol: Option<u32>,
     pub error: Option<String>,
     pub live: usize,
@@ -362,6 +369,12 @@ pub struct MachineSettings {
     /// polling), so the real interval rounds up to that tick. `version_every`
     /// in pastor.toml, two minutes by default.
     pub version_every: Duration,
+    /// While connected or polling, how often the machine's room (free disk
+    /// and memory, `MachineStatus::room`) is read again, whether or not a
+    /// floor is set on it: the numbers move with every checkout and build.
+    /// Checked after each reconcile, like `version_every`. Sixty seconds by
+    /// default; not in `pastor.toml` yet.
+    pub room_every: Duration,
     /// `[agents]` in `pastor.toml`: the startup dialogs each agent may
     /// show and how they are answered (`Agents::dialogs`).
     pub agents: crate::config::Agents,
@@ -395,6 +408,7 @@ impl Default for MachineSettings {
             close_done_after: Some(Duration::from_secs(5)),
             close_failed_after: Some(Duration::from_secs(5)),
             version_every: Duration::from_secs(2 * 60),
+            room_every: Duration::from_secs(60),
             agents: crate::config::Agents::default(),
             head_address: None,
             limits: None,
@@ -877,6 +891,7 @@ pub fn pull_machine(name: String, max_agents: u32, tags: Vec<String>) -> Machine
         herdr_version: None,
         pastor_version: None,
         pastor_read_at: None,
+        room: None,
         protocol: None,
         error: None,
         live: 0,
@@ -926,6 +941,7 @@ pub fn spawn_machine(
         herdr_version: None,
         pastor_version: None,
         pastor_read_at: None,
+        room: None,
         protocol: None,
         error: None,
         live: 0,
@@ -962,6 +978,7 @@ pub fn spawn_machine(
         orphans: vec![],
         stopped_since: HashMap::new(),
         version_asked_at: Instant::now(),
+        room_asked_at: Instant::now(),
     };
     let task = tokio::spawn(actor.run());
     MachineHandle {
@@ -1090,6 +1107,8 @@ struct Actor {
     /// When the machine was last asked for its pastor version; see
     /// `refresh_pastor_version`.
     version_asked_at: Instant,
+    /// When the machine was last asked for its room; see `refresh_room`.
+    room_asked_at: Instant,
 }
 
 /// The pane of `task` if it is live on `machine`: starting with a pane
@@ -1320,6 +1339,52 @@ impl Actor {
         }
     }
 
+    /// Read the machine's room (`Connector::room`) into the status: the
+    /// numbers stamped with now when it answers; on a failure or a timeout
+    /// the error, over the numbers last read and their time, so a reader
+    /// sees how old they are. As with the version, a failure here never
+    /// touches the channel: the ping or reconcile before it just proved the
+    /// machine reachable, and a machine never reconnects over its room.
+    async fn read_room(&mut self) {
+        self.room_asked_at = Instant::now();
+        let read = match tokio::time::timeout(self.settings.request_timeout, self.connector.room())
+            .await
+        {
+            Ok(Ok(room)) => Ok(room),
+            Ok(Err(err)) => Err(err.to_string()),
+            Err(_) => Err(format!(
+                "room probe timed out after {:?}",
+                self.settings.request_timeout
+            )),
+        };
+        if let Err(error) = &read {
+            tracing::warn!(machine = %self.name, %error, "could not read the room");
+        }
+        let mut s = self.status.write().recover();
+        match read {
+            Ok(Some(numbers)) => {
+                s.room = Some(Room {
+                    asked_at: Some(Utc::now()),
+                    error: None,
+                    ..numbers
+                });
+            }
+            // A machine that cannot say has no room, not an empty one.
+            Ok(None) => s.room = None,
+            Err(error) => s.room.get_or_insert_with(Room::default).error = Some(error),
+        }
+    }
+
+    /// Read the room again once `room_every` has passed since the last
+    /// read. Called after a reconcile that worked, connected or polling,
+    /// like `refresh_pastor_version`.
+    async fn refresh_room(&mut self) {
+        if self.room_asked_at.elapsed() < self.settings.room_every {
+            return;
+        }
+        self.read_room().await;
+    }
+
     async fn run(mut self) {
         let mut backoff = self.settings.initial_backoff;
         loop {
@@ -1362,6 +1427,7 @@ impl Actor {
                 }
                 s.protocol = Some(pong.protocol);
             }
+            self.read_room().await;
             if pong.protocol < MIN_HERDR_PROTOCOL {
                 self.set_channel(
                     ChannelState::Incompatible,
@@ -1516,6 +1582,7 @@ impl Actor {
                         }
                         if reconciled {
                             self.refresh_pastor_version().await;
+                            self.refresh_room().await;
                         }
                     }
                     _ = close_tick.tick(), if reconciled && close_every.is_some() => {
@@ -1871,6 +1938,7 @@ impl Actor {
                                 subscribing = self.subscribe_future().ok();
                             }
                             self.refresh_pastor_version().await;
+                            self.refresh_room().await;
                         }
                         Err(err) => {
                             tracing::warn!(machine = %self.name, %err, "poll reconcile failed");
@@ -5063,6 +5131,7 @@ mod tests {
             close_done_after: None,
             close_failed_after: None,
             version_every: Duration::from_millis(200),
+            room_every: Duration::from_millis(200),
             agents: Default::default(),
             head_address: None,
             limits: None,
@@ -11884,6 +11953,260 @@ mod tests {
         assert_eq!(h.snapshot().channel, ChannelState::Polling);
     }
 
+    /// A CLI talks to whatever head is running, which may predate the room.
+    #[test]
+    fn a_status_from_an_older_head_reads_without_a_room() {
+        let s: MachineStatus = serde_json::from_value(serde_json::json!({
+            "name": "pi-3", "host": "fleet@pi-3", "endpoint": "ssh fleet@pi-3",
+            "channel": "connected", "herdr_version": "0.9.1", "protocol": 22,
+            "error": null, "live": 0, "max_agents": 2, "tags": []
+        }))
+        .unwrap();
+        assert_eq!(s.room, None);
+        let r: Room = serde_json::from_value(serde_json::json!({
+            "home_free": 10, "tmp_free": null, "mem_free": 30
+        }))
+        .unwrap();
+        assert_eq!(r.home_free, Some(10));
+        assert_eq!(r.asked_at, None);
+        assert_eq!(r.error, None);
+    }
+
+    fn room(home: u64, tmp: u64, mem: u64) -> Room {
+        Room {
+            home_free: Some(home),
+            tmp_free: Some(tmp),
+            mem_free: Some(mem),
+            asked_at: None,
+            error: None,
+        }
+    }
+
+    fn room_of(h: &MachineHandle) -> Room {
+        h.snapshot().room.expect("a room")
+    }
+
+    /// Each connect reads the machine's room, and the status carries the
+    /// numbers with when they were read and no error.
+    #[tokio::test(start_paused = true)]
+    async fn status_carries_the_room_from_connect() {
+        let fake = FakeHerdr::new();
+        fake.set_room(Some(room(100, 20, 30)));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let r = room_of(&h);
+        assert_eq!(
+            (r.home_free, r.tmp_free, r.mem_free),
+            (Some(100), Some(20), Some(30))
+        );
+        r.asked_at.expect("read at connect");
+        assert_eq!(r.error, None);
+    }
+
+    /// A machine that cannot say (a `command` machine, or macOS for
+    /// memory) carries what it could say and nothing for the rest.
+    #[tokio::test(start_paused = true)]
+    async fn a_machine_that_cannot_say_has_no_room() {
+        let fake = FakeHerdr::new();
+        fake.set_room(None);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        assert_eq!(h.snapshot().room, None);
+        fake.set_room(Some(Room {
+            mem_free: None,
+            ..room(100, 20, 0)
+        }));
+        wait_for("a room without memory", || {
+            h.snapshot().room.is_some_and(|r| r.home_free == Some(100))
+        })
+        .await;
+        assert_eq!(room_of(&h).mem_free, None);
+    }
+
+    /// The room is read again every `room_every` while the machine stays
+    /// connected: the numbers move with the disk, without a reconnect.
+    #[tokio::test(start_paused = true)]
+    async fn a_connected_machine_refreshes_its_room() {
+        let fake = FakeHerdr::new();
+        fake.set_room(Some(room(100, 20, 30)));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let old = Utc::now() - chrono::Duration::hours(1);
+        h.status.write().recover().room.as_mut().unwrap().asked_at = Some(old);
+
+        fake.set_room(Some(room(50, 20, 30)));
+        wait_for("the new numbers", || {
+            h.snapshot().room.is_some_and(|r| r.home_free == Some(50))
+        })
+        .await;
+        let pings = fake
+            .requests()
+            .iter()
+            .filter(|r| r.method == "ping")
+            .count();
+        assert_eq!(pings, 1, "picked up without a reconnect");
+        assert!(room_of(&h).asked_at.expect("read again") > old);
+    }
+
+    /// A probe that fails keeps the numbers last read and when they were
+    /// read, and says what went wrong; the next one that answers clears
+    /// it. The channel never moves over a room: the ping and reconcile just
+    /// proved the machine reachable.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_room_probe_keeps_the_numbers_and_sets_the_error() {
+        let fake = FakeHerdr::new();
+        fake.set_room(Some(room(100, 20, 30)));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let first = room_of(&h).asked_at.expect("read at connect");
+
+        fake.set_room_fails(true);
+        wait_for("the error", || {
+            h.snapshot().room.is_some_and(|r| r.error.is_some())
+        })
+        .await;
+        let r = room_of(&h);
+        assert_eq!(
+            (r.home_free, r.tmp_free, r.mem_free),
+            (Some(100), Some(20), Some(30))
+        );
+        assert_eq!(r.asked_at, Some(first), "the numbers keep their age");
+        assert!(
+            r.error.as_deref().unwrap().contains("connection reset"),
+            "{r:?}"
+        );
+        assert_eq!(h.snapshot().channel, ChannelState::Connected);
+        assert_eq!(
+            fake.requests()
+                .iter()
+                .filter(|r| r.method == "ping")
+                .count(),
+            1,
+            "no reconnect over a room"
+        );
+
+        fake.set_room_fails(false);
+        fake.set_room(Some(room(90, 20, 30)));
+        wait_for("the error cleared", || {
+            h.snapshot()
+                .room
+                .is_some_and(|r| r.error.is_none() && r.home_free == Some(90))
+        })
+        .await;
+        assert!(room_of(&h).asked_at.unwrap() > first);
+    }
+
+    /// A reconnect whose room probe fails keeps the room last read too, with
+    /// the error, rather than starting from nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnect_whose_room_probe_fails_keeps_the_last_read() {
+        let fake = FakeHerdr::new();
+        fake.set_room(Some(room(100, 20, 30)));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let first = room_of(&h).asked_at.expect("read at connect");
+
+        fake.set_room_fails(true);
+        fake.disconnect_all();
+        wait_for("reconnected", || {
+            let pings = fake
+                .requests()
+                .iter()
+                .filter(|r| r.method == "ping")
+                .count();
+            pings >= 2 && h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let r = room_of(&h);
+        assert_eq!(r.home_free, Some(100));
+        assert_eq!(r.asked_at, Some(first));
+        assert!(r.error.is_some(), "{r:?}");
+    }
+
+    /// A first probe that fails still carries the error, with no numbers.
+    #[tokio::test(start_paused = true)]
+    async fn a_first_room_probe_that_fails_carries_only_the_error() {
+        let fake = FakeHerdr::new();
+        fake.set_room_fails(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let r = room_of(&h);
+        assert_eq!((r.home_free, r.tmp_free, r.mem_free), (None, None, None));
+        assert_eq!(r.asked_at, None);
+        assert!(r.error.is_some(), "{r:?}");
+    }
+
+    /// The same refresh while polling: a machine whose events will not open
+    /// still answers requests and can stay that way for as long as it likes.
+    #[tokio::test(start_paused = true)]
+    async fn a_polling_machine_refreshes_its_room() {
+        let fake = FakeHerdr::new();
+        fake.set_room(Some(room(100, 20, 30)));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (events, _rx) = broadcast::channel(64);
+        let mut settings = settings();
+        settings.poll_every = Duration::from_millis(50);
+        let h = spawn_machine(
+            "m".into(),
+            2,
+            vec![],
+            Arc::new(FlakyEvents {
+                subscribes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                fail_until: 1,
+                wedge_forever: true,
+                slow_ack: None,
+                fake: fake.clone(),
+            }),
+            store,
+            settings,
+            events,
+        );
+        wait_for("polling", || h.snapshot().channel == ChannelState::Polling).await;
+        assert_eq!(room_of(&h).home_free, Some(100));
+
+        fake.set_room(Some(room(50, 20, 30)));
+        wait_for("the new numbers", || {
+            h.snapshot().room.is_some_and(|r| r.home_free == Some(50))
+        })
+        .await;
+        assert_eq!(h.snapshot().channel, ChannelState::Polling);
+    }
+
+    /// Sixty seconds by default: a number that moves with every checkout
+    /// and build, read often enough to place on, at one probe per machine
+    /// per minute.
+    #[test]
+    fn room_every_is_a_minute_by_default() {
+        assert_eq!(
+            MachineSettings::default().room_every,
+            Duration::from_secs(60)
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn incompatible_protocol_is_reported_and_not_dispatched_to() {
         let fake = FakeHerdr::new();
@@ -12220,6 +12543,9 @@ mod tests {
         }
         fn pastor_version(&self) -> crate::herdr::transport::VersionFuture<'_> {
             self.fake.pastor_version()
+        }
+        fn room(&self) -> crate::herdr::transport::RoomFuture<'_> {
+            self.fake.room()
         }
     }
 

@@ -1286,6 +1286,7 @@ mod tests {
             herdr_version: Some("0.9.1".into()),
             pastor_version: Some("0.2.0".into()),
             pastor_read_at: Some(Utc::now()),
+            room: None,
             protocol: Some(22),
             error: None,
             live: 1,

@@ -159,6 +159,15 @@ version was last read (`version read`), so a row that still shows the old
 version after an install can be told from a head that has not asked yet.
 `machine list` itself never probes while the head is running.
 
+The head also reads each machine's room: its free disk under `$HOME` and
+`/tmp` (`df -Pk`) and its free memory (`MemAvailable` in `/proc/meminfo`;
+unknown on macOS, which has none), one probe over the same ssh master when
+it connects and again after a reconcile once a minute has passed. The
+numbers sit on the machine's status with when they were read; a probe that
+fails keeps the last numbers and notes the error, and never makes the
+machine reconnect, since the ping just proved it reachable. Nothing acts on
+them yet.
+
 With `pastor serve` running, CHANNEL is the head's live channel state and
 AGENTS counts pastor's tasks and orphans (see below) against the machine's
 room, `max_agents` followed by `+<n>j` for job slots and `+<n>b` for burst
