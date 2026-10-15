@@ -542,8 +542,16 @@ enum Ask {
 /// `cli::ask` for a watcher, which also needs to tell a head that gave no
 /// answer from one that refused.
 async fn ask(client: &crate::ipc::Client, req: IpcRequest) -> Result<IpcResponse, Ask> {
+    use crate::ipc::RequestError;
     let got = crate::ipc::request_head(client, &req).await;
-    let down = matches!(&got, Err(e) if !matches!(e, crate::ipc::RequestError::Refused { .. }));
+    // A connect denied for permissions is the caller being sandboxed, not
+    // a head that is down: the watcher ends with `socket_denied` as every
+    // other command does, instead of polling a connect that never gets in.
+    let down = matches!(
+        &got,
+        Err(e) if !matches!(e, RequestError::Refused { .. })
+            && !matches!(e, RequestError::Connect(io) if io.kind() == std::io::ErrorKind::PermissionDenied)
+    );
     crate::cli::reply(got).map_err(|e| {
         if down {
             Ask::Down(e.message)

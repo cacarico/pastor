@@ -11157,6 +11157,27 @@ mod tests {
         }
     }
 
+    /// A socket this caller may not connect to is refused with
+    /// `socket_denied`, and left where it is: a head may well be live
+    /// behind it.
+    #[tokio::test]
+    async fn a_denied_socket_is_refused_and_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("pastor.sock");
+        let _listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+            // Root ignores the mode; there is nothing to deny.
+            return;
+        }
+        let err = refuse_live_socket(&socket).await.unwrap_err();
+        let err = err.downcast::<crate::cli::CliError>().unwrap();
+        assert_eq!(err.code, "socket_denied", "{}", err.message);
+        assert!(err.message.contains("sandbox"), "{}", err.message);
+        assert!(socket.exists(), "never unlinked over a denial");
+    }
+
     /// A daemon that is mid-request and not answering pings (or a listener that
     /// never reads at all) must not have its socket unlinked by a second `pastor
     /// serve`: staleness is decided by whether the connect is refused, not by

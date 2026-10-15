@@ -226,16 +226,20 @@ pub async fn start_background(paths: &Paths, head: Option<&str>) -> anyhow::Resu
             ));
         }
         let socket = paths.socket_file();
-        if let HeadPing::Pong { role, .. } = ping_head(&socket).await
-            && socket_pid(&socket).await == Some(pid)
-        {
-            println!(
-                "pastor serve is running in the background as the {} (pid {pid})",
-                role_name(role.as_deref())
-            );
-            println!("log: {}", log.display());
-            println!("stop it with `pastor serve stop`");
-            return Ok(());
+        match ping_head(&socket).await {
+            HeadPing::Pong { role, .. } if socket_pid(&socket).await == Some(pid) => {
+                println!(
+                    "pastor serve is running in the background as the {} (pid {pid})",
+                    role_name(role.as_deref())
+                );
+                println!("log: {}", log.display());
+                println!("stop it with `pastor serve stop`");
+                return Ok(());
+            }
+            // The child bound the socket but this caller may not connect
+            // to it: waiting out START_WAIT would only end in `serve_slow`.
+            HeadPing::Denied => return Err(crate::cli::socket_denied(&socket)),
+            _ => {}
         }
         if Instant::now() >= deadline {
             return Err(CliError::err(
@@ -340,9 +344,15 @@ pub async fn status(paths: &Paths, json: bool) -> anyhow::Result<()> {
 /// would start it again, so it is stopped through them.
 pub async fn stop(paths: &Paths) -> anyhow::Result<()> {
     let socket = paths.socket_file();
-    if ping_head(&socket).await == HeadPing::NotRunning {
-        println!("pastor serve is not running here; nothing to stop");
-        return Ok(());
+    match ping_head(&socket).await {
+        HeadPing::NotRunning => {
+            println!("pastor serve is not running here; nothing to stop");
+            return Ok(());
+        }
+        // The caller may not connect: finding the pid would fail the same
+        // way, and `stop_failed` would hide the sandbox.
+        HeadPing::Denied => return Err(crate::cli::socket_denied(&socket)),
+        HeadPing::Unresponsive | HeadPing::Pong { .. } => {}
     }
     let Some(pid) = socket_pid(&socket).await else {
         return Err(CliError::err(
