@@ -2348,7 +2348,16 @@ shows (`waiting for a machine: ...`), or `next pass: <m> has room` for one
 the next pass will start. A flock's number adds two: `flock <f> is at <n> of
 <number> on <m>` when it is at its max there, and `flock <f> is past its
 share on <m>, ... while flock <g> waits under its share` when another flock
-under its share goes first. A paused task reads `paused for t-N;` and then
+under its share goes first. A pull machine (see Pull machines, under A
+headless serve) is never pushed to: a task pinned to one waits on its slots and
+its flock's seat there, as the machine's own claims take it, so it reads
+`machine <m> is full (n/max)`, `flock <f> is at <n> of <number> on <m>`, `is
+not connected` only while the machine has never claimed or is counted lost,
+or `next claim: <m> has room` for one its next claim takes. A loose task never
+reads a pull machine as where it goes next, since whether the machine takes
+flock work is its own serve's setting, and a flock with only pull machines
+reads `flock <f> has only pull machines; a loose task waits for one that
+takes flock work`. A paused task reads `paused for t-N;` and then
 why its machine can't take it yet, or `next pass: resumes on <m>`. `--flock <f>` keeps the tasks waiting in a flock,
 `--machine <m>` the ones pinned to a machine, both keeping their POS in the
 whole queue; `--json` gives each as `pos`, `id`, `priority`, `aged_from`, `where`,
@@ -3726,10 +3735,21 @@ runs no actor for it; `machine list` shows its HOST as `pull`.
   for it, answers the trust prompt and reports it, and the head emits
   `task.trusted`, by the rules given with `task send --trust` under How it
   works. It never gets another machine's pairs.
+- An agent's `pastor task done` on a pull machine reaches the head, which
+  ends the row there (`done`, with the summary). The machine's serve ends
+  its own row the same way at its next report, with the head's summary, so
+  auto-close takes the pane once the agent is idle and reports it closed;
+  one the head ended before the serve started it is closed there without
+  an agent ever starting. The row stays `done` on the head and counts as
+  live, holding its slot and its flock's seat, until the machine reports
+  the pane closed, or reports the agent `failed` (gone, with nothing left
+  to close), which closes the row with its finish and summary kept.
 - A pull machine that sends neither a claim nor a report for
   `pull_lost_after` (head's pastor.toml, default `10m`) is lost, and its
-  `starting` and `running` tasks go stale, as for any lost machine. The
-  clock starts when the head does.
+  `starting` and `running` tasks go stale, as for any lost machine; a task
+  its agent ended with `task done` is closed, its finish kept, since the
+  machine may never report its pane closed. The clock starts when the head
+  does.
 
 ### Jobs on a shepherd
 

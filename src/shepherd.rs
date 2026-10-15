@@ -498,25 +498,25 @@ impl Puller {
     /// Tell the head about every row that changed since it last heard, or
     /// with `all` every row: the head answers an unchanged report with its
     /// row and nothing else, which is how a `task close` there reaches the
-    /// pane here. A row the head has closed is closed here too; one the
-    /// head has done and ended (the agent's `task done` goes to the head)
-    /// is ended here too, so its agent's idle is not read as idle without
-    /// `task done` and auto-close takes its pane; a closed or failed one
-    /// the head has heard of is forgotten here. Stops at the
-    /// first report that does not reach the head, to try again next tick.
-    /// The trust keys the actor pressed for a task go with its reports
-    /// until one reaches the head, which emits `task.trusted` once; a head
-    /// too old for them gets the report without.
+    /// pane here (`follow_head`). A row still queued here, claimed and not
+    /// started, is `starting` on the head since the claim and reported so,
+    /// so what the head did to it meanwhile reaches here before an agent
+    /// is started for it. Stops at the first report that does not reach
+    /// the head, to try again next tick. The trust keys the actor pressed
+    /// for a task go with its reports until one reaches the head, which
+    /// emits `task.trusted` once; a head too old for them gets the report
+    /// without.
     async fn report(&mut self, all: bool) {
         for t in self.tasks() {
-            if t.state == TaskState::Queued {
-                continue;
-            }
             let trust_sent = self.store.trust_sent(t.id).unwrap_or(false);
             let now: Reported = (t.state, t.pane_id.clone(), t.error.clone(), trust_sent);
             if !all && self.sent.get(&t.id) == Some(&now) {
                 continue;
             }
+            let state = match t.state {
+                TaskState::Queued => TaskState::Starting,
+                state => state,
+            };
             // The keys as pressed, kept with the flag: after a restart the
             // config may name others, or none. The head emits once whatever
             // a restart sends again.
@@ -526,7 +526,7 @@ impl Puller {
             let req = |trusted: Option<Vec<String>>| IpcRequest::TaskReport {
                 machine: self.machine.clone(),
                 id: t.id,
-                state: t.state,
+                state,
                 pane: t.pane_id.clone(),
                 detail: t.error.clone(),
                 // Nothing here reads a limit from a pane yet.
@@ -565,33 +565,47 @@ impl Puller {
                     }
                 }
             };
-            tracing::info!(task = %t.display_id(), state = %t.state, "reported to the head");
+            tracing::info!(task = %t.display_id(), state = %state, "reported to the head");
             self.sent.insert(t.id, now);
-            if head_row.state == TaskState::Closed && t.state.is_open() {
-                // Closed on the head (`task close`): the pane is here.
-                let actor = self.actor();
-                if let Err(err) = actor.close(t.id, false).await {
-                    tracing::warn!(task = %t.display_id(), err = %format!("{err:#}"), "close a task the head closed");
+            self.follow_head(&t, head_row).await;
+        }
+    }
+
+    /// Bring the row here (`t`) after the head's (`head`), which a report
+    /// just answered with. One the head has closed (`task close`) is
+    /// closed here, where the pane is. One the head has done and ended
+    /// (the agent's `task done` goes to the head) is ended here too, with
+    /// the head's summary, so its agent's idle is not read as idle without
+    /// `task done` and auto-close takes its pane; one not started here yet
+    /// is closed outright, nothing being here to end, and the head hears
+    /// `closed` at the next report, since its row holds a seat until then.
+    /// A closed or failed row the head has heard of is forgotten here.
+    async fn follow_head(&mut self, t: &Task, head: Task) {
+        let actor = self.actor();
+        let (what, done) = match (head.state, head.ended) {
+            (TaskState::Closed, _) if t.state.is_open() => (
+                "close a task the head closed",
+                actor.close(t.id, false).await,
+            ),
+            (TaskState::Done, true) if t.state == TaskState::Queued => (
+                "close a task the head ended before it started here",
+                actor.close(t.id, false).await,
+            ),
+            (TaskState::Done, true) if t.state.occupies_pane() && !t.ended => (
+                "end a task the head ended",
+                actor
+                    .end_by(t.id, head.summary.map(|s| s.text), EndBy::Head)
+                    .await,
+            ),
+            _ => {
+                if matches!(t.state, TaskState::Closed | TaskState::Failed) {
+                    self.forget(t.id);
                 }
-                continue;
+                return;
             }
-            if head_row.state == TaskState::Done
-                && head_row.ended
-                && t.state.occupies_pane()
-                && !t.ended
-            {
-                // The summary stayed on the head, and the row here goes
-                // with the pane: ended as by hand, so a required summary
-                // is not asked for again.
-                let actor = self.actor();
-                if let Err(err) = actor.end_by(t.id, None, EndBy::Hand).await {
-                    tracing::warn!(task = %t.display_id(), err = %format!("{err:#}"), "end a task the head ended");
-                }
-                continue;
-            }
-            if matches!(t.state, TaskState::Closed | TaskState::Failed) {
-                self.forget(t.id);
-            }
+        };
+        if let Err(err) = done {
+            tracing::warn!(task = %t.display_id(), err = %format!("{err:#}"), "{what}");
         }
     }
 
@@ -1015,7 +1029,7 @@ mod tests {
         run_task(head, machine, repo, "claude").await
     }
 
-    /// `run_in`, with `agent`.
+    /// `run_in`, with `agent`, and a summary the agent must give.
     async fn run_task(
         head: &Daemon,
         machine: Option<&str>,
@@ -1044,7 +1058,7 @@ mod tests {
                 place: Default::default(),
                 session_id: None,
                 label: Default::default(),
-                summary: Default::default(),
+                summary: crate::task::SummaryMode::Require,
                 cwd: None,
                 keep_pane: None,
                 keep_pane_from: None,
@@ -1155,7 +1169,8 @@ mod tests {
     /// there; the row here learns nothing of it on its own. An agent that
     /// is not Claude, idle after it, would read here as idle without `task
     /// done` and sit `blocked` with its pane and the head's seat for good.
-    /// A head row that is done and ended ends the row here too, so
+    /// A head row that is done and ended ends the row here too, with the
+    /// head's summary (the task requires one, and the head took it), so
     /// auto-close takes the pane once the agent is idle, the head hears
     /// `closed`, and the row is forgotten, as a task closed on the head.
     #[tokio::test]
@@ -1200,18 +1215,35 @@ mod tests {
         fake.set_pane_text(&pane, "DONE\n> ");
         fake.set_status(&pane, crate::herdr::AgentStatus::Idle);
 
+        let mut here_events = p.events.subscribe();
+        let mut here_round = None;
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while store.get_task(t.id).unwrap().is_some() {
-            let here = store.get_task(t.id).unwrap().map(|t| (t.state, t.ended));
+        while let Some(here) = store.get_task(t.id).unwrap() {
+            if here.ended {
+                here_round = here.summary.clone();
+            }
             assert!(
                 std::time::Instant::now() < deadline,
-                "never forgotten: here {here:?}, head {}",
+                "never forgotten: here {:?}, head {}",
+                (here.state, here.ended),
                 head.store().get_task(t.id).unwrap().unwrap().state
             );
             let _ = tokio::time::timeout(Duration::from_millis(100), p.changed()).await;
             p.pass().await;
         }
         assert!(fake.agents().is_empty(), "{:?}", fake.agents());
+        // Both stores tell the same story: the agent's own summary, not a
+        // round ended by hand.
+        let round = here_round.expect("the row here was ended with a round");
+        assert_eq!(round.text, "done: pushed");
+        assert_eq!(round.outcome, crate::task::Outcome::Done);
+        let here_done = std::iter::from_fn(|| here_events.try_recv().ok())
+            .find(|e| e.kind == "task.done")
+            .expect("the actor here sent task.done");
+        assert_eq!(
+            here_done.summary.map(|s| s.text),
+            Some("done: pushed".to_string())
+        );
         let row = head.store().get_task(t.id).unwrap().unwrap();
         assert_eq!(row.state, TaskState::Closed);
         assert_eq!(
@@ -1231,6 +1263,73 @@ mod tests {
             kinds,
             ["task.queued", "task.running", "task.done", "task.closed"]
         );
+    }
+
+    /// A task claimed here and not started yet is queued here and
+    /// `starting` on the head. One a person ends on the head meanwhile
+    /// (`task done t-N`) is closed here, no agent ever started for it, and
+    /// the head hears `closed` and frees its seat, with the finish the
+    /// person's end gave it.
+    #[tokio::test]
+    async fn a_task_the_head_ended_before_it_started_here_is_never_started() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (head, ask) = pull_head(tmp.path()).await;
+        let mut events = head.subscribe();
+        let t = run_pinned(&head, Some("laptop")).await;
+        let fake = crate::herdr::fake::FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut p = Puller::new(
+            "laptop".into(),
+            false,
+            Arc::new(fake.clone()),
+            fast(),
+            store.clone(),
+            ask,
+        );
+        // Claimed, and not yet handed to the actor.
+        p.claim().await;
+        let here = store.get_task(t.id).unwrap().expect("claimed");
+        assert_eq!(here.state, TaskState::Queued);
+        assert_eq!(
+            head.store().get_task(t.id).unwrap().unwrap().state,
+            TaskState::Starting
+        );
+        let IpcResponse::Task(ended) = head
+            .handle(IpcRequest::TaskDone {
+                id: t.id,
+                summary: None,
+            })
+            .await
+        else {
+            panic!()
+        };
+        assert!(ended.ended && ended.state == TaskState::Done);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while let Some(here) = store.get_task(t.id).unwrap() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never forgotten: here {}, head {}",
+                here.state,
+                head.store().get_task(t.id).unwrap().unwrap().state
+            );
+            let _ = tokio::time::timeout(Duration::from_millis(100), p.changed()).await;
+            p.pass().await;
+            assert!(
+                fake.agents().is_empty(),
+                "started anyway: {:?}",
+                fake.agents()
+            );
+        }
+        let row = head.store().get_task(t.id).unwrap().unwrap();
+        assert_eq!(row.state, TaskState::Closed);
+        assert_eq!(row.finished_at, ended.finished_at);
+        assert_eq!(row.error, None);
+        let kinds: Vec<String> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter(|e| e.task_id == Some(t.id))
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(kinds, ["task.queued", "task.done", "task.closed"]);
     }
 
     /// The keys pressed on `pane`, each send as one list.

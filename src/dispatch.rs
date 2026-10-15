@@ -37,6 +37,14 @@ pub struct MachineView {
     /// How many of `live` come from a job (`Task::from_job`).
     pub live_jobs: usize,
     pub healthy: bool,
+    /// A pull machine (`pull = true`): a pass never pushes to it, its own
+    /// serve claims. Read by `pastor queue` alone, where `healthy` is
+    /// whether it is connected: a task pinned to it waits on its slots and
+    /// seat as its claims do, while a loose task never reads it as where
+    /// it goes next, since whether its claims take loose tasks is its
+    /// serve's own setting (`takes_flock_work`), which the head does not
+    /// know.
+    pub pull: bool,
     /// The flocks the machine is in now, each with its number and how many
     /// of its live tasks run here.
     pub flocks: Vec<FlockSeat>,
@@ -1301,6 +1309,7 @@ mod tests {
             live,
             live_jobs: 0,
             healthy,
+            pull: false,
             flocks: vec![seat("default", None, live)],
             waiting_under_share: vec![],
         }

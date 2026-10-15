@@ -1181,6 +1181,12 @@ fn task_id_of_agent(name: &str) -> Option<i64> {
 pub enum EndBy {
     Agent,
     Hand,
+    /// The head, whose row the agent's `task done` reached: a pull
+    /// machine's serve ends its own row as the head's is, with the head's
+    /// summary (`shepherd::Puller::report`). The head took the summary,
+    /// so none is asked for again, and the round reads as it does there,
+    /// not as one a person ended.
+    Head,
 }
 
 /// How an idle agent ended its turn, read from its pane before a task is

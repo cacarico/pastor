@@ -1299,7 +1299,8 @@ impl Fleet {
     /// `pastor queue` explains a wait with. A pass never pushes to one,
     /// but its claims take a task under the same room and seat rules, so
     /// a task pinned to it waits for a slot or its flock's seat, not for a
-    /// connection it has.
+    /// connection it has. The view says it is a pull machine, so a loose
+    /// task is never read as going there (`queue::why_waiting`).
     fn queue_views(&self) -> Vec<MachineView> {
         self.views_where(true)
     }
@@ -1342,6 +1343,7 @@ impl Fleet {
                     healthy: (pull_claims || !m.pull)
                         && !m.shutting_down
                         && s.channel.accepts_dispatch(),
+                    pull: m.pull,
                     flocks: seats(&wanted, &s),
                     waiting_under_share: Vec::new(),
                 }
@@ -2410,6 +2412,7 @@ impl Fleet {
             live: s.live,
             live_jobs: s.live_jobs,
             healthy: true,
+            pull: true,
             flocks: seats(&flock, &s),
             waiting_under_share: Vec::new(),
         };
@@ -2493,9 +2496,10 @@ impl Fleet {
     /// A closed or failed row stays as it is, a stale one stays stale while
     /// its agent works (as `task::next_state` keeps it), and one `task done`
     /// ended stays done until its pane closes; each answers the row as it
-    /// is. An ended one reported `failed` is closed instead: its agent is
-    /// gone, and the machine forgets the row after that report, so nothing
-    /// would ever report it closed and it would hold its seat for good.
+    /// is. An ended one reported `failed` is closed instead, as `task
+    /// close` would close it, with no error: its agent is gone, and the
+    /// machine forgets the row after that report, so nothing would ever
+    /// report it closed and it would hold its seat for good.
     /// Trust keys the machine pressed (`PullReport::trusted`) are
     /// `task.trusted` once per task, after a `task.blocked` the same report
     /// brings and before any other state's event, as the actor emits them.
@@ -2558,11 +2562,8 @@ impl Fleet {
             }
             let from = task.state;
             let ended = from == TaskState::Done && task.ended;
-            let state = if ended && state == TaskState::Failed {
-                TaskState::Closed
-            } else {
-                state
-            };
+            let gone = ended && state == TaskState::Failed;
+            let state = if gone { TaskState::Closed } else { state };
             let working = matches!(
                 state,
                 TaskState::Starting | TaskState::Running | TaskState::Blocked
@@ -2587,7 +2588,11 @@ impl Fleet {
             if pane.is_some() {
                 task.pane_id = pane.clone();
             }
-            task.error = detail.clone();
+            // The failure of an agent that had ended its task is no
+            // error of the task's: it finished as the agent said.
+            if !gone {
+                task.error = detail.clone();
+            }
             let now = chrono::Utc::now();
             if matches!(state, TaskState::Running | TaskState::Blocked) && task.started_at.is_none()
             {
@@ -2698,8 +2703,12 @@ impl Fleet {
 
     /// Count each pull machine not heard from for `after` lost, once per
     /// silence: `machine.lost`, and its starting and running tasks go
-    /// stale, as a task does whose agent pastor lost sight of. Tasks pinned
-    /// to it stay queued. Answers the machines it counted lost now.
+    /// stale, as a task does whose agent pastor lost sight of. A task its
+    /// agent ended (`task done`, done and ended here) is closed, its finish
+    /// kept: it waited for the machine to close its pane and report that,
+    /// which a machine that is gone may never do, and until then it held
+    /// its slot and its flock's seat. Tasks pinned to the machine stay
+    /// queued. Answers the machines it counted lost now.
     pub async fn check_pull_lost(&self, after: Duration) -> Vec<String> {
         let _pass = self.dispatch_lock.lock().await;
         let now = tokio::time::Instant::now();
@@ -2734,15 +2743,19 @@ impl Fleet {
                 }
             };
             for mut t in tasks {
-                if !matches!(t.state, TaskState::Starting | TaskState::Running) {
-                    continue;
+                let state = match t.state {
+                    TaskState::Starting | TaskState::Running => TaskState::Stale,
+                    TaskState::Done if t.ended => TaskState::Closed,
+                    _ => continue,
+                };
+                t.state = state;
+                if state == TaskState::Stale {
+                    t.error = Some(why.clone());
                 }
-                t.state = TaskState::Stale;
-                t.error = Some(why.clone());
                 match self.store.update_task(&mut t) {
-                    Ok(()) => self.emit("task.stale", name, Some(&t), None),
+                    Ok(()) => self.emit(&format!("task.{state}"), name, Some(&t), None),
                     Err(err) => {
-                        tracing::warn!(task = %t.display_id(), %err, "mark stale")
+                        tracing::warn!(task = %t.display_id(), %err, "mark {state}")
                     }
                 }
             }
@@ -6068,6 +6081,10 @@ mod tests {
             "the finish is the agent's, not the close's"
         );
         assert_eq!(
+            row.error, None,
+            "the agent's going is no error of the task's"
+        );
+        assert_eq!(
             events_of(&mut rx),
             [(
                 "task.closed".to_string(),
@@ -6121,6 +6138,90 @@ mod tests {
         let lost = d.fleet().check_pull_lost(Duration::ZERO).await;
         assert_eq!(lost, ["laptop"]);
         assert_eq!(why(second.id), "machine laptop is not connected");
+    }
+
+    /// A pull machine with room is nowhere a loose task goes: a pass never
+    /// pushes to it, and whether its claims take flock work is its serve's
+    /// own setting. With the push machine full, a loose task reads its
+    /// flock as full rather than the pull machine as where the next pass
+    /// starts it, and takes no slot there from the task pinned behind it.
+    #[tokio::test]
+    async fn the_queue_never_reads_a_pull_machine_as_where_a_loose_task_goes() {
+        let (d, _tmp) = pull_daemon(1).await;
+        assert!(
+            claim(&d, 1, false).await.is_empty(),
+            "connected, nothing to take"
+        );
+        let on_a = queued(&d, "on a", None).await;
+        assert_eq!(on_a.machine.as_deref(), Some("a"), "a has one slot");
+        let loose = queued(&d, "loose", None).await;
+        let pinned = queued(&d, "pinned", Some("laptop")).await;
+        let whys: Vec<(i64, String)> = d
+            .fleet()
+            .queue(None, None)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.task.id, e.why))
+            .collect();
+        assert_eq!(
+            whys,
+            [
+                (loose.id, "flock default is full".to_string()),
+                (pinned.id, "next claim: laptop has room".to_string()),
+            ]
+        );
+    }
+
+    /// A pull machine counted lost may never report again, and a task its
+    /// agent ended there waits for that: its pane closed and reported, so
+    /// the head stops counting it live. The head closes it itself, its
+    /// finish and summary kept, so its slot and its flock's seat are free
+    /// for the machine's next claim.
+    #[tokio::test]
+    async fn a_lost_pull_machine_s_ended_task_is_closed_and_frees_its_seat() {
+        let (d, _tmp) = pull_daemon(1).await;
+        let first = queued(&d, "first", Some("laptop")).await;
+        assert_eq!(claim(&d, 1, false).await, ["first"]);
+        d.handle(report("laptop", &first, TaskState::Running, None))
+            .await;
+        d.handle(IpcRequest::TaskDone {
+            id: first.id,
+            summary: Some("done: all pushed".into()),
+        })
+        .await;
+        let ended = d.store().get_task(first.id).unwrap().unwrap();
+        assert!(ended.ended && ended.finished_at.is_some());
+        let second = queued(&d, "second", Some("laptop")).await;
+        let mut rx = d.subscribe();
+        assert_eq!(d.fleet().check_pull_lost(Duration::ZERO).await, ["laptop"]);
+        let row = d.store().get_task(first.id).unwrap().unwrap();
+        assert_eq!(row.state, TaskState::Closed);
+        assert_eq!(
+            row.finished_at, ended.finished_at,
+            "the finish is the agent's"
+        );
+        assert_eq!(row.error, None);
+        assert_eq!(
+            row.summary.as_ref().map(|s| s.text.as_str()),
+            Some("done: all pushed")
+        );
+        let lap = |kind: &str, id: Option<i64>| (kind.to_string(), id, "laptop".to_string());
+        assert_eq!(
+            events_of(&mut rx),
+            [
+                lap("machine.lost", None),
+                lap("task.closed", Some(first.id))
+            ]
+        );
+        assert_eq!(claim(&d, 1, false).await, ["second"], "the seat is free");
+        assert_eq!(state_of(&d, &second), TaskState::Starting);
+        assert_eq!(events_of(&mut rx)[0], lap("machine.connected", None));
+        // The machine, back, reports the pane closed at last: the row is
+        // closed already, and stays so.
+        d.handle(report("laptop", &first, TaskState::Closed, None))
+            .await;
+        assert_eq!(state_of(&d, &first), TaskState::Closed);
+        assert!(events_of(&mut rx).is_empty());
     }
 
     /// `pull = true` is a way to reach a machine, like `ssh`, `local` and
