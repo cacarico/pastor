@@ -93,6 +93,9 @@ struct State {
     unpushed: HashSet<String>,
     /// What `Connector::pastor_version` reports.
     pastor_version: Option<String>,
+    /// When set, `Connector::pastor_version` fails as a lost ssh would,
+    /// while the ping and everything else still answer.
+    pastor_version_fails: bool,
     /// Claude sessions' usage, by (config dir, session id): what
     /// `Connector::claude_usage` reports. `None` for the config dir is
     /// `~/.claude`.
@@ -257,6 +260,7 @@ impl FakeHerdr {
                 protocol: 22,
                 home: Some("/home/fake".into()),
                 pastor_version: Some("fake".into()),
+                pastor_version_fails: false,
                 opencode_permissions: Some(false),
                 agy_settings: Some(crate::provision::agy::AgySettings {
                     content: Some(
@@ -320,6 +324,9 @@ impl FakeHerdr {
     }
     pub fn set_pastor_version(&self, version: Option<&str>) {
         self.state.lock().unwrap().pastor_version = version.map(str::to_string);
+    }
+    pub fn set_pastor_version_fails(&self, fails: bool) {
+        self.state.lock().unwrap().pastor_version_fails = fails;
     }
     pub fn set_missing_dir(&self, path: &str) {
         self.state
@@ -1506,8 +1513,16 @@ impl super::transport::Connector for FakeHerdr {
         Box::pin(async move { Ok(answer) })
     }
     fn pastor_version(&self) -> super::transport::VersionFuture<'_> {
-        let version = self.state.lock().unwrap().pastor_version.clone();
-        Box::pin(async move { Ok(version) })
+        let state = self.state.lock().unwrap();
+        let answer = if state.pastor_version_fails {
+            Err(super::transport::ConnectError {
+                message: "ssh fake: connection reset".into(),
+            })
+        } else {
+            Ok(state.pastor_version.clone())
+        };
+        drop(state);
+        Box::pin(async move { answer })
     }
     fn claude_usage(
         &self,

@@ -629,6 +629,7 @@ pub fn machine_text(m: &MachineDescription) -> String {
         ("herdr", dash(r.herdr_version.clone())),
         ("protocol", dash(r.protocol.map(|p| p.to_string()))),
         ("pastor", dash(r.pastor_version.clone())),
+        ("version read", ago(r.pastor_read_at)),
         ("agents", agents),
         ("orphans", dash(Some(r.orphans.join(",")))),
         ("tags", dash(Some(r.tags.join(",")))),

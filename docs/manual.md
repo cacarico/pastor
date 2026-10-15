@@ -148,11 +148,15 @@ runs `pastor --version` in a shell that has `~/.cargo/bin` and
 `~/.local/bin` on its PATH, since ssh's non-login shell often lacks them. A
 `local` machine is the head's own pastor; a `command` machine, one with no
 pastor, or one that gives an odd answer shows `-`. The head asks when it
-connects, then again after each successful reconcile once ten minutes have
-passed since it last asked — a connected machine's own `reconcile_every`
-(60s by default), a polling one's `poll_every` (10s by default, normally
-every tick) — so an upgrade shows within about eleven minutes without a
-restart either way. A probe that gets no answer keeps the version last read.
+connects, then again after each successful reconcile once `version_every`
+(`pastor.toml`, default `2m`) has passed since it last asked — a connected
+machine's own `reconcile_every` (60s by default), a polling one's
+`poll_every` (10s by default, normally every tick) — so an install shows
+within about three minutes without a restart either way, and each machine
+costs one `pastor --version` over ssh per interval. A probe that gets no
+answer keeps the version last read. `pastor machine describe` says when the
+version was last read (`version read`), so a row that still shows the old
+version after an install can be told from a head that has not asked yet.
 `machine list` itself never probes while the head is running.
 
 With `pastor serve` running, CHANNEL is the head's live channel state and
@@ -4060,7 +4064,7 @@ many at once, chosen by state and age (`task prune`).
 
 ```text
 pastor job describe <name>       schedule, connector and its config, dispatch, last runs and errors, next run, recent tasks and job events
-pastor machine describe <name>   host, flock, session, model, profile, channel, herdr, protocol and pastor versions, agents, orphans, tags, its tasks, recent errors
+pastor machine describe <name>   host, flock, session, model, profile, channel, herdr, protocol and pastor versions and when the pastor one was read, agents, orphans, tags, its tasks, recent errors
 pastor flock describe <name>     default or not, its agent, agent args, allow and deny, model, profile, machines, live agents, queued and running tasks
 pastor connector describe <id>   manifest, origin, commands, config, secrets set or missing, jobs using it, status
 pastor task describe <id>        state, machine, agent and where it came from, prompt, error, summary (--all-summaries: every round's)
@@ -4112,7 +4116,7 @@ sends nothing.
 ## Files
 
 ```
-~/.config/pastor/pastor.toml      tick, settle, reconcile_every, request_timeout, agent_ready_timeout, close_done_after, close_failed_after, pull_lost_after, agents_change_fleet, max_orchestrators, head_address, defaults, agents, models, profiles, watch, shepherd (all optional)
+~/.config/pastor/pastor.toml      tick, settle, reconcile_every, version_every, request_timeout, agent_ready_timeout, close_done_after, close_failed_after, pull_lost_after, agents_change_fleet, max_orchestrators, head_address, defaults, agents, models, profiles, watch, shepherd (all optional)
 ~/.config/pastor/flock.toml       flocks and machines
 ~/.config/pastor/jobs/<name>.toml one job per file
 ~/.config/pastor/orchestrators/<name>.toml one orchestrator per file (and an optional .env for its scripts)
@@ -4146,6 +4150,7 @@ locations. `PASTOR_CONNECTOR_GIT_BASE` (default `https://github.com`) is where
 tick = "10s"                 # scheduler pass
 settle = "10s"               # a finished agent stays idle this long before its task is done
 reconcile_every = "60s"
+version_every = "2m"         # a machine is asked for its pastor version again after this
 request_timeout = "60s"      # one herdr request, connect included
 agent_ready_timeout = "30s"  # agent.start to an accepted prompt; below request_timeout
 close_done_after = "5s"      # a done task's pane closes after this; "never" keeps it

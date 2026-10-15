@@ -256,7 +256,7 @@ Still open as of the last review; none of them blocks normal use.
 ## Where things live
 
 ```
-~/.config/pastor/pastor.toml      tick, settle, reconcile_every, close_done_after, close_failed_after, defaults
+~/.config/pastor/pastor.toml      tick, settle, reconcile_every, version_every, close_done_after, close_failed_after, defaults
 ~/.config/pastor/flock.toml       machines
 ~/.config/pastor/jobs/<name>.toml one job per file
 ~/.config/pastor/orchestrators/<name>.toml one orchestrator per file (kind scheduled or session)

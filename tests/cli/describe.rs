@@ -183,7 +183,7 @@ fn descriptions_show_in_lists_describe_and_json_without_a_head() {
         serde_json::from_str(&ok(o.cmd(&["machine", "describe", "pi-1", "--json"]))).unwrap();
     assert_eq!(m["description"], "The desk one");
     let text = ok(o.cmd(&["machine", "describe", "pi-1"]));
-    assert!(text.contains("description: The desk one"), "{text}");
+    assert!(text.contains("description:  The desk one"), "{text}");
 
     let wide = ok(o.cmd(&["connector", "list", "--wide"]));
     assert!(

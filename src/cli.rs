@@ -899,6 +899,10 @@ pub struct MachineRow {
     pub channel: String,
     pub herdr_version: Option<String>,
     pub pastor_version: Option<String>,
+    /// `MachineStatus::pastor_read_at`: when the machine last answered the
+    /// version question; a probe's is now. Absent from an older head.
+    #[serde(default)]
+    pub pastor_read_at: Option<chrono::DateTime<Utc>>,
     pub protocol: Option<u32>,
     pub error: Option<String>,
     pub live: Option<usize>,
@@ -965,6 +969,7 @@ impl From<&MachineStatus> for MachineRow {
             channel: m.channel.to_string(),
             herdr_version: m.herdr_version.clone(),
             pastor_version: m.pastor_version.clone(),
+            pastor_read_at: m.pastor_read_at,
             protocol: m.protocol,
             error: m.error.clone(),
             live: Some(m.live),
@@ -1280,6 +1285,7 @@ mod tests {
             channel: crate::machine::ChannelState::Connected,
             herdr_version: Some("0.9.1".into()),
             pastor_version: Some("0.2.0".into()),
+            pastor_read_at: Some(Utc::now()),
             protocol: Some(22),
             error: None,
             live: 1,
@@ -1375,6 +1381,7 @@ mod tests {
             channel: "unreachable".into(),
             herdr_version: None,
             pastor_version: None,
+            pastor_read_at: None,
             live: None,
             error: Some("no route to host".into()),
             tags: vec![],
@@ -1418,6 +1425,17 @@ mod tests {
         let v = serde_json::to_value(&row).unwrap();
         assert_eq!(v["job_slots"], 1);
         assert_eq!(v["burst"], 1);
+        // When the pastor version was last read travels with the row, for
+        // `machine describe` and scripts; absent from an older head.
+        assert!(v["pastor_read_at"].is_string(), "{v}");
+        let old: MachineRow = serde_json::from_value(serde_json::json!({
+            "name": "pi-3", "host": "h", "endpoint": "e", "flock": "work",
+            "channel": "connected", "herdr_version": null, "pastor_version": null,
+            "protocol": null, "error": null, "live": 0, "max_agents": 1,
+            "tags": [], "orphans": []
+        }))
+        .unwrap();
+        assert_eq!(old.pastor_read_at, None);
     }
 
     /// The head is not a machine: scripts that walk `machines` must not trip

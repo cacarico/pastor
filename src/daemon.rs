@@ -52,6 +52,7 @@ pub fn machine_settings(config: &PastorConfig) -> MachineSettings {
     MachineSettings {
         settle: config.settle_duration(),
         reconcile_every: config.reconcile_duration(),
+        version_every: config.version_every_duration(),
         request_timeout: config.request_timeout_duration(),
         agent_ready_timeout: config.agent_ready_timeout_duration(),
         poll_every: config.tick_duration(),
@@ -5145,6 +5146,24 @@ mod tests {
         }
     }
 
+    /// `version_every` in pastor.toml reaches the actors like the other
+    /// timings, so a reload can shorten how long a new install stays unseen.
+    #[test]
+    fn machine_settings_carry_version_every() {
+        let config = PastorConfig {
+            version_every: "45s".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            machine_settings(&config).version_every,
+            Duration::from_secs(45)
+        );
+        assert_eq!(
+            machine_settings(&test_config()).version_every,
+            Duration::from_secs(120)
+        );
+    }
+
     /// Hands out the fake registered under a machine's name, or a fresh one.
     fn factory(fakes: &[(&str, FakeHerdr)]) -> ConnectorFactory {
         let by_name: std::collections::HashMap<String, FakeHerdr> = fakes
@@ -6451,6 +6470,11 @@ mod tests {
         assert_eq!(m.row.name, "a");
         assert_eq!(m.row.channel, "connected");
         assert_eq!(m.row.live, Some(0));
+        // The connect read the fake's pastor version; the description says
+        // when, so a stale-looking version can be told from one never asked.
+        assert!(m.row.pastor_read_at.is_some(), "{m:?}");
+        let text = crate::describe::machine_text(&m);
+        assert!(text.contains("version read:"), "{text}");
         let resp = d
             .handle(IpcRequest::MachineDescribe { name: "b".into() })
             .await;
@@ -9293,7 +9317,14 @@ mod tests {
             panic!()
         };
         let text = crate::describe::machine_text(&m);
-        assert!(text.contains("profile:     unrestricted"), "{text}");
+        // The label column is as wide as the longest label, so match the
+        // field and not its padding.
+        assert!(
+            text.lines().any(|l| l
+                .split_once(':')
+                .is_some_and(|(k, v)| k == "profile" && v.trim() == "unrestricted")),
+            "{text}"
+        );
     }
 
     /// agy's rules are per machine, so a profiled agy task runs only on a
