@@ -145,6 +145,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from prune" -l json -d 'Print as a JSON object'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from prune" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from send" -l key -d 'A named key to press after the text (Enter, Down, esc, ctrl+c); repeat for more, in order' -r
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from send" -l pick -d 'Answer the picker on screen by the text of one of its options (case does not matter): the arrows to it, then Enter' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from send" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from send" -l no-enter -d 'Type the text without pressing Enter after it'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from send" -l trust -d 'Accept the agent\'s folder-trust prompt with its trust keys, and trust the task\'s repo on its machine from now on'

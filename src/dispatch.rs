@@ -2525,8 +2525,10 @@ mod tests {
             .iter()
             .find(|r| r.method == "workspace.create")
             .unwrap();
+        // The classic renderer is a built-in of the claude kind.
         let want = serde_json::json!({
             "BARE": "/home/fake",
+            "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN": "1",
             "CLAUDE_CONFIG_DIR": "/home/fake/.claude-personal",
             "PASTOR_TASK": "t-7",
             "PLAIN": "a~b",
@@ -2595,7 +2597,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             fake.pane_env(t.pane_id.as_deref().unwrap()),
-            serde_json::json!({"PASTOR_TASK": "t-7"})
+            serde_json::json!({"CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN": "1", "PASTOR_TASK": "t-7"}),
+            "PASTOR_TASK, and the claude kind's classic renderer"
         );
 
         let fake = FakeHerdr::new();

@@ -23,6 +23,11 @@ down here because getting them wrong cost a day.
   `agent_blocked`. pastor marks the task `blocked` without prompting, and
   once the block clears the agent goes straight to active and the pending
   prompt is sent.
+- herdr's Claude manifest (`live_blocked_form`) reads every form with
+  `Enter to confirm` and `Esc to cancel` under the last rule as `blocked`,
+  so each of Claude's startup dialogs is a startup block to pastor, one
+  after the other. `Actor::auto_answer` reads the pane and answers the
+  first dialog it knows (`Agents::dialogs`), once per task and dialog.
 - There is no `completion_seq` in herdr 0.9.1. `agent.list` entries carry
   `agent_status` and `state_change_seq`, a server-wide counter stamped on an
   agent each time its detected state (idle, working, blocked, unknown)
@@ -247,7 +252,7 @@ Still open as of the last review; none of them blocks normal use.
 ~/.config/pastor/jobs/<name>.toml one job per file
 ~/.config/pastor/orchestrators/<name>.toml one orchestrator per file (kind scheduled or session)
 ~/.config/pastor/client.toml      [head]: a head on another machine (`pastor head`)
-~/.local/state/pastor/pastor.db   tasks (schema 17), token usage, seen keys, usage limits, event seq, job state (SQLite)
+~/.local/state/pastor/pastor.db   tasks (schema 18), token usage, seen keys, usage limits, event seq, job state (SQLite)
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/fleet.lock  offline fleet edits and a starting `pastor serve` take turns on it
 ~/.local/state/pastor/shepherd.db a headless serve's job state, seen keys, head event cursor, its pull machine's trusted repos
