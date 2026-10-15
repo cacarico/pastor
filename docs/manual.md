@@ -928,6 +928,7 @@ agent_args = ["--model", "claude-sonnet-5"]
 # place = "pastor"        # optional: where its tasks' panes go, see Where a task's pane goes
 # summary = "require"     # optional: ask, require or off, see Asking for one
 # keep_pane = true        # optional: keep its tasks' panes, see Keeping a task's pane
+# unknown_room = "no_room"  # optional: a machine whose room can't be read holds its tasks, see A room floor
 
 [[machine]]
 name = "desk"
@@ -938,6 +939,9 @@ max_agents = 3
 name = "pi-3"
 ssh = "user@pi-3"
 flock = "work"            # the old way: in work, with pi-3's own limits
+min_disk = "4G"           # optional: free disk on $HOME and /tmp it must have to take a task, see A room floor
+# min_memory = "512M"     # optional: free memory it must have; unset with a floor on: [defaults], else 1G
+# unknown_room = "no_room"  # optional: as on a flock, after the flock's
 
 [[machine]]
 name = "laptop"
@@ -1107,7 +1111,8 @@ that flock has been removed.
 A `[[flock]]` entry takes every per-task setting `[defaults]` has: `agent`,
 `agent_args`, `agents`, `model`, `fallback`, `profile`, `priority`,
 `age_after`, `allow`, `deny`, `timeout`, `place`, `label` and `summary`
-(`max_tasks_per_run` stays a job setting). A task gets the settings of its own flock, the one it is queued
+(`max_tasks_per_run` stays a job setting), and `unknown_room`, which only a
+flock or a machine sets (see [A room floor](#a-room-floor)). A task gets the settings of its own flock, the one it is queued
 in; a machine in many flocks does not mix them.
 
 For everything but the agent, the flock comes before the machine: a task
@@ -1927,6 +1932,38 @@ takes `--job-slots` and `--burst` as it takes `--max-agents`. `machine list` sho
 `2+1j+1b` (`2` alone when both are 0), `machine describe` as `1 of 2+1j+1b`,
 and `--json` has `job_slots` and `burst` on each machine. Changing either
 restarts the machine's actor on reload, as changing `max_agents` does.
+
+### A room floor
+
+A machine can also have a floor: the disk and memory it must have free to
+take a task, so a full disk or a swapping box does not get the next one.
+`min_disk` and `min_memory` on a `[[machine]]` entry are sizes, digits and
+one of `K`, `M`, `G` or `T` (powers of 1024), and a bare `"0"` turns that
+side off. The disk floor applies to each of `$HOME` and `/tmp`, where tasks
+and their worktrees go.
+
+```toml
+# fragment of flock.toml
+[[machine]]
+name = "pi-3"
+ssh = "user@pi-3"
+min_disk = "4G"        # free on $HOME and on /tmp
+min_memory = "0"       # no memory floor
+```
+
+The floor is off until a machine's own entry sets `min_disk` or
+`min_memory`. Once one is set the floor is on for that machine, and the side
+it leaves out comes from `[defaults]` in `pastor.toml` (`min_disk`,
+`min_memory` there, the same sizes), else the built-in `4G` of disk and `1G`
+of memory. `[defaults]` only fills in sizes; on its own it turns no floor on.
+A size that does not parse, in either file, fails the load like any other
+key.
+
+`unknown_room` says how a machine whose room cannot be read counts: `room`,
+the default, lets it take tasks as if it had room; `no_room` holds them. It
+is read from the task's flock first, then the machine, as every setting but
+the agent is. Nothing reads a machine's room yet: the keys load and
+`flock.toml` is checked, and dispatch still counts slots alone.
 
 ### Pausing a low task
 
@@ -4175,6 +4212,8 @@ place = "repo"               # where a task's pane goes: repo, own, pastor or pa
 # profile = "develop"        # a permission profile for tasks that name none; unset: none
 # summary = "ask"            # ask for a summary in each prompt; require: also fail without one; off: neither
 # keep_pane = false          # true: tasks keep their pane once they end, until `pastor task close`
+# min_disk = "4G"            # free disk a machine with a floor needs on $HOME and /tmp, when its entry sets none; "0": no disk floor
+# min_memory = "1G"          # free memory it needs, when its entry sets none; "0": no memory floor
 [agents.claude]              # one table per agent that needs one
 kind = "claude"                  # the herdr agent it starts; default: the table's name
 env = {}                         # env for its pane, e.g. { CLAUDE_CONFIG_DIR = "~/.claude-personal" }
