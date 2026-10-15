@@ -84,6 +84,21 @@ pub struct MachineConfig {
     /// may ask for `unrestricted` here (`Profiles::apply`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// The disk this machine must have free, on each of `$HOME` and `/tmp`,
+    /// to take a task, as a size (`"4G"`); `"0"` is no disk floor. Setting
+    /// it, or `min_memory`, turns the machine's room floor on; the other
+    /// side then comes from `[defaults]`, else the built-in size
+    /// (`Defaults::resolve_floor`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_disk: Option<String>,
+    /// Like `min_disk`, for free memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_memory: Option<String>,
+    /// How this machine counts against a floor while its room cannot be
+    /// read, after its flock's (`config::resolve_unknown_room`); unset,
+    /// as room.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unknown_room: Option<crate::config::UnknownRoom>,
     /// One line on what the machine is for (`machine list --wide`,
     /// `describe`); nothing reads it but people.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -257,6 +272,11 @@ pub struct FlockEntry {
     /// task and its job say nothing; before `[defaults] keep_pane`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_pane: Option<bool>,
+    /// How a machine whose room cannot be read counts for this flock's
+    /// tasks, before the machine's own `unknown_room`
+    /// (`config::resolve_unknown_room`); unset, as room.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unknown_room: Option<crate::config::UnknownRoom>,
     /// One line on what the flock is for (`flock list --wide`, `describe`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -447,6 +467,12 @@ impl Flock {
             }
             if m.max_agents == 0 {
                 return Err(format!("machine {}: max_agents must be at least 1", m.name));
+            }
+            for (key, size) in [("min_disk", &m.min_disk), ("min_memory", &m.min_memory)] {
+                if let Some(v) = size {
+                    crate::config::parse_size(v)
+                        .map_err(|e| format!("machine {}: {key}: {e}", m.name))?;
+                }
             }
             if let Some(f) = &m.flock
                 && !self.has_flock(f)
@@ -1336,6 +1362,9 @@ mod tests {
             priority: Some(crate::task::Priority::High),
             agents: Default::default(),
             profile: None,
+            min_disk: None,
+            min_memory: None,
+            unknown_room: None,
             description: Some("the pi".into()),
         })
         .unwrap();
@@ -1368,6 +1397,9 @@ mod tests {
             priority: None,
             agents: Default::default(),
             profile: None,
+            min_disk: None,
+            min_memory: None,
+            unknown_room: None,
         }
     }
 
@@ -1394,6 +1426,67 @@ mod tests {
             "{out}"
         );
         assert_eq!(out.matches("burst").count(), 1, "{out}");
+    }
+
+    /// A machine's `min_disk`, `min_memory` and `unknown_room` load as
+    /// written, a flock's `unknown_room` too, and a file that sets none
+    /// writes none: the floor stays off.
+    #[test]
+    fn floor_keys_load_and_are_off_when_unset() {
+        let f = flocks(
+            "[[flock]]\nname = \"f\"\ndefault = true\nunknown_room = \"no_room\"\n\n[[machine]]\nname = \"a\"\nlocal = true\n\n[[machine]]\nname = \"b\"\nlocal = true\nmin_disk = \"4G\"\nmin_memory = \"0\"\nunknown_room = \"no_room\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            f.flocks[0].unknown_room,
+            Some(crate::config::UnknownRoom::NoRoom)
+        );
+        let a = &f.machines[0];
+        assert_eq!(
+            (&a.min_disk, &a.min_memory, a.unknown_room),
+            (&None, &None, None)
+        );
+        let b = &f.machines[1];
+        assert_eq!(b.min_disk.as_deref(), Some("4G"));
+        assert_eq!(b.min_memory.as_deref(), Some("0"));
+        assert_eq!(b.unknown_room, Some(crate::config::UnknownRoom::NoRoom));
+        let out = toml::to_string(&f).unwrap();
+        assert_eq!(out.matches("min_disk").count(), 1, "{out}");
+        assert_eq!(out.matches("unknown_room").count(), 2, "{out}");
+    }
+
+    /// A floor size that does not parse, or an `unknown_room` that is
+    /// neither `room` nor `no_room`, is a load error naming the key.
+    #[test]
+    fn bad_floor_keys_are_load_errors() {
+        let path = Path::new("flock.toml");
+        for (key, bad) in [
+            ("min_disk", "4"),
+            ("min_disk", "four"),
+            ("min_memory", "1x"),
+            ("min_memory", ""),
+        ] {
+            let text = format!("[[machine]]\nname = \"a\"\nlocal = true\n{key} = {bad:?}\n");
+            let err = Flock::parse(path, &text).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("machine a: {key}")),
+                "{key} = {bad:?}: {err}"
+            );
+        }
+        let err = Flock::parse(
+            path,
+            "[[machine]]\nname = \"a\"\nlocal = true\nunknown_room = \"maybe\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown_room"), "{err}");
+        let err = Flock::parse(
+            path,
+            "[[flock]]\nname = \"f\"\ndefault = true\nunknown_room = true\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown_room"), "{err}");
     }
 
     #[test]

@@ -898,6 +898,9 @@ mod tests {
             priority: None,
             agents: Default::default(),
             profile: None,
+            min_disk: None,
+            min_memory: None,
+            unknown_room: None,
         }
     }
 
@@ -1103,6 +1106,9 @@ mod tests {
             priority: None,
             agents: Default::default(),
             profile: None,
+            min_disk: None,
+            min_memory: None,
+            unknown_room: None,
         };
         let paths = Paths::new("/tmp/c", "/tmp/s");
         let ep = Endpoint::from_machine(&m, &paths);
@@ -1946,6 +1952,9 @@ mod tests {
             priority: None,
             agents: Default::default(),
             profile: None,
+            min_disk: None,
+            min_memory: None,
+            unknown_room: None,
         };
         let paths = Paths::new("/tmp/c", &deep);
         let Endpoint::Ssh {

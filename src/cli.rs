@@ -1530,6 +1530,9 @@ mod tests {
                 priority: None,
                 agents: Default::default(),
                 profile: None,
+                min_disk: None,
+                min_memory: None,
+                unknown_room: None,
             }],
         };
         let mut rows = task_rows(&tasks);

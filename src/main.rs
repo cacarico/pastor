@@ -2148,6 +2148,9 @@ async fn machine(client: &pastor::ipc::Client, cmd: MachineCmd, head: Head) -> a
                 priority: None,
                 agents: Default::default(),
                 profile: None,
+                min_disk: None,
+                min_memory: None,
+                unknown_room: None,
             };
             // With a head the reload line comes with its answer, before the
             // herdr lines; without one it follows them.
