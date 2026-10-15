@@ -516,6 +516,55 @@ pub struct Defaults {
     /// pane once they end; unset, no. See `resolve_keep_pane`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keep_pane: Option<bool>,
+    /// The disk a machine with a floor must have free, on each of `$HOME`
+    /// and `/tmp`, as a size (`"4G"`), for machines whose entry sets none;
+    /// unset, `DEFAULT_MIN_DISK`. `"0"` turns the disk floor off. It never
+    /// turns a floor on: only a machine's own key does. See `resolve_floor`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_disk: Option<String>,
+    /// Like `min_disk`, for free memory; unset, `DEFAULT_MIN_MEMORY`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_memory: Option<String>,
+}
+
+/// A machine's room floor, resolved (`Defaults::resolve_floor`): the least
+/// free disk, on each of `$HOME` and `/tmp`, and the least free memory it
+/// must show to take a task, in bytes. `None` on a side is that floor off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Floor {
+    pub disk: Option<u64>,
+    pub memory: Option<u64>,
+}
+
+/// How a machine whose room cannot be read counts against a floor:
+/// `unknown_room` on a `[[flock]]` or `[[machine]]` entry. `Room`, the
+/// default, lets it take tasks as if it had room; `NoRoom` holds them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnknownRoom {
+    #[default]
+    Room,
+    NoRoom,
+}
+
+impl UnknownRoom {
+    /// Whether a machine with an unread room is offered a task.
+    pub fn counts_as_room(self) -> bool {
+        matches!(self, UnknownRoom::Room)
+    }
+}
+
+/// How a machine whose room cannot be read counts for a task of `flock`:
+/// the flock's `unknown_room`, else the machine's own, else `Room`. The
+/// flock comes first, as it does for every setting but the agent.
+pub fn resolve_unknown_room(
+    flock: Option<&flock::FlockEntry>,
+    machine: &flock::MachineConfig,
+) -> UnknownRoom {
+    flock
+        .and_then(|f| f.unknown_room)
+        .or(machine.unknown_room)
+        .unwrap_or_default()
 }
 
 /// What `pastor task run` flags or a job file's `[dispatch]` say about the
@@ -1072,6 +1121,39 @@ impl Defaults {
         .into_iter()
         .find_map(|(layer, keep)| Some((keep?, layer)))
     }
+
+    /// `machine`'s room floor, or `None` while it has none: the floor is
+    /// off until the machine's own entry sets `min_disk` or `min_memory`,
+    /// and `[defaults]` alone never turns it on. On, each side is the
+    /// machine's size, else these defaults', else the built-in
+    /// `DEFAULT_MIN_DISK` or `DEFAULT_MIN_MEMORY`; a size of zero is that
+    /// side off. Both files are checked on load; a value that no longer
+    /// parses is passed over, as `resolve_age_after` does.
+    pub fn resolve_floor(&self, machine: &flock::MachineConfig) -> Option<Floor> {
+        if machine.min_disk.is_none() && machine.min_memory.is_none() {
+            return None;
+        }
+        let side = |own: Option<&str>, default: Option<&str>, built_in: &str| {
+            let bytes = [own, default]
+                .into_iter()
+                .flatten()
+                .find_map(|v| parse_size(v).ok())
+                .unwrap_or_else(|| parse_size(built_in).expect("built-in floor sizes are valid"));
+            (bytes > 0).then_some(bytes)
+        };
+        Some(Floor {
+            disk: side(
+                machine.min_disk.as_deref(),
+                self.min_disk.as_deref(),
+                DEFAULT_MIN_DISK,
+            ),
+            memory: side(
+                machine.min_memory.as_deref(),
+                self.min_memory.as_deref(),
+                DEFAULT_MIN_MEMORY,
+            ),
+        })
+    }
 }
 
 impl Default for Defaults {
@@ -1093,6 +1175,8 @@ impl Default for Defaults {
             place: crate::task::Place::Repo,
             label: None,
             keep_pane: None,
+            min_disk: None,
+            min_memory: None,
         }
     }
 }
@@ -2241,6 +2325,14 @@ impl PastorConfig {
             check_age_after(v)
                 .map_err(|e| anyhow::anyhow!("{}: defaults.age_after: {e}", path.display()))?;
         }
+        for (key, size) in [
+            ("defaults.min_disk", &cfg.defaults.min_disk),
+            ("defaults.min_memory", &cfg.defaults.min_memory),
+        ] {
+            if let Some(v) = size {
+                parse_size(v).map_err(|e| anyhow::anyhow!("{}: {key}: {e}", path.display()))?;
+            }
+        }
         for (key, list) in [
             ("defaults.allow", &cfg.defaults.allow),
             ("defaults.deny", &cfg.defaults.deny),
@@ -2508,6 +2600,39 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
         .checked_mul(mult)
         .ok_or_else(|| format!("{s:?}: duration too large"))?;
     Ok(Duration::from_secs(secs))
+}
+
+/// The disk a machine with a floor must have free when neither its entry
+/// nor `[defaults]` says (`Defaults::resolve_floor`).
+pub const DEFAULT_MIN_DISK: &str = "4G";
+
+/// The memory a machine with a floor must have free when neither its entry
+/// nor `[defaults]` says.
+pub const DEFAULT_MIN_MEMORY: &str = "1G";
+
+/// "512K", "4G", "2T": a size in bytes, in powers of 1024, with one unit of
+/// K, M, G or T in either case. A bare `0` needs no unit; it is how a floor
+/// is turned off.
+pub fn parse_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if s == "0" {
+        return Ok(0);
+    }
+    let (num, unit) = s.split_at(
+        s.find(|c: char| !c.is_ascii_digit())
+            .ok_or_else(|| format!("{s:?}: missing unit"))?,
+    );
+    let n: u64 = num.parse().map_err(|_| format!("{s:?}: bad number"))?;
+    let shift = match unit.to_ascii_uppercase().as_str() {
+        "K" => 10,
+        "M" => 20,
+        "G" => 30,
+        "T" => 40,
+        _ => return Err(format!("{s:?}: unit must be K, M, G or T")),
+    };
+    n.checked_shl(shift)
+        .filter(|bytes| bytes >> shift == n)
+        .ok_or_else(|| format!("{s:?}: size too large"))
 }
 
 #[cfg(test)]
@@ -5249,6 +5374,169 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("flock f: age_after"), "{err}");
+    }
+
+    /// A size is digits and one of K, M, G or T, in any case, in powers of
+    /// 1024; a bare `0` alone needs no unit. Anything else is refused with
+    /// the value in the message.
+    #[test]
+    fn parse_size_reads_units_and_rejects_the_rest() {
+        assert_eq!(parse_size("0"), Ok(0));
+        assert_eq!(parse_size(" 0 "), Ok(0));
+        assert_eq!(parse_size("0G"), Ok(0));
+        assert_eq!(parse_size("512K"), Ok(512 << 10));
+        assert_eq!(parse_size("512M"), Ok(512 << 20));
+        assert_eq!(parse_size("4G"), Ok(4 << 30));
+        assert_eq!(parse_size("4g"), Ok(4 << 30));
+        assert_eq!(parse_size("2T"), Ok(2 << 40));
+        for (bad, why) in [
+            ("4", "missing unit"),
+            ("", "missing unit"),
+            ("G", "bad number"),
+            ("four", "bad number"),
+            ("1x", "unit must be K, M, G or T"),
+            ("4GB", "unit must be K, M, G or T"),
+            ("4 G", "unit must be K, M, G or T"),
+            ("99999999999999999999G", "bad number"),
+            ("18446744073709551615G", "size too large"),
+        ] {
+            let err = parse_size(bad).unwrap_err();
+            assert!(err.contains(why), "{bad:?}: {err}");
+        }
+    }
+
+    /// A machine's floor is off until its own entry sets `min_disk` or
+    /// `min_memory`; `[defaults]` alone never turns it on. On, each size
+    /// comes from the machine, else `[defaults]`, else the built-in 4G disk
+    /// and 1G memory, and `"0"` at either turns that one off.
+    #[test]
+    fn floor_is_off_until_the_machine_sets_a_size() {
+        let path = Path::new("pastor.toml");
+        let machine = |extra: &str| -> flock::MachineConfig {
+            toml::from_str(&format!("name = \"m\"\nlocal = true\n{extra}")).unwrap()
+        };
+        let bare = machine("");
+        let disk_only = machine("min_disk = \"10G\"\n");
+        let both = machine("min_disk = \"0\"\nmin_memory = \"512M\"\n");
+        let memory_only = machine("min_memory = \"2G\"\n");
+        let d = Defaults::default();
+        assert_eq!(d.resolve_floor(&bare), None);
+        assert_eq!(
+            d.resolve_floor(&disk_only),
+            Some(Floor {
+                disk: Some(10 << 30),
+                memory: Some(1 << 30),
+            })
+        );
+        assert_eq!(
+            d.resolve_floor(&both),
+            Some(Floor {
+                disk: None,
+                memory: Some(512 << 20),
+            })
+        );
+        let cfg = PastorConfig::parse(path, "[defaults]\nmin_disk = \"8G\"\nmin_memory = \"0\"\n")
+            .unwrap();
+        let d = cfg.defaults;
+        assert_eq!(d.resolve_floor(&bare), None, "[defaults] alone is off");
+        assert_eq!(
+            d.resolve_floor(&disk_only),
+            Some(Floor {
+                disk: Some(10 << 30),
+                memory: None,
+            })
+        );
+        assert_eq!(
+            d.resolve_floor(&memory_only),
+            Some(Floor {
+                disk: Some(8 << 30),
+                memory: Some(2 << 30),
+            })
+        );
+        // A value the file check would refuse, reached without it, is passed
+        // over for the next layer, as `resolve_age_after` does.
+        let broken = Defaults {
+            min_disk: Some("lots".into()),
+            ..Defaults::default()
+        };
+        assert_eq!(
+            broken.resolve_floor(&memory_only),
+            Some(Floor {
+                disk: Some(4 << 30),
+                memory: Some(2 << 30),
+            })
+        );
+    }
+
+    /// `[defaults] min_disk` and `min_memory` are checked as the file
+    /// loads, and a misspelt key is a load error.
+    #[test]
+    fn defaults_floor_sizes_are_checked_on_load() {
+        let path = Path::new("pastor.toml");
+        let cfg = PastorConfig::parse(
+            path,
+            "[defaults]\nmin_disk = \"4G\"\nmin_memory = \"512M\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.defaults.min_disk.as_deref(), Some("4G"));
+        assert_eq!(cfg.defaults.min_memory.as_deref(), Some("512M"));
+        assert_eq!(Defaults::default().min_disk, None);
+        for (key, bad) in [("min_disk", "4"), ("min_memory", "a lot")] {
+            let err = PastorConfig::parse(path, &format!("[defaults]\n{key} = {bad:?}\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(&format!("defaults.{key}")), "{err}");
+        }
+        let err = PastorConfig::parse(path, "[defaults]\nmin_disc = \"4G\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("min_disc"), "{err}");
+    }
+
+    /// A machine whose room cannot be read counts as room unless its flock,
+    /// else its own entry, says `no_room`.
+    #[test]
+    fn unknown_room_comes_from_the_flock_then_the_machine() {
+        let machine = |extra: &str| -> flock::MachineConfig {
+            toml::from_str(&format!("name = \"m\"\nlocal = true\n{extra}")).unwrap()
+        };
+        let bare = machine("");
+        let strict = machine("unknown_room = \"no_room\"\n");
+        let lax_flock = flock::FlockEntry {
+            name: "lax".into(),
+            unknown_room: Some(UnknownRoom::Room),
+            ..Default::default()
+        };
+        let strict_flock = flock::FlockEntry {
+            name: "strict".into(),
+            unknown_room: Some(UnknownRoom::NoRoom),
+            ..Default::default()
+        };
+        let silent = flock::FlockEntry {
+            name: "silent".into(),
+            ..Default::default()
+        };
+        assert_eq!(UnknownRoom::default(), UnknownRoom::Room);
+        assert_eq!(resolve_unknown_room(None, &bare), UnknownRoom::Room);
+        assert_eq!(
+            resolve_unknown_room(Some(&silent), &bare),
+            UnknownRoom::Room
+        );
+        assert_eq!(resolve_unknown_room(None, &strict), UnknownRoom::NoRoom);
+        assert_eq!(
+            resolve_unknown_room(Some(&silent), &strict),
+            UnknownRoom::NoRoom
+        );
+        assert_eq!(
+            resolve_unknown_room(Some(&strict_flock), &bare),
+            UnknownRoom::NoRoom
+        );
+        assert_eq!(
+            resolve_unknown_room(Some(&lax_flock), &strict),
+            UnknownRoom::Room
+        );
+        assert!(UnknownRoom::Room.counts_as_room());
+        assert!(!UnknownRoom::NoRoom.counts_as_room());
     }
 
     /// The manual's pastor.toml block shows every top-level key with its

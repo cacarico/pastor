@@ -171,16 +171,19 @@ fn seats(flock: &Flock, status: &crate::machine::MachineStatus) -> Vec<FlockSeat
 }
 
 /// The part of a machine's entry its actor is built from. The flock, the
-/// agent and its per-kind agents are not: they only decide which tasks the
-/// machine is offered and what they run, which dispatch reads from the flock
-/// last applied, so moving a machine or changing its agent keeps its
-/// connection and the tasks already on it.
+/// agent, its per-kind agents and its room floor are not: they only decide
+/// which tasks the machine is offered and what they run, which dispatch
+/// reads from the flock last applied, so moving a machine, changing its
+/// agent or its floor keeps its connection and the tasks already on it.
 fn actor_config(m: &MachineConfig) -> MachineConfig {
     MachineConfig {
         flock: None,
         agent: None,
         agent_args: None,
         agents: Default::default(),
+        min_disk: None,
+        min_memory: None,
+        unknown_room: None,
         description: None,
         ..m.clone()
     }
@@ -5106,6 +5109,9 @@ mod tests {
             priority: None,
             agents: Default::default(),
             profile: None,
+            min_disk: None,
+            min_memory: None,
+            unknown_room: None,
         }
     }
 
@@ -11193,6 +11199,9 @@ mod tests {
                     priority: None,
                     agents: Default::default(),
                     profile: None,
+                    min_disk: None,
+                    min_memory: None,
+                    unknown_room: None,
                     description: None,
                 },
             },
