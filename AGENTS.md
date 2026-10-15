@@ -237,6 +237,12 @@ Still open as of the last review; none of them blocks normal use.
   so it ignores the repo's own `opencode.json` and `.opencode/` (agents,
   commands, MCP servers, not only permissions); only `AGENTS.md` or
   `CLAUDE.md` are passed back as instructions.
+- agy's `artifactReviewPolicy` defaults to `asks-for-review`, which can
+  stop an interactive session to review a plan artifact; pastor's dialog
+  reading does not know that prompt. A machine that runs agy tasks should
+  set it to `agent-decides` or `always-proceed`. And agy's rules are one
+  file per machine, so an agy machine runs one profile; writing that
+  profile's rules there is a hand step until the provisioner work lands.
 
 ## Where things live
 

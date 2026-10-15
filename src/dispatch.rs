@@ -422,6 +422,48 @@ async fn dispatch_steps(
             spec.profile().unwrap_or_default(),
         )));
     }
+    // agy's rules are in its settings on the machine, and under the flags
+    // pastor adds everything they do not deny runs: so what the task denies
+    // has to be denied there, or the task does not start. A machine that
+    // cannot be asked refuses too, unlike opencode's check: going ahead
+    // would mean the skip flag with nothing verified behind it.
+    if agents.agy_profile(&spec) && !spec.deny.is_empty() {
+        let machine = task.machine.as_deref().unwrap_or("this machine");
+        let profile = spec.profile().unwrap_or_default();
+        let required: Vec<String> = spec
+            .deny
+            .iter()
+            .filter_map(|p| crate::config::agy::required_rule(p))
+            .collect();
+        let why = match conn.agy_rules().await.map_err(CallError::from)? {
+            None => Some(format!(
+                "agy's permission rules on {machine} cannot be read (the machine takes no shell \
+                 command), so pastor cannot check that profile {profile} holds there"
+            )),
+            Some(out) => match crate::config::agy::parse_denies(&out) {
+                Err(e) => Some(format!(
+                    "agy's permission rules on {machine} could not be read: {e}"
+                )),
+                Ok(denies) => {
+                    let missing = crate::config::agy::missing(&required, &denies);
+                    (!missing.is_empty()).then(|| {
+                        format!(
+                            "agy on {machine} does not deny what profile {profile} denies; add to \
+                             \"permissions\".\"deny\" in {}:\n{}",
+                            crate::config::agy::GLOBAL_SETTINGS,
+                            missing.join("\n")
+                        )
+                    })
+                }
+            },
+        };
+        if let Some(why) = why {
+            return Err(DispatchError::Task(format!(
+                "{}: {why}",
+                crate::config::agy::AGY_PERMISSIONS_MISSING
+            )));
+        }
+    }
     // A Claude agent starts on a session pastor names, so `task attach` can
     // resume it once the pane is gone; last, after the tool flags. The task
     // records it only once `agent.start` succeeds (`finish_dispatch`): a
@@ -2230,6 +2272,72 @@ mod tests {
             })),
             ..spec()
         }
+    }
+
+    fn agy_under(profile: Option<&str>) -> DispatchSpec {
+        DispatchSpec {
+            agent: "agy".into(),
+            ..opencode_under(profile)
+        }
+    }
+
+    /// A profiled agy task starts with the flags that stop it asking when
+    /// the machine's agy settings deny what it denies; with a rule missing,
+    /// with settings pastor cannot read, and on a machine that takes no
+    /// shell command, it fails before anything is made there. Without a
+    /// profile nothing is checked.
+    #[tokio::test]
+    async fn a_profiled_agy_task_needs_its_denies_in_the_machines_agy_settings() {
+        let fake = FakeHerdr::new();
+        let mut t = task(agy_under(Some("review")));
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let start = fake.requests();
+        let start = start.iter().find(|r| r.method == "agent.start").unwrap();
+        assert_eq!(start.params["kind"], "agy");
+        assert_eq!(
+            start.params["args"],
+            serde_json::json!(["--dangerously-skip-permissions", "--mode", "accept-edits"])
+        );
+
+        let refused = |rules: Option<String>, says: &'static str| async move {
+            let fake = FakeHerdr::new();
+            fake.set_agy_rules(rules);
+            let mut t = task(agy_under(Some("review")));
+            let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
+                .await
+                .unwrap_err();
+            let text = err.to_string();
+            assert!(text.contains("agy_permissions_missing"), "{text}");
+            assert!(text.contains(says), "{text}");
+            assert!(text.contains("pi-1"), "{text}");
+            assert!(!err.is_transport());
+            assert_eq!(t.state, TaskState::Failed);
+            assert!(!fake.requests().iter().any(|r| r.method == "agent.start"));
+        };
+        refused(
+            Some(crate::config::agy::fake_output(&["command(sudo)"])),
+            "write_file(*)",
+        )
+        .await;
+        refused(
+            Some("==== /home/fake/.gemini/config/config.json\n{\n==== end\n".into()),
+            "config.json",
+        )
+        .await;
+        refused(None, "cannot be read").await;
+
+        let fake = FakeHerdr::new();
+        fake.set_agy_rules(None);
+        let mut t = task(DispatchSpec {
+            allow: vec![],
+            deny: vec![],
+            ..agy_under(None)
+        });
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
     }
 
     /// A profiled opencode task starts with its rules in the pane's env.
