@@ -2174,8 +2174,10 @@ built-in `review` the deny list on the machine needs at least:
 }
 ```
 
-and `develop` the last three without `write_file(*)`. Writing them is a
-hand step today; the provisioner work takes it over.
+and `develop` needs `command(rm -rf)`, `command(sudo)` and
+`command(git push --force)`, not `command(git push)`, which would stop the
+pushes `develop` allows. Writing them is a hand step today; the
+provisioner work takes it over.
 
 An agent whose permissions pastor should leave alone says so with
 `own_permissions`:

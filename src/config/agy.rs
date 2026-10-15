@@ -36,9 +36,21 @@ pub const GLOBAL_SETTINGS: &str = "~/.gemini/antigravity-cli/settings.json";
 /// The config agy shares with the desktop app; read too, never named.
 pub const SHARED_CONFIG: &str = "~/.gemini/config/config.json";
 
-/// Does `arg` pick agy's execution mode or turn its permissions off?
+/// Does `arg` pick agy's execution mode or turn its permissions off? agy
+/// parses flags as Go does: one dash reads as two, and a bool flag takes
+/// `=true` or `=false`.
 pub fn is_permission_arg(arg: &str) -> bool {
-    arg == "--mode" || arg.starts_with("--mode=") || arg == "--dangerously-skip-permissions"
+    let Some(name) = arg
+        .strip_prefix("--")
+        .or_else(|| arg.strip_prefix('-'))
+        .filter(|n| !n.starts_with('-'))
+    else {
+        return false;
+    };
+    name == "mode"
+        || name.starts_with("mode=")
+        || name == "dangerously-skip-permissions"
+        || name.starts_with("dangerously-skip-permissions=")
 }
 
 /// A Claude Code pattern as the agy rule a deny of it requires. `None` for
@@ -46,32 +58,39 @@ pub fn is_permission_arg(arg: &str) -> bool {
 /// unknown one) and for a command with no words, which agy matches to
 /// nothing. A `Bash(x)` with no `:*` is exact in Claude and a prefix in
 /// agy; broader is safe for a deny. A path's trailing `/**` or `/*` goes,
-/// since an agy directory rule covers what is under it.
+/// since an agy directory rule covers what is under it; a glob anywhere
+/// else, or in a command's words, is `None`: agy has no syntax for it, so
+/// a rule written that way would match nothing and still read as covered.
 pub fn required_rule(pattern: &str) -> Option<String> {
     let (tool, arg) = match pattern.split_once('(') {
         Some((tool, rest)) => (tool, Some(rest.strip_suffix(')').unwrap_or(rest))),
         None => (pattern, None),
     };
-    let path = |arg: Option<&str>| {
+    let path = |arg: Option<&str>| -> Option<String> {
         let p = arg.unwrap_or("*");
         let p = p
             .strip_suffix("/**")
             .or_else(|| p.strip_suffix("/*"))
             .unwrap_or(p);
-        if p.is_empty() {
-            "*".to_string()
+        if p.is_empty() || p == "*" {
+            Some("*".to_string())
+        } else if p.contains(['*', '?', '[']) {
+            None
         } else {
-            p.to_string()
+            Some(p.to_string())
         }
     };
     Some(match tool {
-        "Edit" | "Write" | "NotebookEdit" | "MultiEdit" => format!("write_file({})", path(arg)),
-        "Read" => format!("read_file({})", path(arg)),
+        "Edit" | "Write" | "NotebookEdit" | "MultiEdit" => format!("write_file({})", path(arg)?),
+        "Read" => format!("read_file({})", path(arg)?),
         "Bash" => match arg {
             None => "command(*)".to_string(),
             Some(a) => {
                 let words = a.strip_suffix(":*").unwrap_or(a).trim();
                 if words.is_empty() {
+                    return None;
+                }
+                if words != "*" && words.contains('*') {
                     return None;
                 }
                 format!("command({words})")
@@ -263,6 +282,8 @@ mod tests {
             ("Bash(git push --force:*)", "command(git push --force)"),
             ("Bash(rm -rf:*)", "command(rm -rf)"),
             ("Bash(sudo)", "command(sudo)"),
+            ("Bash(*)", "command(*)"),
+            ("Edit(*)", "write_file(*)"),
             ("WebFetch", "read_url(*)"),
             ("WebFetch(domain:example.com)", "read_url(example.com)"),
             ("mcp__linter__lint", "mcp(linter/lint)"),
@@ -280,6 +301,12 @@ mod tests {
             "Bash()",
             "Bash( )",
             "WebFetch(example.com)",
+            "Edit(/srv/app/*.rs)",
+            "Edit(**/*.md)",
+            "Read(/srv/[ab]/**)",
+            "Write(/srv/?)",
+            "Bash(git * main)",
+            "Bash(rm -rf *:*)",
             "mcp__",
             "mcp____x",
             "mcp__a__b(c)",
@@ -293,7 +320,19 @@ mod tests {
         assert!(is_permission_arg("--mode"));
         assert!(is_permission_arg("--mode=plan"));
         assert!(is_permission_arg("--dangerously-skip-permissions"));
+        // Go's flag parser takes one dash as two, and a bool with a value.
+        for arg in [
+            "-mode",
+            "-mode=plan",
+            "-dangerously-skip-permissions",
+            "--dangerously-skip-permissions=true",
+            "-dangerously-skip-permissions=false",
+        ] {
+            assert!(is_permission_arg(arg), "{arg}");
+        }
         assert!(!is_permission_arg("--sandbox"));
+        assert!(!is_permission_arg("---mode"));
+        assert!(!is_permission_arg("mode"));
         assert!(!is_permission_arg("--model"));
     }
 
