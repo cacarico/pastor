@@ -133,6 +133,11 @@ fn parts(rule: &str) -> Option<(&str, &str)> {
 /// tools. A `regex:` command covers nothing: pastor does not evaluate it.
 /// A relative path covers only the identical path.
 pub fn covers(deny: &str, required: &str) -> bool {
+    // The same text covers itself, whatever agy makes of it: what the
+    // provisioner wrote is what it finds.
+    if deny == required {
+        return true;
+    }
     let (Some((da, dt)), Some((ra, rt))) = (parts(deny), parts(required)) else {
         return false;
     };
@@ -156,8 +161,9 @@ pub fn covers(deny: &str, required: &str) -> bool {
             !dw.is_empty() && rw.starts_with(&dw)
         }
         "write_file" | "read_file" => {
-            let dp = dt.trim_end_matches('/');
-            let rp = rt.trim_end_matches('/');
+            // The root stays `/`: a deny of it covers every absolute path.
+            let dp = trim_dir(dt);
+            let rp = trim_dir(rt);
             if dp.starts_with('/') && rp.starts_with('/') {
                 std::path::Path::new(rp).starts_with(std::path::Path::new(dp))
             } else {
@@ -175,12 +181,36 @@ pub fn covers(deny: &str, required: &str) -> bool {
     }
 }
 
+/// A path with its trailing slashes gone, except the root, which stays `/`:
+/// a deny of it covers every absolute path.
+fn trim_dir(p: &str) -> &str {
+    let t = p.trim_end_matches('/');
+    if t.is_empty() && p.starts_with('/') {
+        "/"
+    } else {
+        t
+    }
+}
+
 /// The rules in `required` no rule in `denies` covers, in order, once each.
 pub fn missing(required: &[String], denies: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for r in required {
         if !out.contains(r) && !denies.iter().any(|d| covers(d, r)) {
             out.push(r.clone());
+        }
+    }
+    out
+}
+
+/// The agy rules a deny list requires, in its order, once each: what the
+/// provisioner makes sure the machine's settings deny. Patterns agy has no
+/// rule for are left out.
+pub fn required_rules(deny: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for rule in deny.iter().filter_map(|p| required_rule(p)) {
+        if !out.contains(&rule) {
+            out.push(rule);
         }
     }
     out
@@ -348,6 +378,9 @@ mod tests {
             ("write_file(/srv/app/)", "write_file(/srv/app/src)"),
             ("read_file(/srv/app)", "write_file(/srv/app/src)"),
             ("read_file(*)", "write_file(/x)"),
+            ("read_file(/)", "write_file(/etc)"),
+            ("write_file(/)", "write_file(/srv/app)"),
+            ("command( )", "command( )"),
             ("write_file(src/)", "write_file(src)"),
             ("read_url(example.com)", "read_url(api.example.com)"),
             ("read_url(*)", "read_url(example.com)"),
@@ -363,6 +396,8 @@ mod tests {
             ("command(sudo)", "command(*)"),
             ("write_file(/srv/app)", "write_file(/srv/application)"),
             ("write_file(/srv/app)", "write_file(*)"),
+            ("write_file(/)", "write_file(*)"),
+            ("write_file(/)", "write_file(src)"),
             ("write_file(src)", "write_file(/srv/app/src)"),
             ("write_file(/srv/app)", "read_file(/srv/app)"),
             ("read_url(ample.com)", "read_url(example.com)"),

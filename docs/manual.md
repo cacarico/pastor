@@ -341,7 +341,7 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `agent_refused` | a task or an orchestrator's script asks for a fleet change agents may not make |
 | `agent_tools_unsupported` | the task has tool lists and its agent has no setting to pass them |
 | `agy_deny_unsupported` | a profiled agy task denies a pattern agy has no rule for |
-| `agy_permissions_missing` | a profiled agy task on a machine whose agy settings do not deny what the profile denies, or cannot be read |
+| `agy_permissions_missing` | a profiled agy task on a machine whose agy settings do not deny what the profile denies, or that pastor cannot read or write to make them (a `command` machine, a file that is not JSON, a symlink, a failed write); the message lists the rules to add |
 | `agy_profile_mismatch` | a profiled agy task on a machine whose own profile does not deny everything the task's does |
 | `already_seen` | a job's key was queued before and its task row is gone |
 | `branch_gone` | reopening a closed task: its worktree and its branch are both gone |
@@ -871,7 +871,7 @@ failing.
 |                      | claude                                                                                                                    | agy                                                                                                            | codex                                                                                                                                    | opencode                                                                                                                    |
 | -------------------- | -------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
 | **Trust**            | herdr reads its folder-trust dialog `blocked`; pastor sends the held prompt once it clears. Built-in `trust_marker` and `trust_keys`, so `pastor task send t-N --trust` answers it and saves the repo; its other startup dialogs are built in too (`task.answered`) | no dialog pastor knows | herdr reads its dialog idle and ready, not blocked; pastor holds the prompt until someone answers by hand (`Do you trust the contents of this directory`). No built-in `trust_keys`, so `--trust` needs one set in `[agents.<name>]` (`no_trust_keys` otherwise) | no dialog pastor knows |
-| **Profile**          | `--permission-mode dontAsk`, plus the tool flags                                                                          | `--dangerously-skip-permissions --mode accept-edits`, so it never asks; its settings on the machine must deny what the profile denies, checked before launch (`agy_permissions_missing`), and an agy machine runs one profile, its own (`agy_profile_mismatch`); a shell command can still write, so `review` is not a read-only checkout. `own_permissions = true` adds and checks nothing | `--ask-for-approval never --sandbox workspace-write` (`danger-full-access` under `unrestricted`); no per-command flag, so the sandbox stands in for the lists | `OPENCODE_PERMISSION` in its pane's env instead of flags (deny-first, `unrestricted` allow-first); a machine or repo config with its own permission rules fails the task (`opencode_permissions_conflict`) |
+| **Profile**          | `--permission-mode dontAsk`, plus the tool flags                                                                          | `--dangerously-skip-permissions --mode accept-edits`, so it never asks; pastor first writes the deny rules of the machine's own profile into its settings there (the agy provisioner), then checks they deny what the task's profile denies (`agy_permissions_missing`), and an agy machine runs one profile, its own (`agy_profile_mismatch`); a shell command can still write, so `review` is not a read-only checkout. `own_permissions = true` adds and checks nothing | `--ask-for-approval never --sandbox workspace-write` (`danger-full-access` under `unrestricted`); no per-command flag, so the sandbox stands in for the lists | `OPENCODE_PERMISSION` in its pane's env instead of flags (deny-first, `unrestricted` allow-first); a machine or repo config with its own permission rules fails the task (`opencode_permissions_conflict`) |
 | **Lists** (no profile) | built-in `--allowedTools`/`--disallowedTools`                                                                           | needs `allow_flag`/`deny_flag` in `[agents.<name>]`, else a list refuses the task (`agent_tools_unsupported`)     | same as agy                                                                                                                                 | same as agy                                                                                                                     |
 | **Session**          | `--session-id` at launch, recorded; a pause, wait or model move resumes it with `claude --resume <session>`               | none recorded                                                                                                     | none recorded                                                                                                                               | none recorded                                                                                                                   |
 | **Pause** (`--preempt`) | the only kind eligible: `running`, `low`, a recorded session, not ended, not resumed in the last 10 minutes            | never                                                                                                             | never                                                                                                                                       | never                                                                                                                           |
@@ -2223,8 +2223,47 @@ built-in `review` the deny list on the machine needs at least:
 
 and `develop` needs `command(rm -rf)`, `command(sudo)` and
 `command(git push --force)`, not `command(git push)`, which would stop the
-pushes `develop` allows. Writing them is a hand step today; the
-provisioner work takes it over.
+pushes `develop` allows.
+
+Pastor writes them itself, as the machine's agy provisioner. Before each launch of an agy agent under a profile
+(one without `own_permissions`), pastor, as the machine's agy provisioner,
+makes agy's global settings, `~/.gemini/antigravity-cli/settings.json`,
+deny what the machine's own profile denies: its `[[machine]]` `profile`,
+else its flock's, else `[defaults] profile`, not the task's. Each pattern
+becomes the agy rule it needs (`Edit` is `write_file(*)`, `Bash(sudo:*)` is
+`command(sudo)`, `Read(~/.ssh/**)` is `read_file(~/.ssh)`); one agy has no
+rule for, such as `Glob`, adds nothing. A rule a deny already in the file
+covers (the same rule, the action's `*`, fewer leading words of a command,
+a directory above a path) is not added, and a file that covers them all is
+not written at all. Otherwise the missing rules are appended to
+`permissions.deny`, after the owner's, and the file is put back in one
+rename: no rule is removed or moved, and `allow`, `ask`, the mode and every
+other key keep their values and their place. A missing file is created.
+
+agy can save a copy of its settings from before pastor's edit, so pastor
+trusts no past write and does this before every such launch. When agy saved
+the file between pastor's read and write, pastor reads it again and merges
+once more. A machine whose own profile denies nothing (`unrestricted`, or no
+profile) is not read. A task under a narrower profile than its machine's
+needs rules pastor does not write there: writing a `review` task's
+`write_file(*)` would stop every edit on a `develop` machine, the owner's
+own agy sessions too. Give each agy machine the profile its tasks run, in
+its `[[machine]]` entry. A rule pastor added stays when that profile
+changes: pastor cannot tell its rules from the owner's.
+
+When the machine's own profile needs rules and pastor cannot read or write
+the file (a `command` machine, a file that is not JSON or whose
+`permissions` or `permissions.deny` is of the wrong type, a symlink, which
+pastor never replaces, or a write that fails), the task fails before
+anything is made on the machine with `agy_permissions_missing`, the reason,
+and the rules to add by hand, one per line:
+
+```text
+agy_permissions_missing: ~/.gemini/antigravity-cli/settings.json is a symlink, which pastor does not replace; machine pi-1's own profile needs these deny rules in ~/.gemini/antigravity-cli/settings.json there:
+  command(rm -rf)
+  command(sudo)
+```
+
 
 An agent whose permissions pastor should leave alone says so with
 `own_permissions`:

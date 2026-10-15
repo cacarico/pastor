@@ -13,7 +13,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 use crate::MIN_HERDR_PROTOCOL;
-use crate::dispatch::dispatch;
+use crate::dispatch::dispatch_with;
 use crate::herdr::{
     AgentInfo, AgentStatus, CallError, Connector, ConnectorExt, EventStream,
     subscription_agent_status, subscription_lifecycle,
@@ -344,6 +344,13 @@ pub struct MachineSettings {
     /// `None` on a headless serve, which keeps no table: its tasks settle as
     /// if no limit were read.
     pub limits: Option<crate::config::LimitsConfig>,
+    /// The deny list of the machine's own permission profile (its
+    /// `[[machine]]` profile, else its flock's, else `[defaults]`), in
+    /// Claude Code's patterns: what the agy provisioner makes agy's settings
+    /// there deny before a profiled agy launch (`provision::agy`). Set per
+    /// machine by `Fleet::own_deny`, so a change of profile replaces only
+    /// that machine's actor.
+    pub own_deny: Vec<String>,
 }
 
 impl Default for MachineSettings {
@@ -362,6 +369,7 @@ impl Default for MachineSettings {
             agents: crate::config::Agents::default(),
             head_address: None,
             limits: None,
+            own_deny: vec![],
         }
     }
 }
@@ -3380,10 +3388,13 @@ impl Actor {
             let (conn, agents) = (self.connector.as_ref(), &self.settings.agents);
             let head = self.settings.head_address.as_deref();
             let ready = self.settings.agent_ready_timeout;
+            let provision = crate::dispatch::Provision {
+                own_deny: &self.settings.own_deny,
+            };
             if resume {
-                crate::dispatch::resume(conn, &mut task, agents, head, ready).await
+                crate::dispatch::resume_with(conn, &mut task, agents, head, ready, provision).await
             } else {
-                dispatch(conn, &mut task, agents, head, ready).await
+                dispatch_with(conn, &mut task, agents, head, ready, provision).await
             }
         };
         let outcome = match tokio::time::timeout(timeout, start).await {
@@ -5010,6 +5021,7 @@ mod tests {
             agents: Default::default(),
             head_address: None,
             limits: None,
+            own_deny: vec![],
         }
     }
 
@@ -5165,6 +5177,46 @@ mod tests {
         let t = new_task(&store);
         h.dispatch(t.id).await.unwrap();
         wait_for("live count", || h.snapshot().live == 1).await;
+    }
+
+    /// The actor hands its machine's own deny list (`own_deny`) to dispatch,
+    /// so a profiled agy task there writes those rules into agy's settings.
+    #[tokio::test]
+    async fn the_actor_provisions_agy_with_its_own_profile() {
+        let fake = FakeHerdr::new();
+        fake.set_agy_settings(Some(crate::provision::agy::AgySettings {
+            content: None,
+            link: false,
+        }));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn_with_settings(
+            &fake,
+            &store,
+            MachineSettings {
+                own_deny: vec!["Bash(sudo:*)".into()],
+                ..settings()
+            },
+        );
+        let t = store
+            .insert_task(NewTask {
+                description: None,
+                job: "run".into(),
+                item: serde_json::Value::Null,
+                prompt: "hi".into(),
+                spec: DispatchSpec {
+                    agent: "agy".into(),
+                    agent_source: Some(Box::new(crate::task::AgentSource {
+                        profile: Some("develop".into()),
+                        ..Default::default()
+                    })),
+                    ..spec()
+                },
+                flock: "default".into(),
+            })
+            .unwrap();
+        let _ = h.dispatch(t.id).await;
+        let content = fake.agy_settings_now().unwrap().content.unwrap_or_default();
+        assert!(content.contains("command(sudo)"), "{content}");
     }
 
     /// A flock reload stops a removed or replaced machine's actor. Afterwards
