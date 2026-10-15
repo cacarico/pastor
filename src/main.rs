@@ -1567,6 +1567,18 @@ fn command_argv(s: &str) -> Vec<String> {
     s.split_whitespace().map(str::to_string).collect()
 }
 
+/// A probe's version and when it was read: now whenever the machine
+/// answered, `none` (no pastor installed) included; neither when the ask
+/// failed or was skipped because the ping had, as on the head.
+fn version_read(
+    asked: Option<Result<Option<String>, pastor::herdr::ConnectError>>,
+) -> (Option<String>, Option<chrono::DateTime<chrono::Utc>>) {
+    match asked {
+        Some(Ok(v)) => (v, Some(chrono::Utc::now())),
+        _ => (None, None),
+    }
+}
+
 fn probe_fields(
     ping: Result<pastor::herdr::Pong, pastor::herdr::CallError>,
     agent_count: Option<Result<usize, pastor::herdr::CallError>>,
@@ -1674,10 +1686,11 @@ async fn probe_machine(
     // Only a machine that answered is worth the extra ssh. A failure here
     // leaves the version unknown and the probe's verdict alone, as it does
     // on the head.
-    let pastor_version = match &ping {
-        Ok(_) => ep.pastor_version().await.unwrap_or(None),
+    let asked = match &ping {
+        Ok(_) => Some(ep.pastor_version().await),
         Err(_) => None,
     };
+    let (pastor_version, pastor_read_at) = version_read(asked);
     let (channel, herdr_version, protocol, live, error) = probe_fields(ping, agent_count);
     Ok(pastor::cli::MachineRow {
         now: Vec::new(),
@@ -1688,7 +1701,7 @@ async fn probe_machine(
         flocks,
         channel: channel.into(),
         herdr_version,
-        pastor_read_at: pastor_version.as_ref().map(|_| chrono::Utc::now()),
+        pastor_read_at,
         pastor_version,
         protocol,
         error,
@@ -3782,6 +3795,24 @@ mod tests {
             code: "internal_error".into(),
             message: "boom".into(),
         })
+    }
+
+    /// A probe's row says when the version was read whenever the machine
+    /// answered, `none` (no pastor installed) included, and not when the
+    /// ask failed or was skipped because the ping had.
+    #[test]
+    fn a_probe_records_the_version_read_time_when_the_machine_answered() {
+        let (v, at) = version_read(Some(Ok(Some("0.9.0".into()))));
+        assert_eq!(v.as_deref(), Some("0.9.0"));
+        assert!(at.is_some());
+        let (v, at) = version_read(Some(Ok(None)));
+        assert_eq!(v, None);
+        assert!(at.is_some(), "no pastor is an answer");
+        let failed = pastor::herdr::ConnectError {
+            message: "ssh: connection reset".into(),
+        };
+        assert_eq!(version_read(Some(Err(failed))), (None, None));
+        assert_eq!(version_read(None), (None, None));
     }
 
     #[test]

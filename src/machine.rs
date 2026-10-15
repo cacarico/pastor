@@ -239,8 +239,9 @@ pub struct MachineStatus {
     pub pastor_version: Option<String>,
     /// When the machine last answered the version question, so a fresh
     /// install that still shows the old version can be told from a head
-    /// that has not asked yet. `None` until it answers, and from a head
-    /// that predates the field.
+    /// that has not asked yet. "No pastor there" is an answer, so a `-`
+    /// version with a time means checked and not installed. `None` until
+    /// it answers, and from a head that predates the field.
     #[serde(default)]
     pub pastor_read_at: Option<DateTime<Utc>>,
     pub protocol: Option<u32>,
@@ -1325,10 +1326,13 @@ impl Actor {
             {
                 let mut s = self.status.write().recover();
                 s.herdr_version = Some(pong.version.clone());
-                if asked.is_some() {
+                // An ask that got no answer keeps the version last read and
+                // its time, as the periodic refresh does: a blank here would
+                // read as "no pastor there".
+                if let Some(v) = asked {
+                    s.pastor_version = v;
                     s.pastor_read_at = Some(Utc::now());
                 }
-                s.pastor_version = asked.flatten();
                 s.protocol = Some(pong.protocol);
             }
             if pong.protocol < MIN_HERDR_PROTOCOL {
@@ -11764,7 +11768,11 @@ mod tests {
         // `machine describe` says when the version was last read, so a
         // fresh install that still shows the old one can be told from a
         // head that never asked.
-        let first = h.snapshot().pastor_read_at.expect("read at connect");
+        h.snapshot().pastor_read_at.expect("read at connect");
+        // Age the read time by hand: the paused clock barely moves, so the
+        // refresh has to be seen to write a newer one.
+        let old = Utc::now() - chrono::Duration::hours(1);
+        h.status.write().recover().pastor_read_at = Some(old);
 
         fake.set_pastor_version(Some("0.3.0"));
         wait_for("the new version", || {
@@ -11777,7 +11785,38 @@ mod tests {
             .filter(|r| r.method == "ping")
             .count();
         assert_eq!(pings, 1, "picked up without a reconnect");
-        assert!(h.snapshot().pastor_read_at.expect("read again") >= first);
+        assert!(h.snapshot().pastor_read_at.expect("read again") > old);
+    }
+
+    /// A reconnect whose version ask fails (the ping worked, the extra ssh
+    /// did not) keeps the version last read and when it was read, as the
+    /// periodic refresh does: a blank would read as "no pastor there".
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnect_whose_version_ask_fails_keeps_the_last_read() {
+        let fake = FakeHerdr::new();
+        fake.set_pastor_version(Some("0.2.0"));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let first = h.snapshot().pastor_read_at.expect("read at connect");
+
+        fake.set_pastor_version_fails(true);
+        fake.disconnect_all();
+        wait_for("reconnected", || {
+            let pings = fake
+                .requests()
+                .iter()
+                .filter(|r| r.method == "ping")
+                .count();
+            pings >= 2 && h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let s = h.snapshot();
+        assert_eq!(s.pastor_version.as_deref(), Some("0.2.0"));
+        assert_eq!(s.pastor_read_at, Some(first));
     }
 
     /// The same refresh while polling: a machine whose events will not open
