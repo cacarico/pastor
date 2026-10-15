@@ -436,6 +436,7 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `shepherd_unexpected` | this machine's socket belongs to a head, not a headless serve |
 | `shepherd_unresponsive` | this machine's headless serve does not answer |
 | `shepherd_unsupported` | a request a headless serve does not answer; ask the head |
+| `socket_denied` | the connect to the socket was denied for permissions, most often a sandbox around the command |
 | `stop_failed` | `serve stop` could not tell which process holds the socket |
 | `stop_timeout` | the serve still runs after SIGTERM and the wait |
 | `store_error` | the task database failed or kept changing under the request |

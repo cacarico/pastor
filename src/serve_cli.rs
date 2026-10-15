@@ -295,6 +295,7 @@ pub async fn status(paths: &Paths, json: bool) -> anyhow::Result<()> {
                 ),
             ));
         }
+        HeadPing::Denied => return Err(crate::cli::socket_denied(&socket)),
         HeadPing::Pong {
             version,
             protocol,
