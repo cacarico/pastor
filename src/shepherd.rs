@@ -32,7 +32,7 @@ use crate::herdr::{Connector, Endpoint};
 use crate::ipc::{
     IPC_PROTOCOL, IpcRequest, IpcResponse, ProtocolGate, SHEPHERD_ROLE, request_line,
 };
-use crate::machine::{MachineHandle, MachineSettings, PastorEvent};
+use crate::machine::{EndBy, MachineHandle, MachineSettings, PastorEvent};
 use crate::scheduler::{ConfigFingerprint, Scheduler, SchedulerHandle};
 use crate::store::Store;
 use crate::task::{Task, TaskState};
@@ -498,8 +498,11 @@ impl Puller {
     /// Tell the head about every row that changed since it last heard, or
     /// with `all` every row: the head answers an unchanged report with its
     /// row and nothing else, which is how a `task close` there reaches the
-    /// pane here. A row the head has closed is closed here too; a closed or
-    /// failed one the head has heard of is forgotten here. Stops at the
+    /// pane here. A row the head has closed is closed here too; one the
+    /// head has done and ended (the agent's `task done` goes to the head)
+    /// is ended here too, so its agent's idle is not read as idle without
+    /// `task done` and auto-close takes its pane; a closed or failed one
+    /// the head has heard of is forgotten here. Stops at the
     /// first report that does not reach the head, to try again next tick.
     /// The trust keys the actor pressed for a task go with its reports
     /// until one reaches the head, which emits `task.trusted` once; a head
@@ -569,6 +572,20 @@ impl Puller {
                 let actor = self.actor();
                 if let Err(err) = actor.close(t.id, false).await {
                     tracing::warn!(task = %t.display_id(), err = %format!("{err:#}"), "close a task the head closed");
+                }
+                continue;
+            }
+            if head_row.state == TaskState::Done
+                && head_row.ended
+                && t.state.occupies_pane()
+                && !t.ended
+            {
+                // The summary stayed on the head, and the row here goes
+                // with the pane: ended as by hand, so a required summary
+                // is not asked for again.
+                let actor = self.actor();
+                if let Err(err) = actor.end_by(t.id, None, EndBy::Hand).await {
+                    tracing::warn!(task = %t.display_id(), err = %format!("{err:#}"), "end a task the head ended");
                 }
                 continue;
             }
@@ -995,13 +1012,23 @@ mod tests {
 
     /// `run_pinned`, in `repo` when given.
     async fn run_in(head: &Daemon, machine: Option<&str>, repo: Option<&str>) -> Task {
+        run_task(head, machine, repo, "claude").await
+    }
+
+    /// `run_in`, with `agent`.
+    async fn run_task(
+        head: &Daemon,
+        machine: Option<&str>,
+        repo: Option<&str>,
+        agent: &str,
+    ) -> Task {
         let req = IpcRequest::Run {
             now: false,
             preempt: false,
             prompt: "fix it".into(),
             spec: crate::task::DispatchSpec {
                 now: false,
-                agent: "claude".into(),
+                agent: agent.into(),
                 agent_args: vec![],
                 allow: vec![],
                 deny: vec![],
@@ -1122,6 +1149,88 @@ mod tests {
 
         p.flock_work = true;
         head_reaches(&mut p, &head, &loose, TaskState::Running).await;
+    }
+
+    /// An agent's `pastor task done` reaches the head, which ends its row
+    /// there; the row here learns nothing of it on its own. An agent that
+    /// is not Claude, idle after it, would read here as idle without `task
+    /// done` and sit `blocked` with its pane and the head's seat for good.
+    /// A head row that is done and ended ends the row here too, so
+    /// auto-close takes the pane once the agent is idle, the head hears
+    /// `closed`, and the row is forgotten, as a task closed on the head.
+    #[tokio::test]
+    async fn a_task_its_agent_ended_on_the_head_is_closed_here_once_idle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (head, ask) = pull_head(tmp.path()).await;
+        let mut events = head.subscribe();
+        let t = run_task(&head, Some("laptop"), None, "agy").await;
+        let fake = crate::herdr::fake::FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut p = Puller::new(
+            "laptop".into(),
+            false,
+            Arc::new(fake.clone()),
+            MachineSettings {
+                close_done_after: Some(Duration::from_millis(50)),
+                ..fast()
+            },
+            store.clone(),
+            ask,
+        );
+        head_reaches(&mut p, &head, &t, TaskState::Running).await;
+        let pane = head
+            .store()
+            .get_task(t.id)
+            .unwrap()
+            .unwrap()
+            .pane_id
+            .expect("the pane is reported");
+        // The agent ends its task on the head, prints its last line and
+        // goes idle at its prompt.
+        let IpcResponse::Task(ended) = head
+            .handle(IpcRequest::TaskDone {
+                id: t.id,
+                summary: Some("done: pushed".into()),
+            })
+            .await
+        else {
+            panic!()
+        };
+        assert!(ended.ended);
+        fake.set_pane_text(&pane, "DONE\n> ");
+        fake.set_status(&pane, crate::herdr::AgentStatus::Idle);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while store.get_task(t.id).unwrap().is_some() {
+            let here = store.get_task(t.id).unwrap().map(|t| (t.state, t.ended));
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never forgotten: here {here:?}, head {}",
+                head.store().get_task(t.id).unwrap().unwrap().state
+            );
+            let _ = tokio::time::timeout(Duration::from_millis(100), p.changed()).await;
+            p.pass().await;
+        }
+        assert!(fake.agents().is_empty(), "{:?}", fake.agents());
+        let row = head.store().get_task(t.id).unwrap().unwrap();
+        assert_eq!(row.state, TaskState::Closed);
+        assert_eq!(
+            row.finished_at, ended.finished_at,
+            "the finish is the agent's"
+        );
+        assert_eq!(
+            row.summary.as_ref().map(|s| s.text.as_str()),
+            Some("done: pushed"),
+            "the summary is what the agent said"
+        );
+        let kinds: Vec<String> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter(|e| e.task_id == Some(t.id))
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            ["task.queued", "task.running", "task.done", "task.closed"]
+        );
     }
 
     /// The keys pressed on `pane`, each send as one list.
