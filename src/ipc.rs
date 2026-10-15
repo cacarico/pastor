@@ -2494,6 +2494,25 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), ["ping"]);
     }
 
+    /// A socket the caller may not connect to (a sandbox, or a mode that
+    /// shuts them out) is `Denied`: not a head that does not answer, and
+    /// never "nothing there".
+    #[tokio::test]
+    async fn ping_head_tells_a_denied_connect_from_a_silent_head() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("pastor.sock");
+        let _listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+            // Root ignores the mode; there is nothing to deny.
+            return;
+        }
+        assert_eq!(ping_head(&socket).await, HeadPing::Denied);
+        assert_eq!(probe_daemon(&socket).await, DaemonProbe::Unresponsive);
+        assert!(socket.exists());
+    }
+
     #[tokio::test]
     async fn probe_daemon_reports_not_running_for_a_missing_socket() {
         let tmp = tempfile::tempdir().unwrap();

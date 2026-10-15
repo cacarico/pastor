@@ -96,6 +96,8 @@ fn a_denied_socket_connect_is_not_an_unresponsive_head() {
         &["task", "list"][..],
         &["job", "list"],
         &["serve", "status"],
+        &["serve", "stop"],
+        &["watch", "--now"],
     ] {
         let out = pastor()
             .args(args)
