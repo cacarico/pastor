@@ -421,7 +421,7 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `now_needs_machine` | `task run --now` with no `--machine` |
 | `now_not_started` | `task run --now` could not start the task at once; it is closed, not left queued |
 | `now_refused` | `task run --now` from an agent or an orchestrator's script; a guard against mistakes, not a boundary (see [Starting a task now](#starting-a-task-now)) |
-| `opencode_permissions_conflict` | a profiled opencode task on a machine whose managed opencode config (or managed preferences) has permission rules, or whose global config or `~/.opencode` has rules pastor could not parse |
+| `opencode_permissions_conflict` | a profiled opencode task on a machine whose managed opencode config (or managed preferences) has permission rules, or whose global config or `~/.opencode` has rules under an agent or a mode, a file pastor could not parse, or more config than pastor reads |
 | `orchestrator_held` | a session orchestrator's state could not be read or kept |
 | `orchestrator_invalid` | the orchestrator's file has never been valid |
 | `orchestrator_kind` | `run` of a session orchestrator, or `start`/`stop` of a scheduled one |
@@ -2181,27 +2181,42 @@ Before it makes anything on the machine, pastor reads the machine's own
 global opencode config and `~/.opencode` (`config.json`, `opencode.json`
 and `opencode.jsonc` in `$XDG_CONFIG_HOME/opencode`, else
 `~/.config/opencode`, and the same three in `~/.opencode`) and parses each
-one as JSONC. Every permission key they set — top level, under an agent's
-or a mode's own `permission`, or in the legacy `tools` block — is denied in
+one as JSONC. Every top-level permission key they set — in `permission` (one
+action for everything is the `"*"` key), or in the legacy `tools` block,
+whose `write` and `patch` are opencode's `edit` — is denied in
 `OPENCODE_PERMISSION` too, in the same object, so it stays denied under
 every profile including `unrestricted`: a denied key can never be lifted,
 neither by the profile's own rules nor by a narrower rule in the machine's
 own config for the same key. The patterns a key had on the machine are not
 kept, only the key itself; the task may end up stricter than its profile on
 a tool the machine also restricted, which is safe, since it is told no
-rather than run under rules nobody chose. A file pastor found but could not
-parse (its JSONC does not read as JSON once comments and trailing commas are
-stripped) fails the task instead, since pastor then cannot say what it would
-let through (`opencode_permissions_conflict` in its `error`). The managed
-config (`/etc/opencode`, on macOS `/Library/Application Support/opencode`)
-and, on macOS, the MDM preferences `ai.opencode.managed.plist` in
-`/Library/Managed Preferences/<user>` and `/Library/Managed Preferences`
-(read through `plutil`, one it cannot read counting as rules) are merged
-after `OPENCODE_CONFIG_CONTENT`, so pastor cannot neutralise them the same
-way: a `"permission"` key anywhere in them, or a legacy `"tools"` one, still
-fails the task (`opencode_permissions_conflict`). Move them out, or run the
-task without a profile. A `command` machine cannot be checked, and goes
-ahead. pastor turns the repo's own opencode config (an `opencode.json` or
+rather than run under rules nobody chose. opencode merges the object over
+its config so that a key the machine already set keeps the machine's place,
+ahead of everything pastor adds, and takes the last matching rule: so under
+`unrestricted` on such a machine pastor sends no `"*": "allow"` of its own,
+which would land after the machine's keys and lift their denies; opencode's
+own default allow stands for tools the lists do not name, and what that
+default asks about (a repeated tool call, a path outside the project) is
+allowed by name instead. The other profiles' `"*": "deny"` can only deny
+more, wherever it lands. What that object cannot reach fails the task
+instead (`opencode_permissions_conflict` in its `error`): rules under an
+agent or a mode of the machine's config (`agent.<name>.permission`,
+`mode.<name>.permission`, or their `tools`), which opencode appends to that
+agent's rules after the top-level ones, so an allow there would win over
+pastor's deny; a file pastor found but could not parse (its JSONC does not
+read as JSON once comments and trailing commas are stripped), since pastor
+then cannot say what it would let through; and more config than pastor
+reads, 48 KiB over all six files, a bound under the 64 KiB a probe's answer
+may be, so a large config is a refusal and never a lost machine. The
+managed config (`/etc/opencode`, on macOS `/Library/Application
+Support/opencode`) and, on macOS, the MDM preferences
+`ai.opencode.managed.plist` in `/Library/Managed Preferences/<user>` and
+`/Library/Managed Preferences` (read through `plutil`, one it cannot read
+counting as rules) are merged after `OPENCODE_CONFIG_CONTENT`, so pastor
+cannot neutralise them the same way: a `"permission"` key anywhere in them,
+or a legacy `"tools"` one, still fails the task
+(`opencode_permissions_conflict`). Move them out, or run the task without a
+profile. A `command` machine cannot be checked, and goes ahead. pastor turns the repo's own opencode config (an `opencode.json` or
 `.opencode/` in the checkout) off for a profiled task
 (`OPENCODE_DISABLE_PROJECT_CONFIG=1`), so a branch cannot add rules to the
 profile's, and passes the checkout's instructions back by path in

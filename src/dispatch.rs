@@ -512,19 +512,20 @@ async fn dispatch_steps(
         }
         // The machine's own global config and `~/.opencode` are merged
         // before `OPENCODE_CONFIG_CONTENT`, so pastor neutralises them
-        // instead: every permission key found there is denied in
-        // `OPENCODE_PERMISSION`, under every profile. A file pastor found
-        // but could not parse leaves it unable to say what it would let
-        // through, so the task refuses the same way.
+        // instead: every top-level permission key found there is denied in
+        // `OPENCODE_PERMISSION`, under every profile. What that cannot
+        // reach (rules under an agent or a mode, a file pastor could not
+        // parse, more config than it reads) leaves it unable to say what
+        // would get through, so the task refuses the same way.
         match conn
             .opencode_config_permission_keys()
             .await
             .map_err(CallError::from)?
         {
-            crate::config::opencode::MachineDenyKeys::Unreadable => {
+            crate::config::opencode::MachineDenyKeys::Conflict(why) => {
                 return Err(DispatchError::Task(format!(
-                    "{}: the opencode config on {} has permission rules pastor could not parse; \
-                     move them out of its opencode config, or run without a profile",
+                    "{}: the opencode config on {} {why}; move the rules out of its opencode \
+                     config, or run without a profile",
                     crate::config::opencode::OPENCODE_PERMISSIONS_CONFLICT,
                     task.machine.as_deref().unwrap_or("this machine"),
                 )));
@@ -2732,7 +2733,10 @@ mod tests {
     /// A machine whose own global opencode config or `~/.opencode` has
     /// permission rules of its own no longer fails the task: every key
     /// pastor found there is denied in `OPENCODE_PERMISSION` instead, even
-    /// under `unrestricted`, and the task runs.
+    /// under `unrestricted`, and the task runs. The env then has no open
+    /// fallback of its own, which opencode would put after the machine's
+    /// keys (`config::opencode::permission_json`): what opencode's defaults
+    /// ask about is allowed by name instead.
     #[tokio::test]
     async fn a_profiled_opencode_task_denies_the_machines_own_keys_instead_of_failing() {
         let fake = FakeHerdr::new();
@@ -2747,25 +2751,34 @@ mod tests {
         let env = fake.pane_env(t.pane_id.as_deref().unwrap());
         let permission: serde_json::Value =
             serde_json::from_str(env["OPENCODE_PERMISSION"].as_str().unwrap()).unwrap();
-        assert_eq!(permission["*"], "allow", "unrestricted's own fallback");
+        assert!(permission.get("*").is_none(), "{permission}");
         assert_eq!(permission["bash"], "deny", "{permission}");
         assert_eq!(permission["webfetch"], "deny", "{permission}");
+        assert_eq!(permission["read"], "allow", "{permission}");
+        assert_eq!(permission["external_directory"], "allow", "{permission}");
     }
 
-    /// A file pastor found on the machine's own global config or
-    /// `~/.opencode` but could not parse leaves it unable to say what it
-    /// would let through, so the task fails the same way a managed config's
-    /// rules do.
+    /// What `OPENCODE_PERMISSION` cannot neutralise on the machine's own
+    /// global config or `~/.opencode` (a file pastor could not parse, rules
+    /// under an agent, too much config) fails the task the same way a
+    /// managed config's rules do, saying what was found.
     #[tokio::test]
-    async fn a_profiled_opencode_task_refuses_a_machine_whose_own_config_pastor_cannot_parse() {
+    async fn a_profiled_opencode_task_refuses_a_machine_whose_own_config_it_cannot_neutralise() {
         let fake = FakeHerdr::new();
-        fake.set_opencode_deny_keys(crate::config::opencode::MachineDenyKeys::Unreadable);
+        fake.set_opencode_deny_keys(crate::config::opencode::MachineDenyKeys::Conflict(
+            "has permission rules under agent.build (bash)".into(),
+        ));
         let mut t = task(opencode_under(Some("review")));
         let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap_err();
         assert!(
             err.to_string().contains("opencode_permissions_conflict"),
+            "{err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("on pi-1 has permission rules under agent.build (bash); move"),
             "{err}"
         );
         assert!(!err.is_transport());
