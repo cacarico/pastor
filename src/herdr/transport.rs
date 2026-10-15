@@ -374,6 +374,9 @@ pub type UsageFuture<'a> = Pin<
     Box<dyn Future<Output = Result<Option<crate::usage::TaskUsage>, ConnectError>> + Send + 'a>,
 >;
 
+pub type RoomFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<crate::machine::Room>, ConnectError>> + Send + 'a>>;
+
 /// Anything that can open a fresh herdr connection. Endpoints for real use, FakeHerdr in tests.
 ///
 /// A connection carries one request (see `Connection`), so this is called once
@@ -458,6 +461,12 @@ pub trait Connector: Send + Sync {
     fn pastor_version(&self) -> VersionFuture<'_> {
         Box::pin(async { Ok(None) })
     }
+    /// What the machine has free: disk under `$HOME` and `/tmp` and memory
+    /// (`machine::Room`), read before placing a task there. `None` when it
+    /// cannot be known. The numbers only; the caller stamps `asked_at`.
+    fn room(&self) -> RoomFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
     /// The tokens Claude session `session` used, read from its files on the
     /// machine under `config_dir` (the agent's `CLAUDE_CONFIG_DIR` as
     /// written, `~/.claude` when `None`) by `usage::usage_command`. `None`
@@ -515,6 +524,9 @@ impl Connector for Endpoint {
     }
     fn pastor_version(&self) -> VersionFuture<'_> {
         Box::pin(pastor_version(self))
+    }
+    fn room(&self) -> RoomFuture<'_> {
+        Box::pin(room(self))
     }
     fn claude_usage(&self, config_dir: Option<&str>, session: &str) -> UsageFuture<'_> {
         let command = crate::usage::usage_command(config_dir, session);
@@ -769,6 +781,62 @@ fn remote_pastor_version(
     }
     tracing::warn!(%target, status = %out.status, stdout = ?raw, "no pastor version from the remote shell");
     Ok(None)
+}
+
+async fn room(ep: &Endpoint) -> Result<Option<crate::machine::Room>, ConnectError> {
+    // A local machine runs the same command here, under `sh -c`: the head
+    // and this herdr share a disk and a memory.
+    match probe(ep, ROOM_COMMAND.to_string()).await? {
+        Some(p) => remote_room(&p.target, &p.out),
+        None => Ok(None),
+    }
+}
+
+/// Asks the machine what it has free: `df -Pk` under `$HOME` and `/tmp`
+/// (its 1024-byte blocks available, field 4 on GNU, BSD and macOS alike)
+/// and `MemAvailable` from `/proc/meminfo`. Each number is its own `df` or
+/// `awk`, printed with a label, so a home `df` cannot read, or a macOS with
+/// no `/proc/meminfo`, leaves only that number out instead of shifting the
+/// others; the command's exit status says nothing, since the last `awk`
+/// fails on macOS.
+pub const ROOM_COMMAND: &str = r#"df -Pk "$HOME" | awk 'NR==2 {print "home", $4}'; df -Pk /tmp | awk 'NR==2 {print "tmp", $4}'; awk '/^MemAvailable:/ {print "mem", $2}' /proc/meminfo 2>/dev/null"#;
+
+/// Reads the answer to `ROOM_COMMAND`: `home N`, `tmp N` and `mem N` lines,
+/// in any order, among whatever rc files print. A label without a whole
+/// number after it is read as missing. As with `remote_home`, only ssh
+/// failing to reach the machine is an error.
+fn remote_room(
+    target: &str,
+    out: &std::process::Output,
+) -> Result<Option<crate::machine::Room>, ConnectError> {
+    reached(target, out)?;
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let room = parse_room(&raw);
+    if room.home_free.is_none() || room.tmp_free.is_none() {
+        tracing::warn!(%target, status = %out.status, stdout = ?raw, stderr = %String::from_utf8_lossy(&out.stderr).trim(), "no free disk from the remote shell");
+    }
+    Ok(Some(room))
+}
+
+/// The numbers in `ROOM_COMMAND`'s output; the last line of each label
+/// wins, so a label an rc file happens to print is overridden by the probe's
+/// own, which comes after.
+fn parse_room(raw: &str) -> crate::machine::Room {
+    let mut room = crate::machine::Room::default();
+    for line in raw.lines() {
+        let mut words = line.split_whitespace();
+        let (Some(label), Some(number), None) = (words.next(), words.next(), words.next()) else {
+            continue;
+        };
+        let value = number.parse::<u64>().ok();
+        match label {
+            "home" => room.home_free = value,
+            "tmp" => room.tmp_free = value,
+            "mem" => room.mem_free = value,
+            _ => {}
+        }
+    }
+    room
 }
 
 /// `test -d` in the remote shell, answered on stdout with one word. `test -d`
@@ -1319,6 +1387,103 @@ mod tests {
             stderr: vec![],
         };
         assert!(remote_pastor_version("t", &killed).is_err());
+    }
+
+    /// A local machine runs the room probe here; a bridge command cannot
+    /// know. The ssh command runs through `sh -c`, as the version one does.
+    #[tokio::test]
+    async fn room_per_endpoint() {
+        let argv = ssh_argv_running(
+            "fleet@pi-3",
+            Some(Path::new("/tmp/s/ssh/pi-3-%C")),
+            ROOM_COMMAND.to_string(),
+        );
+        assert!(
+            argv.last().unwrap().starts_with("sh -c 'df -Pk \"$HOME\""),
+            "{argv:?}"
+        );
+        let local = Endpoint::Local {
+            session: "default".into(),
+        };
+        let room = local.room().await.unwrap().expect("a local room");
+        assert!(room.home_free.is_some(), "{room:?}");
+        assert!(room.tmp_free.is_some(), "{room:?}");
+        if cfg!(target_os = "linux") {
+            assert!(room.mem_free.is_some(), "{room:?}");
+        }
+        assert_eq!(room.asked_at, None, "the actor stamps the read");
+        assert_eq!(room.error, None);
+        let command = Endpoint::Command {
+            argv: vec!["true".into()],
+        };
+        assert_eq!(command.room().await.unwrap(), None);
+    }
+
+    /// The command's own shell script, run here, answers the way the parser
+    /// expects: a labelled number per line, memory left out where there is
+    /// no `/proc/meminfo` (macOS) rather than failing the probe.
+    #[test]
+    fn the_room_command_answers_labelled_numbers() {
+        let out = std::process::Command::new("sh")
+            .args(["-c", ROOM_COMMAND])
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+        let room = remote_room("t", &out).unwrap().expect("a room");
+        assert!(room.home_free.is_some(), "{room:?}");
+        assert!(room.tmp_free.is_some(), "{room:?}");
+        let tmp = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new("sh")
+            .args(["-c", ROOM_COMMAND])
+            .env("HOME", tmp.path().join("missing"))
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+        let room = remote_room("t", &out).unwrap().expect("a room");
+        assert_eq!(room.home_free, None, "a home df cannot read is unknown");
+        assert!(room.tmp_free.is_some(), "{room:?}");
+    }
+
+    /// Each number is its own labelled line, so one df failing leaves only
+    /// its number unknown; rc-file noise and an odd number are ignored. Only
+    /// ssh failing to reach the machine is an error.
+    #[test]
+    fn remote_room_reads_labelled_lines() {
+        use std::os::unix::process::ExitStatusExt;
+        let out = |code: i32, stdout: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: b"df: /tmp: No such file".to_vec(),
+        };
+        let r = |code: i32, stdout: &str| remote_room("t", &out(code, stdout)).unwrap().unwrap();
+        let full = r(0, "home 123456\ntmp 7890\nmem 4096\n");
+        assert_eq!(full.home_free, Some(123_456));
+        assert_eq!(full.tmp_free, Some(7_890));
+        assert_eq!(full.mem_free, Some(4_096));
+        let noisy = r(2, "Welcome to Raspberry Pi\nhome 10\nmem 20\n");
+        assert_eq!(noisy.home_free, Some(10));
+        assert_eq!(noisy.tmp_free, None, "a missing line is unknown");
+        assert_eq!(
+            noisy.mem_free,
+            Some(20),
+            "a failed awk still counts the lines that came"
+        );
+        let odd = r(0, "home ten\ntmp 5 extra\nmem -1\nhome 3\n");
+        assert_eq!(odd.home_free, Some(3), "the last good line wins");
+        assert_eq!(odd.tmp_free, None);
+        assert_eq!(odd.mem_free, None);
+        let none = r(0, "");
+        assert_eq!(
+            (none.home_free, none.tmp_free, none.mem_free),
+            (None, None, None)
+        );
+        assert!(remote_room("t", &out(255, "")).is_err());
+        let killed = std::process::Output {
+            status: std::process::ExitStatus::from_raw(9),
+            stdout: vec![],
+            stderr: vec![],
+        };
+        assert!(remote_room("t", &killed).is_err());
     }
 
     /// ssh hands its command to the remote user's login shell, which may be
