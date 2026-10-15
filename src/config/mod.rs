@@ -1914,6 +1914,11 @@ pub struct PastorConfig {
     pub tick: String,
     pub settle: String,
     pub reconcile_every: String,
+    /// How often a connected or polling machine is asked for its pastor
+    /// version again, after a reconcile: one `pastor --version` over ssh per
+    /// machine per interval, so an install shows in `machine list` without
+    /// a reconnect.
+    pub version_every: String,
     /// Bound on one herdr request, connect included. A machine that does not
     /// answer within it is treated as lost.
     pub request_timeout: String,
@@ -2132,6 +2137,7 @@ impl Default for PastorConfig {
             tick: "10s".into(),
             settle: "10s".into(),
             reconcile_every: "60s".into(),
+            version_every: "2m".into(),
             request_timeout: "60s".into(),
             agent_ready_timeout: "30s".into(),
             close_done_after: "5s".into(),
@@ -2191,6 +2197,7 @@ impl PastorConfig {
             ("tick", &cfg.tick, false),
             ("settle", &cfg.settle, false),
             ("reconcile_every", &cfg.reconcile_every, false),
+            ("version_every", &cfg.version_every, false),
             ("request_timeout", &cfg.request_timeout, false),
             ("agent_ready_timeout", &cfg.agent_ready_timeout, false),
             ("defaults.timeout", &cfg.defaults.timeout, true),
@@ -2388,6 +2395,9 @@ impl PastorConfig {
             &self.reconcile_every,
             &PastorConfig::default().reconcile_every,
         )
+    }
+    pub fn version_every_duration(&self) -> Duration {
+        duration_or_default(&self.version_every, &PastorConfig::default().version_every)
     }
     pub fn timeout_duration(&self) -> Duration {
         duration_or_default(
@@ -5324,6 +5334,23 @@ mod tests {
         assert_eq!(p.jobs_dir(), PathBuf::from("/tmp/c/jobs"));
     }
 
+    /// A fresh install on a machine shows in `machine list` within
+    /// `version_every` of a reconcile: two minutes by default, one ssh per
+    /// machine per interval, and a `pastor.toml` key when that is too often.
+    #[test]
+    fn version_every_is_two_minutes_unless_set() {
+        assert_eq!(PastorConfig::default().version_every, "2m");
+        assert_eq!(
+            PastorConfig::default().version_every_duration(),
+            Duration::from_secs(120)
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(&path, "version_every = \"30s\"\n").unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        assert_eq!(cfg.version_every_duration(), Duration::from_secs(30));
+    }
+
     #[test]
     fn zero_intervals_are_rejected() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5337,6 +5364,11 @@ mod tests {
         std::fs::write(&path, "reconcile_every = \"0s\"\n").unwrap();
         let err = PastorConfig::load(&path).unwrap_err().to_string();
         assert!(err.contains("reconcile_every"), "{err}");
+        assert!(err.contains("must not be zero"), "{err}");
+
+        std::fs::write(&path, "version_every = \"0s\"\n").unwrap();
+        let err = PastorConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("version_every"), "{err}");
         assert!(err.contains("must not be zero"), "{err}");
 
         std::fs::write(&path, "settle = \"0s\"\n").unwrap();

@@ -807,6 +807,7 @@ mod tests {
                 channel,
                 herdr_version: Some("0.9.1".into()),
                 pastor_version: None,
+                pastor_read_at: None,
                 protocol: Some(22),
                 error: Some("ssh: connection refused".into()),
                 live: 1,

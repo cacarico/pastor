@@ -293,6 +293,7 @@ mod tests {
             channel: channel.into(),
             herdr_version: None,
             pastor_version: None,
+            pastor_read_at: None,
             protocol: None,
             error: None,
             live: None,

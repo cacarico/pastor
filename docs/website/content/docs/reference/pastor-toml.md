@@ -45,6 +45,7 @@ load, and the error names the key.
 | `tick` | `"10s"` | how often the scheduler and orchestrators run a pass; also how often a machine without an event stream is polled |
 | `settle` | `"10s"` | how long a finished agent stays idle before its task is marked done |
 | `reconcile_every` | `"60s"` | how often each machine's open tasks are checked against its live agents |
+| `version_every` | `"2m"` | how often a connected or polling machine is asked for its pastor version again, after a reconcile; `machine describe` shows when it last answered |
 | `request_timeout` | `"60s"` | the bound on one herdr request, connect included; a machine that does not answer in time counts as lost |
 | `agent_ready_timeout` | `"30s"` | from starting an agent to a prompt herdr accepts; must be shorter than `request_timeout` |
 | `close_done_after` | `"5s"` | a done task's pane closes after this, so its machine slot frees; `"15m"` leaves time for `pastor task attach` to show its last screen; `"never"` keeps it |

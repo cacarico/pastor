@@ -39,7 +39,7 @@ With a head running, it opens with a line about the head (its pastor and herdr v
 | `FLOCKS` | each flock with the machine's number there, `work:2,home:1` |
 | `PROFILE` | the machine's permission profile |
 | `CHANNEL` | `connected`, `polling`, `connecting`, `reconnecting`, `incompatible`; only `connected` and `polling` machines take tasks |
-| `HERDR`, `PASTOR` | the herdr version, and the pastor installed there (`-` when unknown) |
+| `HERDR`, `PASTOR` | the herdr version, and the pastor installed there (`-` when unknown; asked again every `version_every`, 2m by default, and `machine describe` says when it last answered) |
 | `AGENTS` | live tasks over the machine's room: `max_agents`, then `+1j` for job slots and `+1b` for burst when set |
 | `ORPHANS` | agents named `t-N` that no open task owns |
 | `TAGS`, `ERROR` | its tags, and its error when it has one |
