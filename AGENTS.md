@@ -241,8 +241,8 @@ Still open as of the last review; none of them blocks normal use.
   stop an interactive session to review a plan artifact; pastor's dialog
   reading does not know that prompt. A machine that runs agy tasks should
   set it to `agent-decides` or `always-proceed`. And agy's rules are one
-  file per machine, so an agy machine runs one profile; writing that
-  profile's rules there is a hand step until the provisioner work lands.
+  file per machine, so an agy machine runs one profile; the agy
+  provisioner writes that profile's rules there before each launch.
 
 - The agy provisioner (`src/provision/agy.rs`) runs only just before a
   profiled agy launch, not at `machine add` or on reconcile, so a machine's
