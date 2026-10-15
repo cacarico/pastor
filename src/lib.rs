@@ -19,6 +19,7 @@ pub mod limit_cli;
 pub mod machine;
 pub mod orchestrator;
 pub mod orchestrator_cli;
+pub mod picker;
 pub mod profile_cli;
 pub mod provision;
 pub mod queue;

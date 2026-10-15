@@ -1123,6 +1123,11 @@ pub struct AgentDef {
     /// trust presses the keys without reading the pane.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trust_marker: Option<String>,
+    /// Startup dialogs beyond the trust one, `[[agents.<name>.dialogs]]`:
+    /// a row named as a built-in replaces it; one with an empty `pick` and
+    /// no `keys` removes it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dialogs: Vec<DialogDef>,
     /// The flag that hands the agent one pattern of an `allow` list, put
     /// before each pattern. Unset keeps the built-in (`--allowedTools` for
     /// claude); an agent with none refuses tasks that carry an allow list.
@@ -1131,10 +1136,12 @@ pub struct AgentDef {
     /// Like `allow_flag`, for `deny` (`--disallowedTools` for claude).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deny_flag: Option<String>,
-    /// The agent's permissions are in its own settings on the machine (agy's
-    /// allow list), so a task under a profile starts with no permission
-    /// mode and no tool flags, its lists not passed (`lists_unapplied`).
-    /// Without it, an agent with no flags refuses a profiled task.
+    /// The agent's permissions are in its own settings on the machine, for
+    /// an agent whose kind pastor cannot drive or an agy owner who manages
+    /// the file by hand: a task under a profile starts with no permission
+    /// mode and no tool flags, its lists not passed and nothing checked
+    /// (`lists_unapplied`). Without it, an agent of a kind with no profile
+    /// path and no flags refuses a profiled task.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub own_permissions: bool,
     /// The account the agent is logged in to, as a label: every machine
@@ -1168,6 +1175,101 @@ const CLAUDE_TRUST_KEYS: [&str; 2] = ["Down", "Enter"];
 /// accept that; saved trust presses them only while this is on screen.
 const CLAUDE_TRUST_MARKER: &str = "Yes, I trust this folder";
 
+/// Env every Claude task's pane gets, under the definition's own `env`:
+/// the classic renderer. Claude 2.1's fullscreen renderer draws on the
+/// alternate screen with no scrollback, which pastor's pane reads need,
+/// and its startup offer ("Try the new fullscreen renderer?") is gated off
+/// by this variable (checked in 2.1.295).
+pub const CLAUDE_CLASSIC_RENDERER_ENV: (&str, &str) = ("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN", "1");
+
+/// Claude's other startup dialogs (2.1.295 wording), each answered with
+/// the option that keeps things as they are, as (name, marker, pick). The
+/// fullscreen row is a fallback for a pane whose env lost
+/// `CLAUDE_CLASSIC_RENDERER_ENV`. The bypass-permissions warning is not
+/// here: accepting it is a person's call.
+const CLAUDE_DIALOGS: [(&str, &str, &str); 4] = [
+    ("fullscreen", "Try the new fullscreen renderer?", "Not now"),
+    (
+        "auto-mode-default",
+        "Make auto mode your default permission mode?",
+        "No, keep",
+    ),
+    (
+        "auto-mode-setup",
+        "Teach auto mode about your environment?",
+        "Don't show again",
+    ),
+    (
+        "effort-default",
+        "Switch your default effort to",
+        "No, keep",
+    ),
+];
+
+/// The names of the dialogs built in for agents of `kind`.
+fn builtin_dialog_names(kind: &str) -> Vec<&'static str> {
+    if kind == "claude" {
+        CLAUDE_DIALOGS.iter().map(|(n, _, _)| *n).collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// How a dialog is answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answer {
+    /// Arrow to the option whose text contains this, then Enter.
+    Pick(String),
+    /// These keys, as they are.
+    Keys(Vec<String>),
+}
+
+/// A startup dialog an agent may show, and its answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dialog {
+    pub name: String,
+    /// Text only this dialog shows, in the pane's bottom prompt. `None`
+    /// (trust with `trust_marker = ""`) matches any screen.
+    pub marker: Option<String>,
+    pub answer: Answer,
+    /// Pressed only when the task's (machine, repo) is saved as trusted.
+    pub needs_trust: bool,
+}
+
+/// A `[[agents.<name>.dialogs]]` row.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DialogDef {
+    pub name: String,
+    pub marker: String,
+    /// The option to pick by its text. Empty with no `keys`: the dialog is
+    /// removed (a built-in of this name is dropped).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pick: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keys: Option<Vec<String>>,
+}
+
+impl DialogDef {
+    /// `None` removes a dialog of this name.
+    fn answer(&self) -> Option<Answer> {
+        match (&self.pick, &self.keys) {
+            (_, Some(keys)) if !keys.is_empty() => Some(Answer::Keys(keys.clone())),
+            (Some(pick), _) if !pick.trim().is_empty() => Some(Answer::Pick(pick.clone())),
+            _ => None,
+        }
+    }
+
+    fn dialog(&self, answer: Answer) -> Dialog {
+        Dialog {
+            name: self.name.clone(),
+            marker: Some(self.marker.clone()),
+            answer,
+            needs_trust: false,
+        }
+    }
+}
+
 /// Text Codex's folder-trust dialog shows, in its newer and older wording.
 /// herdr reads Codex at that dialog idle and ready, not blocked, so a prompt
 /// sent then would go into the dialog.
@@ -1198,9 +1300,12 @@ pub fn shows_startup_question(screen: &str, markers: &[String]) -> bool {
 }
 
 /// The trailing lines of `screen` that make up the prompt at its bottom:
-/// those after the last output (a `●` or `⏺` message) and, when there is a
-/// menu, after the last option of any menu above the last one (a menu starts
-/// at an option numbered 1). The whole screen when neither is there.
+/// those after the last output (a `●` or `⏺` message), after the last
+/// option of any menu above the last one (a menu starts at an option
+/// numbered 1), and after the key hints (`Enter to confirm · Esc to
+/// cancel`) of any dialog above the last thing on screen, since Claude 2.1
+/// draws most of its dialogs without numbers. The whole screen when none
+/// of those is there.
 fn bottom_prompt(screen: &str) -> String {
     let lines: Vec<&str> = screen.lines().collect();
     let option = |line: &str| -> Option<u32> {
@@ -1220,6 +1325,27 @@ fn bottom_prompt(screen: &str) -> String {
         && let Some(prev) = lines[..menu].iter().rposition(|l| option(l).is_some())
     {
         start = start.max(prev + 1);
+    }
+    // The hints of an earlier dialog: a hint line above the last dialog's
+    // own footer, which is up to two hint lines (one may wrap in a narrow
+    // pane) and whatever Claude draws under them: blank lines, a rule, the
+    // bottom of a box.
+    let trailing = |line: &str| {
+        line.trim().is_empty() || crate::limit::is_rule(line) || crate::picker::is_box_edge(line)
+    };
+    let mut end = lines.len();
+    while end > 0 && trailing(lines[end - 1]) {
+        end -= 1;
+    }
+    let footer = end;
+    while end > 0 && crate::picker::is_key_hint(lines[end - 1]) && footer - end < 2 {
+        end -= 1;
+    }
+    if let Some(hint) = lines[..end]
+        .iter()
+        .rposition(|l| crate::picker::is_key_hint(l))
+    {
+        start = start.max(hint + 1);
     }
     lines[start.min(lines.len())..].join("\n")
 }
@@ -1315,6 +1441,56 @@ impl Agents {
         (!marker.trim().is_empty()).then_some(marker)
     }
 
+    /// The startup dialogs `agent` may show, in the order they are tried:
+    /// the trust dialog (from `trust_keys` and `trust_marker`; absent when
+    /// the agent has no trust keys), the built-ins of its kind as its own
+    /// rows replace or remove them, then its other rows.
+    pub fn dialogs(&self, agent: &str) -> Vec<Dialog> {
+        let mut out = Vec::new();
+        if let Some(keys) = self.trust_keys(agent) {
+            out.push(Dialog {
+                name: "trust".into(),
+                marker: self.trust_marker(agent),
+                answer: Answer::Keys(keys),
+                needs_trust: true,
+            });
+        }
+        let own = self
+            .0
+            .get(agent)
+            .map(|d| d.dialogs.as_slice())
+            .unwrap_or(&[]);
+        let builtin: &[(&str, &str, &str)] = if self.kind(agent) == "claude" {
+            &CLAUDE_DIALOGS
+        } else {
+            &[]
+        };
+        for (name, marker, pick) in builtin {
+            match own.iter().find(|d| d.name == *name) {
+                Some(row) => {
+                    if let Some(answer) = row.answer() {
+                        out.push(row.dialog(answer));
+                    }
+                }
+                None => out.push(Dialog {
+                    name: (*name).into(),
+                    marker: Some((*marker).into()),
+                    answer: Answer::Pick((*pick).into()),
+                    needs_trust: false,
+                }),
+            }
+        }
+        for row in own
+            .iter()
+            .filter(|d| !builtin.iter().any(|(n, _, _)| *n == d.name))
+        {
+            if let Some(answer) = row.answer() {
+                out.push(row.dialog(answer));
+            }
+        }
+        out
+    }
+
     /// What shows that `agent` sits at a startup question herdr reads idle
     /// and ready, so its prompt waits (`shows_startup_question`): its own
     /// `trust_marker`, and Codex's dialog for the `codex` kind. None for
@@ -1362,6 +1538,10 @@ impl Agents {
             .get(&spec.agent)
             .map(|d| d.env.clone())
             .unwrap_or_default();
+        if self.kind(&spec.agent) == "claude" {
+            let (key, value) = CLAUDE_CLASSIC_RENDERER_ENV;
+            env.entry(key.into()).or_insert_with(|| value.into());
+        }
         if self.opencode_profile(spec) {
             for key in opencode::CONFIG_ENV {
                 env.insert(key.into(), String::new());
@@ -1398,6 +1578,13 @@ impl Agents {
                 )
             });
         }
+        if self.agy_profile(spec) {
+            return (!spec.allow.is_empty() || !spec.deny.is_empty()).then(|| {
+                "agy takes no lists: the deny was checked against its settings on the machine, \
+                 the allow is not passed"
+                    .to_string()
+            });
+        }
         if self.kind(&spec.agent) != "codex" {
             return None;
         }
@@ -1424,9 +1611,9 @@ impl Agents {
             && !self.own_permissions(&spec.agent)
     }
 
-    /// Does `spec` run an agy agent under a permission profile, with no
-    /// `own_permissions`? Its rules are then agy's settings on the machine,
-    /// which the agy provisioner (`provision::agy`) keeps up.
+    /// Does `spec` run an agy agent under a permission profile? It then
+    /// starts with `agy::NO_ASK` and dispatch checks its settings on the
+    /// machine (`config::agy`).
     pub fn agy_profile(&self, spec: &crate::task::DispatchSpec) -> bool {
         spec.profile().is_some()
             && self.kind(&spec.agent) == agy::KIND
@@ -1445,8 +1632,11 @@ impl Agents {
     /// and pattern of each `allow`, then of each `deny`; an opencode agent
     /// under a profile gets no tool flags, its lists going in `launch`'s
     /// env, and a Codex one skips a list it has no flag for
-    /// (`lists_unapplied`); an agent with `own_permissions` under a profile
-    /// gets its args alone. Refused when a list is not empty
+    /// (`lists_unapplied`); an agy agent under a profile gets
+    /// `--dangerously-skip-permissions --mode accept-edits` and no tool
+    /// flags (`config::agy`), and is refused a deny pattern agy has no rule
+    /// for (`agy_deny_unsupported`); an agent with `own_permissions` under a
+    /// profile gets its args alone. Refused when a list is not empty
     /// and the agent has no flag for it (`agent_tools_unsupported`):
     /// dropping a deny list without a word would be worse than not
     /// starting. Refused too when a profile applies and the args already
@@ -1461,6 +1651,31 @@ impl Agents {
         let mut args = spec.agent_args.clone();
         // Its own settings hold (`lists_unapplied`).
         if spec.profile().is_some() && self.own_permissions(&spec.agent) {
+            return Ok(args);
+        }
+        if let Some(profile) = spec.profile()
+            && self.agy_profile(spec)
+        {
+            if let Some(arg) = args.iter().find(|a| agy::is_permission_arg(a)) {
+                return Err(AgentRefusal {
+                    code: PROFILE_ARGS_CONFLICT,
+                    message: format!(
+                        "task runs under profile {profile}, and agent {}'s args set {arg}; \
+                         drop it from agent_args or the model's args, or run without a profile",
+                        spec.agent
+                    ),
+                });
+            }
+            if let Some(p) = spec.deny.iter().find(|p| agy::required_rule(p).is_none()) {
+                return Err(AgentRefusal {
+                    code: agy::AGY_DENY_UNSUPPORTED,
+                    message: format!(
+                        "task runs under profile {profile} and denies {p}, which agy has no rule for; \
+                         drop it from the profile or the task's deny list, or run without a profile"
+                    ),
+                });
+            }
+            args.extend(agy::NO_ASK.map(str::to_string));
             return Ok(args);
         }
         if let Some(profile) = spec.profile()
@@ -1601,7 +1816,8 @@ pub const AGENT_KIND_MISSING: &str = "agent_kind_missing";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRefusal {
     /// `unknown_model`, `model_kind_mismatch`, `agent_tools_unsupported`,
-    /// `unknown_profile`, `profile_not_allowed` or `profile_args_conflict`.
+    /// `unknown_profile`, `profile_not_allowed`, `profile_args_conflict`,
+    /// `agy_deny_unsupported` or `agy_profile_mismatch`.
     pub code: &'static str,
     pub message: String,
 }
@@ -2078,6 +2294,37 @@ impl PastorConfig {
                     "{}: agents.{name}.trust_keys: a key name must not be empty",
                     path.display()
                 );
+            }
+            let mut seen = std::collections::HashSet::new();
+            for d in &def.dialogs {
+                let at = format!("{}: agents.{name}.dialogs", path.display());
+                if d.name.trim().is_empty() {
+                    anyhow::bail!("{at}: name must not be empty");
+                }
+                if d.name == "trust" {
+                    anyhow::bail!("{at}: use trust_keys and trust_marker for the trust dialog");
+                }
+                if !seen.insert(d.name.as_str()) {
+                    anyhow::bail!("{at}: {} is named twice", d.name);
+                }
+                let picks = d.pick.as_deref().is_some_and(|p| !p.trim().is_empty());
+                if picks && d.keys.as_ref().is_some_and(|k| !k.is_empty()) {
+                    anyhow::bail!("{at}.{}: pick or keys, not both", d.name);
+                }
+                // A row with no answer removes a built-in, and needs no
+                // marker for that; it has nothing to do with any other name.
+                let removes = d.answer().is_none();
+                if removes
+                    && !builtin_dialog_names(cfg.agents.kind(name)).contains(&d.name.as_str())
+                {
+                    anyhow::bail!("{at}.{}: needs pick or keys", d.name);
+                }
+                if !removes && d.marker.trim().is_empty() {
+                    anyhow::bail!("{at}.{}: marker must not be empty", d.name);
+                }
+                if d.keys.iter().flatten().any(|k| k.trim().is_empty()) {
+                    anyhow::bail!("{at}.{}: a key name must not be empty", d.name);
+                }
             }
         }
         for (name, def) in &cfg.models.0 {
@@ -3754,11 +4001,100 @@ mod tests {
         assert!(Agents::default().launch(&spec).unwrap().env.is_empty());
     }
 
+    /// An agy agent under a profile starts with the two flags that stop it
+    /// asking and no tool flags, even with `allow_flag`/`deny_flag` set;
+    /// `task describe` says the lists are not passed. Args that pick its
+    /// mode are refused, as is a deny pattern agy has no rule for. With
+    /// `own_permissions` nothing is added, and without a profile the lists
+    /// still need flags.
+    #[test]
+    fn an_agy_agent_under_a_profile_starts_with_the_skip_flag_and_accept_edits() {
+        let mut spec = spec_with("agy", &["Read"], &["Edit", "Bash(sudo:*)"]);
+        spec.agent_source = Some(Box::new(crate::task::AgentSource {
+            agent: "defaults".into(),
+            profile: Some("review".into()),
+            profile_from: Some("defaults".into()),
+            ..Default::default()
+        }));
+        let agents = Agents::default();
+        assert!(agents.agy_profile(&spec));
+        let launch = agents.launch(&spec).unwrap();
+        assert_eq!(launch.kind, "agy");
+        assert_eq!(
+            launch.args,
+            vec![
+                "--model",
+                "m",
+                "--dangerously-skip-permissions",
+                "--mode",
+                "accept-edits"
+            ]
+        );
+        assert!(launch.env.is_empty());
+        let why = agents.lists_unapplied(&spec).unwrap();
+        assert!(why.contains("deny was checked"), "{why}");
+        assert!(why.contains("allow is not passed"), "{why}");
+
+        // Flags in its definition are not used under a profile.
+        let flagged: Agents =
+            toml::from_str("[agy]\nallow_flag = \"--allow\"\ndeny_flag = \"--deny\"\n").unwrap();
+        assert_eq!(flagged.launch(&spec).unwrap().args, launch.args);
+
+        for arg in ["--mode", "--mode=plan", "--dangerously-skip-permissions"] {
+            let mut s = spec.clone();
+            s.agent_args.push(arg.into());
+            let err = agents.launch(&s).unwrap_err();
+            assert_eq!(err.code, PROFILE_ARGS_CONFLICT, "{arg}");
+            assert!(err.message.contains(arg), "{err}");
+        }
+        let mut s = spec.clone();
+        s.agent_args.push("--sandbox".into());
+        assert!(agents.launch(&s).is_ok());
+
+        let mut s = spec.clone();
+        s.deny.push("WebSearch".into());
+        let err = agents.launch(&s).unwrap_err();
+        assert_eq!(err.code, agy::AGY_DENY_UNSUPPORTED);
+        assert!(err.message.contains("WebSearch"), "{err}");
+
+        let own: Agents = toml::from_str("[agy]\nown_permissions = true\n").unwrap();
+        assert!(!own.agy_profile(&spec));
+        assert_eq!(own.launch(&spec).unwrap().args, vec!["--model", "m"]);
+
+        // A definition of kind agy under another name.
+        let mine: Agents = toml::from_str("[agy-review]\nkind = \"agy\"\n").unwrap();
+        spec.agent = "agy-review".into();
+        assert!(mine.agy_profile(&spec));
+        assert_eq!(mine.launch(&spec).unwrap().args, launch.args);
+
+        // Without a profile: no flags added, and the lists need flags.
+        spec.agent_source = None;
+        assert!(!mine.agy_profile(&spec));
+        assert_eq!(
+            mine.launch(&spec).unwrap_err().code,
+            "agent_tools_unsupported"
+        );
+        assert_eq!(mine.lists_unapplied(&spec), None);
+        spec.agent = "agy".into();
+        assert_eq!(
+            flagged.launch(&spec).unwrap().args,
+            vec![
+                "--model",
+                "m",
+                "--allow",
+                "Read",
+                "--deny",
+                "Edit",
+                "--deny",
+                "Bash(sudo:*)"
+            ]
+        );
+    }
+
     /// An agent whose permissions are in its own settings on the machine
-    /// (`own_permissions`, agy's allow list) starts under a profile with
-    /// its args alone: no mode, no tool flags, its lists not passed, and
-    /// `task describe` says why. Without the field it is refused, and the
-    /// message names the field.
+    /// (`own_permissions`) starts under a profile with its args alone: no
+    /// mode, no tool flags, its lists not passed, and `task describe` says
+    /// why.
     #[test]
     fn an_agent_with_its_own_permissions_starts_under_a_profile_without_flags() {
         let mut spec = spec_with("agy", &["Edit"], &["Bash(sudo:*)"]);
@@ -3768,11 +4104,6 @@ mod tests {
             profile_from: Some("defaults".into()),
             ..Default::default()
         }));
-
-        let err = Agents::default().launch(&spec).unwrap_err();
-        assert_eq!(err.code, "agent_tools_unsupported");
-        assert!(err.message.contains("own_permissions"), "{err}");
-        assert_eq!(Agents::default().lists_unapplied(&spec), None);
 
         let agents: Agents = toml::from_str("[agy]\nown_permissions = true\n").unwrap();
         let launch = agents.launch(&spec).unwrap();
@@ -4054,6 +4385,214 @@ mod tests {
             vec!["Trust this workspace?"]
         );
         assert!(cfg.agents.startup_markers("claude").is_empty());
+    }
+
+    #[test]
+    fn claude_has_built_in_dialogs_trust_first() {
+        let cfg = PastorConfig::default();
+        let d = cfg.agents.dialogs("claude");
+        let names: Vec<&str> = d.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "trust",
+                "fullscreen",
+                "auto-mode-default",
+                "auto-mode-setup",
+                "effort-default"
+            ]
+        );
+        assert!(d[0].needs_trust && !d[1].needs_trust);
+        assert_eq!(
+            d[0].answer,
+            Answer::Keys(vec!["Down".into(), "Enter".into()])
+        );
+        assert_eq!(d[0].marker.as_deref(), Some("Yes, I trust this folder"));
+        assert_eq!(d[1].answer, Answer::Pick("Not now".into()));
+        assert_eq!(
+            d[2].marker.as_deref(),
+            Some("Make auto mode your default permission mode?")
+        );
+        assert_eq!(d[2].answer, Answer::Pick("No, keep".into()));
+        assert!(cfg.agents.dialogs("codex").is_empty());
+        assert!(cfg.agents.dialogs("agy").is_empty());
+    }
+
+    #[test]
+    fn trust_settings_shape_the_trust_dialog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(
+            &path,
+            "[agents.claude]\ntrust_marker = \"\"\n[agents.mine]\nkind = \"claude\"\ntrust_keys = []\n",
+        )
+        .unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        let claude = cfg.agents.dialogs("claude");
+        assert_eq!(claude[0].name, "trust");
+        assert_eq!(
+            claude[0].marker, None,
+            "empty marker: pressed without reading"
+        );
+        let mine = cfg.agents.dialogs("mine");
+        assert_eq!(
+            mine[0].name, "fullscreen",
+            "no trust keys: no trust row, the rest stay"
+        );
+    }
+
+    #[test]
+    fn dialog_rows_replace_remove_and_add() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(
+            &path,
+            "[[agents.claude.dialogs]]\nname = \"fullscreen\"\nmarker = \"fullscreen renderer\"\npick = \"Yes, try it\"\n\
+             [[agents.claude.dialogs]]\nname = \"auto-mode-setup\"\npick = \"\"\n\
+             [[agents.claude.dialogs]]\nname = \"bypass\"\nmarker = \"Bypass Permissions mode\"\nkeys = [\"Down\", \"Enter\"]\n\
+             [[agents.agy.dialogs]]\nname = \"welcome\"\nmarker = \"Welcome\"\nkeys = [\"Enter\"]\n",
+        )
+        .unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        let d = cfg.agents.dialogs("claude");
+        let names: Vec<&str> = d.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "trust",
+                "fullscreen",
+                "auto-mode-default",
+                "effort-default",
+                "bypass"
+            ]
+        );
+        assert_eq!(d[1].marker.as_deref(), Some("fullscreen renderer"));
+        assert_eq!(d[1].answer, Answer::Pick("Yes, try it".into()));
+        assert_eq!(
+            d[4].answer,
+            Answer::Keys(vec!["Down".into(), "Enter".into()])
+        );
+        assert_eq!(cfg.agents.dialogs("agy").len(), 1);
+    }
+
+    #[test]
+    fn dialog_rows_are_checked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        for (body, want) in [
+            (
+                "[[agents.claude.dialogs]]\nname = \"trust\"\nmarker = \"m\"\npick = \"p\"\n",
+                "use trust_keys and trust_marker",
+            ),
+            (
+                "[[agents.claude.dialogs]]\nname = \"x\"\nmarker = \"\"\npick = \"p\"\n",
+                "marker must not be empty",
+            ),
+            (
+                "[[agents.claude.dialogs]]\nname = \"x\"\nmarker = \"m\"\npick = \"p\"\nkeys = [\"Enter\"]\n",
+                "pick or keys, not both",
+            ),
+            (
+                "[[agents.claude.dialogs]]\nname = \"x\"\nmarker = \"m\"\nkeys = [\"\"]\n",
+                "key name must not be empty",
+            ),
+            (
+                "[[agents.claude.dialogs]]\nname = \"\"\nmarker = \"m\"\npick = \"p\"\n",
+                "name must not be empty",
+            ),
+            (
+                "[[agents.claude.dialogs]]\nname = \"x\"\nmarker = \"m\"\n",
+                "needs pick or keys",
+            ),
+            (
+                "[[agents.agy.dialogs]]\nname = \"fullscreen\"\npick = \"\"\n",
+                "needs pick or keys",
+            ),
+            (
+                "[[agents.claude.dialogs]]\nname = \"x\"\nmarker = \"m\"\npick = \"p\"\n[[agents.claude.dialogs]]\nname = \"x\"\nmarker = \"m\"\npick = \"p\"\n",
+                "named twice",
+            ),
+        ] {
+            std::fs::write(&path, body).unwrap();
+            let err = PastorConfig::load(&path).unwrap_err().to_string();
+            assert!(err.contains(want), "{body}: {err}");
+        }
+    }
+
+    /// Claude 2.1's fullscreen renderer has no scrollback to read, and its
+    /// startup offer is gated off by the same variable, so every Claude
+    /// pane gets it under the definition's own env.
+    #[test]
+    fn claude_starts_on_the_classic_renderer_unless_env_says_otherwise() {
+        let key = "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN";
+        let spec = spec_with("claude", &[], &[]);
+        let launch = Agents::default().launch(&spec).unwrap();
+        assert_eq!(launch.env.get(key).map(String::as_str), Some("1"));
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(
+            &path,
+            "[agents.claude]\nenv = { CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN = \"\" }\n[agents.mine]\nkind = \"claude\"\n",
+        )
+        .unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        assert_eq!(
+            cfg.agents
+                .launch(&spec)
+                .unwrap()
+                .env
+                .get(key)
+                .map(String::as_str),
+            Some("")
+        );
+        let mine = spec_with("mine", &[], &[]);
+        assert_eq!(
+            cfg.agents
+                .launch(&mine)
+                .unwrap()
+                .env
+                .get(key)
+                .map(String::as_str),
+            Some("1"),
+            "the kind's default"
+        );
+        let codex = spec_with("codex", &[], &[]);
+        assert!(cfg.agents.launch(&codex).unwrap().env.is_empty());
+    }
+
+    /// Claude 2.1 draws its startup dialogs without numbers, so an earlier
+    /// one in scrollback is cut off at its key hints, not at a menu.
+    #[test]
+    fn an_earlier_unnumbered_dialog_is_cut_at_its_key_hints() {
+        let marker = "Yes, I trust this folder";
+        let trust = "Quick safety check: Is this a project you trust?\n\n \u{276f} No, exit\n   Yes, I trust this folder\n\n Enter to confirm \u{b7} Esc to cancel\n";
+        let offer = "  Try the new fullscreen renderer?\n\n  \u{276f} 1. Yes, try it\n    2. Not now\n\n  Enter to confirm \u{b7} Esc to cancel\n";
+        assert!(shows_trust_marker(trust, marker));
+        assert!(!shows_trust_marker(&format!("{trust}\n{offer}"), marker));
+        assert!(shows_trust_marker(&format!("{offer}\n{trust}"), marker));
+    }
+
+    /// The current dialog's own footer: two hint lines, one wrapped by a
+    /// narrow pane, or a box edge or rule under it. None of these is the
+    /// footer of an earlier dialog, so nothing above them is cut.
+    #[test]
+    fn the_current_dialog_s_own_hints_do_not_cut_it() {
+        let marker = "Yes, I trust this folder";
+        let body = "Quick safety check: Is this a project you trust?\n\n \u{276f} No, exit\n   Yes, I trust this folder\n\n";
+        for footer in [
+            " \u{2191}/\u{2193} to navigate\n Enter to confirm \u{b7} Esc to cancel\n",
+            " Enter to confirm \u{b7}\n Esc to cancel\n",
+            " Enter to confirm \u{b7} Esc to cancel\n\u{2570}\u{2500}\u{2500}\u{2500}\u{256f}\n",
+            " Enter to confirm \u{b7} Esc to cancel\n\u{2500}\u{2500}\u{2500}\u{2500}\n\n",
+        ] {
+            let screen = format!("{body}{footer}");
+            assert!(shows_trust_marker(&screen, marker), "{footer:?}");
+            let offer = "  Try the new fullscreen renderer?\n\n  \u{276f} 1. Yes, try it\n    2. Not now\n\n  Enter to confirm \u{b7} Esc to cancel\n";
+            assert!(
+                !shows_trust_marker(&format!("{screen}\n{offer}"), marker),
+                "{footer:?}: an earlier dialog's footer still cuts"
+            );
+        }
     }
 
     #[test]

@@ -792,6 +792,27 @@ impl Fleet {
             .read()
             .recover()
             .apply(&pick, own.as_deref(), spec)?;
+        // agy's rules are per machine: a task's profile has to be one the
+        // machine's own profile already denies (`config::agy`).
+        if agents.agy_profile(spec)
+            && let Some(own) = own.as_deref()
+        {
+            let own_deny = self.profiles.read().recover().resolve(own)?.deny;
+            let uncovered = crate::config::agy::not_denied_by(&spec.deny, &own_deny);
+            if !uncovered.is_empty() {
+                let profile = spec.profile().unwrap_or_default();
+                return Err(AgentRefusal {
+                    code: crate::config::agy::AGY_PROFILE_MISMATCH,
+                    message: format!(
+                        "profile {profile} denies {} and the own profile of machine {} ({own}) does not; \
+                         agy's rules are per machine, so run the task under that machine's profile \
+                         or on a machine whose own profile is {profile}",
+                        uncovered.join(", "),
+                        machine.unwrap_or("-"),
+                    ),
+                });
+            }
+        }
         let unapplied = agents.lists_unapplied(spec);
         if let Some(source) = spec.agent_source.as_mut() {
             source.lists_unapplied = unapplied;
@@ -927,12 +948,13 @@ impl Fleet {
         // Unpinned, with the agent left to the machine, its kind is known
         // only on the machine: a mismatch here is not the task's to fix. So
         // is the machine's own profile, which decides where `unrestricted`
-        // may run.
+        // may run and which profile an agy machine runs.
         let per_machine = |e: &AgentRefusal| {
             pinned.is_none()
                 && ((e.code == MODEL_KIND_MISMATCH && ask.agent.is_none())
                     || e.code == AGENT_KIND_MISSING
-                    || e.code == PROFILE_NOT_ALLOWED)
+                    || e.code == PROFILE_NOT_ALLOWED
+                    || e.code == crate::config::agy::AGY_PROFILE_MISMATCH)
         };
         let mut landings = Vec::new();
         match self.settle(spec, ask, flock, pinned.as_deref(), asked_by) {
@@ -2436,7 +2458,7 @@ impl Fleet {
 
     /// `PullTrust`: the folder trust saved for pull machine `machine`, and
     /// only its own, so its actor answers its tasks' trust prompts as the
-    /// head's actor answers another machine's (`Actor::auto_trust`).
+    /// head's actor answers another machine's (`Actor::auto_answer`).
     pub fn pull_trust(&self, machine: &str) -> anyhow::Result<Vec<crate::store::TrustedRepo>> {
         self.pull_handle(machine)?;
         Ok(self
@@ -2465,12 +2487,15 @@ impl Fleet {
         } = report;
         let handle = self.pull_handle(machine)?;
         self.heard(&handle);
-        // Once per task, as `Actor::auto_trust` claims it, so a report sent
+        // Once per task, as `Actor::auto_answer` claims it, so a report sent
         // again (after a restart of the serve, say) is not a second event.
         let trust = |task: &Task| -> anyhow::Result<()> {
             if let Some(keys) = &trusted
                 && self.store.claim_trust_sent(task.id, keys)?
             {
+                // The actor claims both for its own tasks: the two tables
+                // agree on a pull machine's task too.
+                self.store.claim_answered(task.id, "trust", keys)?;
                 self.emit(
                     "task.trusted",
                     machine,
@@ -4524,13 +4549,19 @@ impl Daemon {
     /// row again and types into the pane. A task on no machine, or one whose
     /// machine has left the flock, has no agent to type into.
     async fn send(&self, id: i64, input: SendInput) -> IpcResponse {
-        if input.is_empty() {
-            return IpcResponse::error("nothing_to_send", "give text, --key or --trust");
+        if input.is_empty() || input.pick.as_deref().is_some_and(|p| p.trim().is_empty()) {
+            return IpcResponse::error("nothing_to_send", "give text, --key, --trust or --pick");
         }
         if input.trust && (input.text.is_some() || !input.keys.is_empty()) {
             return IpcResponse::error(
                 "usage_error",
                 "--trust sends the agent's own keys; give no text or --key with it",
+            );
+        }
+        if input.pick.is_some() && (input.text.is_some() || !input.keys.is_empty() || input.trust) {
+            return IpcResponse::error(
+                "usage_error",
+                "--pick answers the picker on screen; give no text, --key or --trust with it",
             );
         }
         let task = match self.store.get_task(id) {
@@ -5844,6 +5875,10 @@ mod tests {
             ]
         );
         assert!(d.store().trust_sent(t1.id).unwrap());
+        assert!(
+            d.store().answered(t1.id, "trust").unwrap(),
+            "claimed as the actor claims it, so the two tables agree"
+        );
         // A report without keys says nothing of trust.
         let t3 = queued(&d, "p3", Some("laptop")).await;
         claim(&d, 1, false).await;
@@ -8785,13 +8820,14 @@ mod tests {
         );
     }
 
-    /// A profiled agy task is refused before it starts while its agent has
-    /// no flags and no `own_permissions`, the message naming the field; with
-    /// the field it starts with no permission flag or mode added, and `task
-    /// describe` says its own settings hold, not the profile's lists.
+    /// End to end: a profiled agy task starts with the flags that stop it
+    /// asking and `task describe` says its lists are not passed; on a
+    /// machine whose agy settings lack a rule it fails before `agent.start`,
+    /// naming the rule; `unrestricted`, which denies nothing, runs no probe;
+    /// with `own_permissions` nothing is added or checked.
     #[tokio::test]
-    async fn an_agy_task_under_a_profile_needs_its_own_permissions() {
-        let run_agy = || {
+    async fn an_agy_task_under_a_profile_starts_without_asking_or_fails_naming_the_rule() {
+        let run_agy = |profile: Option<&str>| {
             let IpcRequest::Run {
                 now,
                 preempt,
@@ -8803,7 +8839,7 @@ mod tests {
                 role,
                 description,
                 agent: Some(choice),
-            } = run_profile(Some("develop"), None)
+            } = run_profile(profile, None)
             else {
                 unreachable!()
             };
@@ -8824,19 +8860,71 @@ mod tests {
             }
         };
         let fake = FakeHerdr::new();
-        let (d, _tmp) = profiles_daemon(vec![machine("pi", 2)], &[("pi", 2, fake.clone())]).await;
-        let resp = d.handle(run_agy()).await;
-        let IpcResponse::Error { code, message } = resp else {
-            panic!("{resp:?}")
+        let (d, _tmp) = profiles_daemon(vec![machine("pi", 4)], &[("pi", 4, fake.clone())]).await;
+        let IpcResponse::Task(t) = d.handle(run_agy(Some("develop"))).await else {
+            panic!()
         };
-        assert_eq!(code, "agent_tools_unsupported");
-        assert!(message.contains("own_permissions"), "{message}");
-        assert!(
-            !fake.requests().iter().any(|r| r.method == "agent.start"),
-            "{:?}",
+        assert_eq!(t.profile(), Some("develop"));
+        let reqs = fake.requests();
+        let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
+        assert_eq!(start.params["kind"], "agy");
+        let args: Vec<&str> = start.params["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            &args[args.len() - 3..],
+            ["--dangerously-skip-permissions", "--mode", "accept-edits"]
+        );
+        for d in &t.spec.deny {
+            assert!(!args.contains(&d.as_str()), "{args:?}");
+        }
+        let text = crate::cli::task_detail(&t);
+        assert!(text.contains("(agy takes no lists:"), "{text}");
+
+        fake.set_agy_settings(Some(crate::provision::agy::AgySettings {
+            content: Some(r#"{"permissions":{"deny":["command(sudo)"]}}"#.into()),
+            link: false,
+        }));
+        let before = fake
+            .requests()
+            .iter()
+            .filter(|r| r.method == "agent.start")
+            .count();
+        let IpcResponse::Task(t) = d.handle(run_agy(Some("develop"))).await else {
+            panic!()
+        };
+        let t = d.store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(t.state, TaskState::Failed);
+        let err = t.error.clone().unwrap_or_default();
+        assert!(err.contains("agy_permissions_missing"), "{err}");
+        assert!(err.contains("command(rm -rf)"), "{err}");
+        assert!(err.contains("command(git push --force)"), "{err}");
+        assert!(!err.contains("command(sudo)"), "{err}");
+        assert_eq!(
             fake.requests()
+                .iter()
+                .filter(|r| r.method == "agent.start")
+                .count(),
+            before
         );
 
+        // `unrestricted` denies nothing: no probe, no refusal.
+        let mut config = profiles_config();
+        config.defaults.profile = Some("unrestricted".into());
+        apply_config(&d, &config).await;
+        fake.set_agy_settings(None);
+        let IpcResponse::Task(t) = d.handle(run_agy(Some("unrestricted"))).await else {
+            panic!()
+        };
+        assert_eq!(
+            d.store.get_task(t.id).unwrap().unwrap().state,
+            TaskState::Running
+        );
+
+        // `own_permissions`: its args alone, nothing checked.
         let mut config = profiles_config();
         config.agents.0.insert(
             "agy".into(),
@@ -8846,30 +8934,17 @@ mod tests {
             },
         );
         apply_config(&d, &config).await;
-        let resp = d.handle(run_agy()).await;
-        let IpcResponse::Task(t) = resp else {
-            panic!("{resp:?}")
+        let IpcResponse::Task(t) = d.handle(run_agy(Some("develop"))).await else {
+            panic!()
         };
-        assert_eq!(t.profile(), Some("develop"));
-        assert!(!t.spec.deny.is_empty());
         let reqs = fake.requests();
-        let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
-        assert_eq!(start.params["kind"], "agy", "{:?}", start.params);
+        let start = reqs.iter().rfind(|r| r.method == "agent.start").unwrap();
         let args: Vec<&str> = start.params["args"]
             .as_array()
             .map(|a| a.iter().map(|a| a.as_str().unwrap()).collect())
             .unwrap_or_default();
         assert_eq!(args, t.spec.agent_args, "{args:?}");
-        for d in &t.spec.deny {
-            assert!(!args.contains(&d.as_str()), "{args:?}");
-        }
-        let text = crate::cli::task_detail(&t);
-        assert!(
-            text.contains(
-                "(not applied: agent agy's permissions are in its own settings on the machine)"
-            ),
-            "{text}"
-        );
+        assert!(crate::cli::task_detail(&t).contains("own settings on the machine"));
     }
 
     /// A machine's profile reaches its tasks, before its flock's; a name
@@ -8988,6 +9063,87 @@ mod tests {
         };
         let text = crate::describe::machine_text(&m);
         assert!(text.contains("profile:     unrestricted"), "{text}");
+    }
+
+    /// agy's rules are per machine, so a profiled agy task runs only on a
+    /// machine whose own profile denies everything the task's does: an
+    /// unpinned `review` task skips a `develop` machine for a `review` one,
+    /// pinned to the `develop` machine it is refused, and a machine with no
+    /// own profile is tried.
+    #[tokio::test]
+    async fn a_profiled_agy_task_needs_a_machine_whose_own_profile_covers_it() {
+        let dev = MachineConfig {
+            profile: Some("develop".into()),
+            ..machine("dev", 2)
+        };
+        let rev = MachineConfig {
+            profile: Some("review".into()),
+            ..machine("rev", 1)
+        };
+        let (d, _tmp) = profiles_daemon(
+            vec![dev, rev, machine("pi", 2)],
+            &[
+                ("dev", 2, FakeHerdr::new()),
+                ("rev", 1, FakeHerdr::new()),
+                ("pi", 2, FakeHerdr::new()),
+            ],
+        )
+        .await;
+        let run = |profile: Option<&str>, machine: Option<&str>| {
+            let IpcRequest::Run {
+                now,
+                preempt,
+                summary,
+                prompt,
+                spec,
+                flock,
+                priority,
+                role,
+                description,
+                agent: Some(choice),
+            } = run_profile(profile, machine)
+            else {
+                unreachable!()
+            };
+            IpcRequest::Run {
+                now,
+                preempt,
+                summary,
+                prompt,
+                spec,
+                flock,
+                priority,
+                role,
+                description,
+                agent: Some(AgentChoice {
+                    agent: Some("agy".into()),
+                    ..choice
+                }),
+            }
+        };
+        let resp = d.handle(run(Some("review"), Some("dev"))).await;
+        let IpcResponse::Error { code, message } = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(code, crate::config::agy::AGY_PROFILE_MISMATCH);
+        assert!(message.contains("Bash(git push:*)"), "{message}");
+        assert!(message.contains("develop"), "{message}");
+
+        let IpcResponse::Task(t) = d.handle(run(Some("review"), None)).await else {
+            panic!()
+        };
+        assert_eq!(t.machine.as_deref(), Some("rev"));
+        // rev is full and dev does not cover review; pi has no own profile,
+        // so it is tried and the dispatch check decides.
+        let IpcResponse::Task(t) = d.handle(run(Some("review"), None)).await else {
+            panic!()
+        };
+        assert_eq!(t.machine.as_deref(), Some("pi"));
+        // develop on the develop machine is fine.
+        let IpcResponse::Task(t) = d.handle(run(Some("develop"), Some("dev"))).await else {
+            panic!()
+        };
+        assert_eq!(t.machine.as_deref(), Some("dev"));
     }
 
     /// A profile dropped from pastor.toml while a task waits for a machine
@@ -11733,6 +11889,29 @@ mod tests {
             .handle(IpcRequest::TaskSend {
                 id: t.id,
                 input: crate::machine::SendInput::default(),
+            })
+            .await;
+        assert_eq!(error_code(resp), "nothing_to_send");
+        // --pick with text or --key is a usage error, like --trust.
+        let resp = d
+            .handle(IpcRequest::TaskSend {
+                id: t.id,
+                input: crate::machine::SendInput {
+                    pick: Some("No".into()),
+                    keys: vec!["esc".into()],
+                    ..Default::default()
+                },
+            })
+            .await;
+        assert_eq!(error_code(resp), "usage_error");
+        // An empty --pick would match every option; it is nothing to send.
+        let resp = d
+            .handle(IpcRequest::TaskSend {
+                id: t.id,
+                input: crate::machine::SendInput {
+                    pick: Some("  ".into()),
+                    ..Default::default()
+                },
             })
             .await;
         assert_eq!(error_code(resp), "nothing_to_send");

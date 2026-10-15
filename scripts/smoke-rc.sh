@@ -143,7 +143,8 @@ if [ "$build" = pass ]; then
     smoke=$(suite smoke smoke SESSION="$SESSION")
     if [ -n "$PROFILES" ]; then
         profiles=$(suite smoke-profiles smoke-profiles \
-            PASTOR="$PASTOR" REPO="$REPO" CLAUDE="${CLAUDE:-}" OPENCODE="${OPENCODE:-}")
+            PASTOR="$PASTOR" REPO="$REPO" CLAUDE="${CLAUDE:-}" OPENCODE="${OPENCODE:-}" \
+            AGY="${AGY:-}")
     fi
 elif [ -n "$PROFILES" ]; then
     profiles="not run"

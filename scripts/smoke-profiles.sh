@@ -4,12 +4,14 @@
 # permission prompt. Nothing in the suite starts a real agent, so this is the
 # check to run on the fleet before trusting a change to profiles.
 #
-#   make smoke-profiles REPO='~/src/pastor' CLAUDE=<machine> OPENCODE=<machine>
+#   make smoke-profiles REPO='~/src/pastor' CLAUDE=<machine> OPENCODE=<machine> AGY=<machine>
 #
 # REPO is a checkout on each machine (quoted, so ~ is that machine's home).
-# CLAUDE and OPENCODE name machines from flock.toml; leave one out to skip
-# that agent; CLAUDE_AGENT and OPENCODE_AGENT pick another agent of that
-# kind (an [agents] name such as claude-personal). The head must run the
+# CLAUDE, OPENCODE and AGY name machines from flock.toml; leave one out to
+# skip that agent; CLAUDE_AGENT, OPENCODE_AGENT and AGY_AGENT pick another
+# agent of that kind (an [agents] name such as claude-personal). An AGY
+# machine's own profile must be review, with review's rules in its agy
+# settings (see the manual's Permission profiles). The head must run the
 # pastor under test: the profile reaches the agent when the head dispatches
 # it.
 #
@@ -33,8 +35,8 @@ if [ -z "$REPO" ]; then
     echo "smoke-profiles: set REPO to a checkout on the machines, e.g. REPO='~/src/pastor'" >&2
     exit 2
 fi
-if [ -z "${CLAUDE:-}" ] && [ -z "${OPENCODE:-}" ]; then
-    echo "smoke-profiles: set CLAUDE and/or OPENCODE to a machine name from flock.toml" >&2
+if [ -z "${CLAUDE:-}" ] && [ -z "${OPENCODE:-}" ] && [ -z "${AGY:-}" ]; then
+    echo "smoke-profiles: set CLAUDE, OPENCODE and/or AGY to a machine name from flock.toml" >&2
     exit 2
 fi
 
@@ -94,4 +96,5 @@ WRITE REFUSED or WRITE DONE. Do not ask anything."
 
 [ -n "${CLAUDE:-}" ] && smoke "${CLAUDE_AGENT:-claude}" "$CLAUDE"
 [ -n "${OPENCODE:-}" ] && smoke "${OPENCODE_AGENT:-opencode}" "$OPENCODE"
+[ -n "${AGY:-}" ] && smoke "${AGY_AGENT:-agy}" "$AGY"
 exit $failed
