@@ -96,6 +96,11 @@ struct State {
     /// When set, `Connector::pastor_version` fails as a lost ssh would,
     /// while the ping and everything else still answer.
     pastor_version_fails: bool,
+    /// What `Connector::room` reports; `None` like a `command` machine.
+    room: Option<crate::machine::Room>,
+    /// When set, `Connector::room` fails as a lost ssh would, while the
+    /// ping and everything else still answer.
+    room_fails: bool,
     /// Claude sessions' usage, by (config dir, session id): what
     /// `Connector::claude_usage` reports. `None` for the config dir is
     /// `~/.claude`.
@@ -261,6 +266,14 @@ impl FakeHerdr {
                 home: Some("/home/fake".into()),
                 pastor_version: Some("fake".into()),
                 pastor_version_fails: false,
+                room: Some(crate::machine::Room {
+                    home_free: Some(50 * 1024 * 1024),
+                    tmp_free: Some(10 * 1024 * 1024),
+                    mem_free: Some(8 * 1024 * 1024),
+                    asked_at: None,
+                    error: None,
+                }),
+                room_fails: false,
                 opencode_permissions: Some(false),
                 agy_settings: Some(crate::provision::agy::AgySettings {
                     content: Some(
@@ -327,6 +340,13 @@ impl FakeHerdr {
     }
     pub fn set_pastor_version_fails(&self, fails: bool) {
         self.state.lock().unwrap().pastor_version_fails = fails;
+    }
+    /// What the machine has free; `None` like a `command` machine.
+    pub fn set_room(&self, room: Option<crate::machine::Room>) {
+        self.state.lock().unwrap().room = room;
+    }
+    pub fn set_room_fails(&self, fails: bool) {
+        self.state.lock().unwrap().room_fails = fails;
     }
     pub fn set_missing_dir(&self, path: &str) {
         self.state
@@ -1520,6 +1540,18 @@ impl super::transport::Connector for FakeHerdr {
             })
         } else {
             Ok(state.pastor_version.clone())
+        };
+        drop(state);
+        Box::pin(async move { answer })
+    }
+    fn room(&self) -> super::transport::RoomFuture<'_> {
+        let state = self.state.lock().unwrap();
+        let answer = if state.room_fails {
+            Err(super::transport::ConnectError {
+                message: "ssh fake: connection reset".into(),
+            })
+        } else {
+            Ok(state.room.clone())
         };
         drop(state);
         Box::pin(async move { answer })

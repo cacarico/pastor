@@ -222,6 +222,27 @@ impl FlockSeat {
     }
 }
 
+/// What a machine has free, as `Connector::room` last read it: disk under
+/// `$HOME` and `/tmp` and memory, in KiB (`df -Pk`'s 1024-byte blocks,
+/// `/proc/meminfo`'s kB). Each number is `None` where the machine could not
+/// say: a home `df` cannot read, memory on macOS, which has no
+/// `/proc/meminfo`. Read at connect and every `MachineSettings::room_every`;
+/// a probe that fails or times out sets `error` and keeps the numbers last
+/// read with their `asked_at`, so a reader can tell how old they are. A
+/// floor on these numbers is another card's; this one only keeps them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Room {
+    pub home_free: Option<u64>,
+    pub tmp_free: Option<u64>,
+    pub mem_free: Option<u64>,
+    /// When the numbers were read. `None` until a probe answers.
+    #[serde(default)]
+    pub asked_at: Option<DateTime<Utc>>,
+    /// What the last probe failed with, `None` once one answers again.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MachineStatus {
     pub name: String,
