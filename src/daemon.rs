@@ -3539,6 +3539,9 @@ pub struct Daemon {
     /// `ssh-keygen -R` and `ssh -O exit` for a removed machine go through
     /// this, so tests script the answer instead of touching the host.
     runner: Arc<dyn crate::setup::Runner + Send + Sync>,
+    /// Downloads into the artifact cache (`ArtifactLocate`) go through this,
+    /// so tests serve local files instead of the network.
+    fetch: Arc<dyn crate::artifacts::Fetch + Send + Sync>,
 }
 
 /// The longest IPC request line, newline excluded. The largest real one is a
@@ -3808,6 +3811,7 @@ impl Daemon {
             orchestrators,
             authorized_keys: crate::authkeys::default_file(),
             runner: Arc::new(crate::setup::SystemRunner),
+            fetch: Arc::new(crate::artifacts::CurlFetch),
         })
     }
 
@@ -4703,6 +4707,11 @@ impl Daemon {
                 Ok(task) => IpcResponse::Task(task),
                 Err(err) => cli_error(err),
             },
+            IpcRequest::ArtifactLocate {
+                name,
+                version,
+                target,
+            } => self.locate_artifact(&name, &version, &target).await,
             IpcRequest::BootstrapReport { machine, result } => {
                 match self.fleet.report_bootstrap(&machine, result) {
                     Ok(()) => IpcResponse::Text(format!("{machine}: bootstrap recorded")),
@@ -4826,6 +4835,36 @@ impl Daemon {
             tasks,
             skipped: out.skipped,
             refused: out.refused,
+        }
+    }
+
+    /// `ArtifactLocate`: the artifact in the cache, fetched and checked
+    /// first when it is not there. A download and the hashing block, so the
+    /// whole of it runs off the runtime's workers. pastor.toml is read here,
+    /// not at start, so an edited `[provision] herdr_index` counts at once.
+    async fn locate_artifact(&self, name: &str, version: &str, target: &str) -> IpcResponse {
+        let a = match crate::artifacts::Artifact::new(name, version, target) {
+            Ok(a) => a,
+            Err(err) => return IpcResponse::error(err.code(), err),
+        };
+        let paths = self.paths.clone();
+        let fetch = self.fetch.clone();
+        let rt = tokio::runtime::Handle::current();
+        let found = tokio::task::spawn_blocking(move || {
+            let cfg = PastorConfig::load(&paths.config_file())?.provision;
+            let (path, sha256) =
+                rt.block_on(crate::artifacts::ensure(&paths, &cfg, &a, fetch.as_ref()))?;
+            let size = std::fs::metadata(&path)?.len();
+            anyhow::Ok((path, sha256, size))
+        })
+        .await;
+        match found {
+            Ok(Ok((path, sha256, size))) => IpcResponse::Artifact { path, sha256, size },
+            Ok(Err(err)) => match crate::artifacts::error_code(&err) {
+                Some(code) => IpcResponse::error(code, format!("{err:#}")),
+                None => cli_error(err),
+            },
+            Err(err) => IpcResponse::error("runtime_error", err),
         }
     }
 
@@ -7087,6 +7126,77 @@ mod tests {
             herdr_version: None,
             pastor_version: None,
         }
+    }
+
+    /// `ArtifactLocate` fills the cache from the `[provision]` index and
+    /// answers where the checked file is, its sum and its size; a bad part
+    /// or a sum that does not match keeps its own code.
+    #[tokio::test]
+    async fn artifact_locate_returns_path_and_sum() {
+        let (mut d, tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("herdr-bin"), b"herdr-binary").unwrap();
+        let sum = |b: &[u8]| -> String {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(b)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        let index = |want: &str| {
+            serde_json::json!({"releases": {"0.9.5": {
+                "assets": {"linux-aarch64": format!("https://herdr.example/{}", src.join("herdr-bin").display())},
+                "sha256": {"linux-aarch64": want},
+            }}})
+        };
+        // The index is a `file://` fixture, as in `artifacts`' own tests;
+        // the asset URL must be https, so the fetch maps it back to a file.
+        struct HttpsToFile;
+        impl crate::artifacts::Fetch for HttpsToFile {
+            fn get(&self, url: &str, to: &std::path::Path) -> anyhow::Result<()> {
+                let path = url
+                    .strip_prefix("https://herdr.example")
+                    .or_else(|| url.strip_prefix("file://"))
+                    .unwrap_or(url);
+                std::fs::copy(path, to)?;
+                Ok(())
+            }
+        }
+        d.fetch = Arc::new(HttpsToFile);
+        let index_path = src.join("latest.json");
+        let mut config = test_config();
+        config.provision.herdr_index = Some(format!("file://{}", index_path.display()));
+        std::fs::write(d.paths.config_file(), toml::to_string(&config).unwrap()).unwrap();
+        let locate = |target: &str| IpcRequest::ArtifactLocate {
+            name: "herdr".into(),
+            version: "0.9.5".into(),
+            target: target.into(),
+        };
+
+        std::fs::write(&index_path, index(&sum(b"something else")).to_string()).unwrap();
+        let resp = d.handle(locate("linux-aarch64")).await;
+        assert!(
+            matches!(&resp, IpcResponse::Error { code, .. } if code == "artifact_checksum_mismatch"),
+            "{resp:?}"
+        );
+
+        std::fs::write(&index_path, index(&sum(b"herdr-binary")).to_string()).unwrap();
+        let resp = d.handle(locate("linux-aarch64")).await;
+        let IpcResponse::Artifact { path, sha256, size } = resp else {
+            panic!("{resp:?}")
+        };
+        let a = crate::artifacts::Artifact::new("herdr", "0.9.5", "linux-aarch64").unwrap();
+        assert_eq!(path, crate::artifacts::cache_path(&d.paths, &a));
+        assert_eq!(sha256, sum(b"herdr-binary"));
+        assert_eq!(size, 12);
+        assert_eq!(std::fs::read(&path).unwrap(), b"herdr-binary");
+
+        let resp = d.handle(locate("..")).await;
+        assert!(
+            matches!(&resp, IpcResponse::Error { code, .. } if code == "invalid_artifact"),
+            "{resp:?}"
+        );
     }
 
     #[tokio::test]

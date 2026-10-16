@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -42,7 +42,8 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 /// `TaskReport::limit`). 31: saved trust on pull machines (`PullTrust`,
 /// `TaskReport::trusted`). 32: a pull machine's own versions
 /// (`TaskClaim::herdr_version`, `TaskClaim::pastor_version`), bootstrap
-/// reports (`BootstrapReport`) and the machine state they record.
+/// reports (`BootstrapReport`) and the machine state they record, and the
+/// artifact cache (`ArtifactLocate`).
 pub const IPC_PROTOCOL: u32 = 32;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
@@ -233,6 +234,11 @@ pub const PULL_VERSIONS_PROTOCOL: u32 = 32;
 /// dispatch never learns to skip the machine.
 pub const BOOTSTRAP_PROTOCOL: u32 = 32;
 
+/// The first protocol whose head answers `ArtifactLocate` from its cache of
+/// the binaries it puts on a machine. An older one refuses the request as
+/// unreadable.
+pub const ARTIFACT_PROTOCOL: u32 = 32;
+
 /// The first protocol whose head honours `Run::priority` and knows
 /// `TaskPriority`. An older one would queue the task at its own level
 /// without a word, or refuse the request as unreadable.
@@ -356,6 +362,8 @@ const REPORT_TRUSTED: &str =
 const PULL_VERSIONS: &str =
     "predates a pull machine's own versions, and would drop the claim's herdr and pastor versions";
 const BOOTSTRAP: &str = "predates bootstrap reports, and would refuse the request without recording the machine's state";
+const ARTIFACT: &str =
+    "predates the artifact cache, and would refuse to say where pastor or herdr is";
 
 /// How long a head's `Pong` settles the protocol check before it is asked
 /// again: a long-lived sender (a headless serve) sees a restarted head
@@ -786,6 +794,15 @@ pub enum IpcRequest {
         machine: String,
         result: crate::bootstrap::Outcome,
     },
+    /// Where the head's cache keeps `name` (`pastor` or `herdr`) at
+    /// `version` for `target`, fetched and checked first when it is not
+    /// there. Only the path, sum and size cross the socket; `pastor bridge
+    /// --fetch` streams the file itself. Answers `Artifact`.
+    ArtifactLocate {
+        name: String,
+        version: String,
+        target: String,
+    },
     /// Every usage limit the head keeps. Answers `Limits`.
     LimitList,
     /// Forget `account`'s limits, only `model`'s when given. Answers
@@ -1054,6 +1071,7 @@ impl IpcRequest {
             }
             R::PullTrust { .. } => need.at(PULL_TRUST_PROTOCOL, PULL_TRUST),
             R::BootstrapReport { .. } => need.at(BOOTSTRAP_PROTOCOL, BOOTSTRAP),
+            R::ArtifactLocate { .. } => need.at(ARTIFACT_PROTOCOL, ARTIFACT),
             R::LimitList | R::LimitClear { .. } => need.at(LIMIT_PROTOCOL, LIMITS),
             R::OrchestratorStart { .. } | R::OrchestratorStop { .. } => {
                 need.at(SESSION_PROTOCOL, SESSION);
@@ -1089,6 +1107,9 @@ impl IpcRequest {
             | IpcRequest::OrchestratorDescribe { .. }
             | IpcRequest::LimitList
             | IpcRequest::Queue { .. } => false,
+            // It may download into the cache, but changes no task, job or
+            // machine.
+            IpcRequest::ArtifactLocate { .. } => false,
             IpcRequest::FileGet { .. } | IpcRequest::JobDescribe { .. } => false,
             IpcRequest::Reload
             | IpcRequest::Tick { .. }
@@ -1260,6 +1281,12 @@ pub enum IpcResponse {
     Orchestrators(Vec<crate::orchestrator::OrchestratorStatus>),
     Orchestrator(crate::orchestrator::OrchestratorDescription),
     Limits(Vec<crate::limit::AccountLimit>),
+    /// `ArtifactLocate`: the checked file in the head's cache.
+    Artifact {
+        path: PathBuf,
+        sha256: String,
+        size: u64,
+    },
 }
 
 /// One of the head's config files as `FileGet` found it.
@@ -2379,6 +2406,13 @@ mod tests {
                 "bootstrap reports",
             ),
             (
+                req(
+                    serde_json::json!({"op": "artifact_locate", "name": "herdr", "version": "0.9.5", "target": "linux-x86_64"}),
+                ),
+                ARTIFACT_PROTOCOL,
+                "artifact cache",
+            ),
+            (
                 req(serde_json::json!({"op": "orchestrator_list"})),
                 ORCHESTRATOR_PROTOCOL,
                 "orchestrator files",
@@ -2454,6 +2488,7 @@ mod tests {
             PULL_TRUST_PROTOCOL,
             PULL_VERSIONS_PROTOCOL,
             BOOTSTRAP_PROTOCOL,
+            ARTIFACT_PROTOCOL,
         ] {
             assert!(covered.contains(&p), "no request needs protocol {p}");
         }

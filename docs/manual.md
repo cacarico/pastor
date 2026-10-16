@@ -392,8 +392,8 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `leave_on_head` | `pastor leave` on a machine where `pastor serve` runs as the head for this login |
 | `leave_unsupported_platform` | `pastor leave` on a platform with neither systemd nor launchd units to remove |
 | `machine_exists` | `machine add` of a machine that exists |
-| `invalid_artifact` | a binary to fetch named with a part that is not a plain name |
-| `artifact_checksum_mismatch` | a downloaded pastor or herdr whose sha256 is not the published one; nothing is cached |
+| `invalid_artifact` | a binary to fetch named with a part that is not a plain name, or a cached path outside `<state>/artifacts` |
+| `artifact_checksum_mismatch` | a downloaded pastor or herdr whose sha256 is not the published one, nothing cached; or a cached file whose size or sha256 is not what the head answered, nothing streamed |
 | `machine_not_connected` | `task run --now` on a machine that is not connected |
 | `machine_shutting_down` | the machine's actor is stopping; try again |
 | `model_kind_mismatch` | the task's model is for another kind of agent |
@@ -3857,14 +3857,32 @@ A pull machine's shepherd gets a line of its own:
 `pastor machine authorized-key pi-1 --key <file> --shepherd` prints one that
 runs `<this pastor> bridge --shepherd --machine pi-1`, marked
 `pastor:machine:pi-1`. That bridge passes on what the agent's does, plus
-claiming and reporting `pi-1`'s tasks, reading its saved trust, job submits
-and the events about `pi-1`. It sets the machine of a claim, a report or a
-trust read to `pi-1` whatever the request said, and answers anything else
+claiming and reporting `pi-1`'s tasks, reading its saved trust, job submits,
+the events about `pi-1`, its bootstrap report and artifact lookups. It sets
+the machine of a claim, a report, a trust read or a bootstrap report to
+`pi-1` whatever the request said, and answers anything else
 `not_allowed_for_shepherd`. A job submit's `[dispatch]` gets `machine =
 "pi-1"` the same way, so a shepherd's jobs run only on its own machine; one
-that sets `agent_args`, `allow`, `deny`, `profile` or `tags`, or names a
-`flock` `pi-1` is not in, is refused `not_allowed_for_shepherd`, since those
-pick the agent's arguments and permissions or other machines. Each claim
+that sets `agent_args`, `allow`, `deny`, `agent_source` or `tags`, or names
+a `flock` `pi-1` is not in, is refused `not_allowed_for_shepherd`, since
+those pick the agent's arguments and permissions or other machines. A
+`profile` may be set: the head never runs it past what `pi-1`'s own profile
+allows, so `unrestricted` still needs `pi-1` to be `unrestricted`. The job
+reaches the head as `pi-1.<job>`, so the head's seen keys of one pull
+machine's jobs are never another's or a head job's; a job name with a `.`
+of its own is refused `not_allowed_for_shepherd`, since `pi` with `1.x`
+would be `pi.1` with `x`. The shepherd keeps its own seen keys under the
+plain name.
+
+The same line fetches the binaries a pull machine installs:
+`pastor bridge --shepherd --machine pi-1 --fetch herdr 0.9.5 linux-x86_64`
+asks the head where its artifact cache (`<state>/artifacts`) keeps that
+file, filling the cache first when it is not there, and streams the file
+raw to stdout; only its path, sha256 and size cross the head's socket. The
+bridge refuses a path that does not resolve inside the cache
+(`invalid_artifact`) and checks the file's size and sha256 against the
+head's answer before it writes a byte (`artifact_checksum_mismatch`). A
+failure goes to stderr as JSON, since stdout is the binary. Each claim
 carries the shepherd's herdr version (as its herdr answers ping) and pastor
 version, which the head keeps for that machine; a version longer than 64
 characters or with anything but letters, digits, `.`, `+` and `-` is

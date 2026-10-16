@@ -220,13 +220,14 @@ pub async fn answer_agent(socket: &Path, machine: &str, line: &[u8]) -> anyhow::
 /// The reply for one request line from the shepherd on `machine`: everything
 /// `answer_agent` allows (`answer_common`), plus claiming and reporting its
 /// own tasks, reading its saved trust, submitting jobs, and reading its own
-/// events. `TaskClaim`, `TaskReport` and `PullTrust` get `machine`
-/// overwritten with `machine`, whatever the request asked for, so a pull
-/// machine's shepherd can only ever claim and report for itself (a hijacked
-/// one cannot take another machine's tasks). A `JobSubmit`'s dispatch is
-/// pinned to `machine` the same way, and refused when it picks the agent's
-/// arguments or permissions or another flock (`pin_dispatch`). `EventsSince`
-/// is cut to the
+/// events, reporting its bootstrap and locating artifacts. `TaskClaim`,
+/// `TaskReport`, `PullTrust` and `BootstrapReport` get `machine` overwritten
+/// with `machine`, whatever the request asked for, so a pull machine's
+/// shepherd can only ever claim and report for itself (a hijacked one cannot
+/// take another machine's tasks). A `JobSubmit`'s dispatch is pinned to
+/// `machine` the same way, and refused when it picks the agent's arguments
+/// or permissions or another flock (`pin_dispatch`); its job name is put
+/// under `machine`'s (`shepherd_job_name`). `EventsSince` is cut to the
 /// records about `machine`. Anything else is refused here and never reaches
 /// the head.
 pub async fn answer_shepherd(socket: &Path, machine: &str, line: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -292,12 +293,30 @@ pub async fn answer_shepherd(socket: &Path, machine: &str, line: &[u8]) -> anyho
             )
             .await
         }
+        IpcRequest::BootstrapReport { result, .. } => {
+            ask(
+                socket,
+                &IpcRequest::BootstrapReport {
+                    machine: machine.to_string(),
+                    result,
+                },
+                None,
+            )
+            .await
+        }
+        // Read-only, and every part is checked by the head before it
+        // becomes a path (`artifacts::Artifact::new`).
+        IpcRequest::ArtifactLocate { .. } => ask(socket, &req, None).await,
         IpcRequest::JobSubmit {
             job,
             dispatch,
             prompt,
             items,
         } => {
+            let job = match shepherd_job_name(machine, &job) {
+                Ok(job) => job,
+                Err(why) => return refuse(NOT_ALLOWED_FOR_SHEPHERD, why),
+            };
             let dispatch = match pin_dispatch(socket, machine, dispatch).await? {
                 Ok(dispatch) => dispatch,
                 Err(why) => return refuse(NOT_ALLOWED_FOR_SHEPHERD, why),
@@ -336,27 +355,146 @@ pub async fn answer_shepherd(socket: &Path, machine: &str, line: &[u8]) -> anyho
         other => refuse(
             NOT_ALLOWED_FOR_SHEPHERD,
             format!(
-                "the shepherd on {machine} may ping, list its flock's tasks, show, read or end its machine's tasks, claim and report its tasks, read its saved trust, submit jobs, and read its own events; not {}",
+                "the shepherd on {machine} may ping, list its flock's tasks, show, read or end its machine's tasks, claim and report its tasks, read its saved trust, submit jobs, read its own events, report its bootstrap and locate artifacts; not {}",
                 op_name(&other)
             ),
         ),
     }
 }
 
+/// `pastor bridge --shepherd --fetch`: asks the head on `socket` where its
+/// cache keeps the artifact (`ArtifactLocate`), then streams that file to
+/// `output` raw; the binary never crosses the head's socket, which caps a
+/// request at 1 MiB. The path must resolve under `<state_dir>/artifacts`
+/// (`invalid_artifact` otherwise), and the file is hashed and measured
+/// again, from the same open handle that is then streamed, against what the
+/// head answered (`artifact_checksum_mismatch`), so nothing is written to
+/// `output` unless it is the file the head vouched for.
+pub async fn fetch(
+    socket: &Path,
+    state_dir: &Path,
+    name: &str,
+    version: &str,
+    target: &str,
+    mut output: impl AsyncWrite + Unpin,
+) -> anyhow::Result<()> {
+    let req = IpcRequest::ArtifactLocate {
+        name: name.into(),
+        version: version.into(),
+        target: target.into(),
+    };
+    let reply = ask(socket, &req, None).await?;
+    let (path, sha256, size) = match serde_json::from_slice::<IpcResponse>(&reply) {
+        Ok(IpcResponse::Artifact { path, sha256, size }) => (path, sha256, size),
+        Ok(IpcResponse::Error { code, message }) => return Err(CliError::err(&code, message)),
+        _ => {
+            return Err(CliError::err(
+                "runtime_error",
+                "the head answered an artifact request with something else",
+            ));
+        }
+    };
+    let what = format!("{name} {version} {target}");
+    let cache = state_dir.join("artifacts");
+    let file =
+        tokio::task::spawn_blocking(move || checked_file(&cache, &path, &sha256, size, &what))
+            .await??;
+    // Plain std reads, a chunk at a time: tokio's `fs` is not built in, and
+    // this process serves only this one stream, so a short blocking read
+    // holds up nothing else.
+    let mut file = std::io::Read::take(file, size);
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = std::io::Read::read(&mut file, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        output.write_all(&buf[..n]).await?;
+    }
+    output.flush().await?;
+    Ok(())
+}
+
+/// The file at `path`, opened and rewound, once it is known to resolve under
+/// `cache` and to hash to `sha256` at `size` bytes. One handle does both, so
+/// a file swapped after the check is never the one sent.
+fn checked_file(
+    cache: &Path,
+    path: &Path,
+    sha256: &str,
+    size: u64,
+    what: &str,
+) -> anyhow::Result<std::fs::File> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek};
+
+    let invalid = |why: String| CliError::err("invalid_artifact", why);
+    let cache = std::fs::canonicalize(cache)
+        .map_err(|e| invalid(format!("no artifact cache at {}: {e}", cache.display())))?;
+    let real =
+        std::fs::canonicalize(path).map_err(|e| invalid(format!("{}: {e}", path.display())))?;
+    if !real.starts_with(&cache) {
+        return Err(invalid(format!(
+            "{} is outside the artifact cache {}",
+            path.display(),
+            cache.display()
+        )));
+    }
+    let mut file =
+        std::fs::File::open(&real).map_err(|e| invalid(format!("{}: {e}", real.display())))?;
+    let mismatch =
+        |why: String| CliError::err("artifact_checksum_mismatch", format!("{what}: {why}"));
+    let mut hasher = Sha256::new();
+    let read = std::io::copy(&mut (&mut file).take(size + 1), &mut hasher)?;
+    if read != size {
+        return Err(mismatch(format!(
+            "the head said {size} bytes, the file has {}",
+            if read > size {
+                "more".to_string()
+            } else {
+                read.to_string()
+            }
+        )));
+    }
+    let got: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    if !got.eq_ignore_ascii_case(sha256) {
+        return Err(mismatch(format!(
+            "the head said sha256 {sha256}, the file has {got}"
+        )));
+    }
+    file.rewind()?;
+    Ok(file)
+}
+
 /// The `[dispatch]` keys a shepherd's `JobSubmit` may not set: they choose
 /// the agent's arguments or permissions (`agent_args`, `allow`, `deny`,
-/// `profile`, `agent_source`) or the machines its tasks may land on
-/// (`tags`, `tag`). `machine` is overwritten instead, and `flock` checked
-/// against the machine's own (`pin_dispatch`).
-const SHEPHERD_DISPATCH_REFUSED: &[&str] = &[
-    "agent_args",
-    "allow",
-    "deny",
-    "profile",
-    "agent_source",
-    "tags",
-    "tag",
-];
+/// `agent_source`) or the machines its tasks may land on (`tags`, `tag`).
+/// `machine` is overwritten instead, and `flock` checked against the
+/// machine's own (`pin_dispatch`). `profile` may be set: the head never
+/// lets one go past what the machine's own profile allows (`unrestricted`
+/// runs only where that is `unrestricted` too).
+const SHEPHERD_DISPATCH_REFUSED: &[&str] =
+    &["agent_args", "allow", "deny", "agent_source", "tags", "tag"];
+
+/// The name a shepherd's job goes to the head under: `<machine>.<job>`, so
+/// the head's `seen` keys (kept by job name) of one pull machine's jobs are
+/// never another's, nor a head job's. A job name cannot hold `/`
+/// (`config::job::check_name`), so the separator is `.`, and a `.` in the
+/// job's own name is refused: a machine name may hold one, and `pi` with
+/// `1.x` would otherwise be `pi.1` with `x`. A machine name that makes no
+/// job name (upper case, too long) is left to the head to refuse.
+fn shepherd_job_name(machine: &str, job: &str) -> Result<String, String> {
+    if job.contains('.') {
+        return Err(format!(
+            "the shepherd on {machine} may not submit job {job:?}: a shepherd's job name holds no '.', which joins it to its machine's"
+        ));
+    }
+    Ok(format!("{machine}.{job}"))
+}
 
 /// A shepherd's job `dispatch` table, pinned to `machine`: `machine` set to
 /// it whatever was sent, and `Err` with the reason for a table that is not
@@ -1032,7 +1170,7 @@ mod tests {
         let resp = head.ask_as_shepherd("pi-1", &req).await;
         assert!(!refused_shepherd(&resp), "{resp:?}");
         assert_eq!(head.last()["op"], "job_submit");
-        assert_eq!(head.last()["job"], "nightly");
+        assert_eq!(head.last()["job"], "pi-1.nightly");
     }
 
     /// A shepherd's job runs on its own machine: whatever `machine` the
@@ -1072,7 +1210,6 @@ mod tests {
             serde_json::json!({"agent_args": []}),
             serde_json::json!({"allow": ["Bash(*)"]}),
             serde_json::json!({"deny": ["Read"]}),
-            serde_json::json!({"profile": "yolo"}),
             serde_json::json!({"agent_source": {"agent": "x"}}),
             serde_json::json!({"tags": ["gpu"]}),
             serde_json::json!({"tag": "gpu"}),
@@ -1176,5 +1313,202 @@ mod tests {
         };
         assert!(page.events.iter().all(|e| e.job.is_none()), "{page:?}");
         assert_eq!(page.events.len(), 1);
+    }
+
+    fn outcome() -> crate::bootstrap::Outcome {
+        crate::bootstrap::Outcome {
+            ok: true,
+            mode: crate::bootstrap::Mode::User,
+            isolation: crate::bootstrap::Isolation::None,
+            steps: vec![],
+            machine_key: None,
+            agent_key: None,
+            host_key: None,
+            herdr_version: Some("0.9.5".into()),
+            pastor_version: None,
+        }
+    }
+
+    /// A shepherd's bootstrap report records only its own machine's state,
+    /// whatever `machine` the line names.
+    #[tokio::test]
+    async fn shepherd_bootstrap_report_pinned_to_self() {
+        let head = fake_head();
+        let resp = head
+            .ask_as_shepherd(
+                "pi-1",
+                &IpcRequest::BootstrapReport {
+                    machine: "pi-2".into(),
+                    result: outcome(),
+                },
+            )
+            .await;
+        assert!(!refused_shepherd(&resp), "{resp:?}");
+        assert_eq!(head.last()["op"], "bootstrap_report");
+        assert_eq!(head.last()["machine"], "pi-1");
+        assert_eq!(head.last()["result"]["herdr_version"], "0.9.5");
+    }
+
+    /// A profile cannot widen what the machine's own allows (the head
+    /// checks `unrestricted` against it), so a shepherd may name one.
+    #[tokio::test]
+    async fn shepherd_job_submit_allows_profile() {
+        let head = fake_head();
+        let req = IpcRequest::JobSubmit {
+            job: "nightly".into(),
+            dispatch: serde_json::json!({"profile": "review"}),
+            prompt: "p".into(),
+            items: vec![],
+        };
+        let resp = head.ask_as_shepherd("pi-1", &req).await;
+        assert!(!refused_shepherd(&resp), "{resp:?}");
+        assert_eq!(head.last()["op"], "job_submit");
+        assert_eq!(head.last()["dispatch"]["profile"], "review");
+        assert_eq!(head.last()["dispatch"]["machine"], "pi-1");
+    }
+
+    /// A shepherd's job reaches the head under its machine's name, so one
+    /// pull machine cannot mark another's seen keys. A `.` in the job's own
+    /// name would make `pi.1` + `x` and `pi` + `1.x` the same job, so it is
+    /// refused.
+    #[tokio::test]
+    async fn shepherd_job_name_prefixed() {
+        let head = fake_head();
+        let submit = |job: &str| IpcRequest::JobSubmit {
+            job: job.into(),
+            dispatch: serde_json::json!({}),
+            prompt: "p".into(),
+            items: vec![],
+        };
+        head.ask_as_shepherd("pi-2", &submit("nightly")).await;
+        assert_eq!(head.last()["job"], "pi-2.nightly");
+        let resp = head.ask_as_shepherd("pi-1", &submit("1.nightly")).await;
+        assert!(refused_shepherd(&resp), "{resp:?}");
+        assert_eq!(head.ops(), ["job_submit"], "the refused one never went");
+    }
+
+    /// A pull machine fetches pastor and herdr from the head's cache.
+    #[tokio::test]
+    async fn shepherd_allows_artifact_locate() {
+        let head = fake_head();
+        let req = IpcRequest::ArtifactLocate {
+            name: "herdr".into(),
+            version: "0.9.5".into(),
+            target: "linux-x86_64".into(),
+        };
+        let resp = head.ask_as_shepherd("pi-1", &req).await;
+        assert!(!refused_shepherd(&resp), "{resp:?}");
+        assert_eq!(head.last()["op"], "artifact_locate");
+        assert_eq!(head.last()["target"], "linux-x86_64");
+    }
+
+    /// A head that answers every request with `reply`.
+    fn fixed_head(reply: serde_json::Value) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("head.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (r, mut w) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(r).read_line(&mut line).await.unwrap();
+                let mut out = serde_json::to_string(&reply).unwrap();
+                out.push('\n');
+                w.write_all(out.as_bytes()).await.unwrap();
+            }
+        });
+        (dir, socket)
+    }
+
+    fn sha(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    fn located(path: &Path, sum: &str, size: u64) -> serde_json::Value {
+        serde_json::json!({"kind": "artifact", "data": {
+            "path": path, "sha256": sum, "size": size,
+        }})
+    }
+
+    /// The file at the path the head names goes to the output raw, after
+    /// its sum and size are checked again.
+    #[tokio::test]
+    async fn fetch_streams_the_file() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = state.path().join("artifacts/herdr/0.9.5/linux-x86_64");
+        std::fs::create_dir_all(&dir).unwrap();
+        let body: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(dir.join("herdr"), &body).unwrap();
+        let (_d, socket) = fixed_head(located(&dir.join("herdr"), &sha(&body), body.len() as u64));
+        let mut out = Vec::new();
+        fetch(
+            &socket,
+            state.path(),
+            "herdr",
+            "0.9.5",
+            "linux-x86_64",
+            &mut out,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, body);
+
+        // A sum or size that does not match is refused, and nothing written.
+        for (sum, size) in [(sha(b"other"), body.len() as u64), (sha(&body), 3)] {
+            let (_d, socket) = fixed_head(located(&dir.join("herdr"), &sum, size));
+            let mut out = Vec::new();
+            let err = fetch(
+                &socket,
+                state.path(),
+                "herdr",
+                "0.9.5",
+                "linux-x86_64",
+                &mut out,
+            )
+            .await
+            .unwrap_err();
+            let err = err.downcast::<CliError>().unwrap();
+            assert_eq!(err.code, "artifact_checksum_mismatch", "{}", err.message);
+            assert!(out.is_empty());
+        }
+
+        // An error from the head comes back with its own code.
+        let (_d, socket) = fixed_head(serde_json::json!({"kind": "error", "data": {
+            "code": "invalid_artifact", "message": "no",
+        }}));
+        let err = fetch(&socket, state.path(), "herdr", "..", "x", &mut Vec::new())
+            .await
+            .unwrap_err();
+        assert_eq!(err.downcast::<CliError>().unwrap().code, "invalid_artifact");
+    }
+
+    /// Only a file under `<state>/artifacts` is ever streamed, however the
+    /// path the head names gets there (a `..`, a symlink).
+    #[tokio::test]
+    async fn fetch_refuses_path_outside_cache() {
+        let state = tempfile::tempdir().unwrap();
+        let cache = state.path().join("artifacts");
+        std::fs::create_dir_all(cache.join("herdr")).unwrap();
+        let secret = state.path().join("pastor.db");
+        std::fs::write(&secret, b"secret").unwrap();
+        std::os::unix::fs::symlink(&secret, cache.join("herdr/link")).unwrap();
+        for path in [
+            secret.clone(),
+            cache.join("herdr/../../pastor.db"),
+            cache.join("herdr/link"),
+        ] {
+            let (_d, socket) = fixed_head(located(&path, &sha(b"secret"), 6));
+            let mut out = Vec::new();
+            let err = fetch(&socket, state.path(), "herdr", "0.9.5", "x", &mut out)
+                .await
+                .unwrap_err();
+            let err = err.downcast::<CliError>().unwrap();
+            assert_eq!(err.code, "invalid_artifact", "{path:?}: {}", err.message);
+            assert!(out.is_empty(), "{path:?}");
+        }
     }
 }

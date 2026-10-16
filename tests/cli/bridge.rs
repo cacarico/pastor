@@ -86,6 +86,35 @@ fn bridge_machine_needs_a_mode_and_the_modes_exclude_each_other() {
     assert!(!state.join("pastor.sock").exists());
 }
 
+/// `--fetch` is a shepherd's: without `--shepherd` it is a usage error, and
+/// with it but no head the failure is JSON on stderr, never on stdout, where
+/// the binary would have been.
+#[test]
+fn bridge_fetch_needs_shepherd_and_fails_on_stderr() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("s");
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", tmp.path().join("c"))
+            .env("PASTOR_STATE_DIR", &state)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let fetch = ["--fetch", "herdr", "0.9.5", "linux-x86_64"];
+    let out = run(&[&["bridge", "--agent", "--machine", "pi-1"][..], &fetch].concat());
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let out = run(&[&["bridge"][..], &fetch].concat());
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let out = run(&[&["bridge", "--shepherd", "--machine", "pi-1"][..], &fetch].concat());
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stderr).unwrap_or_else(|e| panic!("{e}: {out:?}"));
+    assert_eq!(v["code"], "no_head", "{v}");
+}
+
 /// With no head on the socket the bridge answers one `no_head` line on
 /// stdout, where the remote CLI reads, and exits non-zero. It never starts a
 /// head.
