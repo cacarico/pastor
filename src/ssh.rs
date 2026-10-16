@@ -40,6 +40,18 @@ pub struct Ssh<'a> {
     pub keepalive: bool,
     /// `-T`: no pseudo-terminal.
     pub no_tty: bool,
+    /// Pastor's own key: `-i` plus `IdentitiesOnly=yes`, so ssh offers no
+    /// other key and an agent full of keys cannot trip the server's
+    /// `MaxAuthTries`.
+    pub identity: Option<&'a Path>,
+    /// A key offered besides the user's own: `-i` alone, without
+    /// `IdentitiesOnly`, so keys the user already relies on still work.
+    pub extra_identity: Option<&'a Path>,
+    /// Pastor's own `known_hosts` file, instead of the user's.
+    pub known_hosts: Option<&'a Path>,
+    /// With `known_hosts`: trust a host seen for the first time
+    /// (`accept-new`), else only hosts already in the file (`yes`).
+    pub accept_new: bool,
 }
 
 impl Ssh<'_> {
@@ -68,7 +80,19 @@ impl Ssh<'_> {
                 opts.push("ControlPath=none".into());
             }
         }
+        if self.identity.is_some() {
+            opts.push("IdentitiesOnly=yes".into());
+        }
+        if let Some(path) = self.known_hosts {
+            opts.push(format!("UserKnownHostsFile={}", path.display()));
+            let mode = if self.accept_new { "accept-new" } else { "yes" };
+            opts.push(format!("StrictHostKeyChecking={mode}"));
+        }
         let mut args = Vec::new();
+        for key in [self.identity, self.extra_identity].into_iter().flatten() {
+            args.push("-i".to_string());
+            args.push(key.display().to_string());
+        }
         for opt in opts {
             args.push("-o".to_string());
             args.push(opt);
@@ -178,7 +202,92 @@ mod tests {
             control_persist: "600",
             keepalive: false,
             no_tty: false,
+            identity: None,
+            extra_identity: None,
+            known_hosts: None,
+            accept_new: false,
         }
+    }
+
+    fn has_seq(args: &[String], seq: &[&str]) -> bool {
+        args.windows(seq.len()).any(|w| w == seq)
+    }
+
+    #[test]
+    fn identity_adds_identities_only() {
+        let args = Ssh {
+            identity: Some(Path::new("/k")),
+            ..ssh("fleet@pi-3", None)
+        }
+        .args("true");
+        assert!(has_seq(&args, &["-i", "/k"]), "{args:?}");
+        assert!(opt(&args, "IdentitiesOnly=yes"), "{args:?}");
+    }
+
+    #[test]
+    fn extra_identity_does_not_restrict_keys() {
+        let args = Ssh {
+            extra_identity: Some(Path::new("/k")),
+            ..ssh("fleet@pi-3", None)
+        }
+        .args("true");
+        assert!(has_seq(&args, &["-i", "/k"]), "{args:?}");
+        assert!(!args.iter().any(|a| a.starts_with("IdentitiesOnly")));
+    }
+
+    #[test]
+    fn known_hosts_strict_by_default() {
+        let args = Ssh {
+            known_hosts: Some(Path::new("/kh")),
+            ..ssh("fleet@pi-3", None)
+        }
+        .args("true");
+        assert!(opt(&args, "UserKnownHostsFile=/kh"), "{args:?}");
+        assert!(opt(&args, "StrictHostKeyChecking=yes"), "{args:?}");
+    }
+
+    #[test]
+    fn accept_new_when_asked() {
+        let args = Ssh {
+            known_hosts: Some(Path::new("/kh")),
+            accept_new: true,
+            ..ssh("fleet@pi-3", None)
+        }
+        .args("true");
+        assert!(opt(&args, "StrictHostKeyChecking=accept-new"), "{args:?}");
+        assert!(!opt(&args, "StrictHostKeyChecking=yes"), "{args:?}");
+    }
+
+    /// Existing machines see no change: today's argv, byte for byte.
+    #[test]
+    fn no_options_unchanged() {
+        let args = Ssh {
+            keepalive: true,
+            no_tty: true,
+            ..ssh("fleet@pi-3", Some(Path::new("/tmp/s/ssh/pi-3-%C")))
+        }
+        .args("true");
+        assert_eq!(
+            args,
+            [
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=3",
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                "ControlPath=/tmp/s/ssh/pi-3-%C",
+                "-o",
+                "ControlPersist=600",
+                "-T",
+                "--",
+                "fleet@pi-3",
+                "sh -c true"
+            ]
+        );
     }
 
     #[test]

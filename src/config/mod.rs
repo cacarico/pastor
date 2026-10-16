@@ -153,6 +153,27 @@ impl Paths {
         PathBuf::from(format!("{dir}/{safe}-%C"))
     }
 
+    /// Pastor's own `known_hosts`, apart from the user's, so bootstrap never
+    /// touches `~/.ssh/known_hosts`.
+    pub fn known_hosts_file(&self) -> PathBuf {
+        self.state_dir.join("known_hosts")
+    }
+
+    /// The key the head offers to machines it provisions.
+    pub fn head_key(&self) -> PathBuf {
+        self.state_dir.join("head_key")
+    }
+
+    /// The key a machine uses to reach the head.
+    pub fn machine_key(&self) -> PathBuf {
+        self.state_dir.join("machine_key")
+    }
+
+    /// The key an agent user uses to reach the head.
+    pub fn agent_key(&self) -> PathBuf {
+        self.state_dir.join("agent_key")
+    }
+
     pub fn data_dir(&self) -> PathBuf {
         self.data_dir.clone()
     }

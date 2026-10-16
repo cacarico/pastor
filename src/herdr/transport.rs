@@ -159,12 +159,29 @@ pub fn posix_command(command: &str) -> String {
 /// ssh argv that runs `remote` (a POSIX shell command, run through
 /// `posix_command`) over the shared master when there is one.
 fn ssh_argv_running(target: &str, control_path: Option<&Path>, remote: String) -> Vec<String> {
+    ssh_argv_running_as(target, control_path, None, None, remote)
+}
+
+/// `ssh_argv_running` with the head's own key (`-i`, without `IdentitiesOnly`
+/// so the user's keys still work) and pastor's `known_hosts`. Callers pass
+/// `known_hosts` only once the machine has a recorded host key; none does yet.
+fn ssh_argv_running_as(
+    target: &str,
+    control_path: Option<&Path>,
+    head_key: Option<&Path>,
+    known_hosts: Option<&Path>,
+    remote: String,
+) -> Vec<String> {
     let ssh = crate::ssh::Ssh {
         target,
         control_path,
         control_persist: CONTROL_PERSIST,
         keepalive: true,
         no_tty: true,
+        identity: None,
+        extra_identity: head_key,
+        known_hosts,
+        accept_new: false,
     };
     let mut argv = vec!["ssh".to_string()];
     argv.extend(ssh.args(&remote));
@@ -1146,6 +1163,20 @@ mod tests {
     /// `~` in a repo path is the home on the machine: ssh asks the remote
     /// shell, over the same master as every request; a local machine is the
     /// head's own home; a bridge command cannot know.
+    #[test]
+    fn head_key_is_offered_without_identities_only() {
+        let argv = ssh_argv_running_as(
+            "fleet@pi-3",
+            None,
+            Some(Path::new("/k")),
+            Some(Path::new("/kh")),
+            "true".into(),
+        );
+        assert!(argv.windows(2).any(|w| w == ["-i", "/k"]), "{argv:?}");
+        assert!(!argv.iter().any(|a| a.starts_with("IdentitiesOnly")));
+        assert!(argv.contains(&"UserKnownHostsFile=/kh".to_string()));
+    }
+
     #[tokio::test]
     async fn home_dir_per_endpoint() {
         let argv = ssh_argv_running(
