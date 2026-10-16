@@ -108,7 +108,7 @@ The person made these on 2026-10-16. Each is binding on every build.
 | 9 | Machine identity: a key pair now, SSH certificates later | An ed25519 key per machine, made at join, registered on the head with a restricted command. Later, the head acts as an SSH CA. |
 | 10 | Config bundles are files in pastor's config dir | Skills, AGENTS.md / CLAUDE.md, MCP servers and settings, declared once. |
 | 11 | Config sync right after sign-in | Part of the design, not left for later. |
-| 12 | agy: test whether its token file works when copied | The person runs that test; agy's sign-in method waits on it. |
+| 12 | agy signs in by credentials file import | Tested on 2026-10-16: a copy of `~/.gemini/antigravity-cli/antigravity-oauth-token` (mode 0600) signs agy in on another machine with no login step, and both machines keep working. The check is `agy -p "reply with OK"`. The file is not tied to the machine, and agy keeps no secret in the OS keyring. agy refreshes the file on its own, so pastor copies the newest version. |
 | 13 | The first build is bootstrap | `pastor join` and `machine add --bootstrap`. |
 | 14 | Agents run as their own user, from the first build | A `pastor-agent` user runs herdr and every agent. It cannot read the shepherd's machine key. |
 | 15 | The shepherd runs as the login user, or as a `pastor` user on request | The default keeps the login user. An option creates or reuses a `pastor` user for the shepherd and its key. |
