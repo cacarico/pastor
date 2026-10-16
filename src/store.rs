@@ -16,7 +16,7 @@ use crate::task::{
     TaskSummary,
 };
 
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 19;
 
 /// The tables schema 2 added: created on a fresh database and by the v1
 /// migration.
@@ -57,6 +57,30 @@ const V18_TABLES: &str = "CREATE TABLE IF NOT EXISTS answered_dialogs (
         keys TEXT NOT NULL,
         at TEXT NOT NULL,
         PRIMARY KEY (task_id, dialog)
+     );";
+
+/// Schema 19: how each machine's bootstrap ended (`machine_state`, one row
+/// per machine), and the one-use tokens `pastor join` redeems
+/// (`join_tokens`). Times are RFC 3339 UTC strings, so they compare as text.
+const V19_TABLES: &str = "CREATE TABLE IF NOT EXISTS machine_state (
+        machine TEXT PRIMARY KEY,
+        bootstrap TEXT NOT NULL,
+        mode TEXT,
+        isolation TEXT,
+        failed_step TEXT,
+        why TEXT,
+        host_key TEXT,
+        herdr_version TEXT,
+        pastor_version TEXT,
+        updated_at TEXT NOT NULL
+     );
+     CREATE TABLE IF NOT EXISTS join_tokens (
+        id TEXT PRIMARY KEY,
+        flock TEXT,
+        tags TEXT,
+        replace TEXT,
+        expires_at TEXT NOT NULL,
+        used_at TEXT
      );";
 
 /// Schema 8: the last sequence number given to an event record
@@ -131,6 +155,61 @@ pub struct TrustedRepo {
     pub machine: String,
     pub repo: String,
     pub trusted_at: DateTime<Utc>,
+}
+
+/// How a machine's bootstrap stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BootstrapState {
+    Pending,
+    Ok,
+    Failed,
+}
+
+impl BootstrapState {
+    fn as_str(self) -> &'static str {
+        match self {
+            BootstrapState::Pending => "pending",
+            BootstrapState::Ok => "ok",
+            BootstrapState::Failed => "failed",
+        }
+    }
+
+    fn parse(s: &str) -> Option<BootstrapState> {
+        Some(match s {
+            "pending" => BootstrapState::Pending,
+            "ok" => BootstrapState::Ok,
+            "failed" => BootstrapState::Failed,
+            _ => return None,
+        })
+    }
+}
+
+/// What the store knows of a machine's bootstrap: how it ended, the mode
+/// and isolation it chose, the host key it pinned and the versions it saw.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineState {
+    pub machine: String,
+    pub bootstrap: BootstrapState,
+    pub mode: Option<String>,
+    pub isolation: Option<String>,
+    pub failed_step: Option<String>,
+    pub why: Option<String>,
+    pub host_key: Option<String>,
+    pub herdr_version: Option<String>,
+    pub pastor_version: Option<String>,
+    pub updated_at: String,
+}
+
+/// A one-use token a new machine redeems with `pastor join`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinToken {
+    pub id: String,
+    pub flock: Option<String>,
+    pub tags: Vec<String>,
+    pub replace: Option<String>,
+    pub expires_at: String,
+    pub used_at: Option<String>,
 }
 
 /// Runs a call that may wait on SQLite (the connection's lock, then up to
@@ -460,6 +539,7 @@ impl Store {
                 tx.execute_batch(V15_TABLES)?;
                 tx.execute_batch(V16_TABLES)?;
                 tx.execute_batch(V18_TABLES)?;
+                tx.execute_batch(V19_TABLES)?;
                 tx.execute(
                     "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)",
                     params![SCHEMA_VERSION.to_string()],
@@ -475,6 +555,7 @@ impl Store {
                 tx.execute_batch(V15_TABLES)?;
                 tx.execute_batch(V16_TABLES)?;
                 tx.execute_batch(V18_TABLES)?;
+                tx.execute_batch(V19_TABLES)?;
             }
             Some(v) if v < SCHEMA_VERSION => {
                 // One `if v < N` block per migration. The job tables go in
@@ -598,6 +679,9 @@ impl Store {
                          SELECT id, 'trust', COALESCE(trust_keys, '[]'), ?1 FROM tasks WHERE trust_sent = 1",
                         params![Utc::now().to_rfc3339()],
                     )?;
+                }
+                if v < 19 {
+                    tx.execute_batch(V19_TABLES)?;
                 }
                 tx.execute(
                     "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
@@ -1807,6 +1891,173 @@ impl Store {
         self.conn.lock().recover().execute_batch(sql).unwrap();
     }
 
+    /// The bootstrap record of `machine`, if it has one.
+    pub fn machine_state(&self, machine: &str) -> anyhow::Result<Option<MachineState>> {
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let row = conn
+                .query_row(
+                    "SELECT machine, bootstrap, mode, isolation, failed_step, why, host_key,
+                            herdr_version, pastor_version, updated_at
+                     FROM machine_state WHERE machine = ?1",
+                    params![machine],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(1)?,
+                            MachineState {
+                                machine: r.get(0)?,
+                                bootstrap: BootstrapState::Pending,
+                                mode: r.get(2)?,
+                                isolation: r.get(3)?,
+                                failed_step: r.get(4)?,
+                                why: r.get(5)?,
+                                host_key: r.get(6)?,
+                                herdr_version: r.get(7)?,
+                                pastor_version: r.get(8)?,
+                                updated_at: r.get(9)?,
+                            },
+                        ))
+                    },
+                )
+                .optional()?;
+            row.map(|(b, mut m)| {
+                m.bootstrap = BootstrapState::parse(&b)
+                    .with_context(|| format!("unknown bootstrap state {b:?}"))?;
+                Ok(m)
+            })
+            .transpose()
+        })
+    }
+
+    /// Save `s`, replacing the machine's earlier record.
+    pub fn put_machine_state(&self, s: &MachineState) -> anyhow::Result<()> {
+        blocking(|| {
+            self.conn.lock().recover().execute(
+                "INSERT OR REPLACE INTO machine_state
+                    (machine, bootstrap, mode, isolation, failed_step, why, host_key,
+                     herdr_version, pastor_version, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    s.machine,
+                    s.bootstrap.as_str(),
+                    s.mode,
+                    s.isolation,
+                    s.failed_step,
+                    s.why,
+                    s.host_key,
+                    s.herdr_version,
+                    s.pastor_version,
+                    s.updated_at
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Record the versions read from `machine`. A `None` keeps what was
+    /// there; a machine with no record is left alone.
+    pub fn set_versions(
+        &self,
+        machine: &str,
+        herdr: Option<&str>,
+        pastor: Option<&str>,
+    ) -> anyhow::Result<()> {
+        blocking(|| {
+            self.conn.lock().recover().execute(
+                "UPDATE machine_state
+                 SET herdr_version = COALESCE(?2, herdr_version),
+                     pastor_version = COALESCE(?3, pastor_version)
+                 WHERE machine = ?1",
+                params![machine, herdr, pastor],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn drop_machine_state(&self, machine: &str) -> anyhow::Result<()> {
+        blocking(|| {
+            self.conn.lock().recover().execute(
+                "DELETE FROM machine_state WHERE machine = ?1",
+                params![machine],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn put_join_token(&self, t: &JoinToken) -> anyhow::Result<()> {
+        blocking(|| {
+            self.conn.lock().recover().execute(
+                "INSERT OR REPLACE INTO join_tokens (id, flock, tags, replace, expires_at, used_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    t.id,
+                    t.flock,
+                    serde_json::to_string(&t.tags)?,
+                    t.replace,
+                    t.expires_at,
+                    t.used_at
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn join_token(&self, id: &str) -> Option<JoinToken> {
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            conn.query_row(
+                "SELECT id, flock, tags, replace, expires_at, used_at
+                 FROM join_tokens WHERE id = ?1",
+                params![id],
+                |r| {
+                    let tags: Option<String> = r.get(2)?;
+                    Ok(JoinToken {
+                        id: r.get(0)?,
+                        flock: r.get(1)?,
+                        tags: tags
+                            .and_then(|t| serde_json::from_str(&t).ok())
+                            .unwrap_or_default(),
+                        replace: r.get(3)?,
+                        expires_at: r.get(4)?,
+                        used_at: r.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .ok()
+            .flatten()
+        })
+    }
+
+    /// Mark the token used at `now`. False when it is unknown, already
+    /// used or expired; one statement, so two callers cannot both win.
+    pub fn use_join_token(&self, id: &str, now: &str) -> anyhow::Result<bool> {
+        blocking(|| {
+            let n = self.conn.lock().recover().execute(
+                "UPDATE join_tokens SET used_at = ?2
+                 WHERE id = ?1 AND used_at IS NULL AND expires_at > ?2",
+                params![id, now],
+            )?;
+            Ok(n == 1)
+        })
+    }
+
+    /// Ids of the unused tokens whose time ran out before `now`.
+    pub fn expired_join_tokens(&self, now: &str) -> Vec<String> {
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let Ok(mut stmt) = conn.prepare(
+                "SELECT id FROM join_tokens
+                 WHERE used_at IS NULL AND expires_at <= ?1 ORDER BY id",
+            ) else {
+                return Vec::new();
+            };
+            stmt.query_map(params![now], |r| r.get(0))
+                .map(|rows| rows.flatten().collect())
+                .unwrap_or_default()
+        })
+    }
+
     /// Save `repo` on `machine` as trusted. Returns whether it was new.
     pub fn trust_repo(&self, machine: &str, repo: &str) -> anyhow::Result<bool> {
         blocking(|| {
@@ -2311,6 +2562,90 @@ fn row_to_job_state(row: &Row<'_>) -> rusqlite::Result<JobState> {
 mod tests {
     use super::*;
     use crate::task::{Checkout, Reopen, TaskRole};
+
+    fn sample_state() -> MachineState {
+        MachineState {
+            machine: "pi-1".into(),
+            bootstrap: BootstrapState::Failed,
+            mode: Some("user".into()),
+            isolation: Some("none".into()),
+            failed_step: Some("herdr".into()),
+            why: Some("no network".into()),
+            host_key: Some("ssh-ed25519 AAAA".into()),
+            herdr_version: Some("0.9.5".into()),
+            pastor_version: None,
+            updated_at: "2026-10-16T10:00:00+00:00".into(),
+        }
+    }
+
+    #[test]
+    fn machine_state_round_trips() {
+        let s = Store::open_in_memory().unwrap();
+        assert!(s.machine_state("pi-1").unwrap().is_none());
+        let mut m = sample_state();
+        s.put_machine_state(&m).unwrap();
+        assert_eq!(s.machine_state("pi-1").unwrap(), Some(m.clone()));
+        // a second put replaces the row
+        m.bootstrap = BootstrapState::Ok;
+        m.failed_step = None;
+        m.why = None;
+        s.put_machine_state(&m).unwrap();
+        assert_eq!(s.machine_state("pi-1").unwrap(), Some(m));
+        s.set_versions("pi-1", Some("0.9.6"), Some("1.2.3"))
+            .unwrap();
+        let got = s.machine_state("pi-1").unwrap().unwrap();
+        assert_eq!(got.herdr_version.as_deref(), Some("0.9.6"));
+        assert_eq!(got.pastor_version.as_deref(), Some("1.2.3"));
+        // None leaves a version as it was
+        s.set_versions("pi-1", None, Some("1.2.4")).unwrap();
+        let got = s.machine_state("pi-1").unwrap().unwrap();
+        assert_eq!(got.herdr_version.as_deref(), Some("0.9.6"));
+        assert_eq!(got.pastor_version.as_deref(), Some("1.2.4"));
+        s.drop_machine_state("pi-1").unwrap();
+        assert!(s.machine_state("pi-1").unwrap().is_none());
+    }
+
+    fn token(id: &str, expires_at: &str) -> JoinToken {
+        JoinToken {
+            id: id.into(),
+            flock: Some("home".into()),
+            tags: vec!["arm".into(), "pi".into()],
+            replace: None,
+            expires_at: expires_at.into(),
+            used_at: None,
+        }
+    }
+
+    #[test]
+    fn use_join_token_is_single_use() {
+        let s = Store::open_in_memory().unwrap();
+        let t = token("a", "2026-10-16T12:00:00+00:00");
+        s.put_join_token(&t).unwrap();
+        assert_eq!(s.join_token("a"), Some(t));
+        assert!(s.join_token("b").is_none());
+        let now = "2026-10-16T11:00:00+00:00";
+        assert!(s.use_join_token("a", now).unwrap());
+        assert!(!s.use_join_token("a", now).unwrap());
+        assert_eq!(s.join_token("a").unwrap().used_at.as_deref(), Some(now));
+        // an expired token cannot be used, nor an unknown one
+        s.put_join_token(&token("old", "2026-10-16T10:00:00+00:00"))
+            .unwrap();
+        assert!(!s.use_join_token("old", now).unwrap());
+        assert!(!s.use_join_token("nope", now).unwrap());
+    }
+
+    #[test]
+    fn expired_tokens_listed() {
+        let s = Store::open_in_memory().unwrap();
+        s.put_join_token(&token("old", "2026-10-16T10:00:00+00:00"))
+            .unwrap();
+        s.put_join_token(&token("live", "2026-10-16T12:00:00+00:00"))
+            .unwrap();
+        assert_eq!(
+            s.expired_join_tokens("2026-10-16T11:00:00+00:00"),
+            vec!["old".to_string()]
+        );
+    }
 
     /// A panic while a request holds the connection poisons its lock; later
     /// requests still get the connection instead of panicking until restart.
@@ -2992,7 +3327,9 @@ mod tests {
             vec![
                 "answered_dialogs",
                 "event_seq",
+                "join_tokens",
                 "limits",
+                "machine_state",
                 "meta",
                 "task_summaries",
                 "task_usage",
@@ -3007,7 +3344,9 @@ mod tests {
                 "answered_dialogs",
                 "event_seq",
                 "job_state",
+                "join_tokens",
                 "limits",
+                "machine_state",
                 "meta",
                 "seen",
                 "task_summaries",
@@ -3051,7 +3390,9 @@ mod tests {
                 "answered_dialogs",
                 "event_seq",
                 "job_state",
+                "join_tokens",
                 "limits",
+                "machine_state",
                 "meta",
                 "seen",
                 "task_summaries",
@@ -4594,9 +4935,11 @@ mod tests {
                  DROP TABLE limits;
                  DROP TABLE task_usage;
                  DROP TABLE answered_dialogs;
+                 DROP TABLE machine_state;
+                 DROP TABLE join_tokens;
                  UPDATE meta SET value = '1' WHERE key = 'schema_version';
                  CREATE TRIGGER no_bump BEFORE UPDATE ON meta
-                   WHEN NEW.value = '18' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+                   WHEN NEW.value = '19' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
             );
         }
         assert!(Store::open(&path).is_err());
@@ -4642,7 +4985,9 @@ mod tests {
                 && !tables.contains(&"task_summaries".to_string())
                 && !tables.contains(&"limits".to_string())
                 && !tables.contains(&"task_usage".to_string())
-                && !tables.contains(&"answered_dialogs".to_string()),
+                && !tables.contains(&"answered_dialogs".to_string())
+                && !tables.contains(&"machine_state".to_string())
+                && !tables.contains(&"join_tokens".to_string()),
             "rolled back: {tables:?}"
         );
     }
