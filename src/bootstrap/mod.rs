@@ -8,6 +8,7 @@
 
 pub mod facts;
 pub mod outcome;
+pub mod push;
 mod steps;
 
 use std::path::PathBuf;
@@ -211,7 +212,7 @@ fn check_dest(dest: &str) -> anyhow::Result<()> {
 
 /// A user name as useradd takes it (`^[a-z_][a-z0-9_-]*$`, at most 32
 /// characters), so none reads as an option or splits into two words.
-fn check_user(name: &str) -> anyhow::Result<()> {
+pub(crate) fn check_user(name: &str) -> anyhow::Result<()> {
     let mut chars = name.chars();
     let ok = name.len() <= 32
         && chars

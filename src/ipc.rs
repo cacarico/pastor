@@ -233,6 +233,11 @@ pub const PULL_VERSIONS_PROTOCOL: u32 = 32;
 /// dispatch never learns to skip the machine.
 pub const BOOTSTRAP_PROTOCOL: u32 = 32;
 
+/// The first protocol whose head runs a push bootstrap
+/// (`MachineBootstrap`). An older one refuses the request as unreadable,
+/// so `machine add --bootstrap` would add nothing and say only that.
+pub const MACHINE_BOOTSTRAP_PROTOCOL: u32 = 32;
+
 /// The first protocol whose head honours `Run::priority` and knows
 /// `TaskPriority`. An older one would queue the task at its own level
 /// without a word, or refuse the request as unreadable.
@@ -355,6 +360,8 @@ const REPORT_TRUSTED: &str =
     "predates saved trust on pull machines, and would drop the trust answer the report carries";
 const PULL_VERSIONS: &str =
     "predates a pull machine's own versions, and would drop the claim's herdr and pastor versions";
+const MACHINE_BOOTSTRAP: &str =
+    "predates push bootstrap, and would refuse the request without setting the machine up";
 const BOOTSTRAP: &str = "predates bootstrap reports, and would refuse the request without recording the machine's state";
 
 /// How long a head's `Pong` settles the protocol check before it is asked
@@ -549,6 +556,24 @@ pub enum IpcRequest {
     /// whose herdr it is. Answers `Text`.
     MachineAdd {
         machine: crate::config::flock::MachineConfig,
+    },
+    /// `machine add --bootstrap` (with `machine`, the entry to write) and
+    /// `machine bootstrap` (without): the head sets the machine up over ssh
+    /// as `login`, else the entry's own `ssh`, and records how it ended
+    /// (`bootstrap::push`). Binaries go over the head's own ssh, never
+    /// through this socket. Answers `Text`, or the failed step's error.
+    MachineBootstrap {
+        name: String,
+        #[serde(default)]
+        sudo: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        service_user: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host_key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        machine: Option<crate::config::flock::MachineConfig>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        login: Option<String>,
     },
     /// `machine remove`, the flock.toml part, as for `MachineAdd`. Answers
     /// `Text`.
@@ -1054,6 +1079,7 @@ impl IpcRequest {
             }
             R::PullTrust { .. } => need.at(PULL_TRUST_PROTOCOL, PULL_TRUST),
             R::BootstrapReport { .. } => need.at(BOOTSTRAP_PROTOCOL, BOOTSTRAP),
+            R::MachineBootstrap { .. } => need.at(MACHINE_BOOTSTRAP_PROTOCOL, MACHINE_BOOTSTRAP),
             R::LimitList | R::LimitClear { .. } => need.at(LIMIT_PROTOCOL, LIMITS),
             R::OrchestratorStart { .. } | R::OrchestratorStop { .. } => {
                 need.at(SESSION_PROTOCOL, SESSION);
@@ -1099,6 +1125,7 @@ impl IpcRequest {
             | IpcRequest::FlockLeave { .. }
             | IpcRequest::FlockSetDefault { .. }
             | IpcRequest::MachineAdd { .. }
+            | IpcRequest::MachineBootstrap { .. }
             | IpcRequest::MachineRemove { .. }
             | IpcRequest::MachineMove { .. }
             | IpcRequest::JobRun { .. }
@@ -1978,6 +2005,14 @@ mod tests {
                     profile: None,
                 },
             },
+            IpcRequest::MachineBootstrap {
+                name: "m".into(),
+                sudo: true,
+                service_user: None,
+                host_key: None,
+                machine: None,
+                login: None,
+            },
             IpcRequest::MachineRemove { name: "m".into() },
             IpcRequest::MachineMove {
                 name: "m".into(),
@@ -2454,6 +2489,7 @@ mod tests {
             PULL_TRUST_PROTOCOL,
             PULL_VERSIONS_PROTOCOL,
             BOOTSTRAP_PROTOCOL,
+            MACHINE_BOOTSTRAP_PROTOCOL,
         ] {
             assert!(covered.contains(&p), "no request needs protocol {p}");
         }

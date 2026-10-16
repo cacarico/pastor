@@ -949,6 +949,26 @@ impl FlockDoc {
         Ok(())
     }
 
+    /// Point `name`'s `ssh` at `dest`: a push bootstrap in root mode moves
+    /// the entry from the login user to the agent user. Only that key
+    /// changes, so the rest of the table keeps its comments and order.
+    pub fn set_machine_ssh(&mut self, name: &str, dest: &str) -> Result<(), EditError> {
+        let f = self.current()?;
+        let Some(m) = f.get(name) else {
+            return Err(EditError::UnknownMachine(name.into()));
+        };
+        if m.ssh.is_none() {
+            return Err(EditError::Invalid(format!(
+                "machine {name} is not reached over ssh"
+            )));
+        }
+        let t = self
+            .machine_mut(name)
+            .expect("checked above: the machine is in the file");
+        t.insert("ssh", toml_edit::value(dest));
+        Ok(())
+    }
+
     pub fn remove_machine(&mut self, name: &str) -> Result<(), EditError> {
         if self.current()?.get(name).is_none() {
             return Err(EditError::UnknownMachine(name.into()));

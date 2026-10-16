@@ -476,6 +476,35 @@ enum MachineCmd {
         /// Also save it in herdr's sidebar (runs `herdr machine add`)
         #[arg(long, conflicts_with_all = ["local", "command"])]
         herdr: bool,
+        /// Set the machine up over ssh first: pastor, herdr and their services (needs a running head)
+        #[arg(long, requires = "ssh", conflicts_with_all = ["local", "command"])]
+        bootstrap: bool,
+        /// With --bootstrap: do root work through sudo -n (packages, users, lingering), so agents run as pastor-agent
+        #[arg(long, requires = "bootstrap")]
+        sudo: bool,
+        /// With --bootstrap: the user that holds the machine key; created if missing
+        #[arg(long, value_name = "NAME", requires = "bootstrap")]
+        service_user: Option<String>,
+        /// With --bootstrap: the machine's ed25519 host key must be this (SHA256:... or the key itself)
+        #[arg(long, value_name = "KEY", requires = "bootstrap")]
+        host_key: Option<String>,
+    },
+    /// Run bootstrap again on a machine over ssh: after a failed step, or to upgrade pastor and herdr
+    Bootstrap {
+        /// The machine, as flock.toml names it
+        name: String,
+        /// Do root work through sudo -n (packages, users, lingering), so agents run as pastor-agent
+        #[arg(long)]
+        sudo: bool,
+        /// The user that holds the machine key; created if missing
+        #[arg(long, value_name = "NAME")]
+        service_user: Option<String>,
+        /// The login to bootstrap as (default: the machine's ssh); needed once agents run as pastor-agent
+        #[arg(long, value_name = "DEST")]
+        ssh: Option<String>,
+        /// The machine's ed25519 host key must be this (SHA256:... or the key itself)
+        #[arg(long, value_name = "KEY")]
+        host_key: Option<String>,
     },
     /// Remove a machine from flock.toml; tasks already on it keep their rows
     Remove {
@@ -2187,6 +2216,10 @@ async fn machine(client: &pastor::ipc::Client, cmd: MachineCmd, head: Head) -> a
             flock,
             description,
             herdr,
+            bootstrap,
+            sudo,
+            service_user,
+            host_key,
         } => {
             let m = MachineConfig {
                 pull: false,
@@ -2211,7 +2244,24 @@ async fn machine(client: &pastor::ipc::Client, cmd: MachineCmd, head: Head) -> a
             };
             // With a head the reload line comes with its answer, before the
             // herdr lines; without one it follows them.
-            let reload = if head.is_live() {
+            let reload = if bootstrap {
+                println!(
+                    "{}",
+                    machine_bootstrap(
+                        client,
+                        IpcRequest::MachineBootstrap {
+                            name: name.clone(),
+                            sudo,
+                            service_user,
+                            host_key,
+                            machine: Some(m.clone()),
+                            login: None,
+                        },
+                    )
+                    .await?
+                );
+                None
+            } else if head.is_live() {
                 println!(
                     "{}",
                     ask_text(client, IpcRequest::MachineAdd { machine: m.clone() }).await?
@@ -2224,7 +2274,18 @@ async fn machine(client: &pastor::ipc::Client, cmd: MachineCmd, head: Head) -> a
                 );
                 Some(reload_running_head(paths, head).await)
             };
-            match (herdr, m.ssh.as_deref()) {
+            // A root-mode bootstrap moved the entry to the agent user, whose
+            // herdr the sidebar should open.
+            let reached = if bootstrap {
+                head_flock(client)
+                    .await
+                    .ok()
+                    .and_then(|f| f.get(&name).and_then(|m| m.ssh.clone()))
+                    .or(m.ssh.clone())
+            } else {
+                m.ssh.clone()
+            };
+            match (herdr, reached.as_deref()) {
                 // The flock file is already written: a herdr failure below is
                 // reported, not rolled back, so the two lists never diverge
                 // silently in the other direction either.
@@ -2248,6 +2309,29 @@ async fn machine(client: &pastor::ipc::Client, cmd: MachineCmd, head: Head) -> a
             if let Some(reload) = reload {
                 println!("{reload}");
             }
+        }
+        MachineCmd::Bootstrap {
+            name,
+            sudo,
+            service_user,
+            ssh,
+            host_key,
+        } => {
+            println!(
+                "{}",
+                machine_bootstrap(
+                    client,
+                    IpcRequest::MachineBootstrap {
+                        name,
+                        sudo,
+                        service_user,
+                        host_key,
+                        machine: None,
+                        login: ssh,
+                    },
+                )
+                .await?
+            );
         }
         MachineCmd::Remove { name, herdr } => {
             // Only for the herdr hint below, read before the machine goes,
@@ -2352,6 +2436,23 @@ fn offline_fleet_lock(paths: &Paths) -> anyhow::Result<std::fs::File> {
 }
 
 /// `ask`, for a request the head answers with `Text`.
+/// A push bootstrap through the head. It downloads, copies and installs on
+/// the machine before it answers, so it gets far longer than a request's
+/// usual bound.
+async fn machine_bootstrap(
+    client: &pastor::ipc::Client,
+    req: IpcRequest,
+) -> anyhow::Result<String> {
+    const PUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
+    let resp = pastor::cli::reply(
+        pastor::ipc::request_head_with_timeout(client, &req, PUSH_TIMEOUT).await,
+    )?;
+    let IpcResponse::Text(text) = resp else {
+        return Err(unexpected(resp));
+    };
+    Ok(text)
+}
+
 async fn ask_text(client: &pastor::ipc::Client, req: IpcRequest) -> anyhow::Result<String> {
     let resp = ask(client, req).await?;
     let IpcResponse::Text(text) = resp else {

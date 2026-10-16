@@ -391,7 +391,8 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `leave_incomplete` | `pastor leave` ran every step it could and one or more failed; each is printed, and the message lists them |
 | `leave_on_head` | `pastor leave` on a machine where `pastor serve` runs as the head for this login |
 | `leave_unsupported_platform` | `pastor leave` on a platform with neither systemd nor launchd units to remove |
-| `machine_exists` | `machine add` of a machine that exists |
+| `machine_busy` | `machine add --bootstrap` or `machine bootstrap` of a machine a push bootstrap is already running for |
+| `machine_exists` | `machine add` of a machine that exists; with `--bootstrap`, one that is not pending or failed with the same login |
 | `invalid_artifact` | a binary to fetch named with a part that is not a plain name |
 | `artifact_checksum_mismatch` | a downloaded pastor or herdr whose sha256 is not the published one; nothing is cached |
 | `machine_not_connected` | `task run --now` on a machine that is not connected |
@@ -1071,6 +1072,37 @@ the flocks of tasks dispatched after them; tasks already on the machine keep
 running there, and its connection stays up. A queued task pinned to a machine
 that has moved to another flock stays queued for its own flock, and the head
 logs a warning once.
+
+`pastor machine add <name> <login> --bootstrap` sets a bare machine up from
+the head, over ssh as `<login>`, and needs a running head with
+`head_address` in `pastor.toml` (how the machine reaches the head). The
+entry goes in flock.toml first, with its bootstrap pending in the head's
+store, so it takes no task until the end. The head then pins the machine's
+ed25519 host key in pastor's own `known_hosts` (trusted the first time, or
+checked against `--host-key SHA256:...`), reads its platform, copies the
+pastor and herdr builds for it from the head's cache over that ssh into
+`~/.cache/pastor-bootstrap/` (checking each sha256 there before it moves it
+into place), and runs `pastor bootstrap --json` there with `--sudo` and
+`--service-user` passed on. On success it adds the machine's agent line
+(`pastor:agent:<name>`) to the head's `authorized_keys`, records the
+bootstrap as ok, emits `machine.bootstrapped` and ends the ssh master of
+the login. In root mode the entry's `ssh` becomes `pastor-agent@<host>`,
+the user herdr and every agent run as; in user mode it keeps the login.
+A failed step is recorded with its reason and fix, emits
+`machine.bootstrap_failed`, and comes back as the command's error. Run the
+same `machine add` again after the fix (with `--sudo`, say): a machine
+pending or failed with the same login carries on where it stopped instead of
+failing `machine_exists`. `pastor machine bootstrap <name> [--sudo]` does the
+same by name, for a rerun or to upgrade pastor and herdr; once the entry
+names `pastor-agent`, pass the login with `--ssh`. One push per machine
+runs at a time (`machine_busy`), and none holds up dispatch.
+
+```bash
+pastor machine add gpu-3 me@gpu-3 --bootstrap --sudo --tag gpu
+pastor machine add pi-7 pi@pi-7 --bootstrap --sudo --service-user pastor
+pastor machine add lab-1 me@lab-1 --bootstrap        # no root: user mode
+pastor machine bootstrap gpu-3 --ssh me@gpu-3 --sudo # rerun or upgrade
+```
 
 `pastor machine remove <name>` on a head also revokes what let the
 machine in: the `pastor:machine:<name>` and `pastor:agent:<name>` lines of
