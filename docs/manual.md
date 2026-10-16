@@ -3217,8 +3217,11 @@ without user namespaces and leaves pastor's own writes alone.
 `ProtectSystem=strict`, `PrivateTmp` and `ProtectHome` are left off: they would
 stop ssh updating `known_hosts` and connectors writing their caches, hide a
 state dir under `/tmp` or `~/.ssh`, and on a host without unprivileged user
-namespaces keep the unit from starting. `herdr.service` has no hardening,
-since the agents it runs need what the user's own terminal allows. ssh runs
+namespaces keep the unit from starting. `pastor.service` also sets
+`OOMPolicy=continue`, so the kernel killing a child the head spawned (a merge
+orchestrator's `make check`, say) does not stop the head itself along with it.
+`herdr.service` has no hardening, since the agents it runs need what the
+user's own terminal allows. ssh runs
 with `BatchMode=yes`, so it cannot ask for a passphrase under systemd: add
 `Environment=SSH_AUTH_SOCK=...` for an agent, or use a key without one.
 
