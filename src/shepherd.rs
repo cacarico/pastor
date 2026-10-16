@@ -32,7 +32,7 @@ use crate::herdr::{Connector, Endpoint};
 use crate::ipc::{
     IPC_PROTOCOL, IpcRequest, IpcResponse, ProtocolGate, SHEPHERD_ROLE, request_line,
 };
-use crate::machine::{MachineHandle, MachineSettings, PastorEvent};
+use crate::machine::{EndBy, MachineHandle, MachineSettings, PastorEvent};
 use crate::scheduler::{ConfigFingerprint, Scheduler, SchedulerHandle};
 use crate::store::Store;
 use crate::task::{Task, TaskState};
@@ -335,15 +335,15 @@ impl Puller {
     }
 
     /// Copy the folder trust the head saved for this machine into this
-    /// store, where the actor's `auto_trust` reads it, while a task here may
+    /// store, where the actor's `auto_answer` reads it, while a task here may
     /// need it: one with a repo that is queued (before its dispatch, so the
     /// answer after it is immediate, as on the head) or blocked during its
     /// startup with no trust keys sent yet (a `trust add` on the head after
     /// the block; the actor looked at that task when it blocked, so a copy
-    /// that changed sends it `auto_trust` now rather than leaving it to its
+    /// that changed sends it `auto_answer` now rather than leaving it to its
     /// next reconcile). A head that refuses (one too old for `PullTrust`,
-    /// say) leaves nothing here to answer with; an unreachable one leaves
-    /// the last copy.
+    /// say) leaves nothing here to answer with; one that cannot be reached
+    /// or does not answer leaves the last copy.
     async fn fetch_trust(&mut self) {
         let tasks: Vec<Task> = self
             .tasks()
@@ -377,8 +377,15 @@ impl Puller {
                 let Some(e) = err.downcast_ref::<CliError>() else {
                     return;
                 };
-                // An unreachable head is `Follower`'s to report.
-                if matches!(e.code.as_str(), "head_unreachable" | "no_head") {
+                // Only a head that refuses this machine takes its trust
+                // away. Anything else failed on the way (unreachable, a
+                // timeout, a dropped bridge, a head restarting) and keeps
+                // the last copy; an unreachable head is `Follower`'s to
+                // report.
+                if !matches!(
+                    e.code.as_str(),
+                    "head_too_old" | "not_pull_machine" | "unknown_machine"
+                ) {
                     return;
                 }
                 if self.trust_refused.as_deref() != Some(e.code.as_str()) {
@@ -491,22 +498,25 @@ impl Puller {
     /// Tell the head about every row that changed since it last heard, or
     /// with `all` every row: the head answers an unchanged report with its
     /// row and nothing else, which is how a `task close` there reaches the
-    /// pane here. A row the head has closed is closed here too; a closed or
-    /// failed one the head has heard of is forgotten here. Stops at the
-    /// first report that does not reach the head, to try again next tick.
-    /// The trust keys the actor pressed for a task go with its reports
-    /// until one reaches the head, which emits `task.trusted` once; a head
-    /// too old for them gets the report without.
+    /// pane here (`follow_head`). A row still queued here, claimed and not
+    /// started, is `starting` on the head since the claim and reported so,
+    /// so what the head did to it meanwhile reaches here before an agent
+    /// is started for it. Stops at the first report that does not reach
+    /// the head, to try again next tick. The trust keys the actor pressed
+    /// for a task go with its reports until one reaches the head, which
+    /// emits `task.trusted` once; a head too old for them gets the report
+    /// without.
     async fn report(&mut self, all: bool) {
         for t in self.tasks() {
-            if t.state == TaskState::Queued {
-                continue;
-            }
             let trust_sent = self.store.trust_sent(t.id).unwrap_or(false);
             let now: Reported = (t.state, t.pane_id.clone(), t.error.clone(), trust_sent);
             if !all && self.sent.get(&t.id) == Some(&now) {
                 continue;
             }
+            let state = match t.state {
+                TaskState::Queued => TaskState::Starting,
+                state => state,
+            };
             // The keys as pressed, kept with the flag: after a restart the
             // config may name others, or none. The head emits once whatever
             // a restart sends again.
@@ -516,7 +526,7 @@ impl Puller {
             let req = |trusted: Option<Vec<String>>| IpcRequest::TaskReport {
                 machine: self.machine.clone(),
                 id: t.id,
-                state: t.state,
+                state,
                 pane: t.pane_id.clone(),
                 detail: t.error.clone(),
                 // Nothing here reads a limit from a pane yet.
@@ -555,19 +565,47 @@ impl Puller {
                     }
                 }
             };
-            tracing::info!(task = %t.display_id(), state = %t.state, "reported to the head");
+            tracing::info!(task = %t.display_id(), state = %state, "reported to the head");
             self.sent.insert(t.id, now);
-            if head_row.state == TaskState::Closed && t.state.is_open() {
-                // Closed on the head (`task close`): the pane is here.
-                let actor = self.actor();
-                if let Err(err) = actor.close(t.id, false).await {
-                    tracing::warn!(task = %t.display_id(), err = %format!("{err:#}"), "close a task the head closed");
+            self.follow_head(&t, head_row).await;
+        }
+    }
+
+    /// Bring the row here (`t`) after the head's (`head`), which a report
+    /// just answered with. One the head has closed (`task close`) is
+    /// closed here, where the pane is. One the head has done and ended
+    /// (the agent's `task done` goes to the head) is ended here too, with
+    /// the head's summary, so its agent's idle is not read as idle without
+    /// `task done` and auto-close takes its pane; one not started here yet
+    /// is closed outright, nothing being here to end, and the head hears
+    /// `closed` at the next report, since its row holds a seat until then.
+    /// A closed or failed row the head has heard of is forgotten here.
+    async fn follow_head(&mut self, t: &Task, head: Task) {
+        let actor = self.actor();
+        let (what, done) = match (head.state, head.ended) {
+            (TaskState::Closed, _) if t.state.is_open() => (
+                "close a task the head closed",
+                actor.close(t.id, false).await,
+            ),
+            (TaskState::Done, true) if t.state == TaskState::Queued => (
+                "close a task the head ended before it started here",
+                actor.close(t.id, false).await,
+            ),
+            (TaskState::Done, true) if t.state.occupies_pane() && !t.ended => (
+                "end a task the head ended",
+                actor
+                    .end_by(t.id, head.summary.map(|s| s.text), EndBy::Head)
+                    .await,
+            ),
+            _ => {
+                if matches!(t.state, TaskState::Closed | TaskState::Failed) {
+                    self.forget(t.id);
                 }
-                continue;
+                return;
             }
-            if matches!(t.state, TaskState::Closed | TaskState::Failed) {
-                self.forget(t.id);
-            }
+        };
+        if let Err(err) = done {
+            tracing::warn!(task = %t.display_id(), err = %format!("{err:#}"), "{what}");
         }
     }
 
@@ -988,13 +1026,23 @@ mod tests {
 
     /// `run_pinned`, in `repo` when given.
     async fn run_in(head: &Daemon, machine: Option<&str>, repo: Option<&str>) -> Task {
+        run_task(head, machine, repo, "claude").await
+    }
+
+    /// `run_in`, with `agent`, and a summary the agent must give.
+    async fn run_task(
+        head: &Daemon,
+        machine: Option<&str>,
+        repo: Option<&str>,
+        agent: &str,
+    ) -> Task {
         let req = IpcRequest::Run {
             now: false,
             preempt: false,
             prompt: "fix it".into(),
             spec: crate::task::DispatchSpec {
                 now: false,
-                agent: "claude".into(),
+                agent: agent.into(),
                 agent_args: vec![],
                 allow: vec![],
                 deny: vec![],
@@ -1010,7 +1058,7 @@ mod tests {
                 place: Default::default(),
                 session_id: None,
                 label: Default::default(),
-                summary: Default::default(),
+                summary: crate::task::SummaryMode::Require,
                 cwd: None,
                 keep_pane: None,
                 keep_pane_from: None,
@@ -1115,6 +1163,173 @@ mod tests {
 
         p.flock_work = true;
         head_reaches(&mut p, &head, &loose, TaskState::Running).await;
+    }
+
+    /// An agent's `pastor task done` reaches the head, which ends its row
+    /// there; the row here learns nothing of it on its own. An agent that
+    /// is not Claude, idle after it, would read here as idle without `task
+    /// done` and sit `blocked` with its pane and the head's seat for good.
+    /// A head row that is done and ended ends the row here too, with the
+    /// head's summary (the task requires one, and the head took it), so
+    /// auto-close takes the pane once the agent is idle, the head hears
+    /// `closed`, and the row is forgotten, as a task closed on the head.
+    #[tokio::test]
+    async fn a_task_its_agent_ended_on_the_head_is_closed_here_once_idle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (head, ask) = pull_head(tmp.path()).await;
+        let mut events = head.subscribe();
+        let t = run_task(&head, Some("laptop"), None, "agy").await;
+        let fake = crate::herdr::fake::FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut p = Puller::new(
+            "laptop".into(),
+            false,
+            Arc::new(fake.clone()),
+            MachineSettings {
+                close_done_after: Some(Duration::from_millis(50)),
+                ..fast()
+            },
+            store.clone(),
+            ask,
+        );
+        head_reaches(&mut p, &head, &t, TaskState::Running).await;
+        let pane = head
+            .store()
+            .get_task(t.id)
+            .unwrap()
+            .unwrap()
+            .pane_id
+            .expect("the pane is reported");
+        // The agent ends its task on the head, prints its last line and
+        // goes idle at its prompt.
+        let IpcResponse::Task(ended) = head
+            .handle(IpcRequest::TaskDone {
+                id: t.id,
+                summary: Some("done: pushed".into()),
+            })
+            .await
+        else {
+            panic!()
+        };
+        assert!(ended.ended);
+        fake.set_pane_text(&pane, "DONE\n> ");
+        fake.set_status(&pane, crate::herdr::AgentStatus::Idle);
+
+        let mut here_events = p.events.subscribe();
+        let mut here_round = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while let Some(here) = store.get_task(t.id).unwrap() {
+            if here.ended {
+                here_round = here.summary.clone();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never forgotten: here {:?}, head {}",
+                (here.state, here.ended),
+                head.store().get_task(t.id).unwrap().unwrap().state
+            );
+            let _ = tokio::time::timeout(Duration::from_millis(100), p.changed()).await;
+            p.pass().await;
+        }
+        assert!(fake.agents().is_empty(), "{:?}", fake.agents());
+        // Both stores tell the same story: the agent's own summary, not a
+        // round ended by hand.
+        let round = here_round.expect("the row here was ended with a round");
+        assert_eq!(round.text, "done: pushed");
+        assert_eq!(round.outcome, crate::task::Outcome::Done);
+        let here_done = std::iter::from_fn(|| here_events.try_recv().ok())
+            .find(|e| e.kind == "task.done")
+            .expect("the actor here sent task.done");
+        assert_eq!(
+            here_done.summary.map(|s| s.text),
+            Some("done: pushed".to_string())
+        );
+        let row = head.store().get_task(t.id).unwrap().unwrap();
+        assert_eq!(row.state, TaskState::Closed);
+        assert_eq!(
+            row.finished_at, ended.finished_at,
+            "the finish is the agent's"
+        );
+        assert_eq!(
+            row.summary.as_ref().map(|s| s.text.as_str()),
+            Some("done: pushed"),
+            "the summary is what the agent said"
+        );
+        let kinds: Vec<String> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter(|e| e.task_id == Some(t.id))
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            ["task.queued", "task.running", "task.done", "task.closed"]
+        );
+    }
+
+    /// A task claimed here and not started yet is queued here and
+    /// `starting` on the head. One a person ends on the head meanwhile
+    /// (`task done t-N`) is closed here, no agent ever started for it, and
+    /// the head hears `closed` and frees its seat, with the finish the
+    /// person's end gave it.
+    #[tokio::test]
+    async fn a_task_the_head_ended_before_it_started_here_is_never_started() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (head, ask) = pull_head(tmp.path()).await;
+        let mut events = head.subscribe();
+        let t = run_pinned(&head, Some("laptop")).await;
+        let fake = crate::herdr::fake::FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut p = Puller::new(
+            "laptop".into(),
+            false,
+            Arc::new(fake.clone()),
+            fast(),
+            store.clone(),
+            ask,
+        );
+        // Claimed, and not yet handed to the actor.
+        p.claim().await;
+        let here = store.get_task(t.id).unwrap().expect("claimed");
+        assert_eq!(here.state, TaskState::Queued);
+        assert_eq!(
+            head.store().get_task(t.id).unwrap().unwrap().state,
+            TaskState::Starting
+        );
+        let IpcResponse::Task(ended) = head
+            .handle(IpcRequest::TaskDone {
+                id: t.id,
+                summary: None,
+            })
+            .await
+        else {
+            panic!()
+        };
+        assert!(ended.ended && ended.state == TaskState::Done);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while let Some(here) = store.get_task(t.id).unwrap() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never forgotten: here {}, head {}",
+                here.state,
+                head.store().get_task(t.id).unwrap().unwrap().state
+            );
+            let _ = tokio::time::timeout(Duration::from_millis(100), p.changed()).await;
+            p.pass().await;
+            assert!(
+                fake.agents().is_empty(),
+                "started anyway: {:?}",
+                fake.agents()
+            );
+        }
+        let row = head.store().get_task(t.id).unwrap().unwrap();
+        assert_eq!(row.state, TaskState::Closed);
+        assert_eq!(row.finished_at, ended.finished_at);
+        assert_eq!(row.error, None);
+        let kinds: Vec<String> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter(|e| e.task_id == Some(t.id))
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(kinds, ["task.queued", "task.done", "task.closed"]);
     }
 
     /// The keys pressed on `pane`, each send as one list.
@@ -1316,6 +1531,99 @@ mod tests {
         assert_eq!(p.sent.get(&t.id).map(|r| r.3), Some(true), "delivered");
         assert!(!head.store().trust_sent(t.id).unwrap());
         assert!(!std::iter::from_fn(|| events.try_recv().ok()).any(|e| e.kind == "task.trusted"));
+    }
+
+    /// A `PullTrust` that fails on the way (a timeout, a dropped bridge, a
+    /// head mid-restart) keeps the last copy, so the trust prompt is still
+    /// answered; only a head that refuses the machine clears it.
+    #[tokio::test]
+    async fn a_failed_trust_fetch_keeps_the_last_copy_a_refusal_clears_it() {
+        for code in ["timeout", "runtime_error", "daemon_not_running"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (head, ask) = pull_head(tmp.path()).await;
+            head.store().trust_repo("laptop", "~/work/app").unwrap();
+            let fails = Arc::new(Mutex::new(code));
+            let failing = fails.clone();
+            let flaky: Ask = Arc::new(move |req| {
+                let (ask, code) = (ask.clone(), *failing.lock().unwrap());
+                Box::pin(async move {
+                    if let IpcRequest::PullTrust { .. } = req {
+                        return Err(CliError::err(code, "on the way"));
+                    }
+                    ask(req).await
+                })
+            });
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            // The copy an earlier fetch left.
+            store
+                .replace_trusted_repos(&[crate::store::TrustedRepo {
+                    machine: "laptop".into(),
+                    repo: "~/work/app".into(),
+                    trusted_at: chrono::Utc::now(),
+                }])
+                .unwrap();
+            let t = run_in(&head, Some("laptop"), Some("~/work/app")).await;
+            let fake = crate::herdr::fake::FakeHerdr::new();
+            fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
+            let mut p = Puller::new(
+                "laptop".into(),
+                false,
+                Arc::new(fake.clone()),
+                fast(),
+                store.clone(),
+                flaky,
+            );
+            head_reaches(&mut p, &head, &t, TaskState::Running).await;
+            assert_eq!(
+                trust_here(&store),
+                [("laptop".to_string(), "~/work/app".to_string())],
+                "{code}"
+            );
+            assert_eq!(p.trust_refused, None, "{code}");
+
+            // Refused now: nothing left to answer with.
+            *fails.lock().unwrap() = "not_pull_machine";
+            let t2 = run_in(&head, Some("laptop"), Some("~/work/app")).await;
+            head_reaches(&mut p, &head, &t2, TaskState::Blocked).await;
+            assert!(trust_here(&store).is_empty(), "{code}");
+            assert_eq!(p.trust_refused.as_deref(), Some("not_pull_machine"));
+        }
+    }
+
+    /// `pastor trust remove` on the head reaches the pull machine at its
+    /// next fetch: a later task of that repo is left blocked for a person.
+    #[tokio::test]
+    async fn trust_removed_on_the_head_is_removed_here() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (head, ask) = pull_head(tmp.path()).await;
+        head.store().trust_repo("laptop", "~/work/app").unwrap();
+        let t = run_in(&head, Some("laptop"), Some("~/work/app")).await;
+        let fake = crate::herdr::fake::FakeHerdr::new();
+        fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut p = Puller::new(
+            "laptop".into(),
+            false,
+            Arc::new(fake.clone()),
+            fast(),
+            store.clone(),
+            ask,
+        );
+        head_reaches(&mut p, &head, &t, TaskState::Running).await;
+        assert_eq!(trust_here(&store).len(), 1);
+
+        assert!(head.store().untrust("laptop", "~/work/app").unwrap());
+        let t2 = run_in(&head, Some("laptop"), Some("~/work/app")).await;
+        head_reaches(&mut p, &head, &t2, TaskState::Blocked).await;
+        assert!(trust_here(&store).is_empty(), "{:?}", trust_here(&store));
+        let pane = head
+            .store()
+            .get_task(t2.id)
+            .unwrap()
+            .unwrap()
+            .pane_id
+            .unwrap();
+        assert!(keys_sent(&fake, &pane).is_empty());
     }
 
     /// Trust keys pressed before a restart of the serve go to the head as

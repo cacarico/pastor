@@ -1164,6 +1164,8 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
             age_after: None,
             agents: Default::default(),
             profile: None,
+            min_disk: None,
+            min_memory: None,
             label: None,
             summary: None,
             keep_pane: None,

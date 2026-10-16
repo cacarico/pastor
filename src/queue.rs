@@ -187,10 +187,18 @@ fn why_waiting(
             Some(v) => format!("{by}machine {m} is full ({}/{})", v.live, v.max_agents),
         };
     }
-    if let Some(m) = pick_machine_where(views, flock, &task.spec, claim, &|m| accepts(task, m)) {
+    // A pass never pushes to a pull machine, and whether its claims take a
+    // loose task is its serve's own setting, which the head does not know:
+    // a loose task reads one as nowhere it goes next. One pinned to it
+    // waits on its slots and seat, as its claims do (`MachineView::pull`).
+    let pull = |name: &str| views.iter().any(|v| v.name == name && v.pull);
+    let pinned = task.spec.machine.is_some();
+    let takes = |m: &str| accepts(task, m) && (pinned || !pull(m));
+    if let Some(m) = pick_machine_where(views, flock, &task.spec, claim, &takes) {
         let v = views.iter_mut().find(|v| v.name == m).expect("picked");
         v.take(flock, claim);
-        return format!("next pass: {m} has room");
+        let next = if v.pull { "next claim" } else { "next pass" };
+        return format!("{next}: {m} has room");
     }
     let tags = &task.spec.tags;
     let has_tags = |v: &MachineView| tags.iter().all(|t| v.tags.contains(t));
@@ -221,6 +229,10 @@ fn why_waiting(
         format!("flock {flock} has no machines")
     } else if !mine.iter().any(|v| v.healthy) {
         format!("no machine in flock {flock} is connected")
+    } else if mine.iter().all(|v| !v.healthy || v.pull) {
+        format!(
+            "flock {flock} has only pull machines; a loose task waits for one that takes flock work"
+        )
     } else if !mine.iter().any(|v| v.healthy && has_tags(v)) {
         format!("no machine in flock {flock} has tags {}", tags.join(", "))
     } else if let Some(why) = mine
@@ -309,6 +321,7 @@ mod tests {
             live,
             live_jobs: 0,
             healthy,
+            pull: false,
             flocks: vec![crate::dispatch::FlockSeat {
                 name: flock.into(),
                 share: None,
@@ -412,6 +425,55 @@ mod tests {
                 "no machine in flock lab has tags gpu",
                 "waiting for a machine: no agent runs gpt",
                 "machine b is not connected",
+            ]
+        );
+    }
+
+    /// A pull machine with room is where a task pinned to it goes at its
+    /// next claim, and nowhere a loose task goes: the pass never pushes to
+    /// it, and the head does not know whether its claims take flock work.
+    /// A loose task reads the flock's push machines alone, and says so
+    /// when the flock has none.
+    #[test]
+    fn a_loose_task_never_reads_a_pull_machine_as_where_it_goes() {
+        let laptop = || MachineView {
+            pull: true,
+            ..view("laptop", "default", 0, 1, true)
+        };
+        let views = [view("a", "default", 2, 2, true), laptop()];
+        assert_eq!(
+            whys(
+                vec![
+                    task(1, None, None),
+                    task(2, None, Some("laptop")),
+                    task(3, None, Some("laptop")),
+                ],
+                &views
+            ),
+            [
+                "flock default is full",
+                "next claim: laptop has room",
+                "machine laptop is full (1/1)",
+            ]
+        );
+        assert_eq!(
+            whys(vec![task(4, None, None)], &[laptop()]),
+            [
+                "flock default has only pull machines; a loose task waits for one that takes flock work"
+            ]
+        );
+        let lost = MachineView {
+            healthy: false,
+            ..laptop()
+        };
+        assert_eq!(
+            whys(
+                vec![task(5, None, None), task(6, None, Some("laptop"))],
+                &[lost]
+            ),
+            [
+                "no machine in flock default is connected",
+                "machine laptop is not connected",
             ]
         );
     }

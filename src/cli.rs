@@ -573,6 +573,19 @@ pub fn task_result(t: &Task) -> String {
         .map_or_else(|| "-".into(), |s| s.outcome.to_string())
 }
 
+/// The CLI error for a connect to `socket` denied for permissions
+/// (`HeadPing::Denied`). It names the sandbox because that is the usual
+/// cause, and an agent told the head is unresponsive retries forever.
+pub fn socket_denied(socket: &std::path::Path) -> anyhow::Error {
+    CliError::err(
+        "socket_denied",
+        format!(
+            "permission denied connecting to {}; is this command sandboxed? Run it outside the sandbox",
+            socket.display()
+        ),
+    )
+}
+
 /// The CLI error for a request that got no reply, the one mapper every
 /// command uses. Only a connect that was refused or found no socket means
 /// nothing is listening (`daemon_not_running`); one denied for permissions
@@ -587,6 +600,12 @@ pub fn request_error(err: &RequestError) -> CliError {
         RequestError::Connect(e) if connect_error_means_no_daemon(e) => (
             "daemon_not_running",
             format!("pastor serve is not running ({e}); start it with `pastor serve`"),
+        ),
+        RequestError::Connect(e) if e.kind() == std::io::ErrorKind::PermissionDenied => (
+            "socket_denied",
+            format!(
+                "permission denied connecting to pastor serve ({e}); is this command sandboxed? Run it outside the sandbox"
+            ),
         ),
         RequestError::Connect(e) => (
             "runtime_error",
@@ -880,6 +899,10 @@ pub struct MachineRow {
     pub channel: String,
     pub herdr_version: Option<String>,
     pub pastor_version: Option<String>,
+    /// `MachineStatus::pastor_read_at`: when the machine last answered the
+    /// version question; a probe's is now. Absent from an older head.
+    #[serde(default)]
+    pub pastor_read_at: Option<chrono::DateTime<Utc>>,
     pub protocol: Option<u32>,
     pub error: Option<String>,
     pub live: Option<usize>,
@@ -946,6 +969,7 @@ impl From<&MachineStatus> for MachineRow {
             channel: m.channel.to_string(),
             herdr_version: m.herdr_version.clone(),
             pastor_version: m.pastor_version.clone(),
+            pastor_read_at: m.pastor_read_at,
             protocol: m.protocol,
             error: m.error.clone(),
             live: Some(m.live),
@@ -1261,6 +1285,8 @@ mod tests {
             channel: crate::machine::ChannelState::Connected,
             herdr_version: Some("0.9.1".into()),
             pastor_version: Some("0.2.0".into()),
+            pastor_read_at: Some(Utc::now()),
+            room: None,
             protocol: Some(22),
             error: None,
             live: 1,
@@ -1356,6 +1382,7 @@ mod tests {
             channel: "unreachable".into(),
             herdr_version: None,
             pastor_version: None,
+            pastor_read_at: None,
             live: None,
             error: Some("no route to host".into()),
             tags: vec![],
@@ -1399,6 +1426,17 @@ mod tests {
         let v = serde_json::to_value(&row).unwrap();
         assert_eq!(v["job_slots"], 1);
         assert_eq!(v["burst"], 1);
+        // When the pastor version was last read travels with the row, for
+        // `machine describe` and scripts; absent from an older head.
+        assert!(v["pastor_read_at"].is_string(), "{v}");
+        let old: MachineRow = serde_json::from_value(serde_json::json!({
+            "name": "pi-3", "host": "h", "endpoint": "e", "flock": "work",
+            "channel": "connected", "herdr_version": null, "pastor_version": null,
+            "protocol": null, "error": null, "live": 0, "max_agents": 1,
+            "tags": [], "orphans": []
+        }))
+        .unwrap();
+        assert_eq!(old.pastor_read_at, None);
     }
 
     /// The head is not a machine: scripts that walk `machines` must not trip
@@ -1493,6 +1531,9 @@ mod tests {
                 priority: None,
                 agents: Default::default(),
                 profile: None,
+                min_disk: None,
+                min_memory: None,
+                unknown_room: None,
             }],
         };
         let mut rows = task_rows(&tasks);

@@ -52,6 +52,7 @@ pub fn machine_settings(config: &PastorConfig) -> MachineSettings {
     MachineSettings {
         settle: config.settle_duration(),
         reconcile_every: config.reconcile_duration(),
+        version_every: config.version_every_duration(),
         request_timeout: config.request_timeout_duration(),
         agent_ready_timeout: config.agent_ready_timeout_duration(),
         poll_every: config.tick_duration(),
@@ -170,16 +171,19 @@ fn seats(flock: &Flock, status: &crate::machine::MachineStatus) -> Vec<FlockSeat
 }
 
 /// The part of a machine's entry its actor is built from. The flock, the
-/// agent and its per-kind agents are not: they only decide which tasks the
-/// machine is offered and what they run, which dispatch reads from the flock
-/// last applied, so moving a machine or changing its agent keeps its
-/// connection and the tasks already on it.
+/// agent, its per-kind agents and its room floor are not: they only decide
+/// which tasks the machine is offered and what they run, which dispatch
+/// reads from the flock last applied, so moving a machine, changing its
+/// agent or its floor keeps its connection and the tasks already on it.
 fn actor_config(m: &MachineConfig) -> MachineConfig {
     MachineConfig {
         flock: None,
         agent: None,
         agent_args: None,
         agents: Default::default(),
+        min_disk: None,
+        min_memory: None,
+        unknown_room: None,
         description: None,
         ..m.clone()
     }
@@ -792,6 +796,27 @@ impl Fleet {
             .read()
             .recover()
             .apply(&pick, own.as_deref(), spec)?;
+        // agy's rules are per machine: a task's profile has to be one the
+        // machine's own profile already denies (`config::agy`).
+        if agents.agy_profile(spec)
+            && let Some(own) = own.as_deref()
+        {
+            let own_deny = self.profiles.read().recover().resolve(own)?.deny;
+            let uncovered = crate::config::agy::not_denied_by(&spec.deny, &own_deny);
+            if !uncovered.is_empty() {
+                let profile = spec.profile().unwrap_or_default();
+                return Err(AgentRefusal {
+                    code: crate::config::agy::AGY_PROFILE_MISMATCH,
+                    message: format!(
+                        "profile {profile} denies {} and the own profile of machine {} ({own}) does not; \
+                         agy's rules are per machine, so run the task under that machine's profile \
+                         or on a machine whose own profile is {profile}",
+                        uncovered.join(", "),
+                        machine.unwrap_or("-"),
+                    ),
+                });
+            }
+        }
         let unapplied = agents.lists_unapplied(spec);
         if let Some(source) = spec.agent_source.as_mut() {
             source.lists_unapplied = unapplied;
@@ -927,12 +952,13 @@ impl Fleet {
         // Unpinned, with the agent left to the machine, its kind is known
         // only on the machine: a mismatch here is not the task's to fix. So
         // is the machine's own profile, which decides where `unrestricted`
-        // may run.
+        // may run and which profile an agy machine runs.
         let per_machine = |e: &AgentRefusal| {
             pinned.is_none()
                 && ((e.code == MODEL_KIND_MISMATCH && ask.agent.is_none())
                     || e.code == AGENT_KIND_MISSING
-                    || e.code == PROFILE_NOT_ALLOWED)
+                    || e.code == PROFILE_NOT_ALLOWED
+                    || e.code == crate::config::agy::AGY_PROFILE_MISMATCH)
         };
         let mut landings = Vec::new();
         match self.settle(spec, ask, flock, pinned.as_deref(), asked_by) {
@@ -1089,7 +1115,7 @@ impl Fleet {
         }
         let mut plan: Vec<Step> = Vec::new();
         for m in &flock.machines {
-            let want = (actor_config(m), actor_settings(m, settings));
+            let want = (actor_config(m), self.settings_of(m, settings));
             plan.push(match old.iter().position(|o| o.handle.name == m.name) {
                 Some(i) if !old[i].shutting_down && old[i].spawned_from.as_ref() == Some(&want) => {
                     Step::Keep(old.remove(i))
@@ -1200,8 +1226,34 @@ impl Fleet {
         m
     }
 
+    /// The settings `m`'s actor runs with: `actor_settings`, and the deny
+    /// list of its own profile (`own_deny`).
+    fn settings_of(&self, m: &MachineConfig, settings: &MachineSettings) -> MachineSettings {
+        MachineSettings {
+            own_deny: self.own_deny(m),
+            ..actor_settings(m, settings)
+        }
+    }
+
+    /// The deny list of `m`'s own profile, from the flock and `pastor.toml`
+    /// as last applied: its `[[machine]]` profile, else its primary flock's,
+    /// else `[defaults]` (`own_profile`). Empty with no profile, or one
+    /// that no longer resolves (`check_config` refuses that file anyway).
+    pub fn own_deny(&self, m: &MachineConfig) -> Vec<String> {
+        let flock = self.flock().primary_flock(m).to_string();
+        let Some(name) = self.own_profile(&flock, Some(&m.name)) else {
+            return vec![];
+        };
+        self.profiles
+            .read()
+            .recover()
+            .resolve(&name)
+            .map(|p| p.deny)
+            .unwrap_or_default()
+    }
+
     fn spawn(&self, spawner: &Spawner, m: &MachineConfig, settings: &MachineSettings) -> Member {
-        let settings = &actor_settings(m, settings);
+        let settings = &self.settings_of(m, settings);
         if m.pull {
             // Heard from as of now: a head that starts gives the machine
             // `pull_lost_after` to claim before its tasks go stale.
@@ -1244,6 +1296,20 @@ impl Fleet {
     /// store rather than the actor's last count, so a pass sees a task
     /// another placed and the actor claimed at once, and not twice.
     pub fn views(&self) -> Vec<MachineView> {
+        self.views_where(false)
+    }
+
+    /// `views`, with a pull machine healthy while it is connected: what
+    /// `pastor queue` explains a wait with. A pass never pushes to one,
+    /// but its claims take a task under the same room and seat rules, so
+    /// a task pinned to it waits for a slot or its flock's seat, not for a
+    /// connection it has. The view says it is a pull machine, so a loose
+    /// task is never read as going there (`queue::why_waiting`).
+    fn queue_views(&self) -> Vec<MachineView> {
+        self.views_where(true)
+    }
+
+    fn views_where(&self, pull_claims: bool) -> Vec<MachineView> {
         let wanted = self.flock();
         let in_flight = self.in_flight.placed();
         self.members
@@ -1278,7 +1344,10 @@ impl Fleet {
                     // An aborted actor answers nothing, and a dispatch to
                     // it would wait for as long as it stays wedged. A pull
                     // machine takes its tasks itself (`claim`).
-                    healthy: !m.pull && !m.shutting_down && s.channel.accepts_dispatch(),
+                    healthy: (pull_claims || !m.pull)
+                        && !m.shutting_down
+                        && s.channel.accepts_dispatch(),
+                    pull: m.pull,
                     flocks: seats(&wanted, &s),
                     waiting_under_share: Vec::new(),
                 }
@@ -1715,8 +1784,12 @@ impl Fleet {
             self.settled_on(task, target, machine)
                 .is_none_or(|r| r.is_ok())
         };
-        let mut entries =
-            crate::queue::entries(queued, &self.views(), wanted.default_flock(), &accepts);
+        let mut entries = crate::queue::entries(
+            queued,
+            &self.queue_views(),
+            wanted.default_flock(),
+            &accepts,
+        );
         entries.retain(|e| e.matches(flock, machine));
         Ok(entries)
     }
@@ -2343,6 +2416,7 @@ impl Fleet {
             live: s.live,
             live_jobs: s.live_jobs,
             healthy: true,
+            pull: true,
             flocks: seats(&flock, &s),
             waiting_under_share: Vec::new(),
         };
@@ -2410,7 +2484,7 @@ impl Fleet {
 
     /// `PullTrust`: the folder trust saved for pull machine `machine`, and
     /// only its own, so its actor answers its tasks' trust prompts as the
-    /// head's actor answers another machine's (`Actor::auto_trust`).
+    /// head's actor answers another machine's (`Actor::auto_answer`).
     pub fn pull_trust(&self, machine: &str) -> anyhow::Result<Vec<crate::store::TrustedRepo>> {
         self.pull_handle(machine)?;
         Ok(self
@@ -2426,7 +2500,11 @@ impl Fleet {
     /// A closed or failed row stays as it is, a stale one stays stale while
     /// its agent works (as `task::next_state` keeps it), and one `task done`
     /// ended stays done until its pane closes; each answers the row as it
-    /// is. Trust keys the machine pressed (`PullReport::trusted`) are
+    /// is. An ended one reported `failed` is closed instead, as `task
+    /// close` would close it, with no error: its agent is gone, and the
+    /// machine forgets the row after that report, so nothing would ever
+    /// report it closed and it would hold its seat for good.
+    /// Trust keys the machine pressed (`PullReport::trusted`) are
     /// `task.trusted` once per task, after a `task.blocked` the same report
     /// brings and before any other state's event, as the actor emits them.
     pub async fn report(&self, machine: &str, id: i64, report: PullReport) -> anyhow::Result<Task> {
@@ -2439,12 +2517,15 @@ impl Fleet {
         } = report;
         let handle = self.pull_handle(machine)?;
         self.heard(&handle);
-        // Once per task, as `Actor::auto_trust` claims it, so a report sent
+        // Once per task, as `Actor::auto_answer` claims it, so a report sent
         // again (after a restart of the serve, say) is not a second event.
         let trust = |task: &Task| -> anyhow::Result<()> {
             if let Some(keys) = &trusted
                 && self.store.claim_trust_sent(task.id, keys)?
             {
+                // The actor claims both for its own tasks: the two tables
+                // agree on a pull machine's task too.
+                self.store.claim_answered(task.id, "trust", keys)?;
                 self.emit(
                     "task.trusted",
                     machine,
@@ -2484,6 +2565,9 @@ impl Fleet {
                 ));
             }
             let from = task.state;
+            let ended = from == TaskState::Done && task.ended;
+            let gone = ended && state == TaskState::Failed;
+            let state = if gone { TaskState::Closed } else { state };
             let working = matches!(
                 state,
                 TaskState::Starting | TaskState::Running | TaskState::Blocked
@@ -2492,7 +2576,7 @@ impl Fleet {
             // failed row takes no later report, and an ended one only its
             // pane closing, which `next_state` also lets through.
             let kept = matches!(from, TaskState::Closed | TaskState::Failed)
-                || from == TaskState::Done && task.ended && state != TaskState::Closed
+                || ended && state != TaskState::Closed
                 || from == TaskState::Stale && working;
             if kept
                 || from == state
@@ -2508,7 +2592,11 @@ impl Fleet {
             if pane.is_some() {
                 task.pane_id = pane.clone();
             }
-            task.error = detail.clone();
+            // The failure of an agent that had ended its task is no
+            // error of the task's: it finished as the agent said.
+            if !gone {
+                task.error = detail.clone();
+            }
             let now = chrono::Utc::now();
             if matches!(state, TaskState::Running | TaskState::Blocked) && task.started_at.is_none()
             {
@@ -2619,8 +2707,12 @@ impl Fleet {
 
     /// Count each pull machine not heard from for `after` lost, once per
     /// silence: `machine.lost`, and its starting and running tasks go
-    /// stale, as a task does whose agent pastor lost sight of. Tasks pinned
-    /// to it stay queued. Answers the machines it counted lost now.
+    /// stale, as a task does whose agent pastor lost sight of. A task its
+    /// agent ended (`task done`, done and ended here) is closed, its finish
+    /// kept: it waited for the machine to close its pane and report that,
+    /// which a machine that is gone may never do, and until then it held
+    /// its slot and its flock's seat. Tasks pinned to the machine stay
+    /// queued. Answers the machines it counted lost now.
     pub async fn check_pull_lost(&self, after: Duration) -> Vec<String> {
         let _pass = self.dispatch_lock.lock().await;
         let now = tokio::time::Instant::now();
@@ -2655,15 +2747,19 @@ impl Fleet {
                 }
             };
             for mut t in tasks {
-                if !matches!(t.state, TaskState::Starting | TaskState::Running) {
-                    continue;
+                let state = match t.state {
+                    TaskState::Starting | TaskState::Running => TaskState::Stale,
+                    TaskState::Done if t.ended => TaskState::Closed,
+                    _ => continue,
+                };
+                t.state = state;
+                if state == TaskState::Stale {
+                    t.error = Some(why.clone());
                 }
-                t.state = TaskState::Stale;
-                t.error = Some(why.clone());
                 match self.store.update_task(&mut t) {
-                    Ok(()) => self.emit("task.stale", name, Some(&t), None),
+                    Ok(()) => self.emit(&format!("task.{state}"), name, Some(&t), None),
                     Err(err) => {
-                        tracing::warn!(task = %t.display_id(), %err, "mark stale")
+                        tracing::warn!(task = %t.display_id(), %err, "mark {state}")
                     }
                 }
             }
@@ -3414,6 +3510,7 @@ pub async fn refuse_live_socket(socket: &std::path::Path) -> anyhow::Result<()> 
              remove the socket file by hand only if that daemon is dead",
             socket.display()
         ),
+        HeadPing::Denied => Err(crate::cli::socket_denied(socket)),
         HeadPing::NotRunning => Ok(()),
     }
 }
@@ -4498,13 +4595,19 @@ impl Daemon {
     /// row again and types into the pane. A task on no machine, or one whose
     /// machine has left the flock, has no agent to type into.
     async fn send(&self, id: i64, input: SendInput) -> IpcResponse {
-        if input.is_empty() {
-            return IpcResponse::error("nothing_to_send", "give text, --key or --trust");
+        if input.is_empty() || input.pick.as_deref().is_some_and(|p| p.trim().is_empty()) {
+            return IpcResponse::error("nothing_to_send", "give text, --key, --trust or --pick");
         }
         if input.trust && (input.text.is_some() || !input.keys.is_empty()) {
             return IpcResponse::error(
                 "usage_error",
                 "--trust sends the agent's own keys; give no text or --key with it",
+            );
+        }
+        if input.pick.is_some() && (input.text.is_some() || !input.keys.is_empty() || input.trust) {
+            return IpcResponse::error(
+                "usage_error",
+                "--pick answers the picker on screen; give no text, --key or --trust with it",
             );
         }
         let task = match self.store.get_task(id) {
@@ -5006,6 +5109,9 @@ mod tests {
             priority: None,
             agents: Default::default(),
             profile: None,
+            min_disk: None,
+            min_memory: None,
+            unknown_room: None,
         }
     }
 
@@ -5044,6 +5150,24 @@ mod tests {
             settle: "1s".into(),
             ..Default::default()
         }
+    }
+
+    /// `version_every` in pastor.toml reaches the actors like the other
+    /// timings, so a reload can shorten how long a new install stays unseen.
+    #[test]
+    fn machine_settings_carry_version_every() {
+        let config = PastorConfig {
+            version_every: "45s".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            machine_settings(&config).version_every,
+            Duration::from_secs(45)
+        );
+        assert_eq!(
+            machine_settings(&test_config()).version_every,
+            Duration::from_secs(120)
+        );
     }
 
     /// Hands out the fake registered under a machine's name, or a fresh one.
@@ -5142,6 +5266,49 @@ mod tests {
         assert!(fleet.get("b").is_none());
         assert_eq!(fleet.get("a").unwrap().max_agents, 3);
         assert_eq!(fleet.flock(), flock_of(&[("a", 3)]));
+    }
+
+    /// A machine's actor gets the deny list of its own profile: its
+    /// `[[machine]]` one, else its flock's, else `[defaults]`. A change of
+    /// that profile replaces the actor, as an `[agents]` edit does.
+    #[tokio::test]
+    async fn a_machines_own_profile_reaches_its_actor() {
+        let (fleet, _store) = managed(&[]);
+        let profiles = crate::config::profile::Profiles::default();
+        let deny = |name: &str| profiles.resolve(name).unwrap().deny;
+        let mut config = PastorConfig::default();
+        config.defaults.profile = Some("develop".into());
+        let mut flock = flock_of(&[("a", 2), ("b", 2), ("c", 2)]);
+        flock.machines[0].profile = Some("review".into());
+        flock.machines[1].flock = Some("ro".into());
+        flock.flocks.push(crate::config::flock::FlockEntry {
+            name: "ro".into(),
+            profile: Some("unrestricted".into()),
+            ..Default::default()
+        });
+        fleet.set_config(&config);
+        fleet.apply_flock(&flock, &fast()).await;
+        let spawned = |name: &str| {
+            fleet
+                .members
+                .read()
+                .recover()
+                .iter()
+                .find(|m| m.handle.name == name)
+                .and_then(|m| m.spawned_from.clone())
+                .unwrap()
+                .1
+                .own_deny
+        };
+        assert_eq!(spawned("a"), deny("review"));
+        assert!(spawned("b").is_empty(), "the flock's unrestricted");
+        assert_eq!(spawned("c"), deny("develop"));
+
+        config.defaults.profile = Some("review".into());
+        fleet.set_config(&config);
+        let d = fleet.apply_flock(&flock, &fast()).await;
+        assert_eq!(d.retargeted, vec!["c".to_string()]);
+        assert_eq!(spawned("c"), deny("review"));
     }
 
     /// Review Focus 2: an editor re-save, or `machine add other`, must not
@@ -5775,6 +5942,10 @@ mod tests {
             ]
         );
         assert!(d.store().trust_sent(t1.id).unwrap());
+        assert!(
+            d.store().answered(t1.id, "trust").unwrap(),
+            "claimed as the actor claims it, so the two tables agree"
+        );
         // A report without keys says nothing of trust.
         let t3 = queued(&d, "p3", Some("laptop")).await;
         claim(&d, 1, false).await;
@@ -5880,13 +6051,202 @@ mod tests {
             summary: None,
         })
         .await;
-        for late in [TaskState::Failed, TaskState::Stale, TaskState::Running] {
+        for late in [
+            TaskState::Stale,
+            TaskState::Running,
+            TaskState::Blocked,
+            TaskState::Done,
+        ] {
             d.handle(report("laptop", &ended, late, None)).await;
             assert_eq!(state_of(&d, &ended), TaskState::Done, "{late}");
         }
         d.handle(report("laptop", &ended, TaskState::Closed, None))
             .await;
         assert_eq!(state_of(&d, &ended), TaskState::Closed);
+    }
+
+    /// A pull machine reports a task its agent ended (`task done` reaches
+    /// the head, which keeps the row done) `failed` once the agent is gone,
+    /// and then forgets the row: nobody will ever report it closed. The
+    /// head closes it on that report, with its finish kept, so the task
+    /// stops counting as live and the machine's next claim gets its seat.
+    #[tokio::test]
+    async fn a_failed_report_on_an_ended_pull_task_closes_it_and_frees_the_seat() {
+        let (d, _tmp) = pull_daemon(1).await;
+        let first = queued(&d, "first", Some("laptop")).await;
+        assert_eq!(claim(&d, 1, false).await, ["first"]);
+        d.handle(report("laptop", &first, TaskState::Running, None))
+            .await;
+        d.handle(IpcRequest::TaskDone {
+            id: first.id,
+            summary: Some("done: all pushed".into()),
+        })
+        .await;
+        let finished = d.store().get_task(first.id).unwrap().unwrap().finished_at;
+        assert!(finished.is_some());
+        let mut rx = d.subscribe();
+        d.handle(report("laptop", &first, TaskState::Blocked, None))
+            .await;
+        assert_eq!(state_of(&d, &first), TaskState::Done, "ended stays done");
+        d.handle(report(
+            "laptop",
+            &first,
+            TaskState::Failed,
+            Some("agent t-1 not found"),
+        ))
+        .await;
+        let row = d.store().get_task(first.id).unwrap().unwrap();
+        assert_eq!(
+            row.state,
+            TaskState::Closed,
+            "its agent is gone: nothing is left to close"
+        );
+        assert_eq!(
+            row.finished_at, finished,
+            "the finish is the agent's, not the close's"
+        );
+        assert_eq!(
+            row.error, None,
+            "the agent's going is no error of the task's"
+        );
+        assert_eq!(
+            events_of(&mut rx),
+            [(
+                "task.closed".to_string(),
+                Some(first.id),
+                "laptop".to_string()
+            )]
+        );
+        let second = queued(&d, "second", Some("laptop")).await;
+        assert_eq!(
+            claim(&d, 1, false).await,
+            ["second"],
+            "the seat is free again"
+        );
+        assert_eq!(state_of(&d, &second), TaskState::Starting);
+    }
+
+    /// `pastor queue` explains a task pinned to a pull machine by what the
+    /// machine's claims see: full while its slots are taken, not connected
+    /// only while it has never claimed or was counted lost. The dispatch
+    /// pass still never pushes to it.
+    #[tokio::test]
+    async fn the_queue_explains_a_pull_machine_by_its_slots_not_its_actor() {
+        let (d, _tmp) = pull_daemon(1).await;
+        let why = |id: i64| {
+            d.fleet()
+                .queue(None, None)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.task.id == id)
+                .map(|e| e.why)
+                .expect("queued")
+        };
+        let first = queued(&d, "first", Some("laptop")).await;
+        assert_eq!(
+            why(first.id),
+            "machine laptop is not connected",
+            "never claimed yet"
+        );
+        assert_eq!(claim(&d, 1, false).await, ["first"]);
+        d.handle(report("laptop", &first, TaskState::Running, None))
+            .await;
+        let second = queued(&d, "second", Some("laptop")).await;
+        assert_eq!(why(second.id), "machine laptop is full (1/1)");
+        assert!(
+            !d.fleet()
+                .views()
+                .iter()
+                .any(|v| v.name == "laptop" && v.healthy),
+            "a pass never dispatches to a pull machine"
+        );
+        let lost = d.fleet().check_pull_lost(Duration::ZERO).await;
+        assert_eq!(lost, ["laptop"]);
+        assert_eq!(why(second.id), "machine laptop is not connected");
+    }
+
+    /// A pull machine with room is nowhere a loose task goes: a pass never
+    /// pushes to it, and whether its claims take flock work is its serve's
+    /// own setting. With the push machine full, a loose task reads its
+    /// flock as full rather than the pull machine as where the next pass
+    /// starts it, and takes no slot there from the task pinned behind it.
+    #[tokio::test]
+    async fn the_queue_never_reads_a_pull_machine_as_where_a_loose_task_goes() {
+        let (d, _tmp) = pull_daemon(1).await;
+        assert!(
+            claim(&d, 1, false).await.is_empty(),
+            "connected, nothing to take"
+        );
+        let on_a = queued(&d, "on a", None).await;
+        assert_eq!(on_a.machine.as_deref(), Some("a"), "a has one slot");
+        let loose = queued(&d, "loose", None).await;
+        let pinned = queued(&d, "pinned", Some("laptop")).await;
+        let whys: Vec<(i64, String)> = d
+            .fleet()
+            .queue(None, None)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.task.id, e.why))
+            .collect();
+        assert_eq!(
+            whys,
+            [
+                (loose.id, "flock default is full".to_string()),
+                (pinned.id, "next claim: laptop has room".to_string()),
+            ]
+        );
+    }
+
+    /// A pull machine counted lost may never report again, and a task its
+    /// agent ended there waits for that: its pane closed and reported, so
+    /// the head stops counting it live. The head closes it itself, its
+    /// finish and summary kept, so its slot and its flock's seat are free
+    /// for the machine's next claim.
+    #[tokio::test]
+    async fn a_lost_pull_machine_s_ended_task_is_closed_and_frees_its_seat() {
+        let (d, _tmp) = pull_daemon(1).await;
+        let first = queued(&d, "first", Some("laptop")).await;
+        assert_eq!(claim(&d, 1, false).await, ["first"]);
+        d.handle(report("laptop", &first, TaskState::Running, None))
+            .await;
+        d.handle(IpcRequest::TaskDone {
+            id: first.id,
+            summary: Some("done: all pushed".into()),
+        })
+        .await;
+        let ended = d.store().get_task(first.id).unwrap().unwrap();
+        assert!(ended.ended && ended.finished_at.is_some());
+        let second = queued(&d, "second", Some("laptop")).await;
+        let mut rx = d.subscribe();
+        assert_eq!(d.fleet().check_pull_lost(Duration::ZERO).await, ["laptop"]);
+        let row = d.store().get_task(first.id).unwrap().unwrap();
+        assert_eq!(row.state, TaskState::Closed);
+        assert_eq!(
+            row.finished_at, ended.finished_at,
+            "the finish is the agent's"
+        );
+        assert_eq!(row.error, None);
+        assert_eq!(
+            row.summary.as_ref().map(|s| s.text.as_str()),
+            Some("done: all pushed")
+        );
+        let lap = |kind: &str, id: Option<i64>| (kind.to_string(), id, "laptop".to_string());
+        assert_eq!(
+            events_of(&mut rx),
+            [
+                lap("machine.lost", None),
+                lap("task.closed", Some(first.id))
+            ]
+        );
+        assert_eq!(claim(&d, 1, false).await, ["second"], "the seat is free");
+        assert_eq!(state_of(&d, &second), TaskState::Starting);
+        assert_eq!(events_of(&mut rx)[0], lap("machine.connected", None));
+        // The machine, back, reports the pane closed at last: the row is
+        // closed already, and stays so.
+        d.handle(report("laptop", &first, TaskState::Closed, None))
+            .await;
+        assert_eq!(state_of(&d, &first), TaskState::Closed);
+        assert!(events_of(&mut rx).is_empty());
     }
 
     /// `pull = true` is a way to reach a machine, like `ssh`, `local` and
@@ -6116,6 +6476,11 @@ mod tests {
         assert_eq!(m.row.name, "a");
         assert_eq!(m.row.channel, "connected");
         assert_eq!(m.row.live, Some(0));
+        // The connect read the fake's pastor version; the description says
+        // when, so a stale-looking version can be told from one never asked.
+        assert!(m.row.pastor_read_at.is_some(), "{m:?}");
+        let text = crate::describe::machine_text(&m);
+        assert!(text.contains("version read:"), "{text}");
         let resp = d
             .handle(IpcRequest::MachineDescribe { name: "b".into() })
             .await;
@@ -8716,13 +9081,14 @@ mod tests {
         );
     }
 
-    /// A profiled agy task is refused before it starts while its agent has
-    /// no flags and no `own_permissions`, the message naming the field; with
-    /// the field it starts with no permission flag or mode added, and `task
-    /// describe` says its own settings hold, not the profile's lists.
+    /// End to end: a profiled agy task starts with the flags that stop it
+    /// asking and `task describe` says its lists are not passed; on a
+    /// machine whose agy settings lack a rule it fails before `agent.start`,
+    /// naming the rule; `unrestricted`, which denies nothing, runs no probe;
+    /// with `own_permissions` nothing is added or checked.
     #[tokio::test]
-    async fn an_agy_task_under_a_profile_needs_its_own_permissions() {
-        let run_agy = || {
+    async fn an_agy_task_under_a_profile_starts_without_asking_or_fails_naming_the_rule() {
+        let run_agy = |profile: Option<&str>| {
             let IpcRequest::Run {
                 now,
                 preempt,
@@ -8734,7 +9100,7 @@ mod tests {
                 role,
                 description,
                 agent: Some(choice),
-            } = run_profile(Some("develop"), None)
+            } = run_profile(profile, None)
             else {
                 unreachable!()
             };
@@ -8755,19 +9121,71 @@ mod tests {
             }
         };
         let fake = FakeHerdr::new();
-        let (d, _tmp) = profiles_daemon(vec![machine("pi", 2)], &[("pi", 2, fake.clone())]).await;
-        let resp = d.handle(run_agy()).await;
-        let IpcResponse::Error { code, message } = resp else {
-            panic!("{resp:?}")
+        let (d, _tmp) = profiles_daemon(vec![machine("pi", 4)], &[("pi", 4, fake.clone())]).await;
+        let IpcResponse::Task(t) = d.handle(run_agy(Some("develop"))).await else {
+            panic!()
         };
-        assert_eq!(code, "agent_tools_unsupported");
-        assert!(message.contains("own_permissions"), "{message}");
-        assert!(
-            !fake.requests().iter().any(|r| r.method == "agent.start"),
-            "{:?}",
+        assert_eq!(t.profile(), Some("develop"));
+        let reqs = fake.requests();
+        let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
+        assert_eq!(start.params["kind"], "agy");
+        let args: Vec<&str> = start.params["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            &args[args.len() - 3..],
+            ["--dangerously-skip-permissions", "--mode", "accept-edits"]
+        );
+        for d in &t.spec.deny {
+            assert!(!args.contains(&d.as_str()), "{args:?}");
+        }
+        let text = crate::cli::task_detail(&t);
+        assert!(text.contains("(agy takes no lists:"), "{text}");
+
+        fake.set_agy_settings(Some(crate::provision::agy::AgySettings {
+            content: Some(r#"{"permissions":{"deny":["command(sudo)"]}}"#.into()),
+            link: false,
+        }));
+        let before = fake
+            .requests()
+            .iter()
+            .filter(|r| r.method == "agent.start")
+            .count();
+        let IpcResponse::Task(t) = d.handle(run_agy(Some("develop"))).await else {
+            panic!()
+        };
+        let t = d.store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(t.state, TaskState::Failed);
+        let err = t.error.clone().unwrap_or_default();
+        assert!(err.contains("agy_permissions_missing"), "{err}");
+        assert!(err.contains("command(rm -rf)"), "{err}");
+        assert!(err.contains("command(git push --force)"), "{err}");
+        assert!(!err.contains("command(sudo)"), "{err}");
+        assert_eq!(
             fake.requests()
+                .iter()
+                .filter(|r| r.method == "agent.start")
+                .count(),
+            before
         );
 
+        // `unrestricted` denies nothing: no probe, no refusal.
+        let mut config = profiles_config();
+        config.defaults.profile = Some("unrestricted".into());
+        apply_config(&d, &config).await;
+        fake.set_agy_settings(None);
+        let IpcResponse::Task(t) = d.handle(run_agy(Some("unrestricted"))).await else {
+            panic!()
+        };
+        assert_eq!(
+            d.store.get_task(t.id).unwrap().unwrap().state,
+            TaskState::Running
+        );
+
+        // `own_permissions`: its args alone, nothing checked.
         let mut config = profiles_config();
         config.agents.0.insert(
             "agy".into(),
@@ -8777,30 +9195,17 @@ mod tests {
             },
         );
         apply_config(&d, &config).await;
-        let resp = d.handle(run_agy()).await;
-        let IpcResponse::Task(t) = resp else {
-            panic!("{resp:?}")
+        let IpcResponse::Task(t) = d.handle(run_agy(Some("develop"))).await else {
+            panic!()
         };
-        assert_eq!(t.profile(), Some("develop"));
-        assert!(!t.spec.deny.is_empty());
         let reqs = fake.requests();
-        let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
-        assert_eq!(start.params["kind"], "agy", "{:?}", start.params);
+        let start = reqs.iter().rfind(|r| r.method == "agent.start").unwrap();
         let args: Vec<&str> = start.params["args"]
             .as_array()
             .map(|a| a.iter().map(|a| a.as_str().unwrap()).collect())
             .unwrap_or_default();
         assert_eq!(args, t.spec.agent_args, "{args:?}");
-        for d in &t.spec.deny {
-            assert!(!args.contains(&d.as_str()), "{args:?}");
-        }
-        let text = crate::cli::task_detail(&t);
-        assert!(
-            text.contains(
-                "(not applied: agent agy's permissions are in its own settings on the machine)"
-            ),
-            "{text}"
-        );
+        assert!(crate::cli::task_detail(&t).contains("own settings on the machine"));
     }
 
     /// A machine's profile reaches its tasks, before its flock's; a name
@@ -8918,7 +9323,95 @@ mod tests {
             panic!()
         };
         let text = crate::describe::machine_text(&m);
-        assert!(text.contains("profile:     unrestricted"), "{text}");
+        // The label column is as wide as the longest label, so match the
+        // field and not its padding.
+        assert!(
+            text.lines().any(|l| l
+                .split_once(':')
+                .is_some_and(|(k, v)| k == "profile" && v.trim() == "unrestricted")),
+            "{text}"
+        );
+    }
+
+    /// agy's rules are per machine, so a profiled agy task runs only on a
+    /// machine whose own profile denies everything the task's does: an
+    /// unpinned `review` task skips a `develop` machine for a `review` one,
+    /// pinned to the `develop` machine it is refused, and a machine with no
+    /// own profile is tried.
+    #[tokio::test]
+    async fn a_profiled_agy_task_needs_a_machine_whose_own_profile_covers_it() {
+        let dev = MachineConfig {
+            profile: Some("develop".into()),
+            ..machine("dev", 2)
+        };
+        let rev = MachineConfig {
+            profile: Some("review".into()),
+            ..machine("rev", 1)
+        };
+        let (d, _tmp) = profiles_daemon(
+            vec![dev, rev, machine("pi", 2)],
+            &[
+                ("dev", 2, FakeHerdr::new()),
+                ("rev", 1, FakeHerdr::new()),
+                ("pi", 2, FakeHerdr::new()),
+            ],
+        )
+        .await;
+        let run = |profile: Option<&str>, machine: Option<&str>| {
+            let IpcRequest::Run {
+                now,
+                preempt,
+                summary,
+                prompt,
+                spec,
+                flock,
+                priority,
+                role,
+                description,
+                agent: Some(choice),
+            } = run_profile(profile, machine)
+            else {
+                unreachable!()
+            };
+            IpcRequest::Run {
+                now,
+                preempt,
+                summary,
+                prompt,
+                spec,
+                flock,
+                priority,
+                role,
+                description,
+                agent: Some(AgentChoice {
+                    agent: Some("agy".into()),
+                    ..choice
+                }),
+            }
+        };
+        let resp = d.handle(run(Some("review"), Some("dev"))).await;
+        let IpcResponse::Error { code, message } = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(code, crate::config::agy::AGY_PROFILE_MISMATCH);
+        assert!(message.contains("Bash(git push:*)"), "{message}");
+        assert!(message.contains("develop"), "{message}");
+
+        let IpcResponse::Task(t) = d.handle(run(Some("review"), None)).await else {
+            panic!()
+        };
+        assert_eq!(t.machine.as_deref(), Some("rev"));
+        // rev is full and dev does not cover review; pi has no own profile,
+        // so it is tried and the dispatch check decides.
+        let IpcResponse::Task(t) = d.handle(run(Some("review"), None)).await else {
+            panic!()
+        };
+        assert_eq!(t.machine.as_deref(), Some("pi"));
+        // develop on the develop machine is fine.
+        let IpcResponse::Task(t) = d.handle(run(Some("develop"), Some("dev"))).await else {
+            panic!()
+        };
+        assert_eq!(t.machine.as_deref(), Some("dev"));
     }
 
     /// A profile dropped from pastor.toml while a task waits for a machine
@@ -10706,6 +11199,9 @@ mod tests {
                     priority: None,
                     agents: Default::default(),
                     profile: None,
+                    min_disk: None,
+                    min_memory: None,
+                    unknown_room: None,
                     description: None,
                 },
             },
@@ -10929,6 +11425,27 @@ mod tests {
             assert!(Instant::now() < deadline, "daemon never started");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// A socket this caller may not connect to is refused with
+    /// `socket_denied`, and left where it is: a head may well be live
+    /// behind it.
+    #[tokio::test]
+    async fn a_denied_socket_is_refused_and_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("pastor.sock");
+        let _listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+            // Root ignores the mode; there is nothing to deny.
+            return;
+        }
+        let err = refuse_live_socket(&socket).await.unwrap_err();
+        let err = err.downcast::<crate::cli::CliError>().unwrap();
+        assert_eq!(err.code, "socket_denied", "{}", err.message);
+        assert!(err.message.contains("sandbox"), "{}", err.message);
+        assert!(socket.exists(), "never unlinked over a denial");
     }
 
     /// A daemon that is mid-request and not answering pings (or a listener that
@@ -11664,6 +12181,29 @@ mod tests {
             .handle(IpcRequest::TaskSend {
                 id: t.id,
                 input: crate::machine::SendInput::default(),
+            })
+            .await;
+        assert_eq!(error_code(resp), "nothing_to_send");
+        // --pick with text or --key is a usage error, like --trust.
+        let resp = d
+            .handle(IpcRequest::TaskSend {
+                id: t.id,
+                input: crate::machine::SendInput {
+                    pick: Some("No".into()),
+                    keys: vec!["esc".into()],
+                    ..Default::default()
+                },
+            })
+            .await;
+        assert_eq!(error_code(resp), "usage_error");
+        // An empty --pick would match every option; it is nothing to send.
+        let resp = d
+            .handle(IpcRequest::TaskSend {
+                id: t.id,
+                input: crate::machine::SendInput {
+                    pick: Some("  ".into()),
+                    ..Default::default()
+                },
             })
             .await;
         assert_eq!(error_code(resp), "nothing_to_send");

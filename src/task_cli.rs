@@ -128,6 +128,9 @@ pub struct SendArgs {
     /// Accept the agent's folder-trust prompt with its trust keys, and trust the task's repo on its machine from now on
     #[arg(long, group = "send_input", conflicts_with_all = ["text", "keys", "no_enter"])]
     pub trust: bool,
+    /// Answer the picker on screen by the text of one of its options (case does not matter): the arrows to it, then Enter
+    #[arg(long, value_name = "OPTION", group = "send_input", conflicts_with_all = ["text", "keys", "no_enter", "trust"])]
+    pub pick: Option<String>,
     /// Print as a JSON object
     #[arg(long)]
     pub json: bool,
@@ -299,7 +302,7 @@ pub async fn done(client: &Client, a: DoneArgs) -> anyhow::Result<()> {
     }
 }
 
-/// `pastor task send t-N [TEXT] [--key K]... [--no-enter] | --trust`.
+/// `pastor task send t-N [TEXT] [--key K]... [--no-enter] | --trust | --pick OPTION`.
 pub async fn send(client: &Client, a: SendArgs) -> anyhow::Result<()> {
     let id = task_id(&a.task)?;
     let input = SendInput {
@@ -307,6 +310,7 @@ pub async fn send(client: &Client, a: SendArgs) -> anyhow::Result<()> {
         text: a.text,
         keys: a.keys,
         trust: a.trust,
+        pick: a.pick,
     };
     match ask(client, IpcRequest::TaskSend { id, input }).await? {
         IpcResponse::Text(msg) if a.json => {
@@ -448,7 +452,8 @@ mod tests {
         let (code, message) = code_and_message(RequestError::Connect(
             std::io::ErrorKind::PermissionDenied.into(),
         ));
-        assert_eq!(code, "runtime_error");
+        assert_eq!(code, "socket_denied");
+        assert!(message.contains("sandboxed"), "{message}");
         assert!(!message.contains("not running"), "{message}");
         let (code, message) =
             code_and_message(RequestError::Exchange(anyhow::anyhow!("closed early")));

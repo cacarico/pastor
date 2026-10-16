@@ -148,12 +148,25 @@ runs `pastor --version` in a shell that has `~/.cargo/bin` and
 `~/.local/bin` on its PATH, since ssh's non-login shell often lacks them. A
 `local` machine is the head's own pastor; a `command` machine, one with no
 pastor, or one that gives an odd answer shows `-`. The head asks when it
-connects, then again after each successful reconcile once ten minutes have
-passed since it last asked — a connected machine's own `reconcile_every`
-(60s by default), a polling one's `poll_every` (10s by default, normally
-every tick) — so an upgrade shows within about eleven minutes without a
-restart either way. A probe that gets no answer keeps the version last read.
+connects, then again after each successful reconcile once `version_every`
+(`pastor.toml`, default `2m`) has passed since it last asked — a connected
+machine's own `reconcile_every` (60s by default), a polling one's
+`poll_every` (10s by default, normally every tick) — so an install shows
+within about three minutes without a restart either way, and each machine
+costs one `pastor --version` over ssh per interval. A probe that gets no
+answer keeps the version last read. `pastor machine describe` says when the
+version was last read (`version read`), so a row that still shows the old
+version after an install can be told from a head that has not asked yet.
 `machine list` itself never probes while the head is running.
+
+The head also reads each machine's room: its free disk under `$HOME` and
+`/tmp` (`df -Pk`) and its free memory (`MemAvailable` in `/proc/meminfo`;
+unknown on macOS, which has none), one probe over the same ssh master when
+it connects and again after a reconcile once a minute has passed. The
+numbers sit on the machine's status with when they were read; a probe that
+fails keeps the last numbers and notes the error, and never makes the
+machine reconnect, since the ping just proved it reachable. Nothing acts on
+them yet.
 
 With `pastor serve` running, CHANNEL is the head's live channel state and
 AGENTS counts pastor's tasks and orphans (see below) against the machine's
@@ -340,6 +353,9 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `agent_pane_busy` | herdr kept saying the agent's pane was busy after pastor's retries |
 | `agent_refused` | a task or an orchestrator's script asks for a fleet change agents may not make |
 | `agent_tools_unsupported` | the task has tool lists and its agent has no setting to pass them |
+| `agy_deny_unsupported` | a profiled agy task denies a pattern agy has no rule for |
+| `agy_permissions_missing` | a profiled agy task on a machine whose agy settings do not deny what the profile denies, or that pastor cannot read or write to make them (a `command` machine, a file that is not JSON, a symlink, a failed write); the message lists the rules to add |
+| `agy_profile_mismatch` | a profiled agy task on a machine whose own profile does not deny everything the task's does |
 | `already_seen` | a job's key was queued before and its task row is gone |
 | `branch_gone` | reopening a closed task: its worktree and its branch are both gone |
 | `close_failed` | `task close` could not close one or more of the tasks |
@@ -383,7 +399,9 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `no_agent` | `task attach` to a task that has no agent yet |
 | `no_head` | the bridge found no `pastor serve` on its machine |
 | `no_machine` | the task is not on any machine |
+| `no_picker` | `task send --pick` to a task whose pane shows no picker at its bottom |
 | `no_session` | reopening a closed task with no session to resume |
+| `no_such_option` | `task send --pick` with text no option of the picker contains; the message lists them |
 | `no_terminal` | `task attach` to a task on a command machine |
 | `no_trust_keys` | `task send --trust` and the agent has no `trust_keys` |
 | `no_worktree` | `task close --remove-worktree` of a task with no worktree |
@@ -397,13 +415,13 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `not_pull_machine` | a pull machine request from a machine that is not one |
 | `not_queued` | `task priority` or `queue move` of a task that is not waiting in the queue |
 | `not_retryable` | `task retry` of a task in a state that cannot be retried |
-| `not_running` | `serve stop` or `serve status` with no serve running here |
+| `not_running` | `serve stop` or `serve status` with no serve running here; `status` with no head and no `--probe` |
 | `not_trusted` | `trust remove` of a repo that is not trusted on that machine |
-| `nothing_to_send` | `task send` with no text, `--key` or `--trust` |
+| `nothing_to_send` | `task send` with no text, `--key`, `--trust` or `--pick` |
 | `now_needs_machine` | `task run --now` with no `--machine` |
 | `now_not_started` | `task run --now` could not start the task at once; it is closed, not left queued |
 | `now_refused` | `task run --now` from an agent or an orchestrator's script; a guard against mistakes, not a boundary (see [Starting a task now](#starting-a-task-now)) |
-| `opencode_permissions_conflict` | a profiled opencode task on a machine whose opencode config has permission rules |
+| `opencode_permissions_conflict` | a profiled opencode task on a machine whose managed opencode config (or managed preferences) has permission rules, or whose global config or `~/.opencode` has rules under an agent or a mode, a file pastor could not parse, or more config than pastor reads |
 | `orchestrator_held` | a session orchestrator's state could not be read or kept |
 | `orchestrator_invalid` | the orchestrator's file has never been valid |
 | `orchestrator_kind` | `run` of a session orchestrator, or `start`/`stop` of a scheduled one |
@@ -431,6 +449,7 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `shepherd_unexpected` | this machine's socket belongs to a head, not a headless serve |
 | `shepherd_unresponsive` | this machine's headless serve does not answer |
 | `shepherd_unsupported` | a request a headless serve does not answer; ask the head |
+| `socket_denied` | the connect to the socket was denied for permissions, most often a sandbox around the command |
 | `stop_failed` | `serve stop` could not tell which process holds the socket |
 | `stop_timeout` | the serve still runs after SIGTERM and the wait |
 | `store_error` | the task database failed or kept changing under the request |
@@ -573,7 +592,13 @@ No reminder is sent first.
 (starting, running, blocked, or done with its pane still open) and presses
 Enter; `--no-enter` leaves Enter out, and each `--key K` presses one named
 key after the text, in order (`--key esc`, `--key Down --key Enter`; herdr's
-key names). It goes through the head to the task's machine; anything else
+key names). `--pick OPTION` answers the picker on screen by the text of one
+of its options, case ignored: the head reads the pane, presses the arrows
+to the first option containing the text, then Enter, and records the keys
+and the text on `task.input`. It answers `no_picker` when the bottom of the
+pane shows none, and `no_such_option`, naming the options, when none
+matches; like `--key`, it takes any task with a live pane and saves
+nothing. It goes through the head to the task's machine; anything else
 answers `task_not_live`. Each send is a `task.input` event recording the key
 names and the length of the text, never the text, which may be a secret.
 `--json` prints the head's answer as `{"message": "..."}`.
@@ -593,27 +618,46 @@ startup prompt; any other task answers `not_at_trust_prompt`, and nothing is
 sent or saved. An agent without trust keys answers `no_trust_keys`, and a
 task without `--repo` gets the keys but nothing is saved.
 
-From then on, when a task of a saved repo is blocked during startup on that
-machine, the head reads its pane and, if it shows the agent's trust prompt,
-presses the trust keys itself, once per task, and emits `task.trusted`; a
-task still blocked after that is left for a human. The prompt is known by
-its `trust_marker` (Claude's is built in as its "Yes, I trust this folder"
-option), so a task blocked on another dialog the same keys would accept,
-such as Claude's bypass-permissions warning, is left for a human too. The
-marker must be in the prompt at the bottom of the pane (after the last
-output, and after any menu above the last one), since the read includes
-scrollback where an earlier trust prompt can linger above a later dialog. An
-agent with no marker (`trust_marker = ""`, or one that is not Claude and
-sets none) gets the keys without the check.
+From then on, a task blocked while it starts has its pane read when it
+blocks, after each answer's settle window, and at each reconcile, and the
+first of its agent's startup dialogs that shows in the prompt at the bottom
+of the pane, and was not answered for that task, is answered: the head presses the
+dialog's keys, once per task and dialog, and emits `task.answered` with the
+dialog's name and the keys. Inside an answer's settle window the pane is
+not read again, whoever answered: pastor, or a person with `pastor task
+send` (`--pick`, `--key`, `--trust` or text) or at the pane itself. The trust dialog is the first row, known by its
+`trust_marker` (Claude's is built in as its "Yes, I trust this folder"
+option); it is pressed only for a saved repo, and emits `task.trusted` as
+before. Claude's other dialogs are built in, in its 2.1 wording, each
+answered with the option that keeps things as they are: the fullscreen
+renderer offer (`Not now`), the auto-mode default nudge (`No, keep ...`),
+the auto-mode setup offer (`Don't show again`) and the default-effort switch
+(`No, keep ...`). Its bypass-permissions warning is not: accepting it is
+yours to do, with `pastor task send t-N --pick "Yes, I accept"`. One dialog
+is answered per settle window, so a chain of them on a new machine takes a
+few windows. A task blocked on a dialog no row matches, or still blocked
+after its rows, waits for a person. The marker must be in the prompt at the
+bottom of the pane (after the last output, and after any menu above the
+last one, and after the key hints of any dialog above the last thing on
+screen), since the read includes scrollback where an earlier dialog can
+linger above a later one. The trust row with no marker (`trust_marker =
+""`, or an agent that is not Claude and sets none) is pressed without the
+check. `[[agents.<name>.dialogs]]` in pastor.toml adds a dialog or changes
+a built-in (see [Agent definitions](#agent-definitions)).
+
+The fullscreen offer rarely shows at all: every Claude task's pane gets
+`CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1`, which keeps Claude on its classic
+renderer, the one with the scrollback pastor reads, and turns the offer
+off. `env` in `[agents.<name>]` overrides it.
 
 On a pull machine the head never reads the pane, so the machine's own serve
 does all of this, with the same rules: while one of its tasks has a repo and
 is queued, or blocked during startup with no keys sent yet, it asks the head
 for the trust saved for that machine (only that machine's pairs, never
-another's), keeps a copy in `shepherd.db`, and its actor presses the trust
-keys of the pull machine's own `pastor.toml` once per task while the pane
-shows its `trust_marker`. Its next report carries the keys and the head emits
-`task.trusted` with them. `task send --trust` cannot reach a pull machine's
+another's), keeps a copy in `shepherd.db`, and its actor answers the
+dialogs of the pull machine's own `pastor.toml` as the head would, once per
+task and dialog. Its next report carries the trust keys and the head emits
+`task.trusted` with them; its `task.answered` events are only logged there. `task send --trust` cannot reach a pull machine's
 task (`pull_machine_task`), so its repos are saved with `pastor trust add
 <machine> <repo>` on the head; a pair added while a task is blocked is
 picked up at the serve's next tick. A head older than IPC protocol 31 is not
@@ -840,8 +884,8 @@ failing.
 
 |                      | claude                                                                                                                    | agy                                                                                                            | codex                                                                                                                                    | opencode                                                                                                                    |
 | -------------------- | -------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
-| **Trust**            | herdr reads its folder-trust dialog `blocked`; pastor sends the held prompt once it clears. Built-in `trust_marker` and `trust_keys`, so `pastor task send t-N --trust` answers it and saves the repo | no dialog pastor knows | herdr reads its dialog idle and ready, not blocked; pastor holds the prompt until someone answers by hand (`Do you trust the contents of this directory`). No built-in `trust_keys`, so `--trust` needs one set in `[agents.<name>]` (`no_trust_keys` otherwise) | no dialog pastor knows |
-| **Profile**          | `--permission-mode dontAsk`, plus the tool flags                                                                          | its own permission mode, unless `own_permissions = true` (then no flags or mode; its own settings must cover the profile) | `--ask-for-approval never --sandbox workspace-write` (`danger-full-access` under `unrestricted`); no per-command flag, so the sandbox stands in for the lists | `OPENCODE_PERMISSION` in its pane's env instead of flags (deny-first, `unrestricted` allow-first); a machine or repo config with its own permission rules fails the task (`opencode_permissions_conflict`) |
+| **Trust**            | herdr reads its folder-trust dialog `blocked`; pastor sends the held prompt once it clears. Built-in `trust_marker` and `trust_keys`, so `pastor task send t-N --trust` answers it and saves the repo; its other startup dialogs are built in too (`task.answered`) | no dialog pastor knows | herdr reads its dialog idle and ready, not blocked; pastor holds the prompt until someone answers by hand (`Do you trust the contents of this directory`). No built-in `trust_keys`, so `--trust` needs one set in `[agents.<name>]` (`no_trust_keys` otherwise) | no dialog pastor knows |
+| **Profile**          | `--permission-mode dontAsk`, plus the tool flags                                                                          | `--dangerously-skip-permissions --mode accept-edits`, so it never asks; pastor first writes the deny rules of the machine's own profile into its settings there (the agy provisioner), then checks they deny what the task's profile denies (`agy_permissions_missing`), and an agy machine runs one profile, its own (`agy_profile_mismatch`); a shell command can still write, so `review` is not a read-only checkout. `own_permissions = true` adds and checks nothing | `--ask-for-approval never --sandbox workspace-write` (`danger-full-access` under `unrestricted`); no per-command flag, so the sandbox stands in for the lists | `OPENCODE_PERMISSION` in its pane's env instead of flags (deny-first, `unrestricted` allow-first); a machine or repo config with its own permission rules fails the task (`opencode_permissions_conflict`) |
 | **Lists** (no profile) | built-in `--allowedTools`/`--disallowedTools`                                                                           | needs `allow_flag`/`deny_flag` in `[agents.<name>]`, else a list refuses the task (`agent_tools_unsupported`)     | same as agy                                                                                                                                 | same as agy                                                                                                                     |
 | **Session**          | `--session-id` at launch, recorded; a pause, wait or model move resumes it with `claude --resume <session>`               | none recorded                                                                                                     | none recorded                                                                                                                               | none recorded                                                                                                                   |
 | **Pause** (`--preempt`) | the only kind eligible: `running`, `low`, a recorded session, not ended, not resumed in the last 10 minutes            | never                                                                                                             | never                                                                                                                                       | never                                                                                                                           |
@@ -856,6 +900,10 @@ lists](#tool-allow-and-deny-lists) for profile and lists, [Usage
 limits](#usage-limits) for session, limits and prompt delivery,
 [Pausing a low task](#pausing-a-low-task) for pause, and [Reopening a
 finished task](#reopening-a-finished-task) for attach.
+
+A `kind` that is none of these four gets the lists through its `allow_flag`
+and `deny_flag` and no never-ask mode, and refuses a list without them
+(`agent_tools_unsupported`).
 
 ## Flocks
 
@@ -889,6 +937,7 @@ agent_args = ["--model", "claude-sonnet-5"]
 # place = "pastor"        # optional: where its tasks' panes go, see Where a task's pane goes
 # summary = "require"     # optional: ask, require or off, see Asking for one
 # keep_pane = true        # optional: keep its tasks' panes, see Keeping a task's pane
+# unknown_room = "no_room"  # optional: a machine whose room can't be read holds its tasks, see A room floor
 
 [[machine]]
 name = "desk"
@@ -899,6 +948,9 @@ max_agents = 3
 name = "pi-3"
 ssh = "user@pi-3"
 flock = "work"            # the old way: in work, with pi-3's own limits
+min_disk = "4G"           # optional: free disk on $HOME and /tmp it must have to take a task, see A room floor
+# min_memory = "512M"     # optional: free memory it must have; unset with a floor on: [defaults], else 1G
+# unknown_room = "no_room"  # optional: as on a flock, after the flock's
 
 [[machine]]
 name = "laptop"
@@ -1068,7 +1120,8 @@ that flock has been removed.
 A `[[flock]]` entry takes every per-task setting `[defaults]` has: `agent`,
 `agent_args`, `agents`, `model`, `fallback`, `profile`, `priority`,
 `age_after`, `allow`, `deny`, `timeout`, `place`, `label` and `summary`
-(`max_tasks_per_run` stays a job setting). A task gets the settings of its own flock, the one it is queued
+(`max_tasks_per_run` stays a job setting), and `unknown_room`, which only a
+flock or a machine sets (see [A room floor](#a-room-floor)). A task gets the settings of its own flock, the one it is queued
 in; a machine in many flocks does not mix them.
 
 For everything but the agent, the flock comes before the machine: a task
@@ -1291,7 +1344,27 @@ starts with `~/` is expanded against the home of the machine the task runs
 on, as `--repo` is; a `command` machine cannot report a home, so give those
 absolute paths. Keys must be variable names (letters, digits and `_`, not
 starting with a digit). pastor sets the env on the task's pane, worktree
-tasks included (see [Internals](#internals)).
+tasks included (see [Internals](#internals)). A `claude` kind gets
+`CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1` under its own `env` (see [How it
+works](#how-it-works)).
+
+`[[agents.<name>.dialogs]]` lists startup dialogs beyond the trust one, one
+table per dialog: `name`, `marker` (text only that dialog shows) and `pick`
+(the text of the option to choose) or `keys` (named keys, pressed as they
+are). A row named as one of the kind's built-ins replaces it; a row with
+`pick = ""` and no `keys` removes it, and needs no `marker`. Any other row
+needs its `marker` and one of `pick` and `keys` (`needs pick or keys`). The
+trust dialog is set with `trust_keys` and `trust_marker`, never here. Claude's built-ins are
+`fullscreen`, `auto-mode-default`, `auto-mode-setup` and `effort-default`
+(see [How it works](#how-it-works)).
+
+```toml
+# fragment of pastor.toml: accept Claude's bypass warning on this head's tasks
+[[agents.claude.dialogs]]
+name = "bypass"
+marker = "Bypass Permissions mode"
+pick = "Yes, I accept"
+```
 
 The head checks a task's agent against pastor.toml when it queues it (for a
 task that is not pinned, the agent each machine of its flock would run), and
@@ -1869,6 +1942,38 @@ takes `--job-slots` and `--burst` as it takes `--max-agents`. `machine list` sho
 and `--json` has `job_slots` and `burst` on each machine. Changing either
 restarts the machine's actor on reload, as changing `max_agents` does.
 
+### A room floor
+
+A machine can also have a floor: the disk and memory it must have free to
+take a task, so a full disk or a swapping box does not get the next one.
+`min_disk` and `min_memory` on a `[[machine]]` entry are sizes, digits and
+one of `K`, `M`, `G` or `T` (powers of 1024), and a bare `"0"` turns that
+side off. The disk floor applies to each of `$HOME` and `/tmp`, where tasks
+and their worktrees go.
+
+```toml
+# fragment of flock.toml
+[[machine]]
+name = "pi-3"
+ssh = "user@pi-3"
+min_disk = "4G"        # free on $HOME and on /tmp
+min_memory = "0"       # no memory floor
+```
+
+The floor is off until a machine's own entry sets `min_disk` or
+`min_memory`. Once one is set the floor is on for that machine, and the side
+it leaves out comes from `[defaults]` in `pastor.toml` (`min_disk`,
+`min_memory` there, the same sizes), else the built-in `4G` of disk and `1G`
+of memory. `[defaults]` only fills in sizes; on its own it turns no floor on.
+A size that does not parse, in either file, fails the load like any other
+key.
+
+`unknown_room` says how a machine whose room cannot be read counts: `room`,
+the default, lets it take tasks as if it had room; `no_room` holds them. It
+is read from the task's flock first, then the machine, as every setting but
+the agent is. Nothing reads a machine's room yet: the keys load and
+`flock.toml` is checked, and dispatch still counts slots alone.
+
 ### Pausing a low task
 
 A `critical` task does not have to wait behind `low` work, but only when
@@ -2072,24 +2177,61 @@ empty, and `OPENCODE_CONFIG_CONTENT` set to the repo's instructions and
 nothing else (below), over an `[agents]` env that sets any of them, so no
 other config adds rules around the profile's.
 
-Before it makes anything on the machine, pastor checks the machine's own
-opencode config (`config.json`, `opencode.json` and `opencode.jsonc` in
-`$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode`, and in
-`~/.opencode`, and the managed `/etc/opencode`, on macOS
-`/Library/Application Support/opencode` and the MDM preferences
+Before it makes anything on the machine, pastor reads the machine's own
+global opencode config and `~/.opencode` (`config.json`, `opencode.json`
+and `opencode.jsonc` in `$XDG_CONFIG_HOME/opencode`, else
+`~/.config/opencode`, and the same three in `~/.opencode`) and parses each
+one as JSONC. Every top-level permission key they set — in `permission` (one
+action for everything is the `"*"` key), or in the legacy `tools` block,
+whose `write` and `patch` are opencode's `edit` — is denied in
+`OPENCODE_PERMISSION` too, in the same object, so it stays denied under
+every profile including `unrestricted`: a denied key can never be lifted,
+neither by the profile's own rules nor by a narrower rule in the machine's
+own config for the same key. The patterns a key had on the machine are not
+kept, only the key itself; the task may end up stricter than its profile on
+a tool the machine also restricted, which is safe, since it is told no
+rather than run under rules nobody chose. opencode merges the object over
+its config so that a key the machine already set keeps the machine's place,
+ahead of everything pastor adds, and takes the last matching rule: so under
+`unrestricted` on such a machine pastor sends no `"*": "allow"` of its own,
+which would land after the machine's keys and lift their denies; opencode's
+own default allow stands for tools the lists do not name, and what that
+default asks about (a repeated tool call, a path outside the project) is
+allowed by name instead. The other profiles' `"*": "deny"` can only deny
+more, wherever it lands. What that object cannot reach fails the task
+instead (`opencode_permissions_conflict` in its `error`): rules under an
+agent or a mode of the machine's config (`agent.<name>.permission`,
+`mode.<name>.permission`, or their `tools`), which opencode appends to that
+agent's rules after the top-level ones, so an allow there would win over
+pastor's deny; a file pastor found but could not parse (its JSONC does not
+read as JSON once comments and trailing commas are stripped), since pastor
+then cannot say what it would let through; and more config than pastor
+reads, 48 KiB over all six files, a bound under the 64 KiB a probe's answer
+may be, so a large config is a refusal and never a lost machine. The
+managed config (`/etc/opencode`, on macOS `/Library/Application
+Support/opencode`) and, on macOS, the MDM preferences
 `ai.opencode.managed.plist` in `/Library/Managed Preferences/<user>` and
-`/Library/Managed Preferences`, read through `plutil`, one it cannot read
-counting as rules): a `"permission"` key anywhere in
-them, even under an agent, or a legacy `"tools"` one, fails the task
-(`opencode_permissions_conflict` in its `error`), since opencode would merge
-those rules with the profile's. Move them out, or run the task without a
-profile. A `command` machine cannot be checked, and goes ahead. pastor turns
-the repo's own opencode config (an `opencode.json` or `.opencode/` in the
-checkout) off for a profiled task (`OPENCODE_DISABLE_PROJECT_CONFIG=1`), so a
-branch cannot add rules to the profile's, and passes the checkout's
-instructions back by path in `OPENCODE_CONFIG_CONTENT`: its `AGENTS.md`, or
-when there is none its `CLAUDE.md`, the one file opencode would have read
-itself. On a `command` machine, which cannot be asked, both go.
+`/Library/Managed Preferences` (read through `plutil`, one it cannot read
+counting as rules) are merged after `OPENCODE_CONFIG_CONTENT`, so pastor
+cannot neutralise them the same way: a `"permission"` key anywhere in them,
+or a legacy `"tools"` one, still fails the task
+(`opencode_permissions_conflict`). Move them out, or run the task without a
+profile. A `command` machine cannot be checked, and goes ahead. pastor turns the repo's own opencode config (an `opencode.json` or
+`.opencode/` in the checkout) off for a profiled task
+(`OPENCODE_DISABLE_PROJECT_CONFIG=1`), so a branch cannot add rules to the
+profile's, and passes the checkout's instructions back by path in
+`OPENCODE_CONFIG_CONTENT`: its `AGENTS.md`, or when there is none its
+`CLAUDE.md`, the one file opencode would have read itself. On a `command`
+machine, which cannot be asked, both go.
+
+Separately from a profile, an opencode agent reading a path outside its
+`--repo` raises opencode's "Access external directory" dialog and stops
+there; a permission rule for external directories (opencode's
+`permission.external_directory`, set in the machine's own opencode config,
+outside pastor) avoids it. Such a rule should cover every directory a task
+may read, not only its checkouts: a common parent of them (such as `~/ghq`)
+and any other reference directory, such as a notes vault, an agent also
+opens, so the dialog never blocks a task that reads both.
 
 A Codex agent (kind `codex`) starts with `--ask-for-approval never
 --sandbox workspace-write` after its args: it never stops to ask, and its
@@ -2110,8 +2252,109 @@ its agent args; the profile does not turn it on.
 An agent of any other kind gets the lists through its `allow_flag` and
 `deny_flag`, as any list, and keeps its own permission mode.
 
-An agent whose permissions are in its own settings on the machine, such as
-agy with an allow list in its settings, says so with `own_permissions`:
+An agy agent (kind `agy`, the Antigravity CLI) takes no policy at launch:
+its rules live in its settings on the machine, `permissions.allow`,
+`permissions.deny` and `permissions.ask` in `~/.gemini/antigravity-cli/settings.json`
+and in the config it shares with the desktop app,
+`~/.gemini/config/config.json`, and nothing on its command line or in its
+environment carries rules. So a task under a profile starts with
+`--dangerously-skip-permissions --mode accept-edits` after its args, which
+approves every `ask` and skips the diff review before a file write; a
+`deny` still holds under them. Before it makes anything on the machine,
+pastor reads those two files there and checks that each pattern the task
+denies is covered by a deny: `Edit`, `Write` and `NotebookEdit` need
+`write_file(*)`, `Bash(git push:*)` needs `command(git push)` (a prefix by
+words, so `command(git)` covers it too), `Read(~/.ssh/**)` needs
+`read_file(~/.ssh)`, `WebFetch` needs `read_url(*)`, and `mcp__a__b` needs
+`mcp(a/b)`; the action's `*` covers all of it, and a `read_file` deny of a
+path covers a `write_file` of it. A `regex:` rule, an `ask` and an `allow`
+cover nothing. What is missing fails the task before it starts
+(`agy_permissions_missing` in its `error`), with the rules to add, one per
+line. So does a machine whose files pastor cannot read, or that takes no
+shell command (a `command` machine): unlike opencode's check, this one never
+goes ahead, since going ahead would be the skip flag with nothing verified
+behind it. A pattern agy has no rule for (`Glob`, `Grep`, `WebSearch`,
+`Task`, an unknown tool) is refused when the task is queued
+(`agy_deny_unsupported`). agy's project files under
+`~/.gemini/config/projects/` are not read: agy applies only the one for
+its active workspace, which pastor cannot tell, so a deny there does not
+count.
+
+What the profile allows is not passed: agy has no allow list to take, and
+under the flag everything its settings do not deny runs, a shell command
+that writes a file included. A `review` task on agy therefore never asks,
+never uses an edit tool, never runs `git push`, `rm -rf` or `sudo`; it is
+not a read-only checkout, as a Codex one under `review` is not either.
+`pastor task describe` shows the lists with `(agy takes no lists: the deny
+was checked against its settings on the machine, the allow is not passed)`
+after them. Agent args that set `--mode` or `--dangerously-skip-permissions`
+are refused while a profile applies (`profile_args_conflict`).
+
+Those rules are one file per machine, so an agy machine runs one profile at
+a time: `review` needs `write_file(*)` denied, which stops every edit there,
+the owner's own agy sessions included. Give each agy machine its profile in
+its `[[machine]]` entry (or its flock's, or `[defaults]`), write that
+profile's rules into its agy settings, and run its tasks under that
+profile. A task that asks for a profile the machine's own does not cover
+(the task denies a pattern the machine's profile does not) is refused when
+pinned there (`agy_profile_mismatch`), and skips that machine when not; a
+machine with no own profile is tried, and the check above decides. For the
+built-in `review` the deny list on the machine needs at least:
+
+```json
+{
+  "permissions": {
+    "deny": ["write_file(*)", "command(git push)", "command(rm -rf)", "command(sudo)"]
+  }
+}
+```
+
+and `develop` needs `command(rm -rf)`, `command(sudo)` and
+`command(git push --force)`, not `command(git push)`, which would stop the
+pushes `develop` allows.
+
+Pastor writes them itself, as the machine's agy provisioner. Before each launch of an agy agent under a profile
+(one without `own_permissions`), pastor, as the machine's agy provisioner,
+makes agy's global settings, `~/.gemini/antigravity-cli/settings.json`,
+deny what the machine's own profile denies: its `[[machine]]` `profile`,
+else its flock's, else `[defaults] profile`, not the task's. Each pattern
+becomes the agy rule it needs (`Edit` is `write_file(*)`, `Bash(sudo:*)` is
+`command(sudo)`, `Read(~/.ssh/**)` is `read_file(~/.ssh)`); one agy has no
+rule for, such as `Glob`, adds nothing. A rule a deny already in the file
+covers (the same rule, the action's `*`, fewer leading words of a command,
+a directory above a path) is not added, and a file that covers them all is
+not written at all. Otherwise the missing rules are appended to
+`permissions.deny`, after the owner's, and the file is put back in one
+rename: no rule is removed or moved, and `allow`, `ask`, the mode and every
+other key keep their values and their place. A missing file is created.
+
+agy can save a copy of its settings from before pastor's edit, so pastor
+trusts no past write and does this before every such launch. When agy saved
+the file between pastor's read and write, pastor reads it again and merges
+once more. A machine whose own profile denies nothing (`unrestricted`, or no
+profile) is not read. A task under a narrower profile than its machine's
+needs rules pastor does not write there: writing a `review` task's
+`write_file(*)` would stop every edit on a `develop` machine, the owner's
+own agy sessions too. Give each agy machine the profile its tasks run, in
+its `[[machine]]` entry. A rule pastor added stays when that profile
+changes: pastor cannot tell its rules from the owner's.
+
+When the machine's own profile needs rules and pastor cannot read or write
+the file (a `command` machine, a file that is not JSON or whose
+`permissions` or `permissions.deny` is of the wrong type, a symlink, which
+pastor never replaces, or a write that fails), the task fails before
+anything is made on the machine with `agy_permissions_missing`, the reason,
+and the rules to add by hand, one per line:
+
+```text
+agy_permissions_missing: ~/.gemini/antigravity-cli/settings.json is a symlink, which pastor does not replace; machine pi-1's own profile needs these deny rules in ~/.gemini/antigravity-cli/settings.json there:
+  command(rm -rf)
+  command(sudo)
+```
+
+
+An agent whose permissions pastor should leave alone says so with
+`own_permissions`:
 
 ```toml
 # pastor.toml
@@ -2121,20 +2364,17 @@ own_permissions = true
 ```
 
 A task of that agent under a profile starts with its args alone: pastor
-adds no permission flag and no mode, and the profile's lists are not passed.
-The agent's own settings on the machine decide what it may run, so they
-must hold at least what the profile would: pastor cannot check them.
-`pastor task describe` shows the lists with `(not applied: agent
-agy-builder's permissions are in its own settings on the machine)` after
-them. Without `own_permissions`, such a task is refused before it starts
-(`agent_tools_unsupported`), and the message names the field. The field
-cannot stand beside an `allow_flag` or `deny_flag`, and without a profile
-the lists still need flags. The unrestricted rule below holds for it as for
-any agent. To give it to some machines only, define it under its own name
-and name it on those machines (`agent = "agy-builder"`, or `agents = { agy
-= "agy-builder" }` for a model of kind agy). An older pastor refuses a
-pastor.toml with the key, so set it only once every machine runs a release
-that has it.
+adds no permission flag and no mode, runs no check, and the profile's lists
+are not passed. The agent's own settings on the machine decide what it may
+run, so they must hold at least what the profile would, and agy with it
+asks before whatever they do not allow. `pastor task describe` shows the
+lists with `(not applied: agent agy-builder's permissions are in its own
+settings on the machine)` after them. The field cannot stand beside an
+`allow_flag` or `deny_flag`, and without a profile the lists still need
+flags. The unrestricted rule below holds for it as for any agent. To give
+it to some machines only, define it under its own name and name it on those
+machines (`agent = "agy-builder"`, or `agents = { agy = "agy-builder" }`
+for a model of kind agy).
 
 Patterns are passed as written. Claude reads a `~/` path in a pattern
 (`Read(~/.ssh/**)`) as the home of the machine it runs on, so pastor does not
@@ -2195,7 +2435,16 @@ shows (`waiting for a machine: ...`), or `next pass: <m> has room` for one
 the next pass will start. A flock's number adds two: `flock <f> is at <n> of
 <number> on <m>` when it is at its max there, and `flock <f> is past its
 share on <m>, ... while flock <g> waits under its share` when another flock
-under its share goes first. A paused task reads `paused for t-N;` and then
+under its share goes first. A pull machine (see Pull machines, under A
+headless serve) is never pushed to: a task pinned to one waits on its slots and
+its flock's seat there, as the machine's own claims take it, so it reads
+`machine <m> is full (n/max)`, `flock <f> is at <n> of <number> on <m>`, `is
+not connected` only while the machine has never claimed or is counted lost,
+or `next claim: <m> has room` for one its next claim takes. A loose task never
+reads a pull machine as where it goes next, since whether the machine takes
+flock work is its own serve's setting, and a flock with only pull machines
+reads `flock <f> has only pull machines; a loose task waits for one that
+takes flock work`. A paused task reads `paused for t-N;` and then
 why its machine can't take it yet, or `next pass: resumes on <m>`. `--flock <f>` keeps the tasks waiting in a flock,
 `--machine <m>` the ones pinned to a machine, both keeping their POS in the
 whole queue; `--json` gives each as `pos`, `id`, `priority`, `aged_from`, `where`,
@@ -2280,7 +2529,8 @@ A record, which is also what connector event hooks get on stdin:
   limits),
   `task.input` (`pastor task send`, or pastor at Claude's limit picker),
   `task.trusted` (pastor answered a trust prompt: the head, or a pull
-  machine's serve), `job.failed`, `connector.finish_failed` (a connector's
+  machine's serve), `task.answered` (the head answered another of the
+  agent's startup dialogs), `job.failed`, `connector.finish_failed` (a connector's
   `[finish]` command failed), `machine.connected`, `machine.lost`,
   `agent.exhausted` and `agent.reset` (see Usage limits), and
   `orchestrator.started|skipped|held|quota|failed|restarted|stopping|stopped`
@@ -2303,11 +2553,13 @@ A record, which is also what connector event hooks get on stdin:
   A task's machine is `task.machine`.
 - `detail`: only on events that carry more, and absent otherwise. On
   `task.input`, `keys` (the key names pressed, Enter included), `text_len`
-  (the length of any text), `trust` (sent by `--trust`),
+  (the length of any text), `trust` (sent by `--trust`), `pick` (the
+  option text given to `--pick`),
   `limit_picker` (pastor answered Claude's limit picker) and `rate_retry`
   (pastor retried a short limit); on `task.rate_limited`, `line`, `attempt`
   and `retry_at`; on
-  `task.trusted`, `keys`; on a `task.blocked` for an agent that ended its
+  `task.trusted`, `keys`; on `task.answered`, `dialog` and `keys`; on a
+  `task.blocked` for an agent that ended its
   turn on a question, `question`; on `connector.finish_failed`, `connector`
   (its id) and `reason` (why: the exit status and stderr tail, or a timeout);
   on `orchestrator.*`, `orchestrator` (its name) and: `lines` (a count: how
@@ -2337,6 +2589,31 @@ torn write, a hand edit) are skipped.
 
 A client can also read the log through the head by number; the request is
 under [Internals](#internals).
+
+## Status
+
+`pastor status` puts the fleet on one screen: which head answered and its
+version, how many machines can take work and which cannot (with their
+channel), the live tasks by state, the enabled jobs and those whose last run
+failed or whose file does not load, and the accounts out of usage.
+
+```text
+head      user@pi-1 (0.9.0)
+machines  3 up, 1 down (pi-3: reconnecting)
+tasks     1 blocked, 2 running, 3 queued
+jobs      6 enabled of 7, 1 failing (nightly)
+limits    claude until 14:00
+```
+
+It asks the head with the requests `machine list`, `task list`, `job list`
+and `limit list` already send, so any head answers it; one that predates
+usage limits shows `-` on that line (`null` in `--json`). With no head it
+fails with `not_running`, since a summary of stale files would read as the
+fleet's state. `--probe` takes that on: it probes each machine in flock.toml
+over ssh, as `machine list` does without a head, and reads tasks, jobs and
+limits from the files and store here. `--json` prints the same parts as one
+object: `head`, `machines` (`total`, `up`, `down`), `tasks` (a count for
+every live state), `jobs` (`total`, `enabled`, `failing`) and `limits`.
 
 ## Watch
 
@@ -2940,8 +3217,11 @@ without user namespaces and leaves pastor's own writes alone.
 `ProtectSystem=strict`, `PrivateTmp` and `ProtectHome` are left off: they would
 stop ssh updating `known_hosts` and connectors writing their caches, hide a
 state dir under `/tmp` or `~/.ssh`, and on a host without unprivileged user
-namespaces keep the unit from starting. `herdr.service` has no hardening,
-since the agents it runs need what the user's own terminal allows. ssh runs
+namespaces keep the unit from starting. `pastor.service` also sets
+`OOMPolicy=continue`, so the kernel killing a child the head spawned (a merge
+orchestrator's `make check`, say) does not stop the head itself along with it.
+`herdr.service` has no hardening, since the agents it runs need what the
+user's own terminal allows. ssh runs
 with `BatchMode=yes`, so it cannot ask for a passphrase under systemd: add
 `Environment=SSH_AUTH_SOCK=...` for an agent, or use a key without one.
 
@@ -3545,10 +3825,21 @@ runs no actor for it; `machine list` shows its HOST as `pull`.
   for it, answers the trust prompt and reports it, and the head emits
   `task.trusted`, by the rules given with `task send --trust` under How it
   works. It never gets another machine's pairs.
+- An agent's `pastor task done` on a pull machine reaches the head, which
+  ends the row there (`done`, with the summary). The machine's serve ends
+  its own row the same way at its next report, with the head's summary, so
+  auto-close takes the pane once the agent is idle and reports it closed;
+  one the head ended before the serve started it is closed there without
+  an agent ever starting. The row stays `done` on the head and counts as
+  live, holding its slot and its flock's seat, until the machine reports
+  the pane closed, or reports the agent `failed` (gone, with nothing left
+  to close), which closes the row with its finish and summary kept.
 - A pull machine that sends neither a claim nor a report for
   `pull_lost_after` (head's pastor.toml, default `10m`) is lost, and its
-  `starting` and `running` tasks go stale, as for any lost machine. The
-  clock starts when the head does.
+  `starting` and `running` tasks go stale, as for any lost machine; a task
+  its agent ended with `task done` is closed, its finish kept, since the
+  machine may never report its pane closed. The clock starts when the head
+  does.
 
 ### Jobs on a shepherd
 
@@ -3859,7 +4150,7 @@ many at once, chosen by state and age (`task prune`).
 
 ```text
 pastor job describe <name>       schedule, connector and its config, dispatch, last runs and errors, next run, recent tasks and job events
-pastor machine describe <name>   host, flock, session, model, profile, channel, herdr, protocol and pastor versions, agents, orphans, tags, its tasks, recent errors
+pastor machine describe <name>   host, flock, session, model, profile, channel, herdr, protocol and pastor versions and when the pastor one was read, agents, orphans, tags, its tasks, recent errors
 pastor flock describe <name>     default or not, its agent, agent args, allow and deny, model, profile, machines, live agents, queued and running tasks
 pastor connector describe <id>   manifest, origin, commands, config, secrets set or missing, jobs using it, status
 pastor task describe <id>        state, machine, agent and where it came from, prompt, error, summary (--all-summaries: every round's)
@@ -3911,7 +4202,7 @@ sends nothing.
 ## Files
 
 ```
-~/.config/pastor/pastor.toml      tick, settle, reconcile_every, request_timeout, agent_ready_timeout, close_done_after, close_failed_after, pull_lost_after, agents_change_fleet, max_orchestrators, head_address, defaults, agents, models, profiles, watch, shepherd (all optional)
+~/.config/pastor/pastor.toml      tick, settle, reconcile_every, version_every, request_timeout, agent_ready_timeout, close_done_after, close_failed_after, pull_lost_after, agents_change_fleet, max_orchestrators, head_address, defaults, agents, models, profiles, watch, shepherd (all optional)
 ~/.config/pastor/flock.toml       flocks and machines
 ~/.config/pastor/jobs/<name>.toml one job per file
 ~/.config/pastor/orchestrators/<name>.toml one orchestrator per file (and an optional .env for its scripts)
@@ -3945,6 +4236,7 @@ locations. `PASTOR_CONNECTOR_GIT_BASE` (default `https://github.com`) is where
 tick = "10s"                 # scheduler pass
 settle = "10s"               # a finished agent stays idle this long before its task is done
 reconcile_every = "60s"
+version_every = "2m"         # a machine is asked for its pastor version again after this
 request_timeout = "60s"      # one herdr request, connect included
 agent_ready_timeout = "30s"  # agent.start to an accepted prompt; below request_timeout
 close_done_after = "5s"      # a done task's pane closes after this; "never" keeps it
@@ -3969,6 +4261,8 @@ place = "repo"               # where a task's pane goes: repo, own, pastor or pa
 # profile = "develop"        # a permission profile for tasks that name none; unset: none
 # summary = "ask"            # ask for a summary in each prompt; require: also fail without one; off: neither
 # keep_pane = false          # true: tasks keep their pane once they end, until `pastor task close`
+# min_disk = "4G"            # free disk a machine with a floor needs on $HOME and /tmp, when its entry sets none; "0": no disk floor
+# min_memory = "1G"          # free memory it needs, when its entry sets none; "0": no memory floor
 [agents.claude]              # one table per agent that needs one
 kind = "claude"                  # the herdr agent it starts; default: the table's name
 env = {}                         # env for its pane, e.g. { CLAUDE_CONFIG_DIR = "~/.claude-personal" }
@@ -3976,8 +4270,12 @@ trust_keys = ["Down", "Enter"]   # accept its folder-trust prompt; [] for none
 trust_marker = "Yes, I trust this folder"  # saved trust presses them only while the pane shows this
 allow_flag = "--allowedTools"    # the flag before each allow pattern
 deny_flag = "--disallowedTools"  # the flag before each deny pattern
-# own_permissions = false       # true: its own settings hold its permissions; a profiled task gets no flags
+# own_permissions = false       # true: its own settings hold its permissions; a profiled task gets no flags and no check
 # account = "me-personal"       # a label: machines naming it share its usage limits; unset: none
+[[agents.claude.dialogs]]        # a startup dialog beyond trust; a built-in's name replaces it
+name = "bypass"                  # its name, in task.answered
+marker = "Bypass Permissions mode"  # text only that dialog shows
+pick = "Yes, I accept"           # the option to choose by its text; or keys = ["Down", "Enter"]
 [models.sonnet]              # one table per model; none are built in
 kind = "claude"                  # the herdr agent kind that runs it (required)
 args = ["--model", "claude-sonnet-5"]  # put before agent_args (required, may be [])
@@ -4105,7 +4403,7 @@ make test             # unit tests plus an end-to-end run against fake-herdr
 make test-machine     # the machine actor tests on their own
 make portability      # cargo check for the musl and FreeBSD targets; needs cargo-zigbuild, zig and the Rust targets
 make smoke SESSION=s  # opt-in test against a real herdr running session s on this host
-make smoke-profiles REPO='~/src/app' CLAUDE=pi-1 OPENCODE=pi-2  # a live review task per agent through the head
+make smoke-profiles REPO='~/src/app' CLAUDE=pi-1 OPENCODE=pi-2 AGY=pi-3  # a live review task per agent through the head
 make smoke-rc TAG=v1.2.0-rc.1 LABEL=arm64  # make smoke against a tag, in a scratch worktree, as a Markdown report
 make build            # debug build of both binaries; cargo run --bin pastor -- --help works from there
 ```
@@ -4129,9 +4427,11 @@ pastor serve --foreground            # its log in this terminal; ctrl-c stops it
 ```
 
 `make smoke-profiles` starts real agents: through the running head, a task
-under the `review` profile for each agent named (`CLAUDE` and `OPENCODE` take
-a machine from flock.toml, `CLAUDE_AGENT` and `OPENCODE_AGENT` another agent
-of that kind), in the checkout `REPO` on that machine. Each is asked to read,
+under the `review` profile for each agent named (`CLAUDE`, `OPENCODE` and
+`AGY` take a machine from flock.toml, `CLAUDE_AGENT`, `OPENCODE_AGENT` and
+`AGY_AGENT` another agent of that kind; the agy machine's own profile must
+be `review`, with its rules in agy's settings there), in the checkout
+`REPO` on that machine. Each is asked to read,
 then to write a file it must be refused, and passes when it ends `done`
 without ever going `blocked`. It prints the end of each pane, to paste in a
 pull request, and closes the tasks. The head must run the pastor under test,

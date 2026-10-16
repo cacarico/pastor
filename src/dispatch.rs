@@ -37,6 +37,14 @@ pub struct MachineView {
     /// How many of `live` come from a job (`Task::from_job`).
     pub live_jobs: usize,
     pub healthy: bool,
+    /// A pull machine (`pull = true`): a pass never pushes to it, its own
+    /// serve claims. Read by `pastor queue` alone, where `healthy` is
+    /// whether it is connected: a task pinned to it waits on its slots and
+    /// seat as its claims do, while a loose task never reads it as where
+    /// it goes next, since whether its claims take loose tasks is its
+    /// serve's own setting (`takes_flock_work`), which the head does not
+    /// know.
+    pub pull: bool,
     /// The flocks the machine is in now, each with its number and how many
     /// of its live tasks run here.
     pub flocks: Vec<FlockSeat>,
@@ -314,7 +322,36 @@ pub async fn dispatch(
     head: Option<&str>,
     ready_timeout: Duration,
 ) -> Result<DispatchOutcome, DispatchError> {
-    start(conn, task, agents, head, ready_timeout, false).await
+    dispatch_with(
+        conn,
+        task,
+        agents,
+        head,
+        ready_timeout,
+        Provision::default(),
+    )
+    .await
+}
+
+/// What a machine's provisioners make sure of before a launch there
+/// (`provision`): the machine's own permission profile's deny list, which
+/// the agy provisioner writes into agy's settings for an agy task under a
+/// profile. The default asks for nothing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Provision<'a> {
+    pub own_deny: &'a [String],
+}
+
+/// `dispatch` on a machine whose provisioners want `provision`.
+pub async fn dispatch_with(
+    conn: &dyn Connector,
+    task: &mut Task,
+    agents: &Agents,
+    head: Option<&str>,
+    ready_timeout: Duration,
+    provision: Provision<'_>,
+) -> Result<DispatchOutcome, DispatchError> {
+    start(conn, task, agents, head, ready_timeout, false, provision).await
 }
 
 /// `dispatch` for a paused task (`TaskState::Paused`): the same steps, but
@@ -331,7 +368,27 @@ pub async fn resume(
     head: Option<&str>,
     ready_timeout: Duration,
 ) -> Result<DispatchOutcome, DispatchError> {
-    start(conn, task, agents, head, ready_timeout, true).await
+    resume_with(
+        conn,
+        task,
+        agents,
+        head,
+        ready_timeout,
+        Provision::default(),
+    )
+    .await
+}
+
+/// `resume` on a machine whose provisioners want `provision`.
+pub async fn resume_with(
+    conn: &dyn Connector,
+    task: &mut Task,
+    agents: &Agents,
+    head: Option<&str>,
+    ready_timeout: Duration,
+    provision: Provision<'_>,
+) -> Result<DispatchOutcome, DispatchError> {
+    start(conn, task, agents, head, ready_timeout, true, provision).await
 }
 
 async fn start(
@@ -341,6 +398,7 @@ async fn start(
     head: Option<&str>,
     ready_timeout: Duration,
     resume: bool,
+    provision: Provision<'_>,
 ) -> Result<DispatchOutcome, DispatchError> {
     let name = Task::agent_name_for(task.id);
     task.agent_name = Some(name.clone());
@@ -349,7 +407,17 @@ async fn start(
     task.prompt_pending = false;
     task.activity_seen = false;
 
-    let result = dispatch_steps(conn, task, &name, agents, head, ready_timeout, resume).await;
+    let result = dispatch_steps(
+        conn,
+        task,
+        &name,
+        agents,
+        head,
+        ready_timeout,
+        resume,
+        provision,
+    )
+    .await;
     match &result {
         Ok(DispatchOutcome::Running) => {
             task.state = TaskState::Running;
@@ -372,6 +440,7 @@ async fn start(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_steps(
     conn: &dyn Connector,
     task: &mut Task,
@@ -380,6 +449,7 @@ async fn dispatch_steps(
     head: Option<&str>,
     ready_timeout: Duration,
     resume: bool,
+    provision: Provision<'_>,
 ) -> Result<DispatchOutcome, DispatchError> {
     let spec = task.spec.clone();
     // A waiting task goes on after a usage limit (`TaskState::Waiting`): with
@@ -398,29 +468,119 @@ async fn dispatch_steps(
         let from = crate::task::agent_and_model(&s.agent, s.model.as_deref());
         (from, s.tail.clone())
     });
+    // agy reads its permission rules only from its settings on the machine,
+    // and can write back a copy from before pastor's edit at any time, so
+    // the agy provisioner makes them deny what the machine's own profile
+    // denies before every launch, not once. First, so what checks those
+    // rules next reads them as written.
+    if agents.agy_profile(&spec) {
+        let machine = task.machine.as_deref().unwrap_or("this machine");
+        crate::provision::agy::reconcile(conn, provision.own_deny, machine)
+            .await
+            .map_err(|e| match e {
+                crate::provision::agy::ReconcileError::Transport(e) => CallError::from(e).into(),
+                crate::provision::agy::ReconcileError::Refused(message) => {
+                    DispatchError::Task(message)
+                }
+            })?;
+    }
     // Before anything is made on the machine: a task whose agent cannot take
     // its tool lists (an `[agents]` edit since it was queued) leaves nothing
     // behind.
     let mut launch = agents
         .launch(&spec)
         .map_err(|e| DispatchError::Task(e.message))?;
-    // opencode merges `OPENCODE_PERMISSION` over its own config's rules, so a
-    // machine with rules of its own would run the task under both. A machine
-    // that cannot tell (a `command` one) goes ahead.
-    if agents.opencode_profile(&spec)
-        && conn
+    // opencode merges `OPENCODE_PERMISSION` over its own config's rules. Its
+    // managed config, and on macOS its managed preferences, are merged after
+    // `OPENCODE_CONFIG_CONTENT`, so pastor cannot neutralise rules set there,
+    // and the task refuses rather than run under both. A machine that cannot
+    // tell (a `command` one) goes ahead.
+    if agents.opencode_profile(&spec) {
+        if conn
             .opencode_permission_rules()
             .await
             .map_err(CallError::from)?
             == Some(true)
-    {
-        return Err(DispatchError::Task(format!(
-            "{}: the opencode config on {} has permission rules of its own, which opencode would \
-             merge with profile {}'s; move them out of its opencode config, or run without a profile",
-            crate::config::opencode::OPENCODE_PERMISSIONS_CONFLICT,
-            task.machine.as_deref().unwrap_or("this machine"),
-            spec.profile().unwrap_or_default(),
-        )));
+        {
+            return Err(DispatchError::Task(format!(
+                "{}: the opencode config on {} has permission rules of its own, which opencode would \
+                 merge with profile {}'s; move them out of its opencode config, or run without a profile",
+                crate::config::opencode::OPENCODE_PERMISSIONS_CONFLICT,
+                task.machine.as_deref().unwrap_or("this machine"),
+                spec.profile().unwrap_or_default(),
+            )));
+        }
+        // The machine's own global config and `~/.opencode` are merged
+        // before `OPENCODE_CONFIG_CONTENT`, so pastor neutralises them
+        // instead: every top-level permission key found there is denied in
+        // `OPENCODE_PERMISSION`, under every profile. What that cannot
+        // reach (rules under an agent or a mode, a file pastor could not
+        // parse, more config than it reads) leaves it unable to say what
+        // would get through, so the task refuses the same way.
+        match conn
+            .opencode_config_permission_keys()
+            .await
+            .map_err(CallError::from)?
+        {
+            crate::config::opencode::MachineDenyKeys::Conflict(why) => {
+                return Err(DispatchError::Task(format!(
+                    "{}: the opencode config on {} {why}; move the rules out of its opencode \
+                     config, or run without a profile",
+                    crate::config::opencode::OPENCODE_PERMISSIONS_CONFLICT,
+                    task.machine.as_deref().unwrap_or("this machine"),
+                )));
+            }
+            crate::config::opencode::MachineDenyKeys::Keys(keys) if !keys.is_empty() => {
+                launch.env.insert(
+                    crate::config::opencode::PERMISSION_ENV.into(),
+                    agents.opencode_permission_json(&spec, &keys),
+                );
+            }
+            crate::config::opencode::MachineDenyKeys::Keys(_)
+            | crate::config::opencode::MachineDenyKeys::None => {}
+        }
+    }
+    // agy's rules are in its settings on the machine, and under the flags
+    // pastor adds everything they do not deny runs: so what the task denies
+    // has to be denied there, or the task does not start. A machine that
+    // cannot be asked refuses too, unlike opencode's check: going ahead
+    // would mean the skip flag with nothing verified behind it.
+    if agents.agy_profile(&spec) && !spec.deny.is_empty() {
+        let machine = task.machine.as_deref().unwrap_or("this machine");
+        let profile = spec.profile().unwrap_or_default();
+        let required: Vec<String> = spec
+            .deny
+            .iter()
+            .filter_map(|p| crate::config::agy::required_rule(p))
+            .collect();
+        let why = match conn.agy_rules().await.map_err(CallError::from)? {
+            None => Some(format!(
+                "agy's permission rules on {machine} cannot be read (the machine takes no shell \
+                 command), so pastor cannot check that profile {profile} holds there"
+            )),
+            Some(out) => match crate::config::agy::parse_denies(&out) {
+                Err(e) => Some(format!(
+                    "agy's permission rules on {machine} could not be read: {e}"
+                )),
+                Ok(denies) => {
+                    let missing = crate::config::agy::missing(&required, &denies);
+                    (!missing.is_empty()).then(|| {
+                        format!(
+                            "agy on {machine} does not deny what profile {profile} denies; add to \
+                             \"permissions\".\"deny\" in {}:\n{}",
+                            crate::config::agy::GLOBAL_SETTINGS,
+                            missing.join("\n")
+                        )
+                    })
+                }
+            },
+        };
+        if let Some(why) = why {
+            return Err(DispatchError::Task(format!(
+                "{}: {why}",
+                crate::config::agy::AGY_PERMISSIONS_MISSING
+            )));
+        }
     }
     // A Claude agent starts on a session pastor names, so `task attach` can
     // resume it once the pane is gone; last, after the tool flags. The task
@@ -1181,6 +1341,7 @@ mod tests {
             live,
             live_jobs: 0,
             healthy,
+            pull: false,
             flocks: vec![seat("default", None, live)],
             waiting_under_share: vec![],
         }
@@ -2232,13 +2393,294 @@ mod tests {
         }
     }
 
-    /// A profiled opencode task starts with its rules in the pane's env.
-    /// On a machine whose own opencode config has permission rules it fails
-    /// before anything is made there: opencode would merge them with the
-    /// profile's. A machine that cannot tell goes ahead, and a task with no
-    /// profile never asks.
+    fn agy_under(profile: Option<&str>) -> DispatchSpec {
+        DispatchSpec {
+            agent: "agy".into(),
+            ..opencode_under(profile)
+        }
+    }
+
+    fn develop_deny() -> Vec<String> {
+        crate::config::profile::Profiles::default()
+            .resolve("develop")
+            .unwrap()
+            .deny
+    }
+
+    /// An agy task under `develop` whose deny list is `develop`'s, as
+    /// `Profiles::apply` would settle it: what a develop machine may run.
+    fn agy_develop() -> DispatchSpec {
+        DispatchSpec {
+            deny: develop_deny(),
+            ..agy_under(Some("develop"))
+        }
+    }
+
+    /// Dispatch `t` on `fake` whose machine's own profile denies `own_deny`;
+    /// the error, if any.
+    async fn dispatch_agy(fake: &FakeHerdr, t: &mut Task, own_deny: &[String]) -> Option<String> {
+        dispatch_with(
+            fake,
+            t,
+            &Agents::default(),
+            None,
+            READY,
+            Provision { own_deny },
+        )
+        .await
+        .err()
+        .map(|e| e.to_string())
+    }
+
+    fn agy_deny(fake: &FakeHerdr) -> serde_json::Value {
+        let content = fake.agy_settings_now().unwrap().content.unwrap();
+        serde_json::from_str::<serde_json::Value>(&content).unwrap()["permissions"]["deny"].clone()
+    }
+
+    /// Before a profiled agy launch, agy's settings get the deny rules of the
+    /// machine's own profile (here `develop`), not the task's (a `review`
+    /// task's `write_file(*)` would stop every edit on the machine, which is
+    /// why settle keeps such a task off a `develop` machine). The check that
+    /// follows then finds them covered.
     #[tokio::test]
-    async fn a_profiled_opencode_task_refuses_a_machine_with_its_own_rules() {
+    async fn a_profiled_agy_task_writes_the_machines_own_rules_first() {
+        let fake = FakeHerdr::new();
+        fake.set_agy_settings(Some(crate::provision::agy::AgySettings {
+            content: None,
+            link: false,
+        }));
+        let mut t = task(agy_develop());
+        let err = dispatch_agy(&fake, &mut t, &develop_deny()).await;
+        assert!(
+            !err.clone()
+                .unwrap_or_default()
+                .contains("agy_permissions_missing"),
+            "the provisioner refused: {err:?}"
+        );
+        assert_eq!(
+            agy_deny(&fake),
+            serde_json::json!([
+                "command(rm -rf)",
+                "command(sudo)",
+                "command(git push --force)"
+            ])
+        );
+        assert_eq!(fake.agy_writes().len(), 1);
+        // Covered now: the next launch writes nothing.
+        let mut t = task(agy_develop());
+        dispatch_agy(&fake, &mut t, &develop_deny()).await;
+        assert_eq!(fake.agy_writes().len(), 1);
+    }
+
+    /// The owner's file keeps its rules first and its other keys; a rule it
+    /// already covers is not added again.
+    #[tokio::test]
+    async fn the_owners_agy_settings_keep_their_rules() {
+        let fake = FakeHerdr::new();
+        fake.set_agy_settings(Some(crate::provision::agy::AgySettings {
+            content: Some(
+                r#"{"theme":"dark","permissions":{"allow":["command(ls)"],"deny":["command(sudo)"]}}"#.into(),
+            ),
+            link: false,
+        }));
+        let mut t = task(agy_develop());
+        dispatch_agy(&fake, &mut t, &develop_deny()).await;
+        assert_eq!(
+            agy_deny(&fake),
+            serde_json::json!([
+                "command(sudo)",
+                "command(rm -rf)",
+                "command(git push --force)"
+            ])
+        );
+        let content = fake.agy_settings_now().unwrap().content.unwrap();
+        assert!(content.find("theme").unwrap() < content.find("permissions").unwrap());
+        assert!(content.contains("command(ls)"), "{content}");
+    }
+
+    /// A machine whose agy settings cannot be read (a `command` machine) or
+    /// parsed, or are a symlink that needs rules, refuses the task before
+    /// anything is made there, with the rules to add by hand.
+    #[tokio::test]
+    async fn agy_settings_pastor_cannot_write_refuse_the_task() {
+        let refused = async |settings| {
+            let fake = FakeHerdr::new();
+            fake.set_agy_settings(settings);
+            let mut t = task(agy_develop());
+            let err = dispatch_agy(&fake, &mut t, &develop_deny()).await.unwrap();
+            assert!(err.contains("agy_permissions_missing"), "{err}");
+            assert!(err.contains("command(sudo)"), "{err}");
+            assert!(err.contains("pi-1"), "{err}");
+            assert!(
+                err.contains("~/.gemini/antigravity-cli/settings.json"),
+                "{err}"
+            );
+            assert_eq!(t.state, TaskState::Failed);
+            assert!(fake.requests().iter().all(|r| r.method != "agent.start"));
+            assert!(fake.agy_writes().is_empty());
+            err
+        };
+        let err = refused(None).await;
+        assert!(err.contains("cannot read"), "{err}");
+        let err = refused(Some(crate::provision::agy::AgySettings {
+            content: Some("{ not json".into()),
+            link: false,
+        }))
+        .await;
+        assert!(err.contains("not JSON"), "{err}");
+        let err = refused(Some(crate::provision::agy::AgySettings {
+            content: Some("{}".into()),
+            link: true,
+        }))
+        .await;
+        assert!(err.contains("symlink"), "{err}");
+        // A symlink that already denies everything is fine as it is.
+        let fake = FakeHerdr::new();
+        fake.set_agy_settings(Some(crate::provision::agy::AgySettings {
+            content: Some(r#"{"permissions":{"deny":["command(*)"]}}"#.into()),
+            link: true,
+        }));
+        let mut t = task(agy_develop());
+        let err = dispatch_agy(&fake, &mut t, &develop_deny()).await;
+        assert!(
+            !err.clone()
+                .unwrap_or_default()
+                .contains("agy_permissions_missing"),
+            "{err:?}"
+        );
+    }
+
+    /// agy saving between pastor's read and write is read again and merged
+    /// once; twice in a row refuses the task.
+    #[tokio::test]
+    async fn an_agy_save_during_the_write_is_merged_once() {
+        let empty = || {
+            Some(crate::provision::agy::AgySettings {
+                content: None,
+                link: false,
+            })
+        };
+        let fake = FakeHerdr::new();
+        fake.set_agy_settings(empty());
+        fake.agy_saves_before_write(Some(r#"{"model":"x"}"#));
+        let mut t = task(agy_develop());
+        dispatch_agy(&fake, &mut t, &develop_deny()).await;
+        let content = fake.agy_settings_now().unwrap().content.unwrap();
+        assert!(content.contains("\"model\": \"x\""), "{content}");
+        assert_eq!(agy_deny(&fake).as_array().unwrap().len(), 3);
+
+        let fake = FakeHerdr::new();
+        fake.set_agy_settings(empty());
+        fake.agy_saves_before_write(Some("{}"));
+        fake.agy_saves_before_write(Some(r#"{"a":1}"#));
+        let mut t = task(agy_develop());
+        let err = dispatch_agy(&fake, &mut t, &develop_deny()).await.unwrap();
+        assert!(err.contains("agy_permissions_missing"), "{err}");
+        assert!(err.contains("kept saving"), "{err}");
+    }
+
+    /// Nothing is written for a task that is not agy under a profile, or for
+    /// an agent with `own_permissions`: a `command` machine does not refuse
+    /// them. (A profiled agy task on a machine whose own profile denies
+    /// nothing is still checked, and a `command` machine refuses that:
+    /// `a_profiled_agy_task_needs_its_denies_in_the_machines_agy_settings`.)
+    #[tokio::test]
+    async fn the_agy_provisioner_leaves_other_tasks_alone() {
+        let own = develop_deny();
+        let mut claude = agy_develop();
+        claude.agent = "claude".into();
+        let own_permissions: Agents = toml::from_str("[agy]\nown_permissions = true\n").unwrap();
+        for (spec, agents, own) in [
+            (claude, Agents::default(), own.clone()),
+            (agy_under(None), Agents::default(), own.clone()),
+            (agy_develop(), own_permissions, own.clone()),
+        ] {
+            let fake = FakeHerdr::new();
+            fake.set_agy_settings(None);
+            let mut t = task(spec);
+            let err = dispatch_with(
+                &fake,
+                &mut t,
+                &agents,
+                None,
+                READY,
+                Provision { own_deny: &own },
+            )
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+            assert!(!err.contains("agy_permissions_missing"), "{err}");
+        }
+    }
+
+    /// A profiled agy task starts with the flags that stop it asking when
+    /// the machine's agy settings deny what it denies; with a rule missing,
+    /// with settings pastor cannot read, and on a machine that takes no
+    /// shell command, it fails before anything is made there. Without a
+    /// profile nothing is checked.
+    #[tokio::test]
+    async fn a_profiled_agy_task_needs_its_denies_in_the_machines_agy_settings() {
+        let fake = FakeHerdr::new();
+        let mut t = task(agy_under(Some("review")));
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let start = fake.requests();
+        let start = start.iter().find(|r| r.method == "agent.start").unwrap();
+        assert_eq!(start.params["kind"], "agy");
+        assert_eq!(
+            start.params["args"],
+            serde_json::json!(["--dangerously-skip-permissions", "--mode", "accept-edits"])
+        );
+
+        let refused = |content: Option<&'static str>, says: &'static str| async move {
+            let fake = FakeHerdr::new();
+            fake.set_agy_settings(content.map(|c| crate::provision::agy::AgySettings {
+                content: Some(c.into()),
+                link: false,
+            }));
+            let mut t = task(agy_under(Some("review")));
+            let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
+                .await
+                .unwrap_err();
+            let text = err.to_string();
+            assert!(text.contains("agy_permissions_missing"), "{text}");
+            assert!(text.contains(says), "{text}");
+            assert!(text.contains("pi-1"), "{text}");
+            assert!(!err.is_transport());
+            assert_eq!(t.state, TaskState::Failed);
+            assert!(!fake.requests().iter().any(|r| r.method == "agent.start"));
+        };
+        refused(
+            Some(r#"{"permissions":{"deny":["command(sudo)"]}}"#),
+            "write_file(*)",
+        )
+        .await;
+        refused(Some("{"), "settings.json").await;
+        refused(None, "cannot be read").await;
+
+        let fake = FakeHerdr::new();
+        fake.set_agy_settings(None);
+        let mut t = task(DispatchSpec {
+            allow: vec![],
+            deny: vec![],
+            ..agy_under(None)
+        });
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+    }
+
+    /// A profiled opencode task starts with its rules in the pane's env.
+    /// On a machine whose managed opencode config (or managed preferences)
+    /// has permission rules it fails before anything is made there: those
+    /// are merged after `OPENCODE_CONFIG_CONTENT`, so pastor cannot
+    /// neutralise them, and opencode would merge them with the profile's.
+    /// A machine that cannot tell goes ahead, and a task with no profile
+    /// never asks.
+    #[tokio::test]
+    async fn a_profiled_opencode_task_refuses_a_machine_with_managed_rules() {
         let fake = FakeHerdr::new();
         let mut t = task(opencode_under(Some("review")));
         dispatch(&fake, &mut t, &Agents::default(), None, READY)
@@ -2247,7 +2689,7 @@ mod tests {
         let env = fake.pane_env(t.pane_id.as_deref().unwrap());
         assert_eq!(
             env["OPENCODE_PERMISSION"],
-            crate::config::opencode::permission_json(&t.spec.allow, &t.spec.deny, false)
+            crate::config::opencode::permission_json(&t.spec.allow, &t.spec.deny, false, &[])
         );
         assert_eq!(env["OPENCODE_CONFIG"], "");
         let start = fake.requests();
@@ -2286,6 +2728,62 @@ mod tests {
         dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
+    }
+
+    /// A machine whose own global opencode config or `~/.opencode` has
+    /// permission rules of its own no longer fails the task: every key
+    /// pastor found there is denied in `OPENCODE_PERMISSION` instead, even
+    /// under `unrestricted`, and the task runs. The env then has no open
+    /// fallback of its own, which opencode would put after the machine's
+    /// keys (`config::opencode::permission_json`): what opencode's defaults
+    /// ask about is allowed by name instead.
+    #[tokio::test]
+    async fn a_profiled_opencode_task_denies_the_machines_own_keys_instead_of_failing() {
+        let fake = FakeHerdr::new();
+        fake.set_opencode_deny_keys(crate::config::opencode::MachineDenyKeys::Keys(vec![
+            "bash".into(),
+            "webfetch".into(),
+        ]));
+        let mut t = task(opencode_under(Some("unrestricted")));
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let env = fake.pane_env(t.pane_id.as_deref().unwrap());
+        let permission: serde_json::Value =
+            serde_json::from_str(env["OPENCODE_PERMISSION"].as_str().unwrap()).unwrap();
+        assert!(permission.get("*").is_none(), "{permission}");
+        assert_eq!(permission["bash"], "deny", "{permission}");
+        assert_eq!(permission["webfetch"], "deny", "{permission}");
+        assert_eq!(permission["read"], "allow", "{permission}");
+        assert_eq!(permission["external_directory"], "allow", "{permission}");
+    }
+
+    /// What `OPENCODE_PERMISSION` cannot neutralise on the machine's own
+    /// global config or `~/.opencode` (a file pastor could not parse, rules
+    /// under an agent, too much config) fails the task the same way a
+    /// managed config's rules do, saying what was found.
+    #[tokio::test]
+    async fn a_profiled_opencode_task_refuses_a_machine_whose_own_config_it_cannot_neutralise() {
+        let fake = FakeHerdr::new();
+        fake.set_opencode_deny_keys(crate::config::opencode::MachineDenyKeys::Conflict(
+            "has permission rules under agent.build (bash)".into(),
+        ));
+        let mut t = task(opencode_under(Some("review")));
+        let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("opencode_permissions_conflict"),
+            "{err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("on pi-1 has permission rules under agent.build (bash); move"),
+            "{err}"
+        );
+        assert!(!err.is_transport());
+        assert_eq!(t.state, TaskState::Failed);
+        assert!(fake.requests().is_empty(), "{:?}", fake.requests());
     }
 
     /// A profiled opencode task runs with the repo's own opencode config
@@ -2417,8 +2915,10 @@ mod tests {
             .iter()
             .find(|r| r.method == "workspace.create")
             .unwrap();
+        // The classic renderer is a built-in of the claude kind.
         let want = serde_json::json!({
             "BARE": "/home/fake",
+            "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN": "1",
             "CLAUDE_CONFIG_DIR": "/home/fake/.claude-personal",
             "PASTOR_TASK": "t-7",
             "PLAIN": "a~b",
@@ -2487,7 +2987,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             fake.pane_env(t.pane_id.as_deref().unwrap()),
-            serde_json::json!({"PASTOR_TASK": "t-7"})
+            serde_json::json!({"CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN": "1", "PASTOR_TASK": "t-7"}),
+            "PASTOR_TASK, and the claude kind's classic renderer"
         );
 
         let fake = FakeHerdr::new();

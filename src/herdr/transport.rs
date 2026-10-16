@@ -354,8 +354,34 @@ pub type DirFuture<'a> =
 pub type VersionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Option<String>, ConnectError>> + Send + 'a>>;
 
+pub type AgySettingsFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<Option<crate::provision::agy::AgySettings>, ConnectError>>
+            + Send
+            + 'a,
+    >,
+>;
+
+pub type AgyWriteFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<Option<crate::provision::agy::AgyWrite>, ConnectError>>
+            + Send
+            + 'a,
+    >,
+>;
+
 pub type UsageFuture<'a> = Pin<
     Box<dyn Future<Output = Result<Option<crate::usage::TaskUsage>, ConnectError>> + Send + 'a>,
+>;
+
+pub type RoomFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<crate::machine::Room>, ConnectError>> + Send + 'a>>;
+pub type MachineDenyKeysFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<crate::config::opencode::MachineDenyKeys, ConnectError>>
+            + Send
+            + 'a,
+    >,
 >;
 
 /// Anything that can open a fresh herdr connection. Endpoints for real use, FakeHerdr in tests.
@@ -410,17 +436,50 @@ pub trait Connector: Send + Sync {
     fn restore_worktree(&self, _repo: &str, _path: &str, _branch: &str) -> DirFuture<'_> {
         Box::pin(async { Ok(None) })
     }
-    /// Whether the machine's own opencode config sets permission rules,
-    /// which opencode would merge with a profile's (`config::opencode`).
-    /// `None` when it cannot be known.
+    /// Whether the machine's managed opencode config, or on macOS its
+    /// managed preferences, sets permission rules: those are merged after
+    /// `OPENCODE_CONFIG_CONTENT`, so pastor cannot neutralise them
+    /// (`config::opencode`). `None` when it cannot be known.
     fn opencode_permission_rules(&self) -> DirFuture<'_> {
         Box::pin(async { Ok(None) })
+    }
+    /// agy's global settings file on the machine
+    /// (`provision::agy::SETTINGS_FILE`), for the agy provisioner. `None`
+    /// when it cannot be known.
+    fn agy_settings(&self) -> AgySettingsFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
+    /// Put `new` in place of agy's global settings file on the machine when
+    /// it still holds `expected` (`None`: there is still no file), atomically
+    /// (`provision::agy::write_command`). `None` when it cannot be done or
+    /// known.
+    fn write_agy_settings(&self, _expected: Option<&str>, _new: &str) -> AgyWriteFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
+    /// What agy's settings on the machine say, as `config::agy::RULES_COMMAND`
+    /// prints it, for `config::agy::parse_denies`. `None` when the machine
+    /// takes no shell command.
+    fn agy_rules(&self) -> VersionFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
+    /// The machine's own global opencode config and `~/.opencode`'s
+    /// permission keys, which a profiled opencode task must always deny
+    /// (`config::opencode::MachineDenyKeys`). `None` when it cannot be
+    /// known (a `command` machine).
+    fn opencode_config_permission_keys(&self) -> MachineDenyKeysFuture<'_> {
+        Box::pin(async { Ok(crate::config::opencode::MachineDenyKeys::None) })
     }
     /// The version of pastor installed on the machine, for `machine list`: a
     /// fleet runs whatever each machine last installed, and a skill or CLI
     /// that an agent there calls is that version's. `None` when there is no
     /// pastor there or it cannot be known.
     fn pastor_version(&self) -> VersionFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
+    /// What the machine has free: disk under `$HOME` and `/tmp` and memory
+    /// (`machine::Room`), read before placing a task there. `None` when it
+    /// cannot be known. The numbers only; the caller stamps `asked_at`.
+    fn room(&self) -> RoomFuture<'_> {
         Box::pin(async { Ok(None) })
     }
     /// The tokens Claude session `session` used, read from its files on the
@@ -468,8 +527,24 @@ impl Connector for Endpoint {
     fn opencode_permission_rules(&self) -> DirFuture<'_> {
         Box::pin(opencode_permission_rules(self))
     }
+    fn agy_settings(&self) -> AgySettingsFuture<'_> {
+        Box::pin(agy_settings(self))
+    }
+    fn write_agy_settings(&self, expected: Option<&str>, new: &str) -> AgyWriteFuture<'_> {
+        let command = crate::provision::agy::write_command(expected, new);
+        Box::pin(async move { write_agy_settings(self, command).await })
+    }
+    fn agy_rules(&self) -> VersionFuture<'_> {
+        Box::pin(agy_rules(self))
+    }
+    fn opencode_config_permission_keys(&self) -> MachineDenyKeysFuture<'_> {
+        Box::pin(opencode_config_permission_keys(self))
+    }
     fn pastor_version(&self) -> VersionFuture<'_> {
         Box::pin(pastor_version(self))
+    }
+    fn room(&self) -> RoomFuture<'_> {
+        Box::pin(room(self))
     }
     fn claude_usage(&self, config_dir: Option<&str>, session: &str) -> UsageFuture<'_> {
         let command = crate::usage::usage_command(config_dir, session);
@@ -618,6 +693,67 @@ async fn opencode_permission_rules(ep: &Endpoint) -> Result<Option<bool>, Connec
     }
 }
 
+/// Reads agy's global settings through `probe`, on a local machine too.
+/// Only ssh failing to reach the machine is an error; an answer pastor
+/// cannot read is unknown.
+async fn agy_settings(
+    ep: &Endpoint,
+) -> Result<Option<crate::provision::agy::AgySettings>, ConnectError> {
+    let Some(p) = probe(ep, crate::provision::agy::read_command()).await? else {
+        return Ok(None);
+    };
+    reached(&p.target, &p.out)?;
+    let raw = String::from_utf8_lossy(&p.out.stdout);
+    match crate::provision::agy::parse_read(&raw) {
+        Ok(read) if p.out.status.success() => Ok(Some(read)),
+        Ok(_) | Err(_) => {
+            tracing::warn!(target = %p.target, status = %p.out.status, stderr = %String::from_utf8_lossy(&p.out.stderr).trim(), "could not read agy's settings");
+            Ok(None)
+        }
+    }
+}
+
+async fn write_agy_settings(
+    ep: &Endpoint,
+    command: String,
+) -> Result<Option<crate::provision::agy::AgyWrite>, ConnectError> {
+    let Some(p) = probe(ep, command).await? else {
+        return Ok(None);
+    };
+    reached(&p.target, &p.out)?;
+    let answer = crate::provision::agy::parse_write(&String::from_utf8_lossy(&p.out.stdout));
+    if answer.is_none() || !p.out.status.success() {
+        tracing::warn!(target = %p.target, status = %p.out.status, stderr = %String::from_utf8_lossy(&p.out.stderr).trim(), "could not write agy's settings");
+        return Ok(None);
+    }
+    Ok(answer)
+}
+
+async fn agy_rules(ep: &Endpoint) -> Result<Option<String>, ConnectError> {
+    let command = crate::config::agy::RULES_COMMAND.to_string();
+    match probe(ep, command).await? {
+        Some(p) => {
+            reached(&p.target, &p.out)?;
+            Ok(Some(String::from_utf8_lossy(&p.out.stdout).into_owned()))
+        }
+        None => Ok(None),
+    }
+}
+
+async fn opencode_config_permission_keys(
+    ep: &Endpoint,
+) -> Result<crate::config::opencode::MachineDenyKeys, ConnectError> {
+    let command = crate::config::opencode::CONFIG_READ_COMMAND.to_string();
+    match probe(ep, command).await? {
+        Some(p) => {
+            reached(&p.target, &p.out)?;
+            let raw = String::from_utf8_lossy(&p.out.stdout);
+            Ok(crate::config::opencode::parse_permission_keys(&raw))
+        }
+        None => Ok(crate::config::opencode::MachineDenyKeys::None),
+    }
+}
+
 async fn pastor_version(ep: &Endpoint) -> Result<Option<String>, ConnectError> {
     // The head and this herdr share a machine, so the pastor there is this
     // one.
@@ -677,6 +813,62 @@ fn remote_pastor_version(
     }
     tracing::warn!(%target, status = %out.status, stdout = ?raw, "no pastor version from the remote shell");
     Ok(None)
+}
+
+async fn room(ep: &Endpoint) -> Result<Option<crate::machine::Room>, ConnectError> {
+    // A local machine runs the same command here, under `sh -c`: the head
+    // and this herdr share a disk and a memory.
+    match probe(ep, ROOM_COMMAND.to_string()).await? {
+        Some(p) => remote_room(&p.target, &p.out),
+        None => Ok(None),
+    }
+}
+
+/// Asks the machine what it has free: `df -Pk` under `$HOME` and `/tmp`
+/// (its 1024-byte blocks available, field 4 on GNU, BSD and macOS alike)
+/// and `MemAvailable` from `/proc/meminfo`. Each number is its own `df` or
+/// `awk`, printed with a label, so a home `df` cannot read, or a macOS with
+/// no `/proc/meminfo`, leaves only that number out instead of shifting the
+/// others; the command's exit status says nothing, since the last `awk`
+/// fails on macOS.
+pub const ROOM_COMMAND: &str = r#"df -Pk "$HOME" | awk 'NR==2 {print "home", $4}'; df -Pk /tmp | awk 'NR==2 {print "tmp", $4}'; awk '/^MemAvailable:/ {print "mem", $2}' /proc/meminfo 2>/dev/null"#;
+
+/// Reads the answer to `ROOM_COMMAND`: `home N`, `tmp N` and `mem N` lines,
+/// in any order, among whatever rc files print. A label without a whole
+/// number after it is read as missing. As with `remote_home`, only ssh
+/// failing to reach the machine is an error.
+fn remote_room(
+    target: &str,
+    out: &std::process::Output,
+) -> Result<Option<crate::machine::Room>, ConnectError> {
+    reached(target, out)?;
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let room = parse_room(&raw);
+    if room.home_free.is_none() || room.tmp_free.is_none() {
+        tracing::warn!(%target, status = %out.status, stdout = ?raw, stderr = %String::from_utf8_lossy(&out.stderr).trim(), "no free disk from the remote shell");
+    }
+    Ok(Some(room))
+}
+
+/// The numbers in `ROOM_COMMAND`'s output; the last line of each label
+/// wins, so a label an rc file happens to print is overridden by the probe's
+/// own, which comes after.
+fn parse_room(raw: &str) -> crate::machine::Room {
+    let mut room = crate::machine::Room::default();
+    for line in raw.lines() {
+        let mut words = line.split_whitespace();
+        let (Some(label), Some(number), None) = (words.next(), words.next(), words.next()) else {
+            continue;
+        };
+        let value = number.parse::<u64>().ok();
+        match label {
+            "home" => room.home_free = value,
+            "tmp" => room.tmp_free = value,
+            "mem" => room.mem_free = value,
+            _ => {}
+        }
+    }
+    room
 }
 
 /// `test -d` in the remote shell, answered on stdout with one word. `test -d`
@@ -806,6 +998,9 @@ mod tests {
             priority: None,
             agents: Default::default(),
             profile: None,
+            min_disk: None,
+            min_memory: None,
+            unknown_room: None,
         }
     }
 
@@ -1011,6 +1206,9 @@ mod tests {
             priority: None,
             agents: Default::default(),
             profile: None,
+            min_disk: None,
+            min_memory: None,
+            unknown_room: None,
         };
         let paths = Paths::new("/tmp/c", "/tmp/s");
         let ep = Endpoint::from_machine(&m, &paths);
@@ -1229,6 +1427,103 @@ mod tests {
         assert!(remote_pastor_version("t", &killed).is_err());
     }
 
+    /// A local machine runs the room probe here; a bridge command cannot
+    /// know. The ssh command runs through `sh -c`, as the version one does.
+    #[tokio::test]
+    async fn room_per_endpoint() {
+        let argv = ssh_argv_running(
+            "fleet@pi-3",
+            Some(Path::new("/tmp/s/ssh/pi-3-%C")),
+            ROOM_COMMAND.to_string(),
+        );
+        assert!(
+            argv.last().unwrap().starts_with("sh -c 'df -Pk \"$HOME\""),
+            "{argv:?}"
+        );
+        let local = Endpoint::Local {
+            session: "default".into(),
+        };
+        let room = local.room().await.unwrap().expect("a local room");
+        assert!(room.home_free.is_some(), "{room:?}");
+        assert!(room.tmp_free.is_some(), "{room:?}");
+        if cfg!(target_os = "linux") {
+            assert!(room.mem_free.is_some(), "{room:?}");
+        }
+        assert_eq!(room.asked_at, None, "the actor stamps the read");
+        assert_eq!(room.error, None);
+        let command = Endpoint::Command {
+            argv: vec!["true".into()],
+        };
+        assert_eq!(command.room().await.unwrap(), None);
+    }
+
+    /// The command's own shell script, run here, answers the way the parser
+    /// expects: a labelled number per line, memory left out where there is
+    /// no `/proc/meminfo` (macOS) rather than failing the probe.
+    #[test]
+    fn the_room_command_answers_labelled_numbers() {
+        let out = std::process::Command::new("sh")
+            .args(["-c", ROOM_COMMAND])
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+        let room = remote_room("t", &out).unwrap().expect("a room");
+        assert!(room.home_free.is_some(), "{room:?}");
+        assert!(room.tmp_free.is_some(), "{room:?}");
+        let tmp = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new("sh")
+            .args(["-c", ROOM_COMMAND])
+            .env("HOME", tmp.path().join("missing"))
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+        let room = remote_room("t", &out).unwrap().expect("a room");
+        assert_eq!(room.home_free, None, "a home df cannot read is unknown");
+        assert!(room.tmp_free.is_some(), "{room:?}");
+    }
+
+    /// Each number is its own labelled line, so one df failing leaves only
+    /// its number unknown; rc-file noise and an odd number are ignored. Only
+    /// ssh failing to reach the machine is an error.
+    #[test]
+    fn remote_room_reads_labelled_lines() {
+        use std::os::unix::process::ExitStatusExt;
+        let out = |code: i32, stdout: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: b"df: /tmp: No such file".to_vec(),
+        };
+        let r = |code: i32, stdout: &str| remote_room("t", &out(code, stdout)).unwrap().unwrap();
+        let full = r(0, "home 123456\ntmp 7890\nmem 4096\n");
+        assert_eq!(full.home_free, Some(123_456));
+        assert_eq!(full.tmp_free, Some(7_890));
+        assert_eq!(full.mem_free, Some(4_096));
+        let noisy = r(2, "Welcome to Raspberry Pi\nhome 10\nmem 20\n");
+        assert_eq!(noisy.home_free, Some(10));
+        assert_eq!(noisy.tmp_free, None, "a missing line is unknown");
+        assert_eq!(
+            noisy.mem_free,
+            Some(20),
+            "a failed awk still counts the lines that came"
+        );
+        let odd = r(0, "home ten\ntmp 5 extra\nmem -1\nhome 3\n");
+        assert_eq!(odd.home_free, Some(3), "the last good line wins");
+        assert_eq!(odd.tmp_free, None);
+        assert_eq!(odd.mem_free, None);
+        let none = r(0, "");
+        assert_eq!(
+            (none.home_free, none.tmp_free, none.mem_free),
+            (None, None, None)
+        );
+        assert!(remote_room("t", &out(255, "")).is_err());
+        let killed = std::process::Output {
+            status: std::process::ExitStatus::from_raw(9),
+            stdout: vec![],
+            stderr: vec![],
+        };
+        assert!(remote_room("t", &killed).is_err());
+    }
+
     /// ssh hands its command to the remote user's login shell, which may be
     /// fish or csh. Every remote command is wrapped as `sh -c '<command>'`,
     /// so that shell only parses one word and one single-quoted string, and
@@ -1369,6 +1664,176 @@ mod tests {
             argv: vec!["true".into()],
         };
         assert_eq!(command.opencode_permission_rules().await.unwrap(), None);
+    }
+
+    /// agy's settings are read and written under the machine's `HOME` on a
+    /// local endpoint (run in a child process with a temp `HOME`), and are
+    /// unknown on a command one.
+    #[tokio::test]
+    async fn agy_settings_per_endpoint() {
+        use crate::provision::agy::{AgySettings, AgyWrite};
+        const CHILD: &str = "PASTOR_TEST_AGY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let local = Endpoint::Local {
+                session: "s".into(),
+            };
+            let none = AgySettings {
+                content: None,
+                link: false,
+            };
+            assert_eq!(local.agy_settings().await.unwrap(), Some(none));
+            assert_eq!(
+                local.write_agy_settings(None, "{}\n").await.unwrap(),
+                Some(AgyWrite::Written)
+            );
+            assert_eq!(
+                local
+                    .agy_settings()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .content
+                    .as_deref(),
+                Some("{}\n")
+            );
+            assert_eq!(
+                local.write_agy_settings(None, "{}\n").await.unwrap(),
+                Some(AgyWrite::Changed)
+            );
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "herdr::transport::tests::agy_settings_per_endpoint",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(stdout.contains("1 passed"), "{stdout}");
+        assert!(
+            home.path()
+                .join(".gemini/antigravity-cli/settings.json")
+                .is_file()
+        );
+        let command = Endpoint::Command {
+            argv: vec!["true".into()],
+        };
+        assert_eq!(command.agy_settings().await.unwrap(), None);
+        assert_eq!(command.write_agy_settings(None, "{}").await.unwrap(), None);
+    }
+
+    /// `agy_rules` prints agy's settings from the machine's `HOME`, and a
+    /// command machine answers nothing. The local half runs in a child with
+    /// its own `HOME`, as the opencode test does.
+    #[tokio::test]
+    async fn agy_rules_per_endpoint() {
+        const CHILD: &str = "PASTOR_TEST_AGY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let local = Endpoint::Local {
+                session: "s".into(),
+            };
+            let out = local.agy_rules().await.unwrap().unwrap();
+            assert_eq!(
+                crate::config::agy::parse_denies(&out).unwrap(),
+                vec!["command(sudo)"]
+            );
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let cli = home.path().join(".gemini/antigravity-cli");
+        std::fs::create_dir_all(&cli).unwrap();
+        std::fs::write(
+            cli.join("settings.json"),
+            r#"{"permissions":{"deny":["command(sudo)"]}}"#,
+        )
+        .unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "herdr::transport::tests::agy_rules_per_endpoint",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(stdout.contains("1 passed"), "{stdout}");
+        let command = Endpoint::Command {
+            argv: vec!["true".into()],
+        };
+        assert_eq!(command.agy_rules().await.unwrap(), None);
+    }
+
+    /// Same wiring, for the global config and `~/.opencode`: the command
+    /// itself is `config::opencode`'s own to test. A child of this binary
+    /// again, so the real `$HOME` running the suite cannot leak a key in.
+    #[tokio::test]
+    async fn opencode_config_permission_keys_per_endpoint() {
+        const CHILD: &str = "PASTOR_TEST_OPENCODE_KEYS_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let local = Endpoint::Local {
+                session: "s".into(),
+            };
+            assert_eq!(
+                local.opencode_config_permission_keys().await.unwrap(),
+                crate::config::opencode::MachineDenyKeys::None
+            );
+            let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+            let dir = home.join(".config/opencode");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("opencode.json"),
+                r#"{"permission": {"bash": "allow"}}"#,
+            )
+            .unwrap();
+            assert_eq!(
+                local.opencode_config_permission_keys().await.unwrap(),
+                crate::config::opencode::MachineDenyKeys::Keys(vec!["bash".into()])
+            );
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "herdr::transport::tests::opencode_config_permission_keys_per_endpoint",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env("HOME", home.path())
+            .env_remove("XDG_CONFIG_HOME")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(stdout.contains("1 passed"), "{stdout}");
+        let command = Endpoint::Command {
+            argv: vec!["true".into()],
+        };
+        assert_eq!(
+            command.opencode_config_permission_keys().await.unwrap(),
+            crate::config::opencode::MachineDenyKeys::None
+        );
     }
 
     /// Only ssh failing to reach the machine is an error. rc-file noise comes
@@ -1740,6 +2205,9 @@ mod tests {
             priority: None,
             agents: Default::default(),
             profile: None,
+            min_disk: None,
+            min_memory: None,
+            unknown_room: None,
         };
         let paths = Paths::new("/tmp/c", &deep);
         let Endpoint::Ssh {

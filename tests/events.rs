@@ -212,6 +212,9 @@ async fn the_daemon_writes_the_events_log() {
             priority: None,
             agents: Default::default(),
             profile: None,
+            min_disk: None,
+            min_memory: None,
+            unknown_room: None,
         }],
     };
     let fake: Arc<dyn Connector> = Arc::new(FakeHerdr::new());

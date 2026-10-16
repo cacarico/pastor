@@ -195,6 +195,7 @@ Type text or press keys in a live task's agent, to answer what it is waiting on
 | `--key <KEY>` | A named key to press after the text (Enter, Down, esc, ctrl+c); repeat for more, in order |  |
 | `--no-enter` | Type the text without pressing Enter after it |  |
 | `--trust` | Accept the agent's folder-trust prompt with its trust keys, and trust the task's repo on its machine from now on |  |
+| `--pick <OPTION>` | Answer the picker on screen by the text of one of its options (case does not matter): the arrows to it, then Enter |  |
 | `--json` | Print as a JSON object |  |
 
 ### pastor task done
@@ -229,6 +230,15 @@ Put a queued task elsewhere in the queue; it takes the level of where it lands
 | `--before <TASK>` | Just ahead of this queued task |  |
 | `--after <TASK>` | Just behind this queued task |  |
 | `--to <N>` | At this position, as `pastor queue` numbers it (1 is first) |  |
+| `--json` | Print as a JSON object |  |
+
+## status
+
+The fleet on one screen: the head, machines up and down, live tasks by state, failing jobs, exhausted accounts
+
+| argument | does | default |
+|---|---|---|
+| `--probe` | With no head running, probe each machine over ssh and read tasks, jobs and limits from the files and store here, instead of failing |  |
 | `--json` | Print as a JSON object |  |
 
 ## machine

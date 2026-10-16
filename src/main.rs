@@ -61,6 +61,8 @@ enum Command {
     },
     /// The queued tasks in the order they will start, and why each waits; move one
     Queue(pastor::queue_cli::QueueArgs),
+    /// The fleet on one screen: the head, machines up and down, live tasks by state, failing jobs, exhausted accounts
+    Status(pastor::status_cli::StatusArgs),
     /// Manage the machines and which flock each is in
     Machine {
         #[command(subcommand)]
@@ -771,6 +773,7 @@ fn main() {
             Command::Trust { cmd } => pastor::trust_cli::run(&client, cmd, head).await,
             Command::Limit { cmd } => pastor::limit_cli::run(&client, cmd, head).await,
             Command::Queue(args) => pastor::queue_cli::run(&client, args, head).await,
+            Command::Status(args) => status(&client, args, head).await,
             Command::Bridge(_) => unreachable!("handled before the runtime"),
             Command::Head { cmd } => pastor::head::run(&paths, cmd, remote.as_ref()).await,
         }
@@ -986,6 +989,7 @@ async fn probe_head(
                 socket.display()
             ),
         )),
+        HeadPing::Denied => Err(pastor::cli::socket_denied(&socket)),
         HeadPing::Pong {
             version, protocol, ..
         } if need.is_some_and(|(needed, _)| protocol < needed) => {
@@ -1044,6 +1048,7 @@ fn head_use(command: &Command) -> Option<bool> {
         Command::Orchestrator { .. } => Some(false),
         Command::Trust { .. } | Command::Limit { .. } => Some(false),
         Command::Queue(a) => Some(a.flock.is_some()),
+        Command::Status(_) => Some(false),
         Command::Connector { cmd } => {
             (!matches!(cmd, ConnectorCmd::List { .. } | ConnectorCmd::Try { .. })).then_some(false)
         }
@@ -1092,6 +1097,7 @@ fn remote_route(command: &Command) -> RemoteRoute {
         Command::Task { .. }
         | Command::Watch(_)
         | Command::Queue(_)
+        | Command::Status(_)
         | Command::Machine { .. }
         | Command::Flock { .. }
         | Command::Trust { .. }
@@ -1561,6 +1567,18 @@ fn command_argv(s: &str) -> Vec<String> {
     s.split_whitespace().map(str::to_string).collect()
 }
 
+/// A probe's version and when it was read: now whenever the machine
+/// answered, `none` (no pastor installed) included; neither when the ask
+/// failed or was skipped because the ping had, as on the head.
+fn version_read(
+    asked: Option<Result<Option<String>, pastor::herdr::ConnectError>>,
+) -> (Option<String>, Option<chrono::DateTime<chrono::Utc>>) {
+    match asked {
+        Some(Ok(v)) => (v, Some(chrono::Utc::now())),
+        _ => (None, None),
+    }
+}
+
 fn probe_fields(
     ping: Result<pastor::herdr::Pong, pastor::herdr::CallError>,
     agent_count: Option<Result<usize, pastor::herdr::CallError>>,
@@ -1638,6 +1656,7 @@ async fn probe_machine(
             channel: "not probed".into(),
             herdr_version: None,
             pastor_version: None,
+            pastor_read_at: None,
             protocol: None,
             error: None,
             live: Some(on_machine.len()),
@@ -1667,10 +1686,11 @@ async fn probe_machine(
     // Only a machine that answered is worth the extra ssh. A failure here
     // leaves the version unknown and the probe's verdict alone, as it does
     // on the head.
-    let pastor_version = match &ping {
-        Ok(_) => ep.pastor_version().await.unwrap_or(None),
+    let asked = match &ping {
+        Ok(_) => Some(ep.pastor_version().await),
         Err(_) => None,
     };
+    let (pastor_version, pastor_read_at) = version_read(asked);
     let (channel, herdr_version, protocol, live, error) = probe_fields(ping, agent_count);
     Ok(pastor::cli::MachineRow {
         now: Vec::new(),
@@ -1681,6 +1701,7 @@ async fn probe_machine(
         flocks,
         channel: channel.into(),
         herdr_version,
+        pastor_read_at,
         pastor_version,
         protocol,
         error,
@@ -1810,6 +1831,50 @@ async fn machine_list(
         );
     }
     Ok(())
+}
+
+/// `pastor status`. A remote head is never absent (`probe_head`), so the
+/// probe is only ever of this machine's flock.toml.
+async fn status(
+    client: &pastor::ipc::Client,
+    a: pastor::status_cli::StatusArgs,
+    head: Head,
+) -> anyhow::Result<()> {
+    use pastor::status_cli as st;
+    let s = match head {
+        Head::Live => st::from_head(client).await?,
+        Head::Absent if !a.probe => return Err(st::not_running()),
+        Head::Absent => {
+            let paths = &client.paths;
+            let f = Flock::load(&paths.flock_file())?;
+            let config = PastorConfig::load(&paths.config_file())?;
+            let store = open_store(paths)?;
+            let mut rows = Vec::new();
+            for m in &f.machines {
+                rows.push(probe_machine(m, &f, &config, paths, &store).await?);
+            }
+            let filter = TaskFilter {
+                job: None,
+                flock: None,
+                machine: None,
+                states: Some(LIVE_STATES.to_vec()),
+            };
+            let mut sched = standalone(paths)?;
+            sched.reload();
+            st::Status {
+                head: st::HeadSummary {
+                    running: false,
+                    at: "here".into(),
+                    version: None,
+                },
+                machines: st::machines(&rows),
+                tasks: st::tasks(&store.list_tasks(&filter)?),
+                jobs: st::jobs(&sched.statuses(chrono::Utc::now())),
+                limits: Some(store.limits()?),
+            }
+        }
+    };
+    st::print(&s, a.json)
 }
 
 /// The states `pastor task list` selects, `None` meaning all of them. `--blocked`
@@ -2083,6 +2148,9 @@ async fn machine(client: &pastor::ipc::Client, cmd: MachineCmd, head: Head) -> a
                 priority: None,
                 agents: Default::default(),
                 profile: None,
+                min_disk: None,
+                min_memory: None,
+                unknown_room: None,
             };
             // With a head the reload line comes with its answer, before the
             // herdr lines; without one it follows them.
@@ -2938,6 +3006,7 @@ async fn local_serve(paths: &Paths) -> anyhow::Result<bool> {
                 socket.display()
             ),
         )),
+        HeadPing::Denied => Err(pastor::cli::socket_denied(&socket)),
     }
 }
 
@@ -3617,17 +3686,26 @@ mod tests {
     fn a_connect_that_is_not_refused_does_not_say_the_head_is_down() {
         // probe_daemon treats these as "something may be there", so the CLI
         // must not tell the user to start a second head.
-        for kind in [
-            std::io::ErrorKind::PermissionDenied,
-            std::io::ErrorKind::Other,
+        // A permission error is most often a sandbox, and says so.
+        for (kind, want_code, want_text) in [
+            (
+                std::io::ErrorKind::PermissionDenied,
+                "socket_denied",
+                "sandboxed",
+            ),
+            (
+                std::io::ErrorKind::Other,
+                "runtime_error",
+                "could not connect",
+            ),
         ] {
             let err = std::io::Error::from(kind);
             let CliError { code, message } =
                 pastor::cli::request_error(&RequestError::Connect(err));
-            assert_eq!(code, "runtime_error");
+            assert_eq!(code, want_code);
             assert!(!message.contains("not running"), "{kind:?}: {message}");
             assert!(!message.contains("start it"), "{kind:?}: {message}");
-            assert!(message.contains("could not connect"), "{kind:?}: {message}");
+            assert!(message.contains(want_text), "{kind:?}: {message}");
         }
     }
 
@@ -3720,6 +3798,24 @@ mod tests {
             code: "internal_error".into(),
             message: "boom".into(),
         })
+    }
+
+    /// A probe's row says when the version was read whenever the machine
+    /// answered, `none` (no pastor installed) included, and not when the
+    /// ask failed or was skipped because the ping had.
+    #[test]
+    fn a_probe_records_the_version_read_time_when_the_machine_answered() {
+        let (v, at) = version_read(Some(Ok(Some("0.9.0".into()))));
+        assert_eq!(v.as_deref(), Some("0.9.0"));
+        assert!(at.is_some());
+        let (v, at) = version_read(Some(Ok(None)));
+        assert_eq!(v, None);
+        assert!(at.is_some(), "no pastor is an answer");
+        let failed = pastor::herdr::ConnectError {
+            message: "ssh: connection reset".into(),
+        };
+        assert_eq!(version_read(Some(Err(failed))), (None, None));
+        assert_eq!(version_read(None), (None, None));
     }
 
     #[test]
