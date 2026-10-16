@@ -511,12 +511,18 @@ complete -c pastor -n "__fish_pastor_using_subcommand trust; and __fish_seen_sub
 complete -c pastor -n "__fish_pastor_using_subcommand trust; and __fish_seen_subcommand_from help" -f -a "add" -d 'Save a trust, so the repo\'s tasks on that machine are answered'
 complete -c pastor -n "__fish_pastor_using_subcommand trust; and __fish_seen_subcommand_from help" -f -a "remove" -d 'Forget a saved trust; the repo\'s next task asks again'
 complete -c pastor -n "__fish_pastor_using_subcommand trust; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c pastor -n "__fish_pastor_using_subcommand join; and not __fish_seen_subcommand_from create list revoke help" -l name -d 'The name this machine takes in the head\'s flock.toml (default: its hostname)' -r
+complete -c pastor -n "__fish_pastor_using_subcommand join; and not __fish_seen_subcommand_from create list revoke help" -l service-user -d 'The user that holds the machine key and runs the shepherd; created if missing (root mode)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand join; and not __fish_seen_subcommand_from create list revoke help" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
+complete -c pastor -n "__fish_pastor_using_subcommand join; and not __fish_seen_subcommand_from create list revoke help" -l token-stdin -d 'Read the join token from stdin'
+complete -c pastor -n "__fish_pastor_using_subcommand join; and not __fish_seen_subcommand_from create list revoke help" -l sudo -d 'Do root work (packages, users, lingering) through `sudo -n`'
+complete -c pastor -n "__fish_pastor_using_subcommand join; and not __fish_seen_subcommand_from create list revoke help" -l json -d 'Print as a JSON object: mode, isolation, each step, the public keys and versions'
+complete -c pastor -n "__fish_pastor_using_subcommand join; and not __fish_seen_subcommand_from create list revoke help" -l skip-bootstrap -d 'Join and name the shepherd only, for a machine set up beforehand; nothing is installed'
 complete -c pastor -n "__fish_pastor_using_subcommand join; and not __fish_seen_subcommand_from create list revoke help" -s h -l help -d 'Print help'
-complete -c pastor -n "__fish_pastor_using_subcommand join; and not __fish_seen_subcommand_from create list revoke help" -f -a "create" -d 'Make a one-time token a new machine joins the fleet with, as a pull machine; prints the token'
-complete -c pastor -n "__fish_pastor_using_subcommand join; and not __fish_seen_subcommand_from create list revoke help" -f -a "list" -d 'The join tokens the head knows: id, flock, tags, expiry, whether used'
-complete -c pastor -n "__fish_pastor_using_subcommand join; and not __fish_seen_subcommand_from create list revoke help" -f -a "revoke" -d 'Remove a join token\'s key from authorized_keys and forget it'
-complete -c pastor -n "__fish_pastor_using_subcommand join; and not __fish_seen_subcommand_from create list revoke help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c pastor -n "__fish_pastor_using_subcommand join; and not __fish_seen_subcommand_from create list revoke help" -a "create" -d 'Make a one-time token a new machine joins the fleet with, as a pull machine; prints the token'
+complete -c pastor -n "__fish_pastor_using_subcommand join; and not __fish_seen_subcommand_from create list revoke help" -a "list" -d 'The join tokens the head knows: id, flock, tags, expiry, whether used'
+complete -c pastor -n "__fish_pastor_using_subcommand join; and not __fish_seen_subcommand_from create list revoke help" -a "revoke" -d 'Remove a join token\'s key from authorized_keys and forget it'
+complete -c pastor -n "__fish_pastor_using_subcommand join; and not __fish_seen_subcommand_from create list revoke help" -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand join; and __fish_seen_subcommand_from create" -l flock -d 'The flock the machine joins (default: the default flock)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand join; and __fish_seen_subcommand_from create" -l tag -d 'A tag the machine gets; repeat for more' -r
 complete -c pastor -n "__fish_pastor_using_subcommand join; and __fish_seen_subcommand_from create" -l replace -d 'The one machine name already in flock.toml the token may take over' -r
@@ -544,6 +550,8 @@ complete -c pastor -n "__fish_pastor_using_subcommand bootstrap" -l service-user
 complete -c pastor -n "__fish_pastor_using_subcommand bootstrap" -l head-key -d 'The head\'s public key, for the agent user\'s authorized_keys' -r
 complete -c pastor -n "__fish_pastor_using_subcommand bootstrap" -l herdr-from -d 'A herdr binary to install for the agent user' -r -F
 complete -c pastor -n "__fish_pastor_using_subcommand bootstrap" -l write-client -d 'Write client.toml\'s [head] for this user and print `written` or `unchanged`; the client step runs it as each user' -r
+complete -c pastor -n "__fish_pastor_using_subcommand bootstrap" -l write-shepherd -d 'Write pastor.toml\'s [shepherd] machine for this user and print `written` or `unchanged`; `pastor join` runs it as the service user' -r
+complete -c pastor -n "__fish_pastor_using_subcommand bootstrap" -l write-report -d 'Leave this bootstrap outcome (JSON) in this user\'s state dir for its shepherd to report; `pastor join` runs it as the service user' -r
 complete -c pastor -n "__fish_pastor_using_subcommand bootstrap" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand bootstrap" -l sudo -d 'Do root work (packages, users, lingering) through `sudo -n`'
 complete -c pastor -n "__fish_pastor_using_subcommand bootstrap" -l json -d 'Print as a JSON object: mode, isolation, each step, the public keys and versions'

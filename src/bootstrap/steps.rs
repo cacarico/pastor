@@ -11,7 +11,7 @@ use crate::cli::CliError;
 use crate::setup::{CmdOutput, Runner};
 
 /// A step. The run loop fills in its name.
-type Step = fn(&dyn Runner, &Ctx) -> StepResult;
+pub(super) type Step = fn(&dyn Runner, &Ctx) -> StepResult;
 
 /// The steps in the order they run.
 pub(super) const STEPS: [(&str, Step); 9] = [
@@ -26,10 +26,22 @@ pub(super) const STEPS: [(&str, Step); 9] = [
     ("client", client),
 ];
 
+/// The step of [`STEPS`] called `name`.
+pub(super) fn named(name: &str) -> Step {
+    STEPS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, step)| *step)
+        .unwrap_or_else(|| panic!("no bootstrap step {name}"))
+}
+
 /// What the steps share: the options, the facts and the mode, plus what the
 /// steps find for the outcome.
 pub(super) struct Ctx<'a> {
     pub o: &'a Options,
+    /// What `pastor join` adds for its own steps; `None` for `pastor
+    /// bootstrap`.
+    pub pull: Option<&'a super::pull::Pull>,
     pub facts: Facts,
     pub mode: Mode,
     /// The login user's name (`id -un`).
@@ -61,23 +73,23 @@ pub(super) struct Found {
 /// A user bootstrap acts as.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct User {
-    name: String,
-    home: PathBuf,
-    uid: u32,
+    pub name: String,
+    pub home: PathBuf,
+    pub uid: u32,
     /// The state dir this user's pastor uses, as it prints it: its keys
     /// live here.
-    state: PathBuf,
+    pub state: PathBuf,
 }
 
 impl User {
-    fn bin(&self) -> PathBuf {
+    pub(super) fn bin(&self) -> PathBuf {
         self.home.join(".local/bin")
     }
 }
 
 /// A step's body: `Err` is the failure that ended it, so `?` stops a step
 /// at its first failed command.
-type StepOutcome = Result<StepResult, StepResult>;
+pub(super) type StepOutcome = Result<StepResult, StepResult>;
 
 impl Ctx<'_> {
     pub(super) fn service_name(&self) -> String {
@@ -142,7 +154,12 @@ impl Ctx<'_> {
     /// itself. In root mode root copies it, once, into the staging dir, so
     /// the source may sit where only root reads it, and no other user's
     /// path is ever written by root.
-    fn readable(&self, r: &dyn Runner, src: &str, name: &str) -> Result<String, StepResult> {
+    pub(super) fn readable(
+        &self,
+        r: &dyn Runner,
+        src: &str,
+        name: &str,
+    ) -> Result<String, StepResult> {
         if self.mode == Mode::User {
             return Ok(src.to_string());
         }
@@ -189,7 +206,7 @@ impl Ctx<'_> {
         }
     }
 
-    fn service(&self, r: &dyn Runner) -> Result<User, StepResult> {
+    pub(super) fn service(&self, r: &dyn Runner) -> Result<User, StepResult> {
         self.user(r, &self.service_name())
     }
 
@@ -198,7 +215,7 @@ impl Ctx<'_> {
     }
 
     /// The service user, then the agent user, once each.
-    fn users(&self, r: &dyn Runner) -> Result<Vec<User>, StepResult> {
+    pub(super) fn users(&self, r: &dyn Runner) -> Result<Vec<User>, StepResult> {
         let service = self.service(r)?;
         let agent = self.agent(r)?;
         Ok(if service == agent {
@@ -211,7 +228,7 @@ impl Ctx<'_> {
     /// Run as `u`. Another user's command runs with that user's home and
     /// runtime dir, so `systemctl --user` reaches its own manager, and
     /// nothing else of the caller's (`other_user_argv`).
-    fn as_user(
+    pub(super) fn as_user(
         &self,
         r: &dyn Runner,
         u: &User,
@@ -227,7 +244,12 @@ impl Ctx<'_> {
         r.run(wrapper, &full)
     }
 
-    fn as_root(&self, r: &dyn Runner, program: &str, args: &[&str]) -> std::io::Result<CmdOutput> {
+    pub(super) fn as_root(
+        &self,
+        r: &dyn Runner,
+        program: &str,
+        args: &[&str],
+    ) -> std::io::Result<CmdOutput> {
         if self.facts.uid == 0 {
             return r.run(program, args);
         }
@@ -278,12 +300,12 @@ pub(crate) fn other_user_argv(
     ("setsid", full)
 }
 
-fn succeeded(out: std::io::Result<CmdOutput>) -> bool {
+pub(super) fn succeeded(out: std::io::Result<CmdOutput>) -> bool {
     out.is_ok_and(|o| o.success)
 }
 
 /// `out` if the command exited 0, else the step's failure naming it.
-fn must(
+pub(super) fn must(
     out: std::io::Result<CmdOutput>,
     program: &str,
     args: &[&str],
@@ -306,7 +328,7 @@ fn must(
     }
 }
 
-fn path(p: &std::path::Path) -> String {
+pub(super) fn path(p: &std::path::Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
@@ -790,6 +812,7 @@ fn services_inner(r: &dyn Runner, c: &Ctx) -> StepOutcome {
                 ),
             ));
         }
+        wait_runtime_dir(r, c, &u)?;
         &["setup", "systemd", "--herdr", "--yes", "--require-linger"]
     };
     let out = must(
@@ -799,6 +822,46 @@ fn services_inner(r: &dyn Runner, c: &Ctx) -> StepOutcome {
         "read the error above, fix it, then rerun",
     )?;
     Ok(StepResult::changed(!out.stdout.contains("is up to date")))
+}
+
+/// How many times, and how far apart, a user's runtime dir is looked for.
+const RUNTIME_DIR_TRIES: u32 = if cfg!(test) { 2 } else { 20 };
+const RUNTIME_DIR_PAUSE: std::time::Duration =
+    std::time::Duration::from_millis(if cfg!(test) { 1 } else { 250 });
+
+/// Root mode on Linux: `u`'s `/run/user/<uid>`, which systemd makes when it
+/// starts the user's manager. Right after `loginctl enable-linger` it may
+/// not be there yet, and `systemctl --user` then has no bus. So it is
+/// waited for, then the manager (`user@<uid>.service`) is started by hand
+/// and it is waited for again.
+pub(super) fn wait_runtime_dir(r: &dyn Runner, c: &Ctx, u: &User) -> Result<(), StepResult> {
+    if c.mode != Mode::Root || c.facts.os != "linux" {
+        return Ok(());
+    }
+    let dir = format!("/run/user/{}", u.uid);
+    let there = || {
+        (0..RUNTIME_DIR_TRIES).any(|i| {
+            if i > 0 {
+                std::thread::sleep(RUNTIME_DIR_PAUSE);
+            }
+            succeeded(r.run("test", &["-d", &dir]))
+        })
+    };
+    if there() {
+        return Ok(());
+    }
+    let unit = format!("user@{}.service", u.uid);
+    let _ = c.as_root(r, "systemctl", &["start", &unit]);
+    if there() {
+        return Ok(());
+    }
+    Err(StepResult::failed(
+        format!(
+            "{dir} is not there with lingering on for {}, so `systemctl --user` has no bus to reach",
+            u.name
+        ),
+        format!("run `systemctl start {unit}` as root, then rerun"),
+    ))
 }
 
 fn keys(r: &dyn Runner, c: &Ctx) -> StepResult {

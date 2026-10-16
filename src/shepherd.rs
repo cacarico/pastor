@@ -17,6 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -184,6 +185,7 @@ pub async fn run(paths: Paths, head: String, ask: Ask) -> anyhow::Result<()> {
         store.clone(),
         ask.clone(),
     );
+    puller.report_file = Some(crate::bootstrap::pull::report_file(&paths.state_dir));
     let every = config.tick_duration();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(every);
@@ -263,6 +265,8 @@ struct Puller {
     refused: Option<String>,
     /// The code of the last `PullTrust` the head refused, likewise.
     trust_refused: Option<String>,
+    /// `<state>/bootstrap.json`: what `pastor join` left to report.
+    report_file: Option<PathBuf>,
 }
 
 impl Puller {
@@ -291,6 +295,7 @@ impl Puller {
             dispatching: Default::default(),
             refused: None,
             trust_refused: None,
+            report_file: None,
         }
     }
 
@@ -340,7 +345,11 @@ impl Puller {
             self.actor();
         }
         self.report(true).await;
-        self.claim().await;
+        // A machine join left pending gets nothing until its report lands:
+        // once it does, claim again, so its tasks start this pass.
+        if self.claim().await && self.send_bootstrap_report().await {
+            self.claim().await;
+        }
         self.fetch_trust().await;
         self.start_queued();
     }
@@ -436,8 +445,52 @@ impl Puller {
         }
     }
 
-    /// Ask the head for tasks and keep each as a queued row here.
-    async fn claim(&mut self) {
+    /// Send what `pastor join` left in `<state>/bootstrap.json` and delete
+    /// it once the head took it; one that does not parse is logged and
+    /// deleted, since no later pass could parse it either. Returns whether a
+    /// report went.
+    async fn send_bootstrap_report(&mut self) -> bool {
+        let Some(file) = self.report_file.clone() else {
+            return false;
+        };
+        let text = match std::fs::read_to_string(&file) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(err) => {
+                tracing::warn!(file = %file.display(), %err, "read the bootstrap report");
+                return false;
+            }
+        };
+        let result: crate::bootstrap::Outcome = match serde_json::from_str(&text) {
+            Ok(r) => r,
+            Err(err) => {
+                tracing::warn!(file = %file.display(), %err, "the bootstrap report is not one pastor reads; dropped");
+                let _ = std::fs::remove_file(&file);
+                return false;
+            }
+        };
+        let req = IpcRequest::BootstrapReport {
+            machine: self.machine.clone(),
+            result,
+        };
+        match (self.ask)(req).await {
+            Ok(_) => {
+                tracing::info!(machine = %self.machine, "bootstrap reported to the head");
+                if let Err(err) = std::fs::remove_file(&file) {
+                    tracing::warn!(file = %file.display(), %err, "remove the sent bootstrap report");
+                }
+                true
+            }
+            Err(err) => {
+                tracing::warn!(machine = %self.machine, err = %format!("{err:#}"), "report this machine's bootstrap; trying again next claim");
+                false
+            }
+        }
+    }
+
+    /// Ask the head for tasks and keep each as a queued row here. Returns
+    /// whether the head answered.
+    async fn claim(&mut self) -> bool {
         let req = |versions: bool| IpcRequest::TaskClaim {
             machine: self.machine.clone(),
             free_slots: CLAIM_AT_ONCE,
@@ -465,7 +518,7 @@ impl Puller {
             }
             Ok(other) => {
                 tracing::warn!(?other, "the head answered TaskClaim with something else");
-                return;
+                return false;
             }
             Err(err) => {
                 // An unreachable head is `Follower`'s to report.
@@ -481,7 +534,7 @@ impl Puller {
                     );
                     self.refused = Some(e.code.clone());
                 }
-                return;
+                return false;
             }
         };
         self.actor();
@@ -492,6 +545,7 @@ impl Puller {
                 Err(err) => tracing::error!(task = %t.display_id(), %err, "keep a claimed task"),
             }
         }
+        true
     }
 
     /// Ask this machine's herdr, through the connector its tasks run on, for
@@ -1177,6 +1231,136 @@ mod tests {
                 (Some("fake".into()), pastor),
             ]
         );
+    }
+
+    /// A bootstrap outcome as `pastor join` leaves it.
+    fn joined_outcome() -> crate::bootstrap::Outcome {
+        crate::bootstrap::Outcome {
+            ok: true,
+            mode: crate::bootstrap::Mode::User,
+            isolation: crate::bootstrap::Isolation::None,
+            steps: vec![],
+            machine_key: None,
+            agent_key: None,
+            host_key: Some("ssh-ed25519 HOST".into()),
+            herdr_version: Some("0.9.5".into()),
+            pastor_version: None,
+            service_user: None,
+        }
+    }
+
+    /// A machine `pastor join` left pending claims nothing, sends the
+    /// outcome join left in bootstrap.json once the head has answered a
+    /// claim, and then gets its task in the same pass. The file is gone
+    /// once the head took it.
+    #[tokio::test]
+    async fn the_first_claim_sends_the_bootstrap_report_then_gets_tasks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (head, ask) = pull_head(tmp.path()).await;
+        head.store()
+            .put_machine_state(&crate::store::MachineState {
+                machine: "laptop".into(),
+                bootstrap: crate::store::BootstrapState::Pending,
+                mode: None,
+                isolation: None,
+                failed_step: None,
+                why: None,
+                host_key: None,
+                herdr_version: None,
+                pastor_version: None,
+                updated_at: chrono::Utc::now().to_rfc3339(),
+                service_user: None,
+            })
+            .unwrap();
+        let t = run_pinned(&head, Some("laptop")).await;
+        let state = tmp.path().join("laptop/s");
+        std::fs::create_dir_all(&state).unwrap();
+        let file = crate::bootstrap::pull::report_file(&state);
+        std::fs::write(&file, serde_json::to_string(&joined_outcome()).unwrap()).unwrap();
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = sent.clone();
+        let logged: Ask = Arc::new(move |req| {
+            log.lock().unwrap().push(
+                serde_json::to_value(&req).unwrap()["op"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            ask(req)
+        });
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut p = Puller::new(
+            "laptop".into(),
+            false,
+            Arc::new(crate::herdr::fake::FakeHerdr::new()),
+            fast(),
+            store.clone(),
+            logged,
+        );
+        p.report_file = Some(file.clone());
+        p.pass().await;
+        let ops = sent.lock().unwrap().clone();
+        let claims: Vec<usize> = (0..ops.len()).filter(|&i| ops[i] == "task_claim").collect();
+        let report = ops
+            .iter()
+            .position(|o| o == "bootstrap_report")
+            .unwrap_or_else(|| panic!("no report in {ops:?}"));
+        assert!(claims[0] < report && report < claims[1], "{ops:?}");
+        assert!(!file.exists(), "sent, so gone");
+        let row = head.store().machine_state("laptop").unwrap().unwrap();
+        assert_eq!(row.bootstrap, crate::store::BootstrapState::Ok);
+        assert!(
+            store.get_task(t.id).unwrap().is_some(),
+            "claimed in the same pass"
+        );
+        // Sent once: the next pass sends no report.
+        p.pass().await;
+        let reports = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|o| *o == "bootstrap_report")
+            .count();
+        assert_eq!(reports, 1);
+    }
+
+    /// A head that cannot take the report leaves the file for the next
+    /// claim; one that is not there yet is no report at all.
+    #[tokio::test]
+    async fn a_refused_bootstrap_report_is_kept_for_the_next_claim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = crate::bootstrap::pull::report_file(tmp.path());
+        std::fs::write(&file, serde_json::to_string(&joined_outcome()).unwrap()).unwrap();
+        let reports = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = reports.clone();
+        let ask: Ask = Arc::new(move |req| {
+            let n = n.clone();
+            Box::pin(async move {
+                match req {
+                    IpcRequest::BootstrapReport { .. } => {
+                        n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Err(CliError::err("head_unreachable", "ssh: timed out"))
+                    }
+                    _ => Ok(IpcResponse::Tasks(vec![])),
+                }
+            })
+        });
+        let mut p = Puller::new(
+            "laptop".into(),
+            false,
+            Arc::new(crate::herdr::fake::FakeHerdr::new()),
+            fast(),
+            Arc::new(Store::open_in_memory().unwrap()),
+            ask,
+        );
+        p.report_file = Some(file.clone());
+        p.pass().await;
+        p.pass().await;
+        assert_eq!(reports.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(file.exists(), "kept until the head takes it");
+        std::fs::remove_file(&file).unwrap();
+        p.pass().await;
+        assert_eq!(reports.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     /// A shepherd that is a pull machine claims the task pinned to it, runs

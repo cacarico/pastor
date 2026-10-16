@@ -163,15 +163,22 @@ pub fn resolve(
 
 impl RemoteHead {
     pub fn new(paths: &Paths, ssh: &str, pastor: Option<String>, source: HeadSource) -> Self {
+        let identity = [paths.machine_key(), paths.agent_key()]
+            .into_iter()
+            .find(|k| k.exists());
+        // Only beside a pastor key: that is a machine bootstrap or `pastor
+        // join` set up, which pinned the head there. A person's CLI keeps
+        // their own known_hosts, even on a head whose file pins the
+        // machines it reaches.
+        let known_hosts =
+            Some(paths.known_hosts_file()).filter(|k| identity.is_some() && k.exists());
         RemoteHead {
             ssh: ssh.to_string(),
             pastor: pastor.unwrap_or_else(|| DEFAULT_PASTOR.to_string()),
             source,
             control_path: crate::ssh::fitting_control_path(paths, "head"),
-            identity: [paths.machine_key(), paths.agent_key()]
-                .into_iter()
-                .find(|k| k.exists()),
-            known_hosts: Some(paths.known_hosts_file()).filter(|k| k.exists()),
+            identity,
+            known_hosts,
         }
     }
 
@@ -439,9 +446,16 @@ mod tests {
         let (_t, p) = paths();
         let plain = RemoteHead::new(&p, "user@pi-1", None, HeadSource::File).ssh_args();
         assert!(!plain.iter().any(|a| a == "-i" || a.contains("KnownHosts")));
+        // A known_hosts alone (a head that pinned machines it reaches) is
+        // not one for reaching a head: the person's own file decides.
         std::fs::create_dir_all(p.known_hosts_file().parent().unwrap()).unwrap();
-        std::fs::write(p.agent_key(), "k").unwrap();
         std::fs::write(p.known_hosts_file(), "").unwrap();
+        let args = RemoteHead::new(&p, "user@pi-1", None, HeadSource::File).ssh_args();
+        assert!(
+            !args.iter().any(|a| a == "-i" || a.contains("KnownHosts")),
+            "{args:?}"
+        );
+        std::fs::write(p.agent_key(), "k").unwrap();
         let args = RemoteHead::new(&p, "user@pi-1", None, HeadSource::File).ssh_args();
         let agent = p.agent_key().display().to_string();
         assert!(
@@ -455,6 +469,30 @@ mod tests {
         let machine = p.machine_key().display().to_string();
         assert!(
             args.windows(2).any(|w| w == ["-i", machine.as_str()]),
+            "{args:?}"
+        );
+    }
+
+    /// A machine `pastor join` set up holds its machine key and the head's
+    /// pinned host key: its shepherd's ssh uses both, and checks the host
+    /// strictly.
+    #[test]
+    fn a_joined_machine_uses_its_key_and_the_pinned_head() {
+        let (_t, p) = paths();
+        std::fs::create_dir_all(&p.state_dir).unwrap();
+        std::fs::write(p.machine_key(), "k").unwrap();
+        std::fs::write(p.agent_key(), "k").unwrap();
+        std::fs::write(p.known_hosts_file(), "head ssh-ed25519 AAAAHEAD\n").unwrap();
+        let args = RemoteHead::new(&p, "me@head", None, HeadSource::File).ssh_args();
+        let machine = p.machine_key().display().to_string();
+        let known = format!("UserKnownHostsFile={}", p.known_hosts_file().display());
+        assert!(
+            args.windows(2).any(|w| w == ["-i", machine.as_str()]),
+            "{args:?}"
+        );
+        assert!(args.contains(&known), "{args:?}");
+        assert!(
+            args.contains(&"StrictHostKeyChecking=yes".to_string()),
             "{args:?}"
         );
     }

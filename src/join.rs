@@ -595,14 +595,35 @@ fn reply_line(resp: &IpcResponse) -> anyhow::Result<Vec<u8>> {
     Ok(line)
 }
 
-/// `pastor join`: the head's side now (`create`, `list`, `revoke`); the
-/// joining machine's own form (a token) comes as arguments with no
+/// `pastor join`: the head's side as subcommands (`create`, `list`,
+/// `revoke`), and the joining machine's own form, a token and no
 /// subcommand.
 #[derive(clap::Args, Debug)]
 #[command(args_conflicts_with_subcommands = true)]
 pub struct JoinArgs {
     #[command(subcommand)]
     pub cmd: Option<JoinCmd>,
+    /// On the new machine: the token `join create` printed; `ps` shows it, so prefer --token-stdin or PASTOR_JOIN_TOKEN
+    #[arg(value_name = "TOKEN", conflicts_with = "token_stdin")]
+    pub token: Option<String>,
+    /// Read the join token from stdin
+    #[arg(long)]
+    pub token_stdin: bool,
+    /// The name this machine takes in the head's flock.toml (default: its hostname)
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Do root work (packages, users, lingering) through `sudo -n`
+    #[arg(long)]
+    pub sudo: bool,
+    /// The user that holds the machine key and runs the shepherd; created if missing (root mode)
+    #[arg(long, value_name = "NAME")]
+    pub service_user: Option<String>,
+    /// Print as a JSON object: mode, isolation, each step, the public keys and versions
+    #[arg(long)]
+    pub json: bool,
+    /// Join and name the shepherd only, for a machine set up beforehand; nothing is installed
+    #[arg(long, hide = true)]
+    pub skip_bootstrap: bool,
 }
 
 #[derive(clap::Subcommand, Debug)]
