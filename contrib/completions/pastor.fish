@@ -507,6 +507,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand bootstrap" -l write-client
 complete -c pastor -n "__fish_pastor_using_subcommand bootstrap" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand bootstrap" -l sudo -d 'Do root work (packages, users, lingering) through `sudo -n`'
 complete -c pastor -n "__fish_pastor_using_subcommand bootstrap" -l json -d 'Print as a JSON object: mode, isolation, each step, the public keys and versions'
+complete -c pastor -n "__fish_pastor_using_subcommand bootstrap" -l print-state-dir -d 'Print this user\'s pastor state dir; the steps run it as each user to find where its keys go'
 complete -c pastor -n "__fish_pastor_using_subcommand bootstrap" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pastor -n "__fish_pastor_using_subcommand head; and not __fish_seen_subcommand_from set show unset help" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand head; and not __fish_seen_subcommand_from set show unset help" -s h -l help -d 'Print help'

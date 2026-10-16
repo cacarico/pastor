@@ -58,6 +58,9 @@ pub fn run(r: &dyn Runner, o: &Options) -> Outcome {
         login,
         user_bus,
         found: Default::default(),
+        known: Default::default(),
+        stage: Default::default(),
+        staged: Default::default(),
     };
     let mut results = Vec::new();
     for (name, step) in steps::STEPS {
@@ -69,6 +72,7 @@ pub fn run(r: &dyn Runner, o: &Options) -> Outcome {
             break;
         }
     }
+    ctx.unstage(r);
     let found = ctx.found.into_inner();
     Outcome {
         ok: results.iter().all(|s| s.status != StepStatus::Failed),
@@ -138,6 +142,13 @@ pub struct Args {
         conflicts_with_all = ["sudo", "service_user", "head_key", "herdr_from", "json"]
     )]
     pub write_client: Option<String>,
+    /// Print this user's pastor state dir; the steps run it as each user to find where its keys go
+    #[arg(
+        long,
+        hide = true,
+        conflicts_with_all = ["sudo", "service_user", "head_key", "herdr_from", "json", "write_client"]
+    )]
+    pub print_state_dir: bool,
 }
 
 /// Entry point for `pastor bootstrap`; `head` is the global `--head`.
@@ -147,6 +158,14 @@ pub fn cli(args: &Args, head: Option<&str>) -> anyhow::Result<()> {
         let wrote = write_client(&crate::head::client_file(&paths), dest)?;
         println!("{}", if wrote { "written" } else { "unchanged" });
         return Ok(());
+    }
+    if args.print_state_dir {
+        let paths = crate::config::Paths::from_env()?;
+        println!("{}", paths.state_dir.display());
+        return Ok(());
+    }
+    if let Some(user) = &args.service_user {
+        check_user(user)?;
     }
     let Some(head) = head.filter(|h| !h.trim().is_empty()) else {
         return Err(CliError::err(
@@ -182,6 +201,26 @@ fn check_dest(dest: &str) -> anyhow::Result<()> {
         return Err(CliError::err(
             "usage_error",
             format!("{dest:?} is not an ssh destination"),
+        ));
+    }
+    Ok(())
+}
+
+/// A user name as useradd takes it (`^[a-z_][a-z0-9_-]*$`, at most 32
+/// characters), so none reads as an option or splits into two words.
+fn check_user(name: &str) -> anyhow::Result<()> {
+    let mut chars = name.chars();
+    let ok = name.len() <= 32
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+    if !ok {
+        return Err(CliError::err(
+            "invalid_user",
+            format!(
+                "--service-user {name:?} is not a user name (lowercase letters, digits, _ and -, at most 32)"
+            ),
         ));
     }
     Ok(())

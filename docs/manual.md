@@ -382,6 +382,7 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `invalid_path` | `bridge`: a pastor path that cannot go in authorized_keys unquoted |
 | `invalid_report` | a pull machine reported a state it may not set |
 | `invalid_request` | a line that is not a request, on the daemon socket or the bridge; a headless job submission with an invalid job name or an item with no string key |
+| `invalid_user` | `bootstrap --service-user` names something that is not a user name |
 | `item_rejected` | a job item has no usable key or prompt |
 | `job_name_taken` | a headless serve's job has the name of one of the head's |
 | `job_not_found` | no job by that name |

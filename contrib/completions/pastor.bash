@@ -863,7 +863,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__bootstrap)
-            opts="-h --sudo --service-user --head-key --herdr-from --json --write-client --head --help"
+            opts="-h --sudo --service-user --head-key --herdr-from --json --write-client --print-state-dir --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

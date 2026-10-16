@@ -4,7 +4,7 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
 
-use super::facts::{Facts, Init, Pkg, stdout, target_for};
+use super::facts::{Facts, Init, Pkg, passwd, stdout, target_for};
 use super::outcome::{Mode, StepResult};
 use super::{AGENT_USER, Options};
 use crate::cli::CliError;
@@ -38,6 +38,13 @@ pub(super) struct Ctx<'a> {
     /// Root mode makes each user's own, so it is true there.
     pub user_bus: bool,
     pub found: RefCell<Found>,
+    /// Users already looked up, with their state dirs.
+    pub known: RefCell<Vec<User>>,
+    /// Root mode's staging dir: root-owned and 0755, so every user can read
+    /// what root copies there, and none can change it.
+    pub stage: RefCell<Option<String>>,
+    /// The files staged there so far.
+    pub staged: RefCell<Vec<String>>,
 }
 
 /// What the steps read for the outcome.
@@ -52,18 +59,16 @@ pub(super) struct Found {
 
 /// A user bootstrap acts as.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct User {
+pub(super) struct User {
     name: String,
     home: PathBuf,
     uid: u32,
+    /// The state dir this user's pastor uses, as it prints it: its keys
+    /// live here.
+    state: PathBuf,
 }
 
 impl User {
-    /// The state dir pastor uses for this user: its keys live here.
-    fn state(&self) -> PathBuf {
-        self.home.join(".local/state/pastor")
-    }
-
     fn bin(&self) -> PathBuf {
         self.home.join(".local/bin")
     }
@@ -88,27 +93,98 @@ impl Ctx<'_> {
         }
     }
 
+    /// `name` from the user database (never `$HOME`, which `sudo sh`
+    /// keeps), with the state dir its own pastor reports.
     fn user(&self, r: &dyn Runner, name: &str) -> Result<User, StepResult> {
-        if name == self.login {
-            return Ok(User {
-                name: name.to_string(),
-                home: self.facts.home.clone(),
-                uid: self.facts.uid,
-            });
+        if let Some(u) = self.known.borrow().iter().find(|u| u.name == name) {
+            return Ok(u.clone());
         }
-        // name:password:uid:gid:gecos:home:shell
-        let line = stdout(r, "getent", &["passwd", name]).unwrap_or_default();
-        let fields: Vec<&str> = line.split(':').collect();
-        match (fields.get(2).and_then(|u| u.parse().ok()), fields.get(5)) {
-            (Some(uid), Some(home)) if !home.is_empty() => Ok(User {
-                name: name.to_string(),
-                home: PathBuf::from(home),
-                uid,
-            }),
-            _ => Err(StepResult::failed(
-                format!("`getent passwd {name}` names no user with a home"),
+        let Some((uid, home)) = passwd(r, &self.facts.os, name) else {
+            return Err(StepResult::failed(
+                format!("the user database names no user {name} with a home"),
                 "rerun bootstrap with --sudo; its users step creates the user",
-            )),
+            ));
+        };
+        let mut u = User {
+            name: name.to_string(),
+            home,
+            uid,
+            state: PathBuf::new(),
+        };
+        u.state = self.state_dir(r, &u)?;
+        self.known.borrow_mut().push(u.clone());
+        Ok(u)
+    }
+
+    /// `u`'s state dir as its own pastor sees it, so XDG_STATE_HOME and
+    /// PASTOR_STATE_DIR count as they will when that user runs pastor.
+    fn state_dir(&self, r: &dyn Runner, u: &User) -> Result<PathBuf, StepResult> {
+        let pastor = self.readable(r, &path(&self.o.pastor_from), "pastor")?;
+        let args = ["bootstrap", "--print-state-dir"];
+        let out = must(
+            self.as_user(r, u, &pastor, &args),
+            &pastor,
+            &args,
+            "check this pastor runs on this machine, then rerun",
+        )?;
+        let dir = out.stdout.trim();
+        if !dir.starts_with('/') {
+            return Err(StepResult::failed(
+                format!("{}'s pastor printed no state dir: {dir:?}", u.name),
+                "check this pastor runs on this machine, then rerun",
+            ));
+        }
+        Ok(PathBuf::from(dir))
+    }
+
+    /// `src` at a path every user can read. In user mode that is `src`
+    /// itself. In root mode root copies it, once, into the staging dir, so
+    /// the source may sit where only root reads it, and no other user's
+    /// path is ever written by root.
+    fn readable(&self, r: &dyn Runner, src: &str, name: &str) -> Result<String, StepResult> {
+        if self.mode == Mode::User {
+            return Ok(src.to_string());
+        }
+        let made = self.stage.borrow().clone();
+        let dir = match made {
+            Some(dir) => dir,
+            None => {
+                let args = ["-d", "/tmp/pastor-bootstrap.XXXXXX"];
+                let dir = must(self.as_root(r, "mktemp", &args), "mktemp", &args, "rerun")?
+                    .stdout
+                    .trim()
+                    .to_string();
+                if !dir.starts_with('/') {
+                    return Err(StepResult::failed(
+                        format!("`mktemp -d` printed no dir: {dir:?}"),
+                        "rerun",
+                    ));
+                }
+                *self.stage.borrow_mut() = Some(dir.clone());
+                let args = ["755", dir.as_str()];
+                must(self.as_root(r, "chmod", &args), "chmod", &args, "rerun")?;
+                dir
+            }
+        };
+        let staged = format!("{dir}/{name}");
+        if self.staged.borrow().contains(&staged) {
+            return Ok(staged);
+        }
+        let args = ["-m", "0755", src, staged.as_str()];
+        must(
+            self.as_root(r, "install", &args),
+            "install",
+            &args,
+            "check the source file is readable, then rerun",
+        )?;
+        self.staged.borrow_mut().push(staged.clone());
+        Ok(staged)
+    }
+
+    /// Remove root mode's staging dir, if one was made.
+    pub(super) fn unstage(&self, r: &dyn Runner) {
+        if let Some(dir) = self.stage.borrow_mut().take() {
+            let _ = self.as_root(r, "rm", &["-rf", "--", &dir]);
         }
     }
 
@@ -131,8 +207,9 @@ impl Ctx<'_> {
         })
     }
 
-    /// Run as `u`. Another user's command runs through sudo with that user's
-    /// home and runtime dir, so `systemctl --user` reaches its own manager.
+    /// Run as `u`. Another user's command runs with that user's home and
+    /// runtime dir, so `systemctl --user` reaches its own manager: through
+    /// runuser (util-linux) as root, which needs no sudo, else through sudo.
     fn as_user(
         &self,
         r: &dyn Runner,
@@ -144,6 +221,12 @@ impl Ctx<'_> {
             return r.run(program, args);
         }
         let runtime = format!("XDG_RUNTIME_DIR=/run/user/{}", u.uid);
+        if self.facts.uid == 0 {
+            let home = format!("HOME={}", path(&u.home));
+            let mut full = vec!["-u", &u.name, "--", "env", &home, &runtime, program];
+            full.extend_from_slice(args);
+            return r.run("runuser", &full);
+        }
         let mut full = vec!["-n", "-u", &u.name, "-H", "env", &runtime, program];
         full.extend_from_slice(args);
         r.run("sudo", &full)
@@ -156,21 +239,6 @@ impl Ctx<'_> {
         let mut full = vec!["-n", program];
         full.extend_from_slice(args);
         r.run("sudo", &full)
-    }
-
-    /// Root in root mode, where the source may sit in a home the user
-    /// cannot read; the user itself in user mode.
-    fn installer(
-        &self,
-        r: &dyn Runner,
-        u: &User,
-        program: &str,
-        args: &[&str],
-    ) -> std::io::Result<CmdOutput> {
-        match self.mode {
-            Mode::Root => self.as_root(r, program, args),
-            Mode::User => self.as_user(r, u, program, args),
-        }
     }
 }
 
@@ -468,30 +536,58 @@ fn users_inner(r: &dyn Runner, c: &Ctx) -> StepOutcome {
         )?;
     }
     // Each user's state dir is its own and 0700: the agent user must never
-    // read the machine key in the service user's.
+    // read the machine key in the service user's. Each user makes, checks
+    // and closes its own: root never acts on a path another user controls,
+    // where a planted symlink would turn a chmod on /etc.
     for u in c.users(r)? {
-        let state = path(&u.state());
+        let state = path(&u.state);
         let mkdir = ["-p", state.as_str()];
         must(c.as_user(r, &u, "mkdir", &mkdir), "mkdir", &mkdir, "rerun")?;
-        let want = format!("{} 700", u.name);
-        let have = stdout(r, "stat", &["-c", "%U %a", &state]);
-        if have.as_deref() != Some(want.as_str()) {
-            let owner = format!("{}:", u.name);
-            for (program, args) in [
-                ("chown", [owner.as_str(), state.as_str()]),
-                ("chmod", ["700", state.as_str()]),
-            ] {
-                must(c.as_root(r, program, &args), program, &args, "rerun")?;
-            }
+        let fix = format!(
+            "remove {state} as {} and rerun; bootstrap makes it again",
+            u.name
+        );
+        if succeeded(c.as_user(r, &u, "test", &["-L", &state]))
+            || !succeeded(c.as_user(r, &u, "test", &["-d", &state]))
+        {
+            return Err(StepResult::failed(
+                format!(
+                    "{}'s state dir {state} is a symlink or not a directory",
+                    u.name
+                ),
+                fix,
+            ));
+        }
+        let have = c
+            .as_user(r, &u, "stat", &["-c", "%U %a", &state])
+            .ok()
+            .filter(|o| o.success)
+            .map(|o| o.stdout.trim().to_string())
+            .unwrap_or_default();
+        let (owner, mode) = have.split_once(' ').unwrap_or((have.as_str(), ""));
+        if owner != u.name {
+            return Err(StepResult::failed(
+                format!("{}'s state dir {state} is owned by {owner:?}", u.name),
+                fix,
+            ));
+        }
+        if mode != "700" {
+            let args = ["700", state.as_str()];
+            must(c.as_user(r, &u, "chmod", &args), "chmod", &args, "rerun")?;
             changed = true;
         }
         // A service user bootstrap made has a home only it may enter. The
-        // login user's home is left as its owner set it.
+        // login user's home is left as its owner set it. As that user too.
         if u.name == service && service != c.login {
             let home = path(&u.home);
-            if stdout(r, "stat", &["-c", "%a", &home]).as_deref() != Some("700") {
+            let mode = c
+                .as_user(r, &u, "stat", &["-c", "%a", &home])
+                .ok()
+                .filter(|o| o.success)
+                .map(|o| o.stdout.trim().to_string());
+            if mode.as_deref() != Some("700") {
                 let args = ["700", home.as_str()];
-                must(c.as_root(r, "chmod", &args), "chmod", &args, "rerun")?;
+                must(c.as_user(r, &u, "chmod", &args), "chmod", &args, "rerun")?;
                 changed = true;
             }
         }
@@ -499,10 +595,10 @@ fn users_inner(r: &dyn Runner, c: &Ctx) -> StepOutcome {
     Ok(StepResult::changed(changed))
 }
 
-/// Copy `src` to `dest` in `u`'s bin dir unless it is there already.
-/// Returns whether it copied.
+/// Copy `src` (readable by `u`, see [`Ctx::readable`]) to `dest` in `u`'s
+/// bin dir unless it is there already. Returns whether it copied.
 fn place(r: &dyn Runner, c: &Ctx, u: &User, src: &str, dest: &str) -> Result<bool, StepResult> {
-    if succeeded(c.installer(r, u, "cmp", &["-s", src, dest])) {
+    if succeeded(c.as_user(r, u, "cmp", &["-s", src, dest])) {
         return Ok(false);
     }
     copy(r, c, u, src, dest)?;
@@ -510,23 +606,15 @@ fn place(r: &dyn Runner, c: &Ctx, u: &User, src: &str, dest: &str) -> Result<boo
 }
 
 /// `install` unlinks the old file before it writes, so a running binary
-/// keeps its own copy and never sees a half-written one.
+/// keeps its own copy and never sees a half-written one. It runs as `u`,
+/// whose bin dir it is, never as root.
 fn copy(r: &dyn Runner, c: &Ctx, u: &User, src: &str, dest: &str) -> Result<(), StepResult> {
     let bin = path(&u.bin());
     let mkdir = ["-p", bin.as_str()];
     must(c.as_user(r, u, "mkdir", &mkdir), "mkdir", &mkdir, "rerun")?;
-    let (out, args): (_, Vec<&str>) = match c.mode {
-        Mode::Root => {
-            let args = vec!["-o", u.name.as_str(), "-m", "0755", src, dest];
-            (c.as_root(r, "install", &args), args)
-        }
-        Mode::User => {
-            let args = vec!["-m", "0755", src, dest];
-            (c.as_user(r, u, "install", &args), args)
-        }
-    };
+    let args = ["-m", "0755", src, dest];
     must(
-        out,
+        c.as_user(r, u, "install", &args),
         "install",
         &args,
         "check the source file is readable, then rerun",
@@ -541,7 +629,7 @@ fn pastor(r: &dyn Runner, c: &Ctx) -> StepResult {
 /// pastor for the service user (the shepherd) and the agent user (agents
 /// call `pastor task done`).
 fn pastor_inner(r: &dyn Runner, c: &Ctx) -> StepOutcome {
-    let src = path(&c.o.pastor_from);
+    let src = c.readable(r, &path(&c.o.pastor_from), "pastor")?;
     let mut changed = false;
     let users = c.users(r)?;
     for u in &users {
@@ -569,7 +657,7 @@ fn herdr_inner(r: &dyn Runner, c: &Ctx) -> StepOutcome {
     let u = c.agent(r)?;
     let dest = path(&u.bin().join("herdr"));
     let read_version = || version(c.as_user(r, &u, &dest, &["--version"]));
-    let exists = succeeded(c.installer(r, &u, "test", &["-e", &dest]));
+    let exists = succeeded(c.as_user(r, &u, "test", &["-e", &dest]));
     let Some(src) = &c.o.herdr_from else {
         if exists {
             c.found.borrow_mut().herdr_version = read_version();
@@ -581,8 +669,8 @@ fn herdr_inner(r: &dyn Runner, c: &Ctx) -> StepOutcome {
         )
         .with_missing(vec!["herdr".into()]));
     };
-    let src = path(src);
-    if exists && succeeded(c.installer(r, &u, "cmp", &["-s", &src, &dest])) {
+    let src = c.readable(r, &path(src), "herdr")?;
+    if exists && succeeded(c.as_user(r, &u, "cmp", &["-s", &src, &dest])) {
         c.found.borrow_mut().herdr_version = read_version();
         return Ok(StepResult::already_there());
     }
@@ -688,7 +776,7 @@ fn keys_inner(r: &dyn Runner, c: &Ctx) -> StepOutcome {
     let agent = c.agent(r)?;
     let mut changed = false;
     for (u, file) in [(&service, "machine_key"), (&agent, "agent_key")] {
-        let state = path(&u.state());
+        let state = path(&u.state);
         let key = format!("{state}/{file}");
         if !succeeded(c.as_user(r, u, "test", &["-e", &key])) {
             let mkdir = ["-p", state.as_str()];
@@ -730,7 +818,7 @@ fn keys_inner(r: &dyn Runner, c: &Ctx) -> StepOutcome {
         }
         let ssh = path(&agent.home.join(".ssh"));
         let file = format!("{ssh}/authorized_keys");
-        if !succeeded(c.as_user(r, &agent, "grep", &["-qxF", key, &file])) {
+        if !succeeded(c.as_user(r, &agent, "grep", &["-qxF", "-e", key, "--", &file])) {
             let mkdir = ["-p", "-m", "700", ssh.as_str()];
             must(
                 c.as_user(r, &agent, "mkdir", &mkdir),

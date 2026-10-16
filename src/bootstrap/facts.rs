@@ -18,9 +18,11 @@ pub struct Facts {
     pub pkg: Option<Pkg>,
     /// The uid bootstrap runs as.
     pub uid: u32,
-    /// `sudo -n true` works (always true for root).
+    /// `sudo -n true` works. Root needs no sudo, so it is probed there too
+    /// and never assumed.
     pub sudo: bool,
-    /// The login user's home.
+    /// The login user's home, from the user database, not `$HOME`, which
+    /// `sudo sh` keeps from the user who ran it.
     pub home: PathBuf,
     pub hostname: String,
 }
@@ -91,11 +93,10 @@ pub fn facts(r: &dyn Runner) -> Facts {
     let uid = stdout(r, "id", &["-u"])
         .and_then(|u| u.parse().ok())
         .unwrap_or(u32::MAX);
-    let sudo = uid == 0 || r.run("sudo", &["-n", "true"]).is_ok_and(|o| o.success);
-    let home = stdout(r, "printenv", &["HOME"])
-        .filter(|h| !h.is_empty())
-        .map(PathBuf::from)
-        .or_else(dirs::home_dir)
+    let sudo = r.run("sudo", &["-n", "true"]).is_ok_and(|o| o.success);
+    let home = stdout(r, "id", &["-un"])
+        .and_then(|name| passwd(r, &os, &name))
+        .map(|(_, home)| home)
         .unwrap_or_default();
     Facts {
         os,
@@ -107,6 +108,34 @@ pub fn facts(r: &dyn Runner) -> Facts {
         sudo,
         home,
         hostname: crate::config::hostname(),
+    }
+}
+
+/// `name`'s uid and home from the user database: `getent passwd` on
+/// Linux, `dscl` on macOS, which has no getent.
+pub(crate) fn passwd(r: &dyn Runner, os: &str, name: &str) -> Option<(u32, PathBuf)> {
+    let (uid, home) = if os == "darwin" {
+        let user = format!("/Users/{name}");
+        let out = stdout(
+            r,
+            "dscl",
+            &[".", "-read", &user, "UniqueID", "NFSHomeDirectory"],
+        )?;
+        let field = |key: &str| {
+            out.lines()
+                .find_map(|l| l.strip_prefix(key))
+                .map(|v| v.trim().to_string())
+        };
+        (field("UniqueID:")?, field("NFSHomeDirectory:")?)
+    } else {
+        // name:password:uid:gid:gecos:home:shell
+        let line = stdout(r, "getent", &["passwd", name])?;
+        let fields: Vec<&str> = line.split(':').collect();
+        (fields.get(2)?.to_string(), fields.get(5)?.to_string())
+    };
+    match (uid.parse().ok(), home.is_empty()) {
+        (Some(uid), false) => Some((uid, PathBuf::from(home))),
+        _ => None,
     }
 }
 
