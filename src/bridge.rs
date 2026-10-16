@@ -201,13 +201,7 @@ pub fn authorized_key_line(pastor: &Path, machine: &str, key: &str) -> anyhow::R
             "a public key line is its type and its key, like ssh-ed25519 AAAA...",
         ));
     }
-    let pastor = pastor.display().to_string();
-    if pastor.contains(['"', '\\']) || pastor.chars().any(char::is_whitespace) {
-        return Err(CliError::err(
-            "invalid_path",
-            format!("{pastor} cannot go in an authorized_keys command unquoted"),
-        ));
-    }
+    let pastor = crate::authkeys::check_pastor_path(pastor)?;
     if machine.is_empty()
         || machine.contains(['"', '\\'])
         || machine.chars().any(char::is_whitespace)
@@ -218,7 +212,8 @@ pub fn authorized_key_line(pastor: &Path, machine: &str, key: &str) -> anyhow::R
         ));
     }
     Ok(format!(
-        "command=\"{pastor} bridge --agent --machine {machine}\",no-pty,no-user-rc,no-port-forwarding,no-agent-forwarding,no-X11-forwarding {key}"
+        "command=\"{pastor} bridge --agent --machine {machine}\",{} {key}",
+        crate::authkeys::restrict_options()
     ))
 }
 
