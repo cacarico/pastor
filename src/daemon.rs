@@ -584,6 +584,28 @@ impl Fleet {
                             .collect()
                     })
                     .unwrap_or_default();
+                // A pull machine's versions come from its own `TaskClaim`
+                // and `TaskReport`, so a plain `connect` never learns them;
+                // `machine_state` (its `BootstrapReport`, if any) fills in
+                // what the connection itself has not.
+                let saved = (m.pull && (s.herdr_version.is_none() || s.pastor_version.is_none()))
+                    .then(|| {
+                        self.store
+                            .machine_state(&m.handle.name)
+                            .unwrap_or_else(|err| {
+                                tracing::error!(machine = %m.handle.name, %err, "read machine_state");
+                                None
+                            })
+                    })
+                    .flatten();
+                let herdr_version = s
+                    .herdr_version
+                    .clone()
+                    .or_else(|| saved.as_ref().and_then(|st| st.herdr_version.clone()));
+                let pastor_version = s
+                    .pastor_version
+                    .clone()
+                    .or_else(|| saved.as_ref().and_then(|st| st.pastor_version.clone()));
                 crate::machine::MachineStatus {
                     now,
                     profile: self.own_profile(&flock, Some(&m.handle.name)),
@@ -593,6 +615,8 @@ impl Fleet {
                     description: wanted
                         .get(&m.handle.name)
                         .and_then(|c| crate::config::clean_description(c.description.as_deref())),
+                    herdr_version,
+                    pastor_version,
                     ..s
                 }
             })
@@ -2449,6 +2473,7 @@ impl Fleet {
             let theirs = task.flock.as_deref().unwrap_or(default);
             self.settled_on(task, theirs, machine)
                 .is_none_or(|r| r.is_ok())
+                && self.bootstrap_ready(machine)
         };
         let mut claimed = Vec::new();
         for (i, task) in order.iter().enumerate() {
@@ -2496,6 +2521,109 @@ impl Fleet {
         }
         self.count_pull(&handle);
         Ok(claimed)
+    }
+
+    /// `BootstrapReport`: what `pastor bootstrap` found on `machine`, saved
+    /// as its `machine_state` so dispatch skips it while pending or failed
+    /// (`accepts` in `place_queued`) and `machine describe` can show it.
+    /// The table has no column for a step's `fix`, so a failure folds it
+    /// into `why` as `"<why>; fix: <fix>"`, which `describe::bootstrap_line`
+    /// prints back whole.
+    pub fn report_bootstrap(
+        &self,
+        machine: &str,
+        outcome: crate::bootstrap::Outcome,
+    ) -> anyhow::Result<()> {
+        use crate::bootstrap::{Isolation, Mode, StepStatus};
+        use crate::store::{BootstrapState, MachineState};
+        if self.flock().get(machine).is_none() {
+            return Err(crate::cli::CliError::err(
+                "unknown_machine",
+                format!("no machine {machine} in the flock"),
+            ));
+        }
+        let crate::bootstrap::Outcome {
+            ok,
+            mode,
+            isolation,
+            steps,
+            host_key,
+            herdr_version,
+            pastor_version,
+            ..
+        } = outcome;
+        let mode = match mode {
+            Mode::Root => "root",
+            Mode::User => "user",
+        };
+        let isolation = match isolation {
+            Isolation::Users => "users",
+            Isolation::None => "none",
+        };
+        let failed = steps.iter().find(|s| s.status == StepStatus::Failed);
+        let failed_step = failed.map(|s| s.step.clone());
+        let why = failed.map(|s| match &s.fix {
+            Some(fix) => format!("{}; fix: {fix}", s.why.as_deref().unwrap_or("")),
+            None => s.why.clone().unwrap_or_default(),
+        });
+        let missing: Vec<String> = steps.into_iter().flat_map(|s| s.missing).collect();
+        let state = MachineState {
+            machine: machine.to_string(),
+            bootstrap: if ok {
+                BootstrapState::Ok
+            } else {
+                BootstrapState::Failed
+            },
+            mode: Some(mode.to_string()),
+            isolation: Some(isolation.to_string()),
+            failed_step: failed_step.clone(),
+            why: why.clone(),
+            host_key,
+            herdr_version,
+            pastor_version,
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        self.store.put_machine_state(&state)?;
+        if ok {
+            self.emit(
+                "machine.bootstrapped",
+                machine,
+                None,
+                Some(
+                    serde_json::json!({ "mode": mode, "isolation": isolation, "missing": missing }),
+                ),
+            );
+        } else {
+            self.emit(
+                "machine.bootstrap_failed",
+                machine,
+                None,
+                Some(serde_json::json!({
+                    "step": failed_step.unwrap_or_default(),
+                    "why": why.unwrap_or_default(),
+                })),
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether dispatch may place work on `machine`: a `Pending` or
+    /// `Failed` `machine_state` row holds it back until a `BootstrapReport`
+    /// says `Ok`; no row at all reads as ready, so a machine from before
+    /// bootstrap tracking is unaffected. A store error is logged and
+    /// treated as ready, so a read glitch never wedges the whole fleet.
+    fn bootstrap_ready(&self, machine: &str) -> bool {
+        match self.store.machine_state(machine) {
+            Ok(None) => true,
+            Ok(Some(s)) => !matches!(
+                s.bootstrap,
+                crate::store::BootstrapState::Pending | crate::store::BootstrapState::Failed
+            ),
+            Err(err) => {
+                tracing::error!(machine, %err, "read machine_state");
+                true
+            }
+        }
     }
 
     /// `PullTrust`: the folder trust saved for pull machine `machine`, and
@@ -2878,6 +3006,7 @@ impl Fleet {
             let theirs = task.flock.as_deref().unwrap_or(flock.default_flock());
             self.settled_on(task, theirs, machine)
                 .is_none_or(|r| r.is_ok())
+                && self.bootstrap_ready(machine)
         };
         // A waiting task goes on once its `waiting_until` has passed and no
         // live limit holds its agent and model on its machine: at its
@@ -2941,7 +3070,8 @@ impl Fleet {
             // longer resolve it refuses instead of quietly dropping it.
             let settled_on = |machine: &str| self.settled_on(task, target, machine);
             let claim = Claim::of(task);
-            let accepts = |m: &str| settled_on(m).is_none_or(|r| r.is_ok());
+            let accepts =
+                |m: &str| settled_on(m).is_none_or(|r| r.is_ok()) && self.bootstrap_ready(m);
             // A `--now` task takes its pinned machine past its limits, or
             // nothing: it neither waits for a slot nor pauses another task.
             if task.spec.now {
@@ -4573,6 +4703,12 @@ impl Daemon {
                 Ok(task) => IpcResponse::Task(task),
                 Err(err) => cli_error(err),
             },
+            IpcRequest::BootstrapReport { machine, result } => {
+                match self.fleet.report_bootstrap(&machine, result) {
+                    Ok(()) => IpcResponse::Text(format!("{machine}: bootstrap recorded")),
+                    Err(err) => cli_error(err),
+                }
+            }
             IpcRequest::PullTrust { machine } => match self.fleet.pull_trust(&machine) {
                 Ok(list) => IpcResponse::Trusted(list),
                 Err(err) => cli_error(err),
@@ -4728,6 +4864,10 @@ impl Daemon {
         };
         // A description is still worth sending without the log.
         let events = crate::events::read(&self.paths.events_file(), None).unwrap_or_default();
+        let bootstrap = self.store.machine_state(name).unwrap_or_else(|err| {
+            tracing::error!(machine = name, %err, "read machine_state");
+            None
+        });
         IpcResponse::MachineDescription(crate::describe::MachineDescription {
             row: crate::cli::MachineRow::from(&status),
             session: m.session.clone(),
@@ -4736,6 +4876,7 @@ impl Daemon {
             agents_by_kind: m.agents.clone(),
             tasks,
             recent_errors: crate::describe::machine_errors(events, name),
+            bootstrap,
         })
     }
 
@@ -6788,6 +6929,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn describe_shows_bootstrap_line() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        d.store
+            .put_machine_state(&crate::store::MachineState {
+                machine: "a".into(),
+                bootstrap: crate::store::BootstrapState::Ok,
+                mode: Some("root".into()),
+                isolation: Some("users".into()),
+                failed_step: None,
+                why: None,
+                host_key: None,
+                herdr_version: None,
+                pastor_version: None,
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+        let resp = d
+            .handle(IpcRequest::MachineDescribe { name: "a".into() })
+            .await;
+        let IpcResponse::MachineDescription(m) = resp else {
+            panic!("{resp:?}")
+        };
+        let text = crate::describe::machine_text(&m);
+        assert!(
+            text.contains("ok, root mode (agents as pastor-agent, shepherd as the login user)"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
     async fn run_dispatches_immediately() {
         let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
         let mut events = d.subscribe();
@@ -6839,6 +7010,116 @@ mod tests {
             Some("fake"),
             "the flock list carries what the machine answered on connect"
         );
+    }
+
+    fn pending_state(machine: &str) -> crate::store::MachineState {
+        crate::store::MachineState {
+            machine: machine.into(),
+            bootstrap: crate::store::BootstrapState::Pending,
+            mode: None,
+            isolation: None,
+            failed_step: None,
+            why: None,
+            host_key: None,
+            herdr_version: None,
+            pastor_version: None,
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    fn run_req() -> IpcRequest {
+        IpcRequest::Run {
+            now: false,
+            preempt: false,
+            summary: None,
+            role: Default::default(),
+            description: None,
+            prompt: "hi".into(),
+            spec: spec(),
+            flock: None,
+            agent: None,
+            priority: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_machine_gets_no_task() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        d.store.put_machine_state(&pending_state("a")).unwrap();
+        let resp = d.handle(run_req()).await;
+        let IpcResponse::Task(t) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(
+            t.state,
+            TaskState::Queued,
+            "a pending machine never takes a task"
+        );
+    }
+
+    #[tokio::test]
+    async fn machine_without_state_still_dispatches() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        assert!(d.store.machine_state("a").unwrap().is_none());
+        let resp = d.handle(run_req()).await;
+        let IpcResponse::Task(t) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(
+            t.state,
+            TaskState::Running,
+            "a machine with no machine_state row reads as bootstrapped ok"
+        );
+    }
+
+    fn failed_outcome() -> crate::bootstrap::Outcome {
+        crate::bootstrap::Outcome {
+            ok: false,
+            mode: crate::bootstrap::Mode::Root,
+            isolation: crate::bootstrap::Isolation::Users,
+            steps: vec![crate::bootstrap::StepResult {
+                step: "install_herdr".into(),
+                ..crate::bootstrap::StepResult::failed("no sudo", "rerun with --sudo")
+            }],
+            machine_key: None,
+            agent_key: None,
+            host_key: None,
+            herdr_version: None,
+            pastor_version: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_report_emits_event() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        let mut events = d.subscribe();
+        let resp = d
+            .handle(IpcRequest::BootstrapReport {
+                machine: "a".into(),
+                result: failed_outcome(),
+            })
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        let ev = events.try_recv().expect("machine.bootstrap_failed emitted");
+        assert_eq!(ev.kind, "machine.bootstrap_failed");
+        let detail = ev.detail.expect("detail");
+        assert_eq!(detail["step"], "install_herdr");
+        assert!(
+            detail["why"]
+                .as_str()
+                .unwrap()
+                .contains("rerun with --sudo"),
+            "{detail:?}"
+        );
+        let state = d.store.machine_state("a").unwrap().unwrap();
+        assert_eq!(state.bootstrap, crate::store::BootstrapState::Failed);
+        assert_eq!(state.failed_step.as_deref(), Some("install_herdr"));
+        // A second queued task never lands on the now-failed machine.
+        let resp = d.handle(run_req()).await;
+        let IpcResponse::Task(t) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(t.state, TaskState::Queued);
     }
 
     #[tokio::test]
