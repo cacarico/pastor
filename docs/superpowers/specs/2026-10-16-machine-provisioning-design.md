@@ -42,9 +42,15 @@ What pastor has today, read from the code at `aa141fa`:
 - `pastor setup systemd|launchd [--herdr]` installs user services, on the
   machine where it runs.
 - Pull machines (`pull = true`, `src/shepherd.rs`) exist. Their shepherd
-  reaches the head over ssh through `pastor bridge`, and
-  `pastor machine authorized-key` prints the restricted `authorized_keys`
-  line by hand.
+  reaches the head over ssh through plain `pastor bridge`, with an unlocked
+  key. Plain bridge passes any request as if from a person, and a
+  `TaskClaim` names its own machine, so that key can act for any machine.
+- `pastor machine authorized-key` prints a locked line, which is for
+  agents. It forces `bridge --agent --machine X`, which allows only Ping,
+  List, TaskShow, TaskRead and TaskDone (`bridge.rs:104`).
+- Pastor's ssh passes no `-i` and no known-hosts file of its own. It runs
+  with `BatchMode=yes` and uses the user's own keys and `~/.ssh/known_hosts`
+  (`ssh.rs`).
 
 ## Goals
 
@@ -95,7 +101,7 @@ The person made these on 2026-10-16. Each is binding on every build.
 | 2 | Pull and push | `pastor join` with a one-time token, and `machine add --bootstrap` over ssh. |
 | 3 | Harnesses are defined by manifests | claude, codex, opencode, agy and gemini ship as manifests in the binary; anyone adds more without Rust. |
 | 4 | Install: the manifest lists sources, the head caches | Sources in order: a release URL with sha256, npm, the vendor's installer. The head downloads each file once, checks it, and serves it to its machines. Self-update is turned off where the harness allows it. |
-| 5 | Root: two modes | With root: a `pastor` user, OS packages, system services, agents run as `pastor`. Without root: everything at user level, and pastor reports what is missing. |
+| 5 | Root: two modes | With root or `--sudo`: OS packages, lingering and the users below. Without root: everything at user level, and pastor reports what is missing. |
 | 6 | Account pools per harness | Accounts are their own objects. A task goes to the account with the most usage left. |
 | 7 | Secrets in the head's own store | Envelope encryption (below). |
 | 8 | Store protection: envelope encryption | A data key encrypts the store. A key provider wraps the data key: a 0600 key file by default; systemd-creds/TPM and macOS Keychain as options; Vault or KMS helpers later. |
@@ -104,6 +110,9 @@ The person made these on 2026-10-16. Each is binding on every build.
 | 11 | Config sync right after sign-in | Part of the design, not left for later. |
 | 12 | agy: test whether its token file works when copied | The person runs that test; agy's sign-in method waits on it. |
 | 13 | The first build is bootstrap | `pastor join` and `machine add --bootstrap`. |
+| 14 | Agents run as their own user, from the first build | A `pastor-agent` user runs herdr and every agent. It cannot read the shepherd's machine key. |
+| 15 | The shepherd runs as the login user, or as a `pastor` user on request | The default keeps the login user. An option creates or reuses a `pastor` user for the shepherd and its key. |
+| 16 | First-build platforms: Linux with systemd, and macOS in user mode | Alpine/OpenRC, macOS root mode, armv7 and riscv64 are reported as unsupported. herdr ships no armv7 or riscv64 build. |
 
 ## The whole design
 
@@ -145,17 +154,22 @@ connector". Each harness gets one, as a manifest. It declares:
 - the pane text that means a usage limit
 - how a permission profile becomes its flags
 
-What is Rust special-casing today (`config/mod.rs`, `limit.rs`,
-`config/agy.rs`, `config/opencode.rs`) moves into the built-in manifests.
-Writing codex's manifest also adds the usage-limit detection codex lacks
-today.
+What is Rust special-casing today moves into the built-in manifests:
+`config/mod.rs`, `limit.rs`, `config/agy.rs`, `config/opencode.rs`,
+`provision/agy.rs`, the launch code in `dispatch.rs`, `reopen.rs`, and the
+pane rules in `task.rs` (trailing question, background shell, agy's task
+footer). Writing codex's manifest also adds the usage-limit detection codex
+lacks today.
 
 **Accounts and pools.**
 - `pastor account add claude/team-3 --from-stdin` adds an account.
 - Pools are named, and a spec names a pool.
 - The scheduler places each task on the account with the most usage left
-  (decision 6). Limits are already tracked per account (`limits` table),
-  which makes this possible.
+  (decision 6). Today's `limits` table only records accounts that hit a
+  wall, with their retry time; nothing tracks how much an account has
+  left. That build adds the measure. At first it is "not limited, and
+  lowest recent spend", from what `usage.rs` already reads, and later a
+  harness's own quota check where it has one.
 
 **Secret store** (decisions 7 and 8).
 - Secrets are encrypted at rest with a data key.
@@ -201,145 +215,319 @@ config bundles → SSH certificates.
 Push, from the head:
 
 ```sh
-pastor machine add gpu-3 --ssh me@gpu-3 --flock builders --tag gpu --bootstrap
-pastor machine add pi-7  --ssh pi@pi-7  --bootstrap --sudo
+pastor machine add gpu-3 --ssh me@gpu-3 --flock builders --tag gpu --bootstrap --sudo
+pastor machine add pi-7  --ssh pi@pi-7  --bootstrap --sudo --service-user pastor
+pastor machine add lab-1 --ssh me@lab-1 --bootstrap          # no root: user mode
 ```
 
 Pull, on the head first, then on the machine (or in its cloud-init):
 
 ```sh
 pastor join create --flock builders --tag gpu --ttl 1h          # prints a token
-curl -fsSL https://…/install.sh | sh -s -- join head.example pjt_…
+curl -fsSL https://…/install.sh | sudo sh -s -- join --token-stdin <<<"pjt_…"
 ```
 
-Either way, the person then sees, within a minute:
+The token can also come from `PASTOR_JOIN_TOKEN`. The positional
+`join <token>` form works too, but it shows the token in `ps`, so the docs
+lead with stdin.
+
+Within a minute the machine shows up on the head. Its versions are
+reported by the machine itself, pull machines included:
 
 ```
 $ pastor machine list
-gpu-3   builders  connected  herdr 0.9.5  pastor 0.31.0  bootstrap: ok (user mode)
+gpu-3  …  connected  herdr 0.9.5  pastor 0.31.0  …
+$ pastor machine describe gpu-3
+bootstrap: ok, root mode (agents as pastor-agent, shepherd as me)
 ```
 
 When bootstrap cannot finish, `machine describe` names the step that
-failed, why, and the fix. Examples: "git is missing; rerun with --sudo or
-install it", or "lingering is off; services stop at logout".
+failed, why, and the fix. For example: "git is missing; rerun with --sudo
+or install it". Or: "lingering is off, so services stop when you log out;
+rerun with --sudo, or run `loginctl enable-linger me` as root".
 
-### Steps, as one idempotent sequence
+### Users on the machine
 
-Push and pull run the same steps on the machine; only the start differs.
-Every step is safe to run again, so a rerun after a fix carries on.
+Decisions 14 and 15 give a machine up to three users:
 
-1. **Facts.** OS, arch and userland bits (the same rules as `install.sh`,
-   including a 64-bit kernel over a 32-bit userland), init system, package
-   manager, whether root or sudo works, and the home dir.
-2. **Mode.** Root mode when bootstrap runs as root, or with `--sudo` and
-   working sudo. Otherwise user mode.
-3. **Packages.** git, plus what herdr needs. Root mode installs them with
-   the package manager found (apt, dnf, pacman, apk, brew). User mode only
-   checks for them and reports what is missing.
-4. **User.** Root mode creates a `pastor` system user with a home. Every
-   later step runs as that user. User mode uses the login user.
-5. **pastor.** Its binary goes in the user's `~/.local/bin`.
-   - Push copies it from the head's artifact cache (below).
-   - Pull already has it from `install.sh`.
-6. **herdr.** At the version pinned in `pastor.toml` (`[provision] herdr`,
-   defaulting to the head's own herdr version), taken from the artifact
-   cache.
-7. **Services.**
-   - Root mode: system units for herdr and pastor, run as `pastor`.
-   - User mode: `pastor setup systemd --herdr` and `pastor setup systemd`
-     (or launchd), with the existing linger check.
-   - Pull machines run a shepherd (headless serve). Push machines need only
-     herdr running; the head connects to it.
-8. **Identity and registration** (below).
-9. **Report.** The machine-level conditions: `Bootstrapped` (with the mode
-   and any missing items), then `Connected` for push or `Polling` for pull,
-   once the existing channel states say so.
+| Role | Who | Holds | Runs |
+|---|---|---|---|
+| Login user | the ssh user (`me`), or root for `sudo sh` | nothing pastor needs | only bootstrap |
+| Service user | the login user by default; `pastor` with `--service-user pastor` (created if missing, reused if there) | the **machine key** (`bridge --shepherd`) | the shepherd (pull machines) |
+| Agent user | `pastor-agent`, always created in root mode | the **agent key** (`bridge --agent`, as today) | herdr, and every agent pane |
+
+herdr runs as the agent user, because a pane starts as whoever runs herdr.
+The agent user's home holds the repos, worktrees and harness config. It
+cannot read the service user's state dir (0700), so a hijacked agent never
+holds the machine key. All it holds is today's agent key, which can only
+read and end its own machine's tasks.
+
+How the head reaches herdr: the flock entry records the agent user,
+`ssh = "pastor-agent@gpu-3"`. Bootstrap puts the head's public key in that
+user's `authorized_keys`. The head keeps the shell access it has today, as
+that user. The login user is used only for bootstrap and for later reruns
+of it.
+
+**User mode** (no root, no sudo) cannot create users. Everything runs as
+the login user and the machine key is readable by agents. Bootstrap still
+works, and it says so plainly: `isolation: none` in `machine describe`, and
+a `machine.bootstrapped` event carrying the warning. This is the documented
+cost of no root; SECURITY.md says so. (My call: report it rather than
+refuse, so a box without root can still be used.)
+
+**Root needed once.** `--sudo` needs passwordless sudo over ssh
+(`sudo -n true`, checked first, failing fast). Root is used only for:
+- OS packages
+- creating the users
+- `loginctl enable-linger` for the users that run services
+- placing their `authorized_keys`
+
+Services stay `systemd --user` units of their users, with lingering on. So
+no system units are needed, and `pastor setup systemd` is reused. (My
+call: simpler than system units, and the same code runs in both modes.)
+
+### One local command, used by both
+
+`pastor bootstrap` runs the steps on the machine itself and prints one JSON
+result. That result holds the facts, the mode, each step's outcome, both
+public keys and the host key, or the step that failed and why.
+- Push copies pastor to the machine and runs `pastor bootstrap` over ssh.
+- Pull runs it from `pastor join`.
+
+Each step is written and tested once, in Rust, not once as Rust and again
+as shell.
+
+### Steps
+
+Every step checks first and does nothing when the right thing is already
+there, so a rerun after a fix carries on where it stopped.
+
+1. **Facts.** OS, arch and userland bits, using `install.sh`'s rules
+   (including a 64-bit kernel over a 32-bit userland). Also the init system,
+   package manager, root or `sudo -n`, homes, and the hostname via
+   `gethostname`. Today's `config::hostname()` returns `-` on macOS, so it
+   gains that fallback.
+2. **Platform check** (decision 16). Linux with systemd: root mode and user
+   mode. macOS: user mode, with launchd. Anything else, or an arch herdr does
+   not ship, stops with `bootstrap_unsupported_platform` naming what is
+   missing.
+3. **Packages.** git, plus `openssh-client`/`ssh-keygen`, `curl`, `tar` and
+   `ca-certificates` where missing. Root mode installs them with apt, dnf or
+   pacman, and macOS checks only (brew refuses root). User mode checks only
+   and reports what is missing.
+4. **Users** (root mode): create the service user if asked, and
+   `pastor-agent`, each with a home, and turn lingering on for both.
+5. **pastor** into each user's `~/.local/bin`: the service user's, and the
+   agent user's (agents call `pastor task done`).
+6. **herdr** into the agent user's `~/.local/bin`:
+   - The version is `[provision] herdr` in the head's `pastor.toml`.
+   - Without it, the version most of the head's machines report.
+   - Without any, a version compiled into pastor (`DEFAULT_HERDR_VERSION`).
+7. **Services** (`pastor setup systemd|launchd`, run with `--yes` since
+   nothing is a terminal):
+   - herdr as the agent user;
+   - on pull machines, the shepherd as the service user.
+
+   `setup` learns to find herdr in `~/.local/bin` next to its own binary,
+   not only on `PATH`. With lingering off and no way to turn it on, the step
+   fails rather than reporting a machine that dies at logout. It also fails
+   when there is no user bus (`XDG_RUNTIME_DIR` unset); the fix is to rerun
+   with `--sudo`.
+8. **Keys.** The service user makes the machine key, and the agent user
+   makes the agent key. Each is ed25519, 0600, in its user's state dir.
+   Each user gets a `client.toml` naming the head, so `PASTOR_HEAD` no
+   longer depends on `head_address`. Pastor's ssh to the head then passes
+   `-i <key> -o IdentitiesOnly=yes -o UserKnownHostsFile=<state>/known_hosts`
+   whenever that key exists.
+9. **Shepherd name** (pull): `pastor join` writes `[shepherd] machine =
+   "<name>"` to the service user's `pastor.toml`, so the name survives
+   restarts.
+
+### Order and state, push and pull
+
+**Push.**
+1. `machine add --bootstrap` first writes the flock entry, with
+   `bootstrap = "pending"` kept in the head's store, not in `flock.toml`.
+   A pending machine takes no tasks.
+2. It runs `pastor bootstrap` over ssh, as the login user.
+3. It reads the result, installs the agent key's line and the machine's
+   host key on the head, and rewrites the entry's `ssh` to the agent user.
+4. It sets the state to `ok`, or to `failed` with the step and why.
+
+`machine add` again on a pending or failed machine with the same target
+reruns bootstrap instead of failing with `machine_exists`.
+`pastor machine bootstrap NAME [--sudo]` does the same by name.
+
+**Pull.**
+1. `pastor join` joins **first**, then bootstraps. Join registers the
+   machine as `pull = true` with `bootstrap = "pending"`, using the service
+   user's new key.
+2. The bootstrap that follows fetches herdr from the head's cache over its
+   own `bridge --shepherd`.
+3. It reports each step back. So a failed pull bootstrap shows on the head
+   like a failed push one, and `machine.bootstrap_failed` fires either way.
+
+**Where the state lives.** A new `machine_state` table in the head's store
+(schema bump) holds:
+- the bootstrap state, mode, isolation and the failed step;
+- the host key;
+- the reported herdr and pastor versions.
+
+`flock.toml` keeps `deny_unknown_fields` and gains nothing.
+
+**Pull versions.** `TaskClaim` (and the new bootstrap report) carry the
+machine's herdr and pastor versions, and `Fleet::heard` stores them. Today
+pull machines show `-` there. Both push and pull end `Connected`. A pull
+machine is `Connected` once the head hears from it (`Fleet::heard`).
+`Polling` stays what it is today: a push machine whose event stream will
+not open.
+
+### The join token
+
+- `pastor join create` makes 32 random bytes. They are the token's secret
+  and also the seed of a **per-token ed25519 key**.
+- The head writes that key's public half to its `authorized_keys` with
+  `restrict,command="pastor bridge --join --id <id>"`, and stores a hash of
+  the seed, the expiry, and the flock, tags and `--replace` target.
+- The token is `pjt_` + base64 of (head ssh destination, head host key,
+  seed): one word.
+- The machine derives the key from the seed and connects. sshd itself checks
+  the token.
+- `bridge --join --id` accepts exactly one request:
+  `Join { name, machine key, agent key, facts }`.
+- On success, or at expiry (swept on each tick), the head deletes that
+  token's line. A used or expired token then gets nothing, not even an ssh
+  session.
+- There is no shared join key.
+- `--replace NAME`, the flock and the tags are fixed when the head makes the
+  token. The joining machine cannot choose them, so a stolen token cannot
+  take over another machine's name.
+- A name already in `flock.toml` is refused, unless the token was made with
+  `--replace` for that exact name.
+
+### The head's `authorized_keys` and `known_hosts`
+
+**`authorized_keys`.**
+- Every pastor-written line carries a marker comment,
+  `pastor:machine:<name>` or `pastor:join:<id>`.
+- Edits take a lock, write a 0600 temp file, fsync it and rename it, so
+  100 machines joining at once lose nothing.
+- Pastor never touches a line without its marker.
+
+**`known_hosts`.**
+- Pastor keeps its own, at `<state>/known_hosts`, and passes
+  `UserKnownHostsFile` on every ssh it runs. Recycled cloud IPs and the
+  user's own file then never collide.
+- Push bootstrap accepts a new host key once (`accept-new`), or checks it
+  against `--host-key <fp>` when given.
+- A pull machine's host key arrives with `Join`.
+- `machine remove` and `--replace` delete the entry, and close the ssh
+  ControlMaster for that machine (`ssh -O exit`), so a live mux socket does
+  not skip the check.
+
+### Bridge modes
+
+| Mode | Who uses it | May send |
+|---|---|---|
+| `--join --id` | a joining machine, once | `Join` only |
+| `--shepherd --machine X` (new) | the service user's machine key | Ping, the agent set, `TaskClaim`, `TaskReport`, `PullTrust`, `JobSubmit`, `EventsSince`, the bootstrap report, and artifact fetches |
+| `--agent --machine X` (today) | the agent user's agent key | Ping, List, TaskShow, TaskRead, TaskDone |
+| plain | a person's own key | everything, as today |
+
+Rules for `--shepherd`:
+- The bridge sets the `machine` field of every claim, report and trust
+  request to `X` before forwarding. A machine can only act for itself.
+- `EventsSince` is filtered to records about `X` and its tasks.
+- `JobSubmit` is allowed, because pull machines run their own jobs today.
+
+Existing pull machines keep working on plain bridge. `pastor machine
+authorized-key --shepherd` prints the new locked line, for moving them over.
 
 ### The artifact cache
 
-- It lives on the head under the state dir, one entry per file and target:
-  `artifacts/<name>/<version>/<target>/`, with the sha256 kept beside it.
-- The first build caches pastor and herdr. The harness provisioners later
-  reuse the same cache.
-- pastor's own artifacts come from the release tarball and `SHA256SUMS`, as
-  `install.sh` does. A head whose own build matches the target may copy
+- It lives on the head under `<state>/artifacts/<name>/<version>/<target>`,
+  with the sha256 beside each file.
+- Names, versions and targets must match `[A-Za-z0-9._-]+`, with no `..`,
+  so a request cannot leave the cache.
+- **pastor**: the release tarball checked against its `SHA256SUMS`, as
+  `install.sh` does. A head whose own build matches the target copies
   itself.
-- A push machine gets files over the ssh connection bootstrap already uses.
-- A pull machine gets them through `pastor bridge` with a new request that
-  streams one artifact by name, version and target. It may only fetch what
-  its spec allows.
-- Pull's own pastor comes from `install.sh`. It downloads from GitHub, or
-  from `PASTOR_DOWNLOAD_URL` for an offline fleet. The head can serve that
-  directory too.
+- **herdr**: `https://herdr.dev/latest.json` lists every release, with
+  per-target assets and sha256s for `linux-x86_64`, `linux-aarch64`,
+  `macos-x86_64` and `macos-aarch64`. It is a static binary, not a tarball.
+  `[provision] herdr_index` overrides the index URL, for a mirror.
+- **Moving files.** Binaries never go through the head's JSON socket, which
+  caps a request at 1 MiB (`MAX_IPC_REQUEST`).
+  - A pull machine's artifact request asks the daemon for the checked path
+    and sha256 only. `pastor bridge` then streams the file itself over the
+    ssh session.
+  - A push bootstrap copies over its own ssh connection.
+  - The machine checks the sha256 again before it installs anything.
+- **Offline pull** in the first build: `install.sh` honours
+  `PASTOR_DOWNLOAD_URL` (a mirror the person hosts, or `file://`). After the
+  join, herdr comes from the head. The head serving `install.sh` itself is
+  left for later.
 
-### Identity and the join token
+### Removal and upgrades
 
-This uses only ssh, which is decision 9 together with the no-second-transport
-anti-goal.
+**`pastor machine remove NAME`** also:
+- deletes the machine's `authorized_keys` lines and its `known_hosts`
+  entry;
+- closes its ssh mux socket;
+- drops its `machine_state` row.
 
-- **Machine key.** Each machine makes an ed25519 key pair at bootstrap,
-  kept in pastor's state dir as the pastor user. The head trusts that public
-  key only, through an `authorized_keys` line with a forced command, built
-  like today's `authorized_key_line`. Removing the machine
-  (`pastor machine remove`) deletes its line. That revokes one machine alone.
-- **Push.** The head already reaches the machine over ssh. It reads the new
-  public key back during bootstrap and installs the line itself. The head
-  also records the machine's ssh host key, so a later connection that sees a
-  different host key fails.
-- **Pull: the token.** `pastor join create` makes a token with:
-  - the head's ssh destination,
-  - the head's ssh host key, so the first connection is pinned rather than
-    trusting whatever answers,
-  - a single-use secret with an expiry,
-  - the flock and tags.
+A removed pull machine's shepherd then fails to log in. It backs off and
+says why. `pastor leave` on the machine stops and removes its services, for
+a clean teardown.
 
-  The head stores only a hash of the secret.
-- **Pull: the join key.** The head keeps one join key pair. Its
-  `authorized_keys` line forces `pastor bridge --join`, which accepts exactly
-  one request: `Join { secret, machine name, public key, facts }`. The
-  private join key travels inside the token.
-  - It is harmless without a live secret, and it can do nothing but ask to
-    join.
-  - On a valid secret, the head marks the secret used, writes the machine's
-    own `authorized_keys` line, adds the machine to `flock.toml` as
-    `pull = true` with the token's flock and tags, and answers with the
-    machine's name.
-  - From then on the shepherd uses its own key.
-- **Names.** Pull takes the machine's hostname unless `join` is given
-  `--name`. A name already in `flock.toml` is refused, unless the token
-  was made with `--replace NAME` (reinstalling a machine).
+**Upgrades** in the first build: rerun `pastor machine bootstrap NAME`, and
+herdr upgrades with `herdr update --handoff` semantics, so running panes
+carry on. Upgrades driven by the machine spec and reconcile come with the
+later builds.
 
 ### Errors and events
 
-- New stable error codes follow the existing JSON error style:
+- New stable error codes:
   - `join_token_invalid`, `join_token_used`, `join_token_expired`
   - `machine_name_taken`
   - `bootstrap_unsupported_platform`
   - `bootstrap_missing`, which lists what is missing
+  - `bootstrap_needs_sudo`
   - `artifact_checksum_mismatch`
-- New events: `machine.joined`, `machine.bootstrapped` (with the mode and
-  missing items) and `machine.bootstrap_failed` (with the step and why),
-  for `watch`, hooks and orchestrators.
+  - `not_allowed_for_shepherd`
+- New events:
+  - `machine.joined`
+  - `machine.bootstrapped`, with the mode, isolation and missing items
+  - `machine.bootstrap_failed`, with the step and why
+  - `machine.join_token_expired`
 
 ### Testing
 
-- Unit tests for each step, with a fake runner, as `setup.rs` tests
-  systemd and loginctl today.
-- End-to-end tests in containers with sshd, beside the existing
-  `tests/real_ssh.rs`:
-  - Debian, Fedora, Arch and Alpine
-  - push and pull
-  - root mode and user mode
-  - a rerun after a failed step
-- The fake herdr covers what does not need a real herdr.
-- Token tests: used twice, expired, a wrong head host key, a name clash.
+- Unit tests for each step with a fake runner, as `setup.rs` tests systemd
+  and loginctl.
+- Bridge modes:
+  - each request allowed or refused per mode;
+  - a forged `machine` field gets overwritten.
+- Tokens:
+  - used twice, expired, wrong head host key;
+  - a name clash, and `--replace`;
+  - the line is removed after use and at expiry.
+- `authorized_keys`:
+  - concurrent joins lose no line;
+  - pastor never edits a line without its marker.
+- End-to-end in containers with sshd and systemd, next to `tests/real_ssh.rs`:
+  - Debian, Fedora and Arch;
+  - push and pull;
+  - root mode and user mode;
+  - a rerun after a failed step;
+  - a hijacked-agent check: the agent user cannot read the machine key.
+  - macOS user mode is tested by hand at first.
 
 ## Left to the builder
 
-- Every TOML key, flag, request name and the shape of the token.
-- How the token is encoded, as long as it is one copy-pasteable word.
-- Unit file contents for root mode.
-- The order of package names per distro, and whether herdr needs any beyond
-  git.
-- Where the bootstrap steps live in `src/`, and whether `install.sh` gains a
-  `join` subcommand or hands off to `pastor join`.
+- Every TOML key, flag and request name not fixed above.
+- Exactly how the token is encoded, as long as it is one copy-pasteable
+  word.
+- Package names per distro.
+- Where the steps live in `src/`.
+- Whether `install.sh` runs `pastor join` itself or prints the command.
