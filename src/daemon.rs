@@ -40,9 +40,19 @@ pub type HeadForward = crate::shepherd::Ask;
 pub type ConnectorFactory = Arc<dyn Fn(&MachineConfig) -> Arc<dyn Connector> + Send + Sync>;
 
 /// The transports `pastor serve` uses: ssh, the local socket or a command.
-pub fn endpoint_factory(paths: Paths) -> ConnectorFactory {
+/// An ssh machine's host key is looked up in `store` on each connection, so
+/// one pinned by a push is checked from the push's end on.
+pub fn endpoint_factory(paths: Paths, store: Arc<Store>) -> ConnectorFactory {
     Arc::new(move |m: &MachineConfig| {
-        Arc::new(Endpoint::from_machine(m, &paths)) as Arc<dyn Connector>
+        let (store, name) = (store.clone(), m.name.clone());
+        let pinned: crate::herdr::transport::Pinned = Arc::new(move || {
+            store
+                .machine_state(&name)
+                .ok()
+                .flatten()
+                .is_some_and(|s| s.host_key.is_some())
+        });
+        Arc::new(Endpoint::from_machine_with(m, &paths, pinned)) as Arc<dyn Connector>
     })
 }
 
@@ -63,6 +73,34 @@ pub fn machine_settings(config: &PastorConfig) -> MachineSettings {
         limits: Some(config.limits.clone()),
         ..Default::default()
     }
+}
+
+/// A failed report's step and reason: its failed step, else the last one
+/// run, else `unknown`. The table has no column for a step's `fix`, so it
+/// folds into the reason as `"<why>; fix: <fix>"`. `(None, None)` when ok.
+fn bootstrap_failure(
+    ok: bool,
+    steps: &[crate::bootstrap::StepResult],
+) -> (Option<String>, Option<String>) {
+    use crate::bootstrap::StepStatus;
+    let failed = (!ok).then(|| {
+        steps
+            .iter()
+            .find(|s| s.status == StepStatus::Failed)
+            .or(steps.last())
+    });
+    let failed_step = failed.map(|s| s.map_or_else(|| "unknown".to_string(), |s| s.step.clone()));
+    let why = failed.flatten().and_then(|s| {
+        let parts: Vec<String> = s
+            .why
+            .iter()
+            .filter(|w| !w.is_empty())
+            .cloned()
+            .chain(s.fix.iter().map(|fix| format!("fix: {fix}")))
+            .collect();
+        (!parts.is_empty()).then(|| parts.join("; "))
+    });
+    (failed_step, why)
 }
 
 /// "text and 1 key", "2 keys": what `task send` reports it sent.
@@ -2548,7 +2586,7 @@ impl Fleet {
         machine: &str,
         outcome: crate::bootstrap::Outcome,
     ) -> anyhow::Result<bool> {
-        use crate::bootstrap::{Isolation, Mode, StepStatus};
+        use crate::bootstrap::{Isolation, Mode};
         use crate::store::{BootstrapState, MachineState};
         if self.flock().get(machine).is_none() {
             return Err(crate::cli::CliError::err(
@@ -2576,26 +2614,7 @@ impl Fleet {
             Isolation::Users => "users",
             Isolation::None => "none",
         };
-        // A failed report names its failed step, else the last one run,
-        // else none at all.
-        let failed = (!ok).then(|| {
-            steps
-                .iter()
-                .find(|s| s.status == StepStatus::Failed)
-                .or(steps.last())
-        });
-        let failed_step =
-            failed.map(|s| s.map_or_else(|| "unknown".to_string(), |s| s.step.clone()));
-        let why = failed.flatten().and_then(|s| {
-            let parts: Vec<String> = s
-                .why
-                .iter()
-                .filter(|w| !w.is_empty())
-                .cloned()
-                .chain(s.fix.iter().map(|fix| format!("fix: {fix}")))
-                .collect();
-            (!parts.is_empty()).then(|| parts.join("; "))
-        });
+        let (failed_step, why) = bootstrap_failure(ok, &steps);
         let missing: Vec<String> = steps
             .into_iter()
             .flat_map(|s| s.missing)
@@ -2641,6 +2660,33 @@ impl Fleet {
             );
         }
         Ok(ok && was_held)
+    }
+
+    /// A push that failed before the machine's own steps ran, on a machine
+    /// already `Ok`: nothing there changed, so its state stays as it is and
+    /// only `machine.bootstrap_failed` says what happened.
+    pub fn report_bootstrap_kept(
+        &self,
+        machine: &str,
+        outcome: &crate::bootstrap::Outcome,
+    ) -> anyhow::Result<()> {
+        if self.flock().get(machine).is_none() {
+            return Err(crate::cli::CliError::err(
+                "unknown_machine",
+                format!("no machine {machine} in the flock"),
+            ));
+        }
+        let (failed_step, why) = bootstrap_failure(outcome.ok, &outcome.steps);
+        self.emit(
+            "machine.bootstrap_failed",
+            machine,
+            None,
+            Some(serde_json::json!({
+                "step": failed_step.unwrap_or_default(),
+                "why": why.unwrap_or_default(),
+            })),
+        );
+        Ok(())
     }
 
     /// Whether dispatch may place work on `machine`: a `Pending` or
@@ -3575,9 +3621,41 @@ pub struct Daemon {
     /// `ssh-keygen -R` and `ssh -O exit` for a removed machine go through
     /// this, so tests script the answer instead of touching the host.
     runner: Arc<dyn crate::setup::Runner + Send + Sync>,
-    /// Downloads into the artifact cache (`ArtifactLocate`) go through this,
-    /// so tests serve local files instead of the network.
+    /// What a push bootstrap runs on the head (ssh, ssh-keyscan,
+    /// ssh-keygen); tests put fakes here.
+    push_runner: Arc<dyn crate::bootstrap::push::PushRunner>,
+    /// Downloads into the artifact cache (`ArtifactLocate`, and a push
+    /// bootstrap's own binaries) go through this, so tests serve local
+    /// files instead of the network.
     fetch: Arc<dyn crate::artifacts::Fetch + Send + Sync>,
+    /// The machines a push bootstrap is running for: a second push of one
+    /// of them is refused (`machine_busy`) rather than racing the first.
+    pushing: Arc<std::sync::Mutex<HashSet<String>>>,
+}
+
+/// A machine's place in `Daemon::pushing`, given back when its push ends,
+/// however it ends.
+struct Pushing {
+    set: Arc<std::sync::Mutex<HashSet<String>>>,
+    name: String,
+}
+
+impl Pushing {
+    fn take(set: &Arc<std::sync::Mutex<HashSet<String>>>, name: &str) -> Option<Pushing> {
+        set.lock()
+            .recover()
+            .insert(name.to_string())
+            .then(|| Pushing {
+                set: set.clone(),
+                name: name.to_string(),
+            })
+    }
+}
+
+impl Drop for Pushing {
+    fn drop(&mut self) {
+        self.set.lock().recover().remove(&self.name);
+    }
 }
 
 /// The longest IPC request line, newline excluded. The largest real one is a
@@ -3799,7 +3877,7 @@ impl Daemon {
         // sees a task from before flocks without one.
         store.adopt_default_flock(flock.default_flock())?;
         let (events, log_rx) = broadcast::channel(1024);
-        let connect = connect.unwrap_or_else(|| endpoint_factory(paths.clone()));
+        let connect = connect.unwrap_or_else(|| endpoint_factory(paths.clone(), store.clone()));
         let fleet = Arc::new(Fleet::managed(store.clone(), events.clone(), connect));
         fleet.apply_flock(&flock, &machine_settings(&config)).await;
         // Fresh set: nothing has been warned about yet, so every task on a
@@ -3847,7 +3925,9 @@ impl Daemon {
             orchestrators,
             authorized_keys: crate::authkeys::default_file(),
             runner: Arc::new(crate::setup::SystemRunner),
+            push_runner: Arc::new(crate::bootstrap::push::SystemPushRunner),
             fetch: Arc::new(crate::artifacts::CurlFetch),
+            pushing: Arc::default(),
         })
     }
 
@@ -4173,6 +4253,118 @@ impl Daemon {
             tracing::warn!(machine = %name, "{why}");
         }
         failed
+    }
+
+    /// `MachineBootstrap`: a push bootstrap of `name`, run in this request's
+    /// own task. Only its flock edits take the dispatch lock, and each for a
+    /// moment, so a bootstrap that takes minutes never holds up dispatch.
+    async fn machine_bootstrap(
+        &self,
+        name: String,
+        sudo: bool,
+        service_user: Option<String>,
+        host_key: Option<String>,
+        machine: Option<MachineConfig>,
+        login: Option<String>,
+    ) -> IpcResponse {
+        use crate::bootstrap::push;
+        let config = match PastorConfig::load(&self.paths.config_file()) {
+            Ok(c) => c,
+            Err(err) => return IpcResponse::error("config_error", format!("{err:#}")),
+        };
+        let Some(head) = config.head_address.clone() else {
+            return IpcResponse::error(
+                "config_error",
+                "bootstrap needs head_address in pastor.toml: the ssh destination the machine reaches this head at, like me@head",
+            );
+        };
+        let login = match &machine {
+            Some(m) if m.name != name => {
+                return IpcResponse::error(
+                    "invalid_request",
+                    format!("the entry is named {}, not {name}", m.name),
+                );
+            }
+            Some(m) => match &m.ssh {
+                Some(ssh) => ssh.clone(),
+                None => {
+                    return IpcResponse::error(
+                        "usage_error",
+                        "machine add --bootstrap needs the machine's ssh destination",
+                    );
+                }
+            },
+            None => match self.fleet.flock().get(&name) {
+                Some(entry) => match push::login_for(entry, login.as_deref()) {
+                    Ok(login) => login,
+                    Err(err) => return cli_error(err),
+                },
+                None => {
+                    return IpcResponse::error(
+                        "unknown_machine",
+                        format!("no machine {name} in the flock"),
+                    );
+                }
+            },
+        };
+        let Some(_busy) = Pushing::take(&self.pushing, &name) else {
+            return IpcResponse::error(
+                "machine_busy",
+                format!("{name} is being bootstrapped already; wait for that run to end"),
+            );
+        };
+        let fleet_versions = self
+            .fleet
+            .statuses()
+            .into_iter()
+            .filter_map(|s| s.herdr_version)
+            .collect();
+        let opts = push::PushOpts {
+            sudo,
+            service_user,
+            host_key,
+            machine,
+            head,
+            provision: config.provision.clone(),
+            fleet_versions,
+            authorized_keys: self.authorized_keys.clone(),
+            runner: self.push_runner.clone(),
+            fetch: self.fetch.clone(),
+        };
+        let outcome =
+            match push::push(&self.paths, &self.store, &self.fleet, &name, &login, opts).await {
+                Ok(outcome) => outcome,
+                Err(err) => return cli_error(err),
+            };
+        // The entry was added, or its ssh moved to the agent user: the
+        // scheduler starts or reconnects its actor from the file.
+        let reload = match self.scheduler.reload().await {
+            Ok(_) => "the running pastor serve picked it up".to_string(),
+            Err(err) => format!("the reload after it failed ({err}); run `pastor job reload`"),
+        };
+        if let Some(err) = crate::bootstrap::error(&outcome) {
+            return cli_error(err);
+        }
+        // Tasks that waited for it start now, not next tick.
+        self.fleet.dispatch_queued().await;
+        let reached = self
+            .fleet
+            .flock()
+            .get(&name)
+            .and_then(|m| m.ssh.clone())
+            .unwrap_or(login);
+        let how = match outcome.mode {
+            crate::bootstrap::Mode::Root => {
+                format!("root mode, agents as {}", crate::bootstrap::AGENT_USER)
+            }
+            crate::bootstrap::Mode::User => {
+                "user mode, isolation: none (agents run as the login user and can read its keys)"
+                    .to_string()
+            }
+        };
+        IpcResponse::Text(format!(
+            "bootstrapped {name} ({how}), reached as {reached}; {reload}"
+        ))
     }
 
     /// `ssh-keygen -R` of `target`'s host key from pastor's known_hosts,
@@ -4740,7 +4932,28 @@ impl Daemon {
                 self.edit_flock_file("\n", |file| crate::fleet_edit::add_machine(file, &machine))
                     .await
             }
+            IpcRequest::MachineBootstrap {
+                name,
+                sudo,
+                service_user,
+                host_key,
+                machine,
+                login,
+            } => {
+                self.machine_bootstrap(name, sudo, service_user, host_key, machine, login)
+                    .await
+            }
             IpcRequest::MachineRemove { name } => {
+                // Held for the whole remove, so a push of the machine cannot
+                // start under it either.
+                let Some(_busy) = Pushing::take(&self.pushing, &name) else {
+                    return IpcResponse::error(
+                        "machine_busy",
+                        format!(
+                            "{name} is being bootstrapped; wait for that run to end, then remove it"
+                        ),
+                    );
+                };
                 let ssh_target = self
                     .fleet
                     .flock()
@@ -6591,6 +6804,7 @@ mod tests {
                 pastor_version: None,
                 service_user: None,
                 updated_at: "2026-10-16T10:00:00+00:00".into(),
+                service_user: None,
             })
             .unwrap();
         claim_with(Some("0.9.5"), Some("1.2.3")).await;
@@ -6622,6 +6836,7 @@ mod tests {
                 pastor_version: None,
                 service_user: None,
                 updated_at: "2026-10-16T10:00:00+00:00".into(),
+                service_user: None,
             })
             .unwrap();
         for bad in ["0.9.5\u{1b}[2J", &"1".repeat(65), "", "1 2"] {
@@ -7678,6 +7893,86 @@ mod tests {
             panic!("{resp:?}")
         };
         assert_eq!(t.state, TaskState::Queued);
+    }
+
+    fn bootstrap_req(name: &str) -> IpcRequest {
+        IpcRequest::MachineBootstrap {
+            name: name.into(),
+            sudo: true,
+            service_user: None,
+            host_key: None,
+            machine: None,
+            login: Some("me@a".into()),
+        }
+    }
+
+    /// pastor.toml as `serve` found it, plus `head_address`.
+    fn set_head_address(d: &Daemon) {
+        let mut config = test_config();
+        config.head_address = Some("me@head".into());
+        std::fs::write(d.paths.config_file(), toml::to_string(&config).unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_second_push_of_a_machine_is_busy() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        set_head_address(&d);
+        let first = Pushing::take(&d.pushing, "a").expect("free");
+        let resp = d.handle(bootstrap_req("a")).await;
+        let IpcResponse::Error { code, .. } = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(code, "machine_busy");
+        assert!(
+            d.store.machine_state("a").unwrap().is_none(),
+            "nothing recorded"
+        );
+        // Free again once the first push ends.
+        drop(first);
+        assert!(Pushing::take(&d.pushing, "a").is_some());
+    }
+
+    /// A remove while the push runs would leave the push to write its agent
+    /// line for a machine no longer there.
+    #[tokio::test]
+    async fn remove_during_a_push_is_busy() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        let first = Pushing::take(&d.pushing, "a").expect("free");
+        let resp = d
+            .handle(IpcRequest::MachineRemove { name: "a".into() })
+            .await;
+        let IpcResponse::Error { code, .. } = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(code, "machine_busy");
+        assert!(d.fleet.flock().get("a").is_some(), "still in the flock");
+        drop(first);
+        assert!(
+            Pushing::take(&d.pushing, "a").is_some(),
+            "the remove let go"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_needs_head_address() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        let resp = d.handle(bootstrap_req("a")).await;
+        let IpcResponse::Error { code, message } = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(code, "config_error");
+        assert!(message.contains("head_address"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn push_of_an_unknown_machine_is_refused() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        set_head_address(&d);
+        let resp = d.handle(bootstrap_req("nope")).await;
+        let IpcResponse::Error { code, .. } = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(code, "unknown_machine");
     }
 
     fn outcome(ok: bool, mode: crate::bootstrap::Mode) -> crate::bootstrap::Outcome {
@@ -11533,6 +11828,7 @@ mod tests {
                 pastor_version: None,
                 service_user: None,
                 updated_at: "2026-10-16T10:00:00+00:00".into(),
+                service_user: None,
             })
             .unwrap();
         (d, tmp)

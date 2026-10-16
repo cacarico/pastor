@@ -299,7 +299,7 @@ async fn fill(
 
 /// A work dir name no other `ensure` uses at the same time: pid, a counter
 /// for calls in this process, and the clock for a pid reused after a crash.
-fn work_dir_name() -> String {
+pub(crate) fn work_dir_name() -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()

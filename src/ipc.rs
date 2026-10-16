@@ -43,8 +43,8 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 /// `TaskReport::trusted`). 32: a pull machine's own versions
 /// (`TaskClaim::herdr_version`, `TaskClaim::pastor_version`), join tokens
 /// (`JoinCreate`, `JoinList`, `JoinRevoke`, `Join`), bootstrap reports
-/// (`BootstrapReport`) and the machine state they record, and the
-/// artifact cache (`ArtifactLocate`).
+/// (`BootstrapReport`) and the machine state they record, push bootstrap
+/// (`MachineBootstrap`), and the artifact cache (`ArtifactLocate`).
 pub const IPC_PROTOCOL: u32 = 32;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
@@ -240,6 +240,11 @@ pub const JOIN_TOKEN_PROTOCOL: u32 = 32;
 /// dispatch never learns to skip the machine.
 pub const BOOTSTRAP_PROTOCOL: u32 = 32;
 
+/// The first protocol whose head runs a push bootstrap
+/// (`MachineBootstrap`). An older one refuses the request as unreadable,
+/// so `machine add --bootstrap` would add nothing and say only that.
+pub const MACHINE_BOOTSTRAP_PROTOCOL: u32 = 32;
+
 /// The first protocol whose head answers `ArtifactLocate` from its cache of
 /// the binaries it puts on a machine. An older one refuses the request as
 /// unreadable.
@@ -369,6 +374,8 @@ const REPORT_TRUSTED: &str =
 const PULL_VERSIONS: &str =
     "predates a pull machine's own versions, and would drop the claim's herdr and pastor versions";
 const BOOTSTRAP: &str = "predates bootstrap reports, and would refuse the request without recording the machine's state";
+const MACHINE_BOOTSTRAP: &str =
+    "predates push bootstrap, and would refuse the request without setting the machine up";
 const ARTIFACT: &str =
     "predates the artifact cache, and would refuse to say where pastor or herdr is";
 
@@ -564,6 +571,24 @@ pub enum IpcRequest {
     /// whose herdr it is. Answers `Text`.
     MachineAdd {
         machine: crate::config::flock::MachineConfig,
+    },
+    /// `machine add --bootstrap` (with `machine`, the entry to write) and
+    /// `machine bootstrap` (without): the head sets the machine up over ssh
+    /// as `login`, else the entry's own `ssh`, and records how it ended
+    /// (`bootstrap::push`). Binaries go over the head's own ssh, never
+    /// through this socket. Answers `Text`, or the failed step's error.
+    MachineBootstrap {
+        name: String,
+        #[serde(default)]
+        sudo: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        service_user: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host_key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        machine: Option<crate::config::flock::MachineConfig>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        login: Option<String>,
     },
     /// `machine remove`, the flock.toml part, as for `MachineAdd`. Answers
     /// `Text`.
@@ -1111,6 +1136,7 @@ impl IpcRequest {
             }
             R::PullTrust { .. } => need.at(PULL_TRUST_PROTOCOL, PULL_TRUST),
             R::BootstrapReport { .. } => need.at(BOOTSTRAP_PROTOCOL, BOOTSTRAP),
+            R::MachineBootstrap { .. } => need.at(MACHINE_BOOTSTRAP_PROTOCOL, MACHINE_BOOTSTRAP),
             R::ArtifactLocate { .. } => need.at(ARTIFACT_PROTOCOL, ARTIFACT),
             R::LimitList | R::LimitClear { .. } => need.at(LIMIT_PROTOCOL, LIMITS),
             R::OrchestratorStart { .. } | R::OrchestratorStop { .. } => {
@@ -1164,6 +1190,7 @@ impl IpcRequest {
             | IpcRequest::FlockLeave { .. }
             | IpcRequest::FlockSetDefault { .. }
             | IpcRequest::MachineAdd { .. }
+            | IpcRequest::MachineBootstrap { .. }
             | IpcRequest::MachineRemove { .. }
             | IpcRequest::MachineMove { .. }
             | IpcRequest::JobRun { .. }
@@ -2064,6 +2091,14 @@ mod tests {
                     profile: None,
                 },
             },
+            IpcRequest::MachineBootstrap {
+                name: "m".into(),
+                sudo: true,
+                service_user: None,
+                host_key: None,
+                machine: None,
+                login: None,
+            },
             IpcRequest::MachineRemove { name: "m".into() },
             IpcRequest::MachineMove {
                 name: "m".into(),
@@ -2564,6 +2599,7 @@ mod tests {
             PULL_TRUST_PROTOCOL,
             PULL_VERSIONS_PROTOCOL,
             BOOTSTRAP_PROTOCOL,
+            MACHINE_BOOTSTRAP_PROTOCOL,
             ARTIFACT_PROTOCOL,
         ] {
             assert!(covered.contains(&p), "no request needs protocol {p}");

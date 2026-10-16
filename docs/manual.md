@@ -348,7 +348,7 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `agy_permissions_missing` | a profiled agy task on a machine whose agy settings do not deny what the profile denies, or that pastor cannot read or write to make them (a `command` machine, a file that is not JSON, a symlink, a failed write); the message lists the rules to add |
 | `agy_profile_mismatch` | a profiled agy task on a machine whose own profile does not deny everything the task's does |
 | `already_seen` | a job's key was queued before and its task row is gone |
-| `artifact_checksum_mismatch` | a downloaded pastor or herdr whose sha256 is not the published one, nothing cached; or a cached file whose size or sha256 is not what the head answered, nothing streamed |
+| `artifact_checksum_mismatch` | a downloaded pastor or herdr whose sha256 is not the published one, nothing cached; or a cached file whose size or sha256 is not what the head answered, nothing streamed; or a push's copy that reached the machine with another sha256, nothing runs there |
 | `bootstrap_missing` | `pastor bootstrap` found something the machine lacks and could not install it: a package in user mode, or herdr with no `--herdr-from` |
 | `bootstrap_needs_sudo` | `pastor bootstrap --sudo` where `sudo -n true` fails: sudo wants a password or is not allowed |
 | `bootstrap_unsupported_platform` | `pastor bootstrap` on a platform it does not set up: not Linux with systemd or macOS, macOS as root, or an arch herdr ships no build for |
@@ -398,7 +398,8 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `leave_incomplete` | `pastor leave` ran every step it could and one or more failed; each is printed, and the message lists them |
 | `leave_on_head` | `pastor leave` on a machine where `pastor serve` runs as the head for this login |
 | `leave_unsupported_platform` | `pastor leave` on a platform with neither systemd nor launchd units to remove |
-| `machine_exists` | `machine add` of a machine that exists |
+| `machine_busy` | `machine add --bootstrap`, `machine bootstrap` or `machine remove` of a machine a push bootstrap is already running for |
+| `machine_exists` | `machine add` of a machine that exists; with `--bootstrap`, one that is not pending or failed with the same login |
 | `machine_name_taken` | a join named a machine already in flock.toml, with a token not made with `--replace` for that name |
 | `machine_not_connected` | `task run --now` on a machine that is not connected |
 | `machine_shutting_down` | the machine's actor is stopping; try again |
@@ -1077,6 +1078,49 @@ the flocks of tasks dispatched after them; tasks already on the machine keep
 running there, and its connection stays up. A queued task pinned to a machine
 that has moved to another flock stays queued for its own flock, and the head
 logs a warning once.
+
+`pastor machine add <name> <login> --bootstrap` sets a bare machine up from
+the head, over ssh as `<login>`, and needs a running head with
+`head_address` in `pastor.toml` (how the machine reaches the head). The
+entry goes in flock.toml first, with its bootstrap pending in the head's
+store, so it takes no task until the end. The head then pins the machine's
+ed25519 host key in pastor's own `known_hosts` (trusted the first time, or
+checked against `--host-key SHA256:...`; every ssh of the push after that
+asks for that ed25519 key only and accepts no other, and gives up on a
+machine that stops answering), reads its platform, copies the
+pastor and herdr builds for it from the head's cache over that ssh into
+`~/.cache/pastor-bootstrap/` (checking each sha256 there before it moves it
+into place), and runs `pastor bootstrap --json` there with `--sudo` and
+`--service-user` passed on. On success it adds the machine's agent line
+(`pastor:agent:<name>`) to the head's `authorized_keys`, records the
+bootstrap as ok, emits `machine.bootstrapped` and ends the ssh master of
+the login. In root mode the entry's `ssh` becomes `pastor-agent@<host>`,
+the user herdr and every agent run as; in user mode it keeps the login.
+From then on the head's own ssh to the machine offers its `head_key`
+(beside the user's keys, not instead) and checks the host against the key
+pinned in pastor's `known_hosts`. A machine that ssh cannot reach fails step
+`connect` (`runtime_error`); a copy that arrives with another sha256 fails
+step `checksum` (`artifact_checksum_mismatch`) and runs nothing there; and
+the host key the machine reports must be the one pinned, which is what is
+stored. A failed step is recorded with its reason and fix, emits
+`machine.bootstrap_failed`, and comes back as the command's error. A rerun
+of a machine already ok keeps it ok, taking work, until `pastor bootstrap`
+starts there: a failure before that only emits `machine.bootstrap_failed`,
+one from then on records it failed. Run the
+same `machine add` again after the fix (with `--sudo`, say): a machine
+pending or failed with the same login carries on where it stopped instead of
+failing `machine_exists`. `pastor machine bootstrap <name> [--sudo]` does the
+same by name, for a rerun or to upgrade pastor and herdr; once the entry
+names `pastor-agent`, pass the login with `--ssh`. One push per machine
+runs at a time, and a `machine remove` waits for it (`machine_busy`); none
+holds up dispatch.
+
+```bash
+pastor machine add gpu-3 me@gpu-3 --bootstrap --sudo --tag gpu
+pastor machine add pi-7 pi@pi-7 --bootstrap --sudo --service-user pastor
+pastor machine add lab-1 me@lab-1 --bootstrap        # no root: user mode
+pastor machine bootstrap gpu-3 --ssh me@gpu-3 --sudo # rerun or upgrade
+```
 
 `pastor machine remove <name>` on a head also revokes what let the
 machine in: the `pastor:machine:<name>` and `pastor:agent:<name>` lines of

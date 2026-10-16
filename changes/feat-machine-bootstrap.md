@@ -21,3 +21,17 @@
   user mode with none),
   and `machine list` falls back to the saved state for a pull machine's
   versions. Gated at IPC protocol 32.
+- `pastor machine add NAME LOGIN --bootstrap [--sudo] [--service-user U]
+  [--host-key K]` and `pastor machine bootstrap NAME`: the head pins the
+  machine's host key, copies pastor and herdr from its cache over its own
+  ssh, runs `pastor bootstrap` there and records the outcome, adding the
+  agent's `authorized_keys` line and, in root mode, moving the entry to
+  `pastor-agent@<host>`. A rerun after a failed step carries on instead of
+  failing `machine_exists`; two at once for one machine get `machine_busy`.
+  The head makes its own key (`head_key` in the state dir) on first use,
+  and from then on offers it on its ssh to every machine (beside the
+  user's keys), checking a pushed machine's host against the pinned key.
+  The push's own ssh asks for the pinned ed25519 key only and times out on
+  a machine that stops answering; a `machine remove` during a push gets
+  `machine_busy`; a rerun of an ok machine keeps it ok until `pastor
+  bootstrap` starts there. Gated at IPC protocol 32 (`MachineBootstrap`).
