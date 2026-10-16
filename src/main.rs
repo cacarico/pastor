@@ -178,6 +178,15 @@ struct BridgeArgs {
     /// Take one join request for the join token with this id, then exit; what a token's authorized_keys line runs
     #[arg(long, value_name = "ID", conflicts_with_all = ["agent", "machine"])]
     join: Option<String>,
+    /// Stream pastor or herdr from the head's artifact cache to stdout, checked against its sha256 (needs --shepherd)
+    #[arg(
+        long,
+        num_args = 3,
+        value_names = ["NAME", "VERSION", "TARGET"],
+        requires = "shepherd",
+        conflicts_with = "agent"
+    )]
+    fetch: Option<Vec<String>>,
 }
 
 #[derive(Args, Debug)]
@@ -943,6 +952,25 @@ fn completion_tree() -> clap::Command {
 fn bridge(paths: &Paths, args: &BridgeArgs) -> ! {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let socket = paths.socket_file();
+    if let Some([name, version, target]) = args.fetch.as_deref() {
+        // stdout carries the binary, so a failure goes to stderr as any
+        // other command's does.
+        let fetched = rt.block_on(pastor::bridge::fetch(
+            &socket,
+            &paths.state_dir,
+            name,
+            version,
+            target,
+            tokio::io::stdout(),
+        ));
+        match fetched {
+            Ok(()) => std::process::exit(0),
+            Err(err) => match err.downcast_ref::<CliError>() {
+                Some(e) => fail(&e.code, &e.message),
+                None => fail("runtime_error", &format!("{err:#}")),
+            },
+        }
+    }
     let input = tokio::io::BufReader::new(tokio::io::stdin());
     let result = rt.block_on(async {
         match (args.agent, args.shepherd, &args.machine) {
@@ -1715,8 +1743,10 @@ async fn probe_machine(
         .collect();
     // Nothing connects to a pull machine, and with no head running nobody
     // has heard its claims: its row says so, with the tasks the store puts
-    // there, rather than probing whatever herdr runs here.
+    // there, rather than probing whatever herdr runs here. Its versions
+    // come from its last `BootstrapReport`, if it has one.
     if m.pull {
+        let saved = store.machine_state(&m.name)?;
         return Ok(pastor::cli::MachineRow {
             now: Vec::new(),
             name: m.name.clone(),
@@ -1725,8 +1755,8 @@ async fn probe_machine(
             flock: flock.to_string(),
             flocks,
             channel: "not probed".into(),
-            herdr_version: None,
-            pastor_version: None,
+            herdr_version: saved.as_ref().and_then(|s| s.herdr_version.clone()),
+            pastor_version: saved.as_ref().and_then(|s| s.pastor_version.clone()),
             pastor_read_at: None,
             protocol: None,
             error: None,
@@ -3384,6 +3414,7 @@ async fn machine_describe(
     let config = PastorConfig::load(&paths.config_file())?;
     let row = probe_machine(m, &f, &config, paths, &store).await?;
     let tasks = store.list_tasks(&pastor::describe::machine_tasks(name))?;
+    let bootstrap = store.machine_state(name)?;
     let d = pastor::describe::MachineDescription {
         row,
         session: m.session.clone(),
@@ -3392,6 +3423,7 @@ async fn machine_describe(
         agents_by_kind: m.agents.clone(),
         tasks,
         recent_errors: pastor::describe::machine_errors(events_log(paths), name),
+        bootstrap,
     };
     print_description(&d, json, pastor::describe::machine_text)
 }

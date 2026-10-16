@@ -942,7 +942,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__bridge)
-            opts="-h --agent --shepherd --machine --join --head --help"
+            opts="-h --agent --shepherd --machine --join --fetch --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -953,6 +953,10 @@ _pastor() {
                     return 0
                     ;;
                 --join)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --fetch)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

@@ -797,6 +797,7 @@ Pass request lines from stdin to this machine's head; for a remote CLI over ssh
 | `--shepherd` | Pass on only what the shepherd on --machine may ask: claiming and reporting its own tasks, its saved trust, job submits and its events |  |
 | `--machine <MACHINE>` | The machine this bridge serves (needs --agent or --shepherd), as flock.toml names it |  |
 | `--join <ID>` | Take one join request for the join token with this id, then exit; what a token's authorized_keys line runs |  |
+| `--fetch <NAME>` | Stream pastor or herdr from the head's artifact cache to stdout, checked against its sha256 (needs --shepherd) |  |
 
 ## head
 

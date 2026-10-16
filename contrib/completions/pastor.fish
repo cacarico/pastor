@@ -523,6 +523,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand join; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand join; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand bridge" -l machine -d 'The machine this bridge serves (needs --agent or --shepherd), as flock.toml names it' -r
 complete -c pastor -n "__fish_pastor_using_subcommand bridge" -l join -d 'Take one join request for the join token with this id, then exit; what a token\'s authorized_keys line runs' -r
+complete -c pastor -n "__fish_pastor_using_subcommand bridge" -l fetch -d 'Stream pastor or herdr from the head\'s artifact cache to stdout, checked against its sha256 (needs --shepherd)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand bridge" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand bridge" -l agent -d 'Pass on only what an agent on --machine may ask: its machine\'s tasks'
 complete -c pastor -n "__fish_pastor_using_subcommand bridge" -l shepherd -d 'Pass on only what the shepherd on --machine may ask: claiming and reporting its own tasks, its saved trust, job submits and its events'

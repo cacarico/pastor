@@ -139,6 +139,11 @@ pub struct MachineDescription {
     /// Its recent `machine.*` events that carried an error, and its failed
     /// tasks, oldest first.
     pub recent_errors: Vec<EventRecord>,
+    /// `Store::machine_state`: how its bootstrap ended, if it ran through
+    /// `pastor bootstrap` at all. `None` for a machine from before bootstrap
+    /// tracking, or one never bootstrapped; `machine_text` says nothing then.
+    #[serde(default)]
+    pub bootstrap: Option<crate::store::MachineState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -606,7 +611,7 @@ pub fn machine_text(m: &MachineDescription) -> String {
         Some(n) => format!("{n} of {room}"),
         None => format!("- of {room}"),
     };
-    let mut out = fields(&[
+    let mut rows = vec![
         ("name", r.name.clone()),
         ("description", description(&r.description)),
         ("host", r.host.clone()),
@@ -634,7 +639,14 @@ pub fn machine_text(m: &MachineDescription) -> String {
         ("orphans", dash(Some(r.orphans.join(",")))),
         ("tags", dash(Some(r.tags.join(",")))),
         ("error", dash(r.error.clone().map(|e| one_line(&e)))),
-    ]);
+    ];
+    if let Some(line) = bootstrap_line(&r.host, m.bootstrap.as_ref()) {
+        rows.push(("bootstrap", line));
+    }
+    if let Some(line) = isolation_line(m.bootstrap.as_ref()) {
+        rows.push(("isolation", line));
+    }
+    let mut out = fields(&rows);
     section(&mut out, "tasks", task_table(&m.tasks));
     section(
         &mut out,
@@ -642,6 +654,48 @@ pub fn machine_text(m: &MachineDescription) -> String {
         m.recent_errors.iter().map(EventRecord::line).collect(),
     );
     out.join("\n")
+}
+
+/// `machine describe`'s `bootstrap:` line, from `Store::machine_state`:
+/// `None` for a machine with no row, so an existing machine's description
+/// is unchanged. `host` is the flock's `ssh` destination as written (`me@gpu-3`),
+/// which `machine list`'s `host` column already carries; its user before the
+/// `@` is the login user, the service user by default (root mode).
+fn bootstrap_line(host: &str, state: Option<&crate::store::MachineState>) -> Option<String> {
+    use crate::store::BootstrapState;
+    let s = state?;
+    Some(match s.bootstrap {
+        BootstrapState::Pending => "pending".to_string(),
+        BootstrapState::Failed => format!(
+            "failed at {}: {}",
+            s.failed_step.as_deref().unwrap_or("?"),
+            s.why.as_deref().unwrap_or("?"),
+        ),
+        BootstrapState::Ok => match s.mode.as_deref() {
+            Some("root") => format!(
+                "ok, root mode (agents as pastor-agent, shepherd as {})",
+                ssh_user(host)
+            ),
+            _ => "ok, user mode".to_string(),
+        },
+    })
+}
+
+/// The extra `isolation:` line a user-mode machine with no isolation gets:
+/// its agents run as the login user, so they can read the machine key.
+fn isolation_line(state: Option<&crate::store::MachineState>) -> Option<String> {
+    let s = state?;
+    (s.mode.as_deref() == Some("user") && s.isolation.as_deref() == Some("none"))
+        .then(|| "none (agents can read the machine key)".to_string())
+}
+
+/// The user before the `@` in an ssh destination (`Endpoint::host`), else a
+/// placeholder for a local or command machine, which has none.
+fn ssh_user(host: &str) -> &str {
+    match host.split_once('@') {
+        Some((user, _)) if !user.is_empty() => user,
+        _ => "the login user",
+    }
 }
 
 pub fn flock_text(f: &FlockDescription) -> String {
