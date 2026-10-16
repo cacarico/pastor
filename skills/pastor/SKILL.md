@@ -17,6 +17,7 @@ pastor task --help
 pastor job --help
 pastor machine --help
 pastor flock --help
+pastor join --help
 pastor events --help
 pastor setup --help
 ```
@@ -259,9 +260,29 @@ pastor flock describe work --json     # one flock: default, agent, machines, liv
 
 These commands edit `flock.toml` in place, keeping its comments.
 
+A bare machine with ssh access but nothing installed does not need the PATH
+checklist below: `pastor machine add <name> <login> --bootstrap [--sudo]
+[--service-user NAME]` and `pastor machine bootstrap <name>` (a rerun, to
+retry a failed step or install a newer release) do it from the head, over
+the login's own ssh. A machine the head cannot reach instead makes a
+one-time token on the head and redeems it on itself:
+
+```bash
+pastor join create --flock builders --tag gpu --ttl 1h   # prints a pjt_... token
+pastor join --token-stdin --name gpu-3 --sudo < tokenfile # on the new machine
+pastor join list                                          # tokens: id, flock, tags, expiry, used
+pastor join revoke <id>                                   # before it is redeemed
+```
+
+Never pass the token on a command line or in an environment variable before
+`sh`; both show up in `ps`. `--token-stdin` or a file redirect are the ways
+to use it. `pastor leave --yes` on the machine itself undoes a bootstrap or
+a join (stops and removes the services, deletes the keys) before `pastor
+machine remove <name>` on the head.
+
 Before a new machine takes work unattended, go through this once:
 
-1. herdr, pastor and the agents must be on the PATH of a non-interactive ssh command. The head runs `ssh user@host sh -c 'herdr … remote-api-bridge'`, and many `~/.bashrc` files return early when not interactive (Debian's does), so put the PATH line before that check. Check each name on its own, since POSIX `command -v` takes one: `ssh user@host 'command -v claude && command -v herdr && command -v pastor'`.
+1. `pastor machine add <name> <login> --bootstrap [--sudo] [--service-user NAME]` sets pastor, herdr and the agent user up over ssh from the head: it installs both binaries, makes the users and keys (root mode with `--sudo`: `pastor-agent` runs every agent pane, isolated from the service user's machine key; without it, user mode, no isolation), starts herdr's service, and adds the machine's agent key to the head's `authorized_keys`. A machine the head cannot reach (behind NAT) pulls the same setup onto itself instead: `pastor join create` on the head makes a one-time token, then `pastor join` (or `install.sh join`) on the machine. `pastor machine bootstrap <name>` reruns it later, to retry a failed step or install a newer release. Skip this only for a machine already set up by hand, which still needs herdr, pastor and the agents on the PATH of a non-interactive ssh command: the head runs `ssh user@host sh -c 'herdr … remote-api-bridge'`, and many `~/.bashrc` files return early when not interactive (Debian's does), so put the PATH line before that check; `ssh user@host 'command -v claude && command -v herdr && command -v pastor'` checks each by hand (POSIX `command -v` takes one name).
 2. Every repo the flock's jobs and tasks use must exist at the same path on the machine. pastor does not clone. Clone each one before the machine joins a flock whose jobs use it.
 3. Save trust for each repo right after cloning: `pastor trust add <machine> <repo>`. The head then answers Claude's folder-trust prompt for that repo's tasks and worktrees on that machine. `pastor trust list` shows the pairs.
 4. Log the agent in, then finish its first-run setup once. For Claude, `claude auth login` saves credentials, but the first interactive start still stops on first-run screens (theme, login confirmation) and the first task sits `blocked`. Finish them with `pastor task attach t-N` and detach with ctrl+b q. `~/.claude.json` has `hasCompletedOnboarding: true` once it is done.

@@ -149,6 +149,23 @@ down here because getting them wrong cost a day.
   for code that changes how pastor itself behaves; what installs a connector
   command or event hooks is a connector. The Claude Code plugin `pastor` that
   ships the skills is Claude Code's word, not pastor's.
+- `pastor bridge` with no flag is unrestricted: whatever reaches the head's
+  user over ssh reaches the fleet. `--agent --machine NAME`, `--shepherd
+  --machine NAME` (folding in `--fetch`) and `--join ID` are narrower
+  `authorized_keys` forced commands instead, each a key that can only act as
+  its one machine or redeem its one token; a shepherd's `TaskClaim`,
+  `TaskReport`, `PullTrust`, `BootstrapReport` and job submits all get their
+  `machine` field overwritten to the bridge's own, whatever the request
+  said, so a hijacked pull machine can never claim or report as another.
+  `pastor-agent` is the fixed user bootstrap makes for every agent pane in
+  root mode, with its own `0700` state dir, so a prompt-injected agent
+  cannot read the service user's machine key; in user mode there is no such
+  user and no such isolation.
+- A bootstrapped machine's own state (ok, pending or failed, its mode,
+  isolation, host key, herdr and pastor versions, service user) lives in
+  the store's `machine_state` table (schema 19), not `flock.toml`, which
+  keeps `deny_unknown_fields` and gained no keys for bootstrap. Join tokens
+  live in the store too (`join_tokens`).
 - Runtime CLI errors are JSON on stderr with a stable code and exit 1; clap
   usage errors stay plain text with exit 2.
 - Rust edition 2024, toolchain from mise. No new runtime dependencies without
@@ -261,7 +278,7 @@ Still open as of the last review; none of them blocks normal use.
 ~/.config/pastor/jobs/<name>.toml one job per file
 ~/.config/pastor/orchestrators/<name>.toml one orchestrator per file (kind scheduled or session)
 ~/.config/pastor/client.toml      [head]: a head on another machine (`pastor head`)
-~/.local/state/pastor/pastor.db   tasks (schema 18), token usage, seen keys, usage limits, event seq, job state (SQLite)
+~/.local/state/pastor/pastor.db   tasks (schema 19), token usage, seen keys, usage limits, event seq, job state, machine_state, join_tokens (SQLite)
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/fleet.lock  offline fleet edits and a starting `pastor serve` take turns on it
 ~/.local/state/pastor/shepherd.db a headless serve's job state, seen keys, head event cursor, its pull machine's trusted repos

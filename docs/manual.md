@@ -1079,6 +1079,53 @@ running there, and its connection stays up. A queued task pinned to a machine
 that has moved to another flock stays queued for its own flock, and the head
 logs a warning once.
 
+### Bootstrapping a machine
+
+A bare machine with a user account and ssh access needs pastor, herdr and a
+user to run them as before it can take work. Two ways get it there, both
+running the same nine steps in order (`pastor bootstrap`, hidden from the
+command list, since push and `pastor join` are the only callers): facts,
+platform, packages, users, pastor, herdr, services, keys, client. Each step
+checks before it acts, so a rerun after a failed one carries on where it
+stopped instead of redoing what is already there.
+
+- **Push**, below: the head reaches the machine over its own ssh and runs
+  the steps there. For a machine the head can already ssh into.
+- **Pull**, under [Join tokens](#join-tokens) and [Joining a
+  machine](#joining-a-machine): the machine runs the steps on itself, with
+  a one-time token, and adds itself to the head's flock.toml as it finishes.
+  For a machine behind NAT or otherwise unreachable from the head.
+
+Either way, root (uid 0, or `--sudo` with working passwordless sudo) buys
+isolation: bootstrap makes a service user (the login user, or `pastor` with
+`--service-user pastor`) that holds the machine key and runs herdr and the
+shepherd, and `pastor-agent`, which every agent pane runs as; each gets its
+own `0700` state directory, so `pastor-agent` cannot read the service
+user's machine key. Without root, bootstrap makes neither: herdr and every
+agent run as the login user, so there is no isolation between them, and an
+agent can read the machine key the same as the user it runs as can.
+`machine describe` and `pastor bootstrap`'s own output say so
+(`isolation: none; agents run as this user and can read the machine key`).
+macOS only bootstraps in user mode; root there is
+`bootstrap_unsupported_platform`, since brew refuses root and launchd
+agents are per user.
+
+Rerun bootstrap (`pastor machine bootstrap <name>`, or `pastor join` again
+with `--skip-bootstrap` left out) at any time to upgrade pastor and herdr to
+what the head's cache, or herdr's own index, now gives; a machine already
+`ok` keeps taking work throughout. Only `pastor bootstrap` itself may send
+its report: a task's agent asking for one is a fleet change agents may not
+make (`agent_refused`).
+
+To undo a push or a join, run `pastor leave` on the machine itself first
+(its own teardown: it stops and removes the pastor and herdr services of
+this login and, in root mode, of `pastor-agent`, and deletes the machine
+and agent keys), then `pastor machine remove <name>` on the head, which
+revokes the `authorized_keys` lines bootstrap added, forgets the pinned
+host key and drops the machine's bootstrap record. Removing on the head
+first still works, but a machine left un-`leave`d keeps a key that logs in
+with nothing on the other end to answer it.
+
 `pastor machine add <name> <login> --bootstrap` sets a bare machine up from
 the head, over ssh as `<login>`, and needs a running head with
 `head_address` in `pastor.toml` (how the machine reaches the head). The
@@ -1120,6 +1167,16 @@ pastor machine add gpu-3 me@gpu-3 --bootstrap --sudo --tag gpu
 pastor machine add pi-7 pi@pi-7 --bootstrap --sudo --service-user pastor
 pastor machine add lab-1 me@lab-1 --bootstrap        # no root: user mode
 pastor machine bootstrap gpu-3 --ssh me@gpu-3 --sudo # rerun or upgrade
+```
+
+A machine whose host key changed for a legitimate reason (reinstalled, its
+disk replaced) fails every push with a key mismatch instead of trusting the
+new one blindly. Forget the old key, then bootstrap again to pin the new
+one:
+
+```bash
+ssh-keygen -f ~/.local/state/pastor/known_hosts -R gpu-3
+pastor machine bootstrap gpu-3 --ssh me@gpu-3 --sudo
 ```
 
 `pastor machine remove <name>` on a head also revokes what let the
@@ -2531,6 +2588,12 @@ A record, which is also what connector event hooks get on stdin:
   token `id`, `flock`, `tags` and `replaced`), `machine.join_token_expired`
   (a token's time ran out unused and its key left authorized_keys; the
   detail has its `id`),
+  `machine.bootstrapped` (a bootstrap report, from a push or a pull
+  machine's own, left the machine ready; the detail has `mode` (`root` or
+  `user`), `isolation` (`users` or `none`) and `missing`, what it found but
+  could not install), `machine.bootstrap_failed` (a bootstrap report, or a
+  push that never reached the machine, recorded a failure; the detail has
+  `step`, the step that failed, and `why`),
   `agent.exhausted` and `agent.reset` (see Usage limits), and
   `orchestrator.started|skipped|held|quota|failed|restarted|stopping|stopped`
   (see Orchestrators).
@@ -3644,7 +3707,23 @@ writes each reply line to stdout until stdin closes. It never starts a head
 or reads `flock.toml`; with no head running it writes one `no_head` error
 line and exits non-zero. It checks nothing itself: the head refuses what it
 would refuse from a local CLI, so ssh access to the head's user is access to
-the fleet.
+the fleet. That plain, unrestricted form is what a person's own `pastor
+head set` uses; three narrower forms, each an `authorized_keys` forced
+command of its own, let a machine reach the head with a key that can do no
+more than its part needs:
+
+- `--agent --machine NAME`: an agent's own key. Ping, list and read or end
+  only `NAME`'s tasks; anything else is `not_allowed_for_agent`. See [Agents
+  on other machines](#agents-on-other-machines).
+- `--shepherd --machine NAME` (with `--fetch NAME VERSION TARGET` folded in,
+  for the one that streams a binary): a pull machine's own key. The agent's
+  reach, plus claiming and reporting its own tasks, its saved trust, job
+  submits (pinned to its own machine) and fetching pastor or herdr from the
+  head's cache; anything else, or a job submit or claim naming another
+  machine, is `not_allowed_for_shepherd`. See [Pull machines](#pull-machines).
+- `--join ID`: a join token's key, for one `pastor join` request only, then
+  the connection ends; a line that is not one is `join_token_invalid`. See
+  [Join tokens](#join-tokens).
 
 ## A head on another machine
 
@@ -3888,11 +3967,21 @@ pastor and runs it with the rest of its arguments, unchanged:
 
 ```sh
 pastor join --token-stdin --name gpu-3 --sudo < token
-curl -fsSL https://cacari.co/pastor/install.sh | sudo PASTOR_JOIN_TOKEN=pjt_... sh -s -- join --name gpu-3 --sudo
+curl -fsSL https://cacari.co/pastor/install.sh | sudo sh -s -- join --name gpu-3 --sudo
 ```
 
-`curl | sh` gives the script on stdin, so it leaves `--token-stdin` nothing
-to read: there the variable carries the token. Run as root, `install.sh`
+The second form prompts for the token on `/dev/tty` with echo off: `curl |
+sh` gives the script itself on stdin, leaving `--token-stdin` nothing to
+read there. For a script with no one to answer a prompt, fetch the
+installer first so its stdin is free for the token:
+
+```sh
+sudo sh -c "$(curl -fsSL https://cacari.co/pastor/install.sh)" sh join --name gpu-3 --sudo --token-stdin < tokenfile
+```
+
+Never put the token on the command line, or in `PASTOR_JOIN_TOKEN=pjt_...`
+before `sh`: both become part of `sudo`'s own argv, which `ps` shows to
+anyone else on the machine while it runs. Run as root, `install.sh`
 first installs what is missing of openssh-client, curl, tar and
 ca-certificates with apt, dnf or pacman.
 

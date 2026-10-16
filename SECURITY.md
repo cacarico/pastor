@@ -21,6 +21,43 @@ fed by issues or chat messages from outside your team; run herdr for that
 work as a separate user and add it as an ssh machine instead. Connectors also
 run as that user, so installing one grants it control of the fleet.
 
+## Bootstrapping and joining a machine
+
+The head's own user is the trust root for every machine it bootstraps or
+takes a join from, not just the ones it already had: its `head_key` reaches
+every pushed machine's agent user, and the ed25519 key a join token hands
+out reaches the head itself, scoped to one `pastor join` request. Treat the
+head's account with the same care on day one as on the hundredth machine.
+
+**User mode has no isolation.** Without root (no `--sudo`, not already
+root), bootstrap makes no separate user: herdr, the shepherd and every agent
+pane run as the login user, so an agent can read that user's ssh keys,
+including the machine key that logs the machine into the head. Root mode's
+`pastor-agent`, with its own `0700` state directory, is what keeps a
+prompt-injected agent from reading the service user's machine key; pick it
+for any machine that runs work you do not fully trust.
+
+**A leaked join token** reaches only `bridge --join <id>`, a forced command
+answering exactly one `pastor join` request before the connection ends.
+Before it is redeemed or its `--ttl` runs out, that one request can add one
+machine, under a name not already in `flock.toml` (or the one name the
+token's own `--replace` targets). Once it is used, revoked or past its
+`--ttl`, the same token's ssh gets `Permission denied`: its line is gone
+from `authorized_keys`, and no later request, successful or not, adds a
+second machine or extends its life.
+
+**A hijacked pull machine's shepherd** reaches the head through its own
+`bridge --shepherd --machine NAME` key, which answers for `NAME` and nothing
+else: `TaskClaim`, `TaskReport`, `PullTrust` and `BootstrapReport` all get
+their `machine` field forced to `NAME` whatever the request said, so it can
+claim, report or mark bootstrapped only itself, never another machine. A
+job it submits is pinned to `NAME` the same way, and one that sets
+`agent_args`, `allow`, `deny`, `agent_source` or `tags`, or names a flock
+`NAME` is not in, is refused outright (`not_allowed_for_shepherd`): a
+compromised pull machine cannot pick what an agent runs with or widen its
+own reach. It can read its own machine's events and fetch pastor or herdr
+from the head's artifact cache, and nothing past that.
+
 ## What connectors inherit
 
 A connector command (a connector's run or one of its hooks) runs on the head,
