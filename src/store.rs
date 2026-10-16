@@ -72,6 +72,7 @@ const V19_TABLES: &str = "CREATE TABLE IF NOT EXISTS machine_state (
         host_key TEXT,
         herdr_version TEXT,
         pastor_version TEXT,
+        service_user TEXT,
         updated_at TEXT NOT NULL
      );
      CREATE TABLE IF NOT EXISTS join_tokens (
@@ -198,6 +199,10 @@ pub struct MachineState {
     pub host_key: Option<String>,
     pub herdr_version: Option<String>,
     pub pastor_version: Option<String>,
+    /// The user that runs the shepherd and holds the machine key, when the
+    /// report said.
+    #[serde(default)]
+    pub service_user: Option<String>,
     pub updated_at: String,
 }
 
@@ -1898,7 +1903,7 @@ impl Store {
             let row = conn
                 .query_row(
                     "SELECT machine, bootstrap, mode, isolation, failed_step, why, host_key,
-                            herdr_version, pastor_version, updated_at
+                            herdr_version, pastor_version, updated_at, service_user
                      FROM machine_state WHERE machine = ?1",
                     params![machine],
                     |r| {
@@ -1915,6 +1920,7 @@ impl Store {
                                 herdr_version: r.get(7)?,
                                 pastor_version: r.get(8)?,
                                 updated_at: r.get(9)?,
+                                service_user: r.get(10)?,
                             },
                         ))
                     },
@@ -1935,8 +1941,8 @@ impl Store {
             self.conn.lock().recover().execute(
                 "INSERT OR REPLACE INTO machine_state
                     (machine, bootstrap, mode, isolation, failed_step, why, host_key,
-                     herdr_version, pastor_version, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                     herdr_version, pastor_version, updated_at, service_user)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     s.machine,
                     s.bootstrap.as_str(),
@@ -1947,7 +1953,8 @@ impl Store {
                     s.host_key,
                     s.herdr_version,
                     s.pastor_version,
-                    s.updated_at
+                    s.updated_at,
+                    s.service_user
                 ],
             )?;
             Ok(())
@@ -2611,6 +2618,7 @@ mod tests {
             host_key: Some("ssh-ed25519 AAAA".into()),
             herdr_version: Some("0.9.5".into()),
             pastor_version: None,
+            service_user: Some("pastor".into()),
             updated_at: "2026-10-16T10:00:00+00:00".into(),
         }
     }

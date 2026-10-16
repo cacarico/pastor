@@ -691,6 +691,7 @@ fn machine_describe_json_is_the_row_its_tasks_and_errors() {
             host_key: None,
             herdr_version: None,
             pastor_version: None,
+            service_user: Some("pastor".into()),
             updated_at: "2024-01-01T00:00:00Z".into(),
         }),
     };

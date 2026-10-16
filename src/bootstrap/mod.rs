@@ -74,6 +74,7 @@ pub fn run(r: &dyn Runner, o: &Options) -> Outcome {
         }
     }
     ctx.unstage(r);
+    let service_user = Some(ctx.service_name()).filter(|u| !u.is_empty());
     let found = ctx.found.into_inner();
     Outcome {
         ok: results.iter().all(|s| s.status != StepStatus::Failed),
@@ -88,6 +89,7 @@ pub fn run(r: &dyn Runner, o: &Options) -> Outcome {
         host_key: found.host_key,
         herdr_version: found.herdr_version,
         pastor_version: found.pastor_version,
+        service_user,
     }
 }
 
