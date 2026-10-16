@@ -1612,10 +1612,13 @@ impl Agents {
     /// How to start `spec`'s agent: its kind, `launch_args` and the env of
     /// its definition. Refused as `launch_args` is.
     /// An opencode agent under a profile gets its lists in the env instead
-    /// (`opencode::permission_json`), over its definition's, with the
+    /// (`opencode_permission_json`), over its definition's, with the
     /// variables that would load another config emptied and the repo's
     /// config turned off; dispatch gives it the repo's instruction file back
-    /// once it knows the checkout (`opencode::instructions_content`).
+    /// once it knows the checkout (`opencode::instructions_content`), and
+    /// recomputes `OPENCODE_PERMISSION` once it knows the machine's own
+    /// must-deny keys (`opencode::MachineDenyKeys`), which `launch` cannot:
+    /// it has no connector to ask.
     pub fn launch(&self, spec: &crate::task::DispatchSpec) -> Result<Launch, AgentRefusal> {
         let mut env = self
             .0
@@ -1633,11 +1636,7 @@ impl Agents {
             env.insert(opencode::DISABLE_PROJECT_CONFIG_ENV.into(), "1".into());
             env.insert(
                 opencode::PERMISSION_ENV.into(),
-                opencode::permission_json(
-                    &spec.allow,
-                    &spec.deny,
-                    spec.profile() == Some(profile::UNRESTRICTED),
-                ),
+                self.opencode_permission_json(spec, &[]),
             );
         }
         Ok(Launch {
@@ -1645,6 +1644,24 @@ impl Agents {
             args: self.launch_args(spec)?,
             env,
         })
+    }
+
+    /// `OPENCODE_PERMISSION` for `spec`'s settled lists, denying
+    /// `never_allow` under every profile including `unrestricted`
+    /// (`opencode::permission_json`). `launch` calls this with nothing to
+    /// deny yet; dispatch calls it again, once it knows the machine's own
+    /// must-deny keys, to overwrite what `launch` set.
+    pub fn opencode_permission_json(
+        &self,
+        spec: &crate::task::DispatchSpec,
+        never_allow: &[String],
+    ) -> String {
+        opencode::permission_json(
+            &spec.allow,
+            &spec.deny,
+            spec.profile() == Some(profile::UNRESTRICTED),
+            never_allow,
+        )
     }
 
     /// Why `spec`'s allow and deny lists do not reach its agent, when they
@@ -4108,7 +4125,7 @@ mod tests {
         assert_eq!(launch.args, vec!["--model", "m"]);
         assert_eq!(
             launch.env["OPENCODE_PERMISSION"],
-            opencode::permission_json(&spec.allow, &spec.deny, false)
+            opencode::permission_json(&spec.allow, &spec.deny, false, &[])
         );
         for key in opencode::CONFIG_ENV {
             assert_eq!(launch.env[key], "", "{key}");

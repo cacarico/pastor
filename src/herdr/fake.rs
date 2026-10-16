@@ -116,6 +116,8 @@ struct State {
     agy_saves: std::collections::VecDeque<Option<String>>,
     /// Every content `Connector::write_agy_settings` put in place.
     agy_writes: Vec<String>,
+    /// What `Connector::opencode_config_permission_keys` reports.
+    opencode_deny_keys: crate::config::opencode::MachineDenyKeys,
     /// Branches `Connector::restore_worktree` finds gone.
     gone_branches: HashSet<String>,
     /// Every `Connector::restore_worktree` call, as (repo, path, branch).
@@ -320,6 +322,12 @@ impl FakeHerdr {
     /// Every content pastor wrote into agy's settings, in order.
     pub fn agy_writes(&self) -> Vec<String> {
         self.state.lock().unwrap().agy_writes.clone()
+    }
+    /// What the machine's own global opencode config and `~/.opencode` set,
+    /// for a profiled opencode task to always deny
+    /// (`Connector::opencode_config_permission_keys`).
+    pub fn set_opencode_deny_keys(&self, keys: crate::config::opencode::MachineDenyKeys) {
+        self.state.lock().unwrap().opencode_deny_keys = keys;
     }
     /// Claude session `session` under `config_dir` (`None` for `~/.claude`)
     /// used `usage`.
@@ -1531,6 +1539,10 @@ impl super::transport::Connector for FakeHerdr {
             }
         };
         Box::pin(async move { Ok(answer) })
+    }
+    fn opencode_config_permission_keys(&self) -> super::transport::MachineDenyKeysFuture<'_> {
+        let keys = self.state.lock().unwrap().opencode_deny_keys.clone();
+        Box::pin(async move { Ok(keys) })
     }
     fn pastor_version(&self) -> super::transport::VersionFuture<'_> {
         let state = self.state.lock().unwrap();

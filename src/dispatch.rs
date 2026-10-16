@@ -490,23 +490,55 @@ async fn dispatch_steps(
     let mut launch = agents
         .launch(&spec)
         .map_err(|e| DispatchError::Task(e.message))?;
-    // opencode merges `OPENCODE_PERMISSION` over its own config's rules, so a
-    // machine with rules of its own would run the task under both. A machine
-    // that cannot tell (a `command` one) goes ahead.
-    if agents.opencode_profile(&spec)
-        && conn
+    // opencode merges `OPENCODE_PERMISSION` over its own config's rules. Its
+    // managed config, and on macOS its managed preferences, are merged after
+    // `OPENCODE_CONFIG_CONTENT`, so pastor cannot neutralise rules set there,
+    // and the task refuses rather than run under both. A machine that cannot
+    // tell (a `command` one) goes ahead.
+    if agents.opencode_profile(&spec) {
+        if conn
             .opencode_permission_rules()
             .await
             .map_err(CallError::from)?
             == Some(true)
-    {
-        return Err(DispatchError::Task(format!(
-            "{}: the opencode config on {} has permission rules of its own, which opencode would \
-             merge with profile {}'s; move them out of its opencode config, or run without a profile",
-            crate::config::opencode::OPENCODE_PERMISSIONS_CONFLICT,
-            task.machine.as_deref().unwrap_or("this machine"),
-            spec.profile().unwrap_or_default(),
-        )));
+        {
+            return Err(DispatchError::Task(format!(
+                "{}: the opencode config on {} has permission rules of its own, which opencode would \
+                 merge with profile {}'s; move them out of its opencode config, or run without a profile",
+                crate::config::opencode::OPENCODE_PERMISSIONS_CONFLICT,
+                task.machine.as_deref().unwrap_or("this machine"),
+                spec.profile().unwrap_or_default(),
+            )));
+        }
+        // The machine's own global config and `~/.opencode` are merged
+        // before `OPENCODE_CONFIG_CONTENT`, so pastor neutralises them
+        // instead: every top-level permission key found there is denied in
+        // `OPENCODE_PERMISSION`, under every profile. What that cannot
+        // reach (rules under an agent or a mode, a file pastor could not
+        // parse, more config than it reads) leaves it unable to say what
+        // would get through, so the task refuses the same way.
+        match conn
+            .opencode_config_permission_keys()
+            .await
+            .map_err(CallError::from)?
+        {
+            crate::config::opencode::MachineDenyKeys::Conflict(why) => {
+                return Err(DispatchError::Task(format!(
+                    "{}: the opencode config on {} {why}; move the rules out of its opencode \
+                     config, or run without a profile",
+                    crate::config::opencode::OPENCODE_PERMISSIONS_CONFLICT,
+                    task.machine.as_deref().unwrap_or("this machine"),
+                )));
+            }
+            crate::config::opencode::MachineDenyKeys::Keys(keys) if !keys.is_empty() => {
+                launch.env.insert(
+                    crate::config::opencode::PERMISSION_ENV.into(),
+                    agents.opencode_permission_json(&spec, &keys),
+                );
+            }
+            crate::config::opencode::MachineDenyKeys::Keys(_)
+            | crate::config::opencode::MachineDenyKeys::None => {}
+        }
     }
     // agy's rules are in its settings on the machine, and under the flags
     // pastor adds everything they do not deny runs: so what the task denies
@@ -2641,12 +2673,14 @@ mod tests {
     }
 
     /// A profiled opencode task starts with its rules in the pane's env.
-    /// On a machine whose own opencode config has permission rules it fails
-    /// before anything is made there: opencode would merge them with the
-    /// profile's. A machine that cannot tell goes ahead, and a task with no
-    /// profile never asks.
+    /// On a machine whose managed opencode config (or managed preferences)
+    /// has permission rules it fails before anything is made there: those
+    /// are merged after `OPENCODE_CONFIG_CONTENT`, so pastor cannot
+    /// neutralise them, and opencode would merge them with the profile's.
+    /// A machine that cannot tell goes ahead, and a task with no profile
+    /// never asks.
     #[tokio::test]
-    async fn a_profiled_opencode_task_refuses_a_machine_with_its_own_rules() {
+    async fn a_profiled_opencode_task_refuses_a_machine_with_managed_rules() {
         let fake = FakeHerdr::new();
         let mut t = task(opencode_under(Some("review")));
         dispatch(&fake, &mut t, &Agents::default(), None, READY)
@@ -2655,7 +2689,7 @@ mod tests {
         let env = fake.pane_env(t.pane_id.as_deref().unwrap());
         assert_eq!(
             env["OPENCODE_PERMISSION"],
-            crate::config::opencode::permission_json(&t.spec.allow, &t.spec.deny, false)
+            crate::config::opencode::permission_json(&t.spec.allow, &t.spec.deny, false, &[])
         );
         assert_eq!(env["OPENCODE_CONFIG"], "");
         let start = fake.requests();
@@ -2694,6 +2728,62 @@ mod tests {
         dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
+    }
+
+    /// A machine whose own global opencode config or `~/.opencode` has
+    /// permission rules of its own no longer fails the task: every key
+    /// pastor found there is denied in `OPENCODE_PERMISSION` instead, even
+    /// under `unrestricted`, and the task runs. The env then has no open
+    /// fallback of its own, which opencode would put after the machine's
+    /// keys (`config::opencode::permission_json`): what opencode's defaults
+    /// ask about is allowed by name instead.
+    #[tokio::test]
+    async fn a_profiled_opencode_task_denies_the_machines_own_keys_instead_of_failing() {
+        let fake = FakeHerdr::new();
+        fake.set_opencode_deny_keys(crate::config::opencode::MachineDenyKeys::Keys(vec![
+            "bash".into(),
+            "webfetch".into(),
+        ]));
+        let mut t = task(opencode_under(Some("unrestricted")));
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let env = fake.pane_env(t.pane_id.as_deref().unwrap());
+        let permission: serde_json::Value =
+            serde_json::from_str(env["OPENCODE_PERMISSION"].as_str().unwrap()).unwrap();
+        assert!(permission.get("*").is_none(), "{permission}");
+        assert_eq!(permission["bash"], "deny", "{permission}");
+        assert_eq!(permission["webfetch"], "deny", "{permission}");
+        assert_eq!(permission["read"], "allow", "{permission}");
+        assert_eq!(permission["external_directory"], "allow", "{permission}");
+    }
+
+    /// What `OPENCODE_PERMISSION` cannot neutralise on the machine's own
+    /// global config or `~/.opencode` (a file pastor could not parse, rules
+    /// under an agent, too much config) fails the task the same way a
+    /// managed config's rules do, saying what was found.
+    #[tokio::test]
+    async fn a_profiled_opencode_task_refuses_a_machine_whose_own_config_it_cannot_neutralise() {
+        let fake = FakeHerdr::new();
+        fake.set_opencode_deny_keys(crate::config::opencode::MachineDenyKeys::Conflict(
+            "has permission rules under agent.build (bash)".into(),
+        ));
+        let mut t = task(opencode_under(Some("review")));
+        let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("opencode_permissions_conflict"),
+            "{err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("on pi-1 has permission rules under agent.build (bash); move"),
+            "{err}"
+        );
+        assert!(!err.is_transport());
+        assert_eq!(t.state, TaskState::Failed);
+        assert!(fake.requests().is_empty(), "{:?}", fake.requests());
     }
 
     /// A profiled opencode task runs with the repo's own opencode config

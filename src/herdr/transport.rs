@@ -376,6 +376,13 @@ pub type UsageFuture<'a> = Pin<
 
 pub type RoomFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Option<crate::machine::Room>, ConnectError>> + Send + 'a>>;
+pub type MachineDenyKeysFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<crate::config::opencode::MachineDenyKeys, ConnectError>>
+            + Send
+            + 'a,
+    >,
+>;
 
 /// Anything that can open a fresh herdr connection. Endpoints for real use, FakeHerdr in tests.
 ///
@@ -429,9 +436,10 @@ pub trait Connector: Send + Sync {
     fn restore_worktree(&self, _repo: &str, _path: &str, _branch: &str) -> DirFuture<'_> {
         Box::pin(async { Ok(None) })
     }
-    /// Whether the machine's own opencode config sets permission rules,
-    /// which opencode would merge with a profile's (`config::opencode`).
-    /// `None` when it cannot be known.
+    /// Whether the machine's managed opencode config, or on macOS its
+    /// managed preferences, sets permission rules: those are merged after
+    /// `OPENCODE_CONFIG_CONTENT`, so pastor cannot neutralise them
+    /// (`config::opencode`). `None` when it cannot be known.
     fn opencode_permission_rules(&self) -> DirFuture<'_> {
         Box::pin(async { Ok(None) })
     }
@@ -453,6 +461,13 @@ pub trait Connector: Send + Sync {
     /// takes no shell command.
     fn agy_rules(&self) -> VersionFuture<'_> {
         Box::pin(async { Ok(None) })
+    }
+    /// The machine's own global opencode config and `~/.opencode`'s
+    /// permission keys, which a profiled opencode task must always deny
+    /// (`config::opencode::MachineDenyKeys`). `None` when it cannot be
+    /// known (a `command` machine).
+    fn opencode_config_permission_keys(&self) -> MachineDenyKeysFuture<'_> {
+        Box::pin(async { Ok(crate::config::opencode::MachineDenyKeys::None) })
     }
     /// The version of pastor installed on the machine, for `machine list`: a
     /// fleet runs whatever each machine last installed, and a skill or CLI
@@ -521,6 +536,9 @@ impl Connector for Endpoint {
     }
     fn agy_rules(&self) -> VersionFuture<'_> {
         Box::pin(agy_rules(self))
+    }
+    fn opencode_config_permission_keys(&self) -> MachineDenyKeysFuture<'_> {
+        Box::pin(opencode_config_permission_keys(self))
     }
     fn pastor_version(&self) -> VersionFuture<'_> {
         Box::pin(pastor_version(self))
@@ -719,6 +737,20 @@ async fn agy_rules(ep: &Endpoint) -> Result<Option<String>, ConnectError> {
             Ok(Some(String::from_utf8_lossy(&p.out.stdout).into_owned()))
         }
         None => Ok(None),
+    }
+}
+
+async fn opencode_config_permission_keys(
+    ep: &Endpoint,
+) -> Result<crate::config::opencode::MachineDenyKeys, ConnectError> {
+    let command = crate::config::opencode::CONFIG_READ_COMMAND.to_string();
+    match probe(ep, command).await? {
+        Some(p) => {
+            reached(&p.target, &p.out)?;
+            let raw = String::from_utf8_lossy(&p.out.stdout);
+            Ok(crate::config::opencode::parse_permission_keys(&raw))
+        }
+        None => Ok(crate::config::opencode::MachineDenyKeys::None),
     }
 }
 
@@ -1746,6 +1778,62 @@ mod tests {
             argv: vec!["true".into()],
         };
         assert_eq!(command.agy_rules().await.unwrap(), None);
+    }
+
+    /// Same wiring, for the global config and `~/.opencode`: the command
+    /// itself is `config::opencode`'s own to test. A child of this binary
+    /// again, so the real `$HOME` running the suite cannot leak a key in.
+    #[tokio::test]
+    async fn opencode_config_permission_keys_per_endpoint() {
+        const CHILD: &str = "PASTOR_TEST_OPENCODE_KEYS_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let local = Endpoint::Local {
+                session: "s".into(),
+            };
+            assert_eq!(
+                local.opencode_config_permission_keys().await.unwrap(),
+                crate::config::opencode::MachineDenyKeys::None
+            );
+            let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+            let dir = home.join(".config/opencode");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("opencode.json"),
+                r#"{"permission": {"bash": "allow"}}"#,
+            )
+            .unwrap();
+            assert_eq!(
+                local.opencode_config_permission_keys().await.unwrap(),
+                crate::config::opencode::MachineDenyKeys::Keys(vec!["bash".into()])
+            );
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "herdr::transport::tests::opencode_config_permission_keys_per_endpoint",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env("HOME", home.path())
+            .env_remove("XDG_CONFIG_HOME")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(stdout.contains("1 passed"), "{stdout}");
+        let command = Endpoint::Command {
+            argv: vec!["true".into()],
+        };
+        assert_eq!(
+            command.opencode_config_permission_keys().await.unwrap(),
+            crate::config::opencode::MachineDenyKeys::None
+        );
     }
 
     /// Only ssh failing to reach the machine is an error. rc-file noise comes
