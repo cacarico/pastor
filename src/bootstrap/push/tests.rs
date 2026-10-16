@@ -1,4 +1,5 @@
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use sha2::{Digest, Sha256};
 
@@ -19,8 +20,13 @@ type Call = (String, bool);
 struct FakePush {
     calls: Mutex<Vec<Call>>,
     outcome: Mutex<Outcome>,
-    host_key: String,
+    /// What `ssh-keyscan` finds; empty, it finds no ed25519 key.
+    host_key: Mutex<String>,
     fingerprint: String,
+    /// ssh cannot reach the machine (exit 255).
+    unreachable: AtomicBool,
+    /// The copy arrives with another sum.
+    corrupt: AtomicBool,
     /// Run when the bootstrap call comes, to look at the head mid-push.
     on_bootstrap: Mutex<Option<Box<dyn FnMut() + Send>>>,
 }
@@ -30,8 +36,10 @@ impl FakePush {
         Arc::new(FakePush {
             calls: Mutex::default(),
             outcome: Mutex::new(outcome),
-            host_key: "ssh-ed25519 AAAAHOSTKEY".into(),
+            host_key: Mutex::new("ssh-ed25519 AAAAHOSTKEY".into()),
             fingerprint: "SHA256:goodfp".into(),
+            unreachable: AtomicBool::new(false),
+            corrupt: AtomicBool::new(false),
             on_bootstrap: Mutex::default(),
         })
     }
@@ -88,11 +96,26 @@ impl PushRunner for FakePush {
                 true,
                 format!("256 {} gpu-3.lan (ED25519)\n", self.fingerprint),
             ),
-            "ssh-keyscan" => answer(true, format!("gpu-3.lan {}\n", self.host_key)),
+            "ssh-keyscan" => {
+                let key = self.host_key.lock().unwrap().clone();
+                if key.is_empty() {
+                    answer(true, "")
+                } else {
+                    answer(true, format!("gpu-3.lan {key}\n"))
+                }
+            }
             "ssh" if args.first().map(String::as_str) == Some("-G") => {
                 answer(true, "user me\nhostname gpu-3.lan\nport 22\n")
             }
             "ssh" if args.iter().any(|a| a == "-O") => answer(true, ""),
+            "ssh" if self.unreachable.load(Ordering::SeqCst) => CmdOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: "ssh: connect to host gpu-3.lan port 22: Connection refused\n".into(),
+            },
+            "ssh" if remote.contains("cat >") && self.corrupt.load(Ordering::SeqCst) => {
+                answer(false, "0badc0de\n")
+            }
             "ssh" if remote.contains("uname -sm") => answer(true, "Linux x86_64\n64\n"),
             "ssh" if remote.contains("cat >") => {
                 let bytes = std::fs::read(stdin.expect("the copy reads a file")).unwrap();
@@ -539,4 +562,263 @@ fn copy_checks_the_sum_before_it_moves() {
     let check = cmd.find("|| exit 3").unwrap();
     let mv = cmd.find("mv -f").unwrap();
     assert!(check < mv, "{cmd}");
+}
+
+/// The ssh calls to the machine itself, not `-G` or the master's `-O exit`.
+fn machine_calls(runner: &FakePush) -> Vec<String> {
+    runner
+        .calls()
+        .into_iter()
+        .filter(|c| c.starts_with("ssh -") && !c.contains("ssh -G") && !c.contains("-O exit"))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn push_ssh_checks_the_pinned_ed25519_key_strictly_and_times_out() {
+    let h = head().await;
+    let runner = FakePush::new(ok_outcome(Mode::User));
+    assert!(h.push(h.opts(&runner, false)).await.unwrap().ok);
+    let calls = machine_calls(&runner);
+    assert!(!calls.is_empty());
+    for c in calls {
+        // After the pin nothing new is accepted, and only the ed25519 key
+        // that was pinned is asked for: a man in the middle offering an
+        // RSA or ECDSA key is not "a new host".
+        assert!(c.contains("-o StrictHostKeyChecking=yes"), "{c}");
+        assert!(!c.contains("accept-new"), "{c}");
+        assert!(c.contains("-o HostKeyAlgorithms=ssh-ed25519"), "{c}");
+        for o in [
+            "ConnectTimeout=20",
+            "ServerAliveInterval=15",
+            "ServerAliveCountMax=4",
+        ] {
+            assert!(c.contains(&format!("-o {o}")), "{o} in {c}");
+        }
+        assert!(!c.contains("ServerAliveCountMax=3"), "{c}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_ed25519_host_key_stops_with_a_clear_message() {
+    let h = head().await;
+    let runner = FakePush::new(ok_outcome(Mode::User));
+    runner.host_key.lock().unwrap().clear();
+    let out = h.push(h.opts(&runner, false)).await.unwrap();
+    assert!(!out.ok);
+    let step = out.steps.last().unwrap();
+    assert_eq!(step.step, "host_key");
+    let why = step.why.as_deref().unwrap();
+    assert!(why.contains("no ed25519 host key"), "{why}");
+    assert!(machine_calls(&runner).is_empty(), "{:?}", runner.calls());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unreachable_machine_is_a_connect_failure_not_a_platform() {
+    let h = head().await;
+    let runner = FakePush::new(ok_outcome(Mode::User));
+    runner.unreachable.store(true, Ordering::SeqCst);
+    let out = h.push(h.opts(&runner, false)).await.unwrap();
+    assert!(!out.ok);
+    let step = out.steps.last().unwrap();
+    assert_eq!(step.step, "connect", "{out:?}");
+    assert!(step.why.as_deref().unwrap().contains("Connection refused"));
+    let err = crate::bootstrap::error(&out).expect("an error");
+    assert_eq!(code(&err), "runtime_error", "{err:#}");
+    assert_eq!(h.state().failed_step.as_deref(), Some("connect"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn corrupted_copy_runs_nothing() {
+    let h = head().await;
+    let runner = FakePush::new(ok_outcome(Mode::User));
+    runner.corrupt.store(true, Ordering::SeqCst);
+    let out = h.push(h.opts(&runner, false)).await.unwrap();
+    assert!(!out.ok);
+    let err = crate::bootstrap::error(&out).expect("an error");
+    assert_eq!(code(&err), "artifact_checksum_mismatch", "{err:#}");
+    // One copy tried, the second never sent, bootstrap never run.
+    let copies = runner
+        .calls()
+        .iter()
+        .filter(|c| c.contains("cat >"))
+        .count();
+    assert_eq!(copies, 1, "{:?}", runner.calls());
+    assert!(runner.bootstrap_calls().is_empty());
+    assert_eq!(h.state().bootstrap, BootstrapState::Failed);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_fingerprints_do_not_share_a_temp_file() {
+    let h = head().await;
+    let fake = FakePush::new(ok_outcome(Mode::User));
+    let runner: Arc<dyn PushRunner> = fake.clone();
+    let (a, b) = tokio::join!(
+        fingerprint(&h.paths, &runner, "a.lan", "ssh-ed25519 AAAA"),
+        fingerprint(&h.paths, &runner, "b.lan", "ssh-ed25519 BBBB"),
+    );
+    assert!(a.is_ok() && b.is_ok());
+    // The files `ssh-keygen -l -f` was pointed at.
+    let files: Vec<String> = fake
+        .calls()
+        .into_iter()
+        .filter(|c| c.starts_with("ssh-keygen -l"))
+        .map(|c| c.rsplit(' ').next().unwrap().to_string())
+        .collect();
+    assert_eq!(files.len(), 2, "{files:?}");
+    assert_ne!(files[0], files[1], "one temp file each");
+    for f in files {
+        assert!(!Path::new(&f).exists(), "{f} removed");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_key_the_machine_reports_otherwise_fails_the_push() {
+    let h = head().await;
+    let mut o = ok_outcome(Mode::User);
+    o.host_key = Some("ssh-ed25519 AAAAOTHER".into());
+    let runner = FakePush::new(o);
+    let out = h.push(h.opts(&runner, false)).await.unwrap();
+    assert!(!out.ok, "{out:?}");
+    assert_eq!(out.steps.last().unwrap().step, "host_key");
+    let state = h.state();
+    assert_eq!(state.bootstrap, BootstrapState::Failed);
+    assert_ne!(state.host_key.as_deref(), Some("ssh-ed25519 AAAAOTHER"));
+    let keys =
+        std::fs::read_to_string(h.paths.state_dir.join("authorized_keys")).unwrap_or_default();
+    assert!(!keys.contains("pastor:agent:gpu-3"), "{keys}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_pinned_key_is_what_is_stored() {
+    let h = head().await;
+    let mut o = ok_outcome(Mode::User);
+    o.host_key = Some("ssh-ed25519 AAAAHOSTKEY root@gpu-3".into());
+    let runner = FakePush::new(o);
+    assert!(h.push(h.opts(&runner, false)).await.unwrap().ok);
+    assert_eq!(
+        h.state().host_key.as_deref(),
+        Some("ssh-ed25519 AAAAHOSTKEY")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ok_with_a_failed_step_is_not_success() {
+    let h = head().await;
+    let mut o = ok_outcome(Mode::User);
+    let mut failed = StepResult::failed("no", "fix it");
+    failed.step = "services".into();
+    o.steps.push(failed);
+    let runner = FakePush::new(o);
+    let out = h.push(h.opts(&runner, false)).await.unwrap();
+    assert!(!out.ok, "{out:?}");
+    assert_eq!(h.state().bootstrap, BootstrapState::Failed);
+    let keys =
+        std::fs::read_to_string(h.paths.state_dir.join("authorized_keys")).unwrap_or_default();
+    assert!(!keys.contains("pastor:agent:gpu-3"), "{keys}");
+}
+
+#[test]
+fn not_ok_with_no_failed_step_is_an_error() {
+    let o = Outcome {
+        ok: false,
+        ..ok_outcome(Mode::User)
+    };
+    let err = crate::bootstrap::error(&o).expect("not ok is an error");
+    assert_eq!(code(&err), "runtime_error");
+}
+
+/// Take `gpu-3` out of the flock mid-push, as a `machine remove` would.
+fn remove_on_bootstrap(h: &Head, runner: &FakePush) {
+    let (fleet, file) = (h.d.fleet(), h.paths.flock_file());
+    let rt = tokio::runtime::Handle::current();
+    *runner.on_bootstrap.lock().unwrap() = Some(Box::new(move || {
+        rt.block_on(
+            fleet.edit_flock_file(&file, |f| crate::fleet_edit::remove_machine(f, "gpu-3")),
+        )
+        .unwrap();
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn root_mode_writes_the_agent_line_only_after_the_entry_moves() {
+    let h = head().await;
+    let runner = FakePush::new(ok_outcome(Mode::Root));
+    remove_on_bootstrap(&h, &runner);
+    let _ = h.push(h.opts(&runner, true)).await;
+    let keys =
+        std::fs::read_to_string(h.paths.state_dir.join("authorized_keys")).unwrap_or_default();
+    assert!(!keys.contains("pastor:agent:gpu-3"), "{keys}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_report_takes_the_agent_line_back() {
+    let h = head().await;
+    let runner = FakePush::new(ok_outcome(Mode::User));
+    remove_on_bootstrap(&h, &runner);
+    let res = h.push(h.opts(&runner, false)).await;
+    assert!(res.is_err(), "{res:?}");
+    let keys =
+        std::fs::read_to_string(h.paths.state_dir.join("authorized_keys")).unwrap_or_default();
+    assert!(!keys.contains("pastor:agent:gpu-3"), "{keys}");
+}
+
+/// `machine bootstrap` of a machine already Ok.
+fn rerun_opts(h: &Head, runner: &Arc<FakePush>) -> PushOpts {
+    PushOpts {
+        machine: None,
+        ..h.opts(runner, false)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ok_machine_rerun_stays_ok_until_its_own_steps_start() {
+    let h = head().await;
+    let runner = FakePush::new(ok_outcome(Mode::User));
+    assert!(h.push(h.opts(&runner, false)).await.unwrap().ok);
+    let seen = Arc::new(Mutex::new(None));
+    {
+        let (store, seen) = (h.d.store(), seen.clone());
+        *runner.on_bootstrap.lock().unwrap() = Some(Box::new(move || {
+            *seen.lock().unwrap() = store.machine_state("gpu-3").unwrap().map(|s| s.bootstrap);
+        }));
+    }
+    let out = h.push(rerun_opts(&h, &runner)).await.unwrap();
+    assert!(out.ok, "{out:?}");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        Some(BootstrapState::Pending),
+        "pending once the machine's own steps run"
+    );
+    assert_eq!(h.state().bootstrap, BootstrapState::Ok);
+    assert_eq!(runner.bootstrap_calls().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ok_machine_rerun_that_fails_before_its_steps_stays_ok() {
+    let h = head().await;
+    let runner = FakePush::new(ok_outcome(Mode::User));
+    assert!(h.push(h.opts(&runner, false)).await.unwrap().ok);
+    let mut events = h.d.subscribe();
+    runner.unreachable.store(true, Ordering::SeqCst);
+    let out = h.push(rerun_opts(&h, &runner)).await.unwrap();
+    assert!(!out.ok);
+    let state = h.state();
+    assert_eq!(state.bootstrap, BootstrapState::Ok, "{state:?}");
+    assert_eq!(state.host_key.as_deref(), Some("ssh-ed25519 AAAAHOSTKEY"));
+    let ev = events.try_recv().expect("an event");
+    assert_eq!(ev.kind, "machine.bootstrap_failed");
+    assert_eq!(ev.detail.unwrap()["step"], "connect");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ok_machine_rerun_that_fails_in_its_steps_is_failed() {
+    let h = head().await;
+    let runner = FakePush::new(ok_outcome(Mode::User));
+    assert!(h.push(h.opts(&runner, false)).await.unwrap().ok);
+    *runner.outcome.lock().unwrap() = failed_at_packages();
+    let out = h.push(rerun_opts(&h, &runner)).await.unwrap();
+    assert!(!out.ok);
+    let state = h.state();
+    assert_eq!(state.bootstrap, BootstrapState::Failed);
+    assert_eq!(state.failed_step.as_deref(), Some("packages"));
 }

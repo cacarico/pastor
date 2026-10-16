@@ -391,10 +391,10 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `leave_incomplete` | `pastor leave` ran every step it could and one or more failed; each is printed, and the message lists them |
 | `leave_on_head` | `pastor leave` on a machine where `pastor serve` runs as the head for this login |
 | `leave_unsupported_platform` | `pastor leave` on a platform with neither systemd nor launchd units to remove |
-| `machine_busy` | `machine add --bootstrap` or `machine bootstrap` of a machine a push bootstrap is already running for |
+| `machine_busy` | `machine add --bootstrap`, `machine bootstrap` or `machine remove` of a machine a push bootstrap is already running for |
 | `machine_exists` | `machine add` of a machine that exists; with `--bootstrap`, one that is not pending or failed with the same login |
 | `invalid_artifact` | a binary to fetch named with a part that is not a plain name |
-| `artifact_checksum_mismatch` | a downloaded pastor or herdr whose sha256 is not the published one; nothing is cached |
+| `artifact_checksum_mismatch` | a downloaded pastor or herdr whose sha256 is not the published one, and nothing is cached; or a push's copy that reached the machine with another sha256, and nothing runs there |
 | `machine_not_connected` | `task run --now` on a machine that is not connected |
 | `machine_shutting_down` | the machine's actor is stopping; try again |
 | `model_kind_mismatch` | the task's model is for another kind of agent |
@@ -1079,7 +1079,9 @@ the head, over ssh as `<login>`, and needs a running head with
 entry goes in flock.toml first, with its bootstrap pending in the head's
 store, so it takes no task until the end. The head then pins the machine's
 ed25519 host key in pastor's own `known_hosts` (trusted the first time, or
-checked against `--host-key SHA256:...`), reads its platform, copies the
+checked against `--host-key SHA256:...`; every ssh of the push after that
+asks for that ed25519 key only and accepts no other, and gives up on a
+machine that stops answering), reads its platform, copies the
 pastor and herdr builds for it from the head's cache over that ssh into
 `~/.cache/pastor-bootstrap/` (checking each sha256 there before it moves it
 into place), and runs `pastor bootstrap --json` there with `--sudo` and
@@ -1088,14 +1090,24 @@ into place), and runs `pastor bootstrap --json` there with `--sudo` and
 bootstrap as ok, emits `machine.bootstrapped` and ends the ssh master of
 the login. In root mode the entry's `ssh` becomes `pastor-agent@<host>`,
 the user herdr and every agent run as; in user mode it keeps the login.
-A failed step is recorded with its reason and fix, emits
-`machine.bootstrap_failed`, and comes back as the command's error. Run the
+From then on the head's own ssh to the machine offers its `head_key`
+(beside the user's keys, not instead) and checks the host against the key
+pinned in pastor's `known_hosts`. A machine that ssh cannot reach fails step
+`connect` (`runtime_error`); a copy that arrives with another sha256 fails
+step `checksum` (`artifact_checksum_mismatch`) and runs nothing there; and
+the host key the machine reports must be the one pinned, which is what is
+stored. A failed step is recorded with its reason and fix, emits
+`machine.bootstrap_failed`, and comes back as the command's error. A rerun
+of a machine already ok keeps it ok, taking work, until `pastor bootstrap`
+starts there: a failure before that only emits `machine.bootstrap_failed`,
+one from then on records it failed. Run the
 same `machine add` again after the fix (with `--sudo`, say): a machine
 pending or failed with the same login carries on where it stopped instead of
 failing `machine_exists`. `pastor machine bootstrap <name> [--sudo]` does the
 same by name, for a rerun or to upgrade pastor and herdr; once the entry
 names `pastor-agent`, pass the login with `--ssh`. One push per machine
-runs at a time (`machine_busy`), and none holds up dispatch.
+runs at a time, and a `machine remove` waits for it (`machine_busy`); none
+holds up dispatch.
 
 ```bash
 pastor machine add gpu-3 me@gpu-3 --bootstrap --sudo --tag gpu

@@ -96,10 +96,18 @@ pub fn run(r: &dyn Runner, o: &Options) -> Outcome {
 
 /// The CLI error for a failed outcome, `None` when it is ok.
 pub fn error(outcome: &Outcome) -> Option<anyhow::Error> {
-    let failed = outcome
+    let Some(failed) = outcome
         .steps
         .iter()
-        .find(|s| s.status == StepStatus::Failed)?;
+        .find(|s| s.status == StepStatus::Failed)
+    else {
+        return (!outcome.ok).then(|| {
+            CliError::err(
+                "runtime_error",
+                "bootstrap did not finish: it reported no success and no failed step",
+            )
+        });
+    };
     let mut message = format!(
         "bootstrap step {} failed: {}",
         failed.step,
@@ -113,6 +121,8 @@ pub fn error(outcome: &Outcome) -> Option<anyhow::Error> {
     let code = match failed.step.as_str() {
         "facts" => "bootstrap_needs_sudo",
         "platform" => "bootstrap_unsupported_platform",
+        // A push's copy that arrived with another sum.
+        "checksum" => "artifact_checksum_mismatch",
         _ if !failed.missing.is_empty() => "bootstrap_missing",
         _ => "runtime_error",
     };

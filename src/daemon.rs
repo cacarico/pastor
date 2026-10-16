@@ -40,9 +40,19 @@ pub type HeadForward = crate::shepherd::Ask;
 pub type ConnectorFactory = Arc<dyn Fn(&MachineConfig) -> Arc<dyn Connector> + Send + Sync>;
 
 /// The transports `pastor serve` uses: ssh, the local socket or a command.
-pub fn endpoint_factory(paths: Paths) -> ConnectorFactory {
+/// An ssh machine's host key is looked up in `store` on each connection, so
+/// one pinned by a push is checked from the push's end on.
+pub fn endpoint_factory(paths: Paths, store: Arc<Store>) -> ConnectorFactory {
     Arc::new(move |m: &MachineConfig| {
-        Arc::new(Endpoint::from_machine(m, &paths)) as Arc<dyn Connector>
+        let (store, name) = (store.clone(), m.name.clone());
+        let pinned: crate::herdr::transport::Pinned = Arc::new(move || {
+            store
+                .machine_state(&name)
+                .ok()
+                .flatten()
+                .is_some_and(|s| s.host_key.is_some())
+        });
+        Arc::new(Endpoint::from_machine_with(m, &paths, pinned)) as Arc<dyn Connector>
     })
 }
 
@@ -63,6 +73,34 @@ pub fn machine_settings(config: &PastorConfig) -> MachineSettings {
         limits: Some(config.limits.clone()),
         ..Default::default()
     }
+}
+
+/// A failed report's step and reason: its failed step, else the last one
+/// run, else `unknown`. The table has no column for a step's `fix`, so it
+/// folds into the reason as `"<why>; fix: <fix>"`. `(None, None)` when ok.
+fn bootstrap_failure(
+    ok: bool,
+    steps: &[crate::bootstrap::StepResult],
+) -> (Option<String>, Option<String>) {
+    use crate::bootstrap::StepStatus;
+    let failed = (!ok).then(|| {
+        steps
+            .iter()
+            .find(|s| s.status == StepStatus::Failed)
+            .or(steps.last())
+    });
+    let failed_step = failed.map(|s| s.map_or_else(|| "unknown".to_string(), |s| s.step.clone()));
+    let why = failed.flatten().and_then(|s| {
+        let parts: Vec<String> = s
+            .why
+            .iter()
+            .filter(|w| !w.is_empty())
+            .cloned()
+            .chain(s.fix.iter().map(|fix| format!("fix: {fix}")))
+            .collect();
+        (!parts.is_empty()).then(|| parts.join("; "))
+    });
+    (failed_step, why)
 }
 
 /// "text and 1 key", "2 keys": what `task send` reports it sent.
@@ -2542,7 +2580,7 @@ impl Fleet {
         machine: &str,
         outcome: crate::bootstrap::Outcome,
     ) -> anyhow::Result<bool> {
-        use crate::bootstrap::{Isolation, Mode, StepStatus};
+        use crate::bootstrap::{Isolation, Mode};
         use crate::store::{BootstrapState, MachineState};
         if self.flock().get(machine).is_none() {
             return Err(crate::cli::CliError::err(
@@ -2569,26 +2607,7 @@ impl Fleet {
             Isolation::Users => "users",
             Isolation::None => "none",
         };
-        // A failed report names its failed step, else the last one run,
-        // else none at all.
-        let failed = (!ok).then(|| {
-            steps
-                .iter()
-                .find(|s| s.status == StepStatus::Failed)
-                .or(steps.last())
-        });
-        let failed_step =
-            failed.map(|s| s.map_or_else(|| "unknown".to_string(), |s| s.step.clone()));
-        let why = failed.flatten().and_then(|s| {
-            let parts: Vec<String> = s
-                .why
-                .iter()
-                .filter(|w| !w.is_empty())
-                .cloned()
-                .chain(s.fix.iter().map(|fix| format!("fix: {fix}")))
-                .collect();
-            (!parts.is_empty()).then(|| parts.join("; "))
-        });
+        let (failed_step, why) = bootstrap_failure(ok, &steps);
         let missing: Vec<String> = steps.into_iter().flat_map(|s| s.missing).collect();
         let state = MachineState {
             machine: machine.to_string(),
@@ -2630,6 +2649,33 @@ impl Fleet {
             );
         }
         Ok(ok && was_held)
+    }
+
+    /// A push that failed before the machine's own steps ran, on a machine
+    /// already `Ok`: nothing there changed, so its state stays as it is and
+    /// only `machine.bootstrap_failed` says what happened.
+    pub fn report_bootstrap_kept(
+        &self,
+        machine: &str,
+        outcome: &crate::bootstrap::Outcome,
+    ) -> anyhow::Result<()> {
+        if self.flock().get(machine).is_none() {
+            return Err(crate::cli::CliError::err(
+                "unknown_machine",
+                format!("no machine {machine} in the flock"),
+            ));
+        }
+        let (failed_step, why) = bootstrap_failure(outcome.ok, &outcome.steps);
+        self.emit(
+            "machine.bootstrap_failed",
+            machine,
+            None,
+            Some(serde_json::json!({
+                "step": failed_step.unwrap_or_default(),
+                "why": why.unwrap_or_default(),
+            })),
+        );
+        Ok(())
     }
 
     /// Whether dispatch may place work on `machine`: a `Pending` or
@@ -3818,7 +3864,7 @@ impl Daemon {
         // sees a task from before flocks without one.
         store.adopt_default_flock(flock.default_flock())?;
         let (events, log_rx) = broadcast::channel(1024);
-        let connect = connect.unwrap_or_else(|| endpoint_factory(paths.clone()));
+        let connect = connect.unwrap_or_else(|| endpoint_factory(paths.clone(), store.clone()));
         let fleet = Arc::new(Fleet::managed(store.clone(), events.clone(), connect));
         fleet.apply_flock(&flock, &machine_settings(&config)).await;
         // Fresh set: nothing has been warned about yet, so every task on a
@@ -4661,6 +4707,16 @@ impl Daemon {
                     .await
             }
             IpcRequest::MachineRemove { name } => {
+                // Held for the whole remove, so a push of the machine cannot
+                // start under it either.
+                let Some(_busy) = Pushing::take(&self.pushing, &name) else {
+                    return IpcResponse::error(
+                        "machine_busy",
+                        format!(
+                            "{name} is being bootstrapped; wait for that run to end, then remove it"
+                        ),
+                    );
+                };
                 let ssh_target = self
                     .fleet
                     .flock()
@@ -7371,6 +7427,27 @@ mod tests {
         // Free again once the first push ends.
         drop(first);
         assert!(Pushing::take(&d.pushing, "a").is_some());
+    }
+
+    /// A remove while the push runs would leave the push to write its agent
+    /// line for a machine no longer there.
+    #[tokio::test]
+    async fn remove_during_a_push_is_busy() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        let first = Pushing::take(&d.pushing, "a").expect("free");
+        let resp = d
+            .handle(IpcRequest::MachineRemove { name: "a".into() })
+            .await;
+        let IpcResponse::Error { code, .. } = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(code, "machine_busy");
+        assert!(d.fleet.flock().get("a").is_some(), "still in the flock");
+        drop(first);
+        assert!(
+            Pushing::take(&d.pushing, "a").is_some(),
+            "the remove let go"
+        );
     }
 
     #[tokio::test]

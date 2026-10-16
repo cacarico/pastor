@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 
-use super::{AGENT_USER, Isolation, Mode, Outcome, StepResult};
+use super::{AGENT_USER, Isolation, Mode, Outcome, StepResult, StepStatus};
 use crate::artifacts::{Artifact, Fetch};
 use crate::cli::CliError;
 use crate::config::flock::MachineConfig;
@@ -145,6 +145,10 @@ impl Stop {
 /// step comes back as an `Outcome` with `ok: false`, already recorded as
 /// `Failed`; an `Err` is a push that never started (`machine_exists`, an
 /// unknown machine, a bad flag) or a store that would not write.
+///
+/// A machine already `Ok` (a rerun or an upgrade) stays `Ok` until its own
+/// steps start: a failure before that changed nothing there, so it only
+/// emits `machine.bootstrap_failed`.
 pub async fn push(
     paths: &Paths,
     store: &Store,
@@ -157,19 +161,108 @@ pub async fn push(
         super::check_user(user)?;
     }
     let head_key = head_key(paths, &opts.runner).await?;
-    record(paths, store, fleet, name, login, &opts).await?;
-    let outcome = match steps(paths, login, &head_key, &opts).await {
-        Ok(outcome) if outcome.ok => match finish(paths, fleet, name, login, &outcome, &opts).await
-        {
-            Ok(()) => outcome,
-            Err(stop) => stopped(stop, &opts, Some(outcome)),
-        },
-        Ok(outcome) => outcome,
+    let before = record(paths, store, fleet, name, login, &opts).await?;
+    let pinned = match prepare(paths, login, &opts).await {
+        Ok(pinned) => pinned,
+        Err(stop) => {
+            let outcome = stopped(stop, &opts, None);
+            if before
+                .as_ref()
+                .is_some_and(|s| s.bootstrap == BootstrapState::Ok)
+            {
+                fleet.report_bootstrap_kept(name, &outcome)?;
+            } else {
+                fleet.report_bootstrap(name, outcome.clone())?;
+            }
+            close_master(paths, name, login, &opts.runner).await;
+            return Ok(outcome);
+        }
+    };
+    if before
+        .as_ref()
+        .is_some_and(|s| s.bootstrap == BootstrapState::Ok)
+    {
+        store.put_machine_state(&pending(name, before.as_ref()))?;
+    }
+    let mut wrote_line = false;
+    let outcome = match run_bootstrap(paths, login, &head_key, &opts).await {
+        Ok(mut outcome) => {
+            outcome.ok = succeeded(&outcome);
+            // What is stored is the key pastor scanned and pinned, never
+            // the machine's own word for it.
+            let reported = outcome.host_key.replace(pinned.clone());
+            match reported.filter(|k| !same_key(k, &pinned)) {
+                Some(other) if outcome.ok => stopped(
+                    Stop::new(
+                        "host_key",
+                        format!(
+                            "the machine reports host key {other}, not the {pinned} pastor scanned and pinned"
+                        ),
+                        "check the machine's /etc/ssh/ssh_host_ed25519_key.pub on its console",
+                    ),
+                    &opts,
+                    Some(outcome),
+                ),
+                _ if outcome.ok => match finish(paths, fleet, name, login, &outcome, &opts).await {
+                    Ok(()) => {
+                        wrote_line = true;
+                        outcome
+                    }
+                    Err(stop) => stopped(stop, &opts, Some(outcome)),
+                },
+                _ => outcome,
+            }
+        }
         Err(stop) => stopped(stop, &opts, None),
     };
-    fleet.report_bootstrap(name, outcome.clone())?;
+    if let Err(err) = fleet.report_bootstrap(name, outcome.clone()) {
+        // Not on record as ok, so its agent line does not stay either.
+        if wrote_line {
+            let marker = crate::authkeys::Marker::Agent(name.to_string());
+            if let Err(undo) = crate::authkeys::remove(&opts.authorized_keys, &marker) {
+                tracing::warn!(machine = %name, %undo, "could not take the agent line back");
+            }
+        }
+        return Err(err);
+    }
     close_master(paths, name, login, &opts.runner).await;
     Ok(outcome)
+}
+
+/// Ok, and no step says otherwise.
+fn succeeded(outcome: &Outcome) -> bool {
+    outcome.ok && outcome.steps.iter().all(|s| s.status != StepStatus::Failed)
+}
+
+/// Two `keytype base64 [comment]` keys are the same key.
+fn same_key(a: &str, b: &str) -> bool {
+    let mut a = a.split_whitespace();
+    let mut b = b.split_whitespace();
+    (a.next(), a.next()) == (b.next(), b.next())
+}
+
+/// The pending row for `name`, keeping what `before` knew about it.
+fn pending(name: &str, before: Option<&MachineState>) -> MachineState {
+    MachineState {
+        machine: name.to_string(),
+        bootstrap: BootstrapState::Pending,
+        failed_step: None,
+        why: None,
+        updated_at: chrono::Utc::now().to_rfc3339(),
+        ..before.cloned().unwrap_or(MachineState {
+            machine: name.to_string(),
+            bootstrap: BootstrapState::Pending,
+            mode: None,
+            isolation: None,
+            failed_step: None,
+            why: None,
+            host_key: None,
+            herdr_version: None,
+            pastor_version: None,
+            service_user: None,
+            updated_at: String::new(),
+        })
+    }
 }
 
 /// A failed outcome for a step the head ran, keeping what the machine
@@ -199,7 +292,9 @@ fn stopped(Stop(step): Stop, opts: &PushOpts, from: Option<Outcome>) -> Outcome 
 /// Step 1: the attempt is on record before anything touches the machine,
 /// so dispatch skips it from the moment its entry exists. A rerun of a
 /// pending or failed `machine add --bootstrap` with the same login goes on;
-/// anything else of that name is `machine_exists`.
+/// anything else of that name is `machine_exists`. A machine already `Ok`
+/// is left `Ok` here (`push` marks it pending at step 5). Returns the row
+/// as it was.
 async fn record(
     paths: &Paths,
     store: &Store,
@@ -207,7 +302,7 @@ async fn record(
     name: &str,
     login: &str,
     opts: &PushOpts,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<MachineState>> {
     let entry = fleet.flock().get(name).cloned();
     let before = store.machine_state(name)?;
     let exists = || CliError::err("machine_exists", format!("machine {name} already exists"));
@@ -233,27 +328,12 @@ async fn record(
         }
         (None, Some(_)) => {}
     }
-    let pending = MachineState {
-        machine: name.to_string(),
-        bootstrap: BootstrapState::Pending,
-        failed_step: None,
-        why: None,
-        updated_at: chrono::Utc::now().to_rfc3339(),
-        ..before.clone().unwrap_or(MachineState {
-            machine: name.to_string(),
-            bootstrap: BootstrapState::Pending,
-            mode: None,
-            isolation: None,
-            failed_step: None,
-            why: None,
-            host_key: None,
-            herdr_version: None,
-            pastor_version: None,
-            service_user: None,
-            updated_at: String::new(),
-        })
-    };
-    store.put_machine_state(&pending)?;
+    if !before
+        .as_ref()
+        .is_some_and(|s| s.bootstrap == BootstrapState::Ok)
+    {
+        store.put_machine_state(&pending(name, before.as_ref()))?;
+    }
     if let (None, Some(m)) = (&entry, &opts.machine) {
         let added = fleet
             .edit_flock_file(&paths.flock_file(), |file| {
@@ -277,7 +357,7 @@ async fn record(
             );
         }
     }
-    Ok(())
+    Ok(before)
 }
 
 /// The head's own key, made with `ssh-keygen` on first use. Its public half
@@ -315,14 +395,10 @@ async fn head_key(paths: &Paths, runner: &Arc<dyn PushRunner>) -> anyhow::Result
     Ok(text.trim().to_string())
 }
 
-/// Steps 2 to 5: pin, read, copy, run.
-async fn steps(
-    paths: &Paths,
-    login: &str,
-    head_key: &str,
-    opts: &PushOpts,
-) -> Result<Outcome, Stop> {
-    pin_host_key(paths, login, opts).await?;
+/// Steps 2 to 4: pin, read, copy. Nothing on the machine changes before
+/// the end of these but a file under its cache. Returns the pinned key.
+async fn prepare(paths: &Paths, login: &str, opts: &PushOpts) -> Result<String, Stop> {
+    let pinned = pin_host_key(paths, login, opts).await?;
     let ssh = |remote: &str| ssh_args(paths, login, remote);
     let (pastor_target, herdr_target) = platform(opts, ssh("uname -sm; getconf LONG_BIT")).await?;
     let herdr_version = crate::artifacts::herdr_version(&opts.provision, &opts.fleet_versions);
@@ -337,10 +413,20 @@ async fn steps(
         let (file, sum) = cached(paths, opts, name, &version, &target).await?;
         copy(opts, &ssh(&copy_command(name, &sum)), name, &file, &sum).await?;
     }
+    Ok(pinned)
+}
+
+/// Step 5: the machine's own steps, `pastor bootstrap` there.
+async fn run_bootstrap(
+    paths: &Paths,
+    login: &str,
+    head_key: &str,
+    opts: &PushOpts,
+) -> Result<Outcome, Stop> {
     let out = run(
         &opts.runner,
         "ssh",
-        ssh(&bootstrap_command(head_key, opts)),
+        ssh_args(paths, login, &bootstrap_command(head_key, opts)),
         None,
     )
     .await
@@ -368,22 +454,37 @@ async fn steps(
 }
 
 /// The ssh argv for one remote command as the login user: pastor's own
-/// known_hosts, a new key accepted once (it was just pinned), and no shared
-/// master, so a socket opened before the pin cannot skip the check.
+/// known_hosts, checked strictly against the ed25519 key just pinned (and
+/// only that type asked for, so a host offering another key type is not
+/// "new"), no shared master, so a socket opened before the pin cannot skip
+/// the check, and timeouts, so a machine that stops answering does not
+/// hold the push (and its `machine_busy`) forever.
 fn ssh_args(paths: &Paths, login: &str, remote: &str) -> Vec<String> {
     let known_hosts = paths.known_hosts_file();
-    crate::ssh::Ssh {
-        target: login,
-        control_path: None,
-        control_persist: "",
-        keepalive: true,
-        no_tty: true,
-        identity: None,
-        extra_identity: None,
-        known_hosts: Some(&known_hosts),
-        accept_new: true,
-    }
-    .args(remote)
+    let mut args: Vec<String> = [
+        "ConnectTimeout=20",
+        "ServerAliveInterval=15",
+        "ServerAliveCountMax=4",
+        "HostKeyAlgorithms=ssh-ed25519",
+    ]
+    .into_iter()
+    .flat_map(|o| ["-o".to_string(), o.to_string()])
+    .collect();
+    args.extend(
+        crate::ssh::Ssh {
+            target: login,
+            control_path: None,
+            control_persist: "",
+            keepalive: false,
+            no_tty: true,
+            identity: None,
+            extra_identity: None,
+            known_hosts: Some(&known_hosts),
+            accept_new: false,
+        }
+        .args(remote),
+    );
+    args
 }
 
 async fn run(
@@ -415,7 +516,7 @@ fn tail(stderr: &str) -> String {
 /// With `--host-key` the scanned key must be that one. A key that differs
 /// from one already pinned for the host stops the push: that is what a
 /// man in the middle looks like, as much as a reinstalled machine.
-async fn pin_host_key(paths: &Paths, login: &str, opts: &PushOpts) -> Result<(), Stop> {
+async fn pin_host_key(paths: &Paths, login: &str, opts: &PushOpts) -> Result<String, Stop> {
     let stop = |why: String, fix: &str| Stop::new("host_key", why, fix);
     let fallback = (host_part(login).to_string(), "22".to_string());
     let (host, port) = match run(
@@ -473,7 +574,7 @@ async fn pin_host_key(paths: &Paths, login: &str, opts: &PushOpts) -> Result<(),
             continue;
         }
         if pinned == key {
-            return Ok(());
+            return Ok(key);
         }
         return Err(stop(
             format!(
@@ -502,7 +603,8 @@ async fn pin_host_key(paths: &Paths, login: &str, opts: &PushOpts) -> Result<(),
             format!("could not write {}: {e}", file.display()),
             "check the head's state dir",
         )
-    })
+    })?;
+    Ok(key)
 }
 
 /// `names keytype base64` from a known_hosts or keyscan line, as
@@ -535,9 +637,10 @@ async fn fingerprint(
     key: &str,
 ) -> Result<String, Stop> {
     let stop = |why: String| Stop::new("host_key", why, "check that ssh-keygen works on the head");
+    // One file per call: two pushes at once must not read each other's.
     let file = paths
         .state_dir
-        .join(format!(".scanned-{}", std::process::id()));
+        .join(format!(".scanned{}", crate::artifacts::work_dir_name()));
     std::fs::write(&file, format!("{names} {key}\n"))
         .map_err(|e| stop(format!("could not write {}: {e}", file.display())))?;
     let args = vec![
@@ -581,14 +684,14 @@ fn resolved_host(out: &str) -> Option<(String, String)> {
 async fn platform(opts: &PushOpts, argv: Vec<String>) -> Result<(String, String), Stop> {
     let out = run(&opts.runner, "ssh", argv, None).await.map_err(|e| {
         Stop::new(
-            "platform",
+            "connect",
             format!("could not run ssh: {e}"),
             "check that ssh is installed on the head",
         )
     })?;
     if !out.success {
         return Err(Stop::new(
-            "platform",
+            "connect",
             format!("ssh could not reach the machine: {}", tail(&out.stderr)),
             "check that ssh with this login works without a password (BatchMode)",
         ));
@@ -687,12 +790,14 @@ async fn copy(
                 "check that ssh is installed on the head",
             )
         })?;
+    // The remote prints the sum it found before it compares; nothing
+    // printed means the copy never got that far.
     let got = out.stdout.split_whitespace().next().unwrap_or_default();
-    if got != sum {
+    if !got.is_empty() && got != sum {
         return Err(Stop::new(
-            "copy",
+            "checksum",
             format!(
-                "{name} arrived with sha256 {got:?}, not {sum}: {}",
+                "{name} arrived with sha256 {got}, not {sum}: {}",
                 tail(&out.stderr)
             ),
             "check the machine's free space in ~/.cache, then rerun",
@@ -725,8 +830,8 @@ fn bootstrap_command(head_key: &str, opts: &PushOpts) -> String {
     cmd
 }
 
-/// Step 6, before the state is set: the agent line on the head, and in
-/// root mode the entry's `ssh` moved to the agent user.
+/// Step 6, before the state is set: in root mode the entry's `ssh` moved
+/// to the agent user, then the agent line on the head.
 async fn finish(
     paths: &Paths,
     fleet: &Fleet,
@@ -748,6 +853,22 @@ async fn finish(
             "rerun the bootstrap",
         )
     })?;
+    // The entry first: an agent line is written only for a machine whose
+    // entry already says how it is reached.
+    if outcome.mode == Mode::Root {
+        let agent = format!("{AGENT_USER}@{}", host_part(login));
+        fleet
+            .edit_flock_file(&paths.flock_file(), |file| {
+                crate::fleet_edit::set_machine_ssh(file, name, &agent)
+            })
+            .await
+            .map_err(|e| {
+                stop(
+                    format!("could not set its ssh to {agent}: {e:#}"),
+                    "check flock.toml",
+                )
+            })?;
+    }
     // The marked form of `machine authorized-key`'s line: pastor edits
     // only lines it can find again by their marker.
     let marker = crate::authkeys::Marker::Agent(name.to_string());
@@ -767,20 +888,6 @@ async fn finish(
             "check that the head's authorized_keys is writable",
         )
     })?;
-    if outcome.mode == Mode::Root {
-        let agent = format!("{AGENT_USER}@{}", host_part(login));
-        fleet
-            .edit_flock_file(&paths.flock_file(), |file| {
-                crate::fleet_edit::set_machine_ssh(file, name, &agent)
-            })
-            .await
-            .map_err(|e| {
-                stop(
-                    format!("could not set its ssh to {agent}: {e:#}"),
-                    "check flock.toml",
-                )
-            })?;
-    }
     Ok(())
 }
 

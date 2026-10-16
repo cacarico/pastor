@@ -19,5 +19,10 @@
   agent's `authorized_keys` line and, in root mode, moving the entry to
   `pastor-agent@<host>`. A rerun after a failed step carries on instead of
   failing `machine_exists`; two at once for one machine get `machine_busy`.
-  The head makes its own key (`head_key` in the state dir) on first use.
-  Gated at IPC protocol 32 (`MachineBootstrap`).
+  The head makes its own key (`head_key` in the state dir) on first use,
+  and from then on offers it on its ssh to every machine (beside the
+  user's keys), checking a pushed machine's host against the pinned key.
+  The push's own ssh asks for the pinned ed25519 key only and times out on
+  a machine that stops answering; a `machine remove` during a push gets
+  `machine_busy`; a rerun of an ok machine keeps it ok until `pastor
+  bootstrap` starts there. Gated at IPC protocol 32 (`MachineBootstrap`).
