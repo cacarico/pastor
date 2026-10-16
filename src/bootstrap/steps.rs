@@ -250,7 +250,7 @@ const SAFE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin
 /// controlling tty, so it cannot push input into the caller's terminal
 /// (TIOCSTI), and waits for its exit status; stdin is /dev/null
 /// (`SystemRunner`).
-pub(super) fn other_user_argv(
+pub(crate) fn other_user_argv(
     root: bool,
     name: &str,
     home: &std::path::Path,

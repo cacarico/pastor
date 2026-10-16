@@ -3925,32 +3925,90 @@ impl Daemon {
     /// What `MachineRemove` does beyond the flock edit: drop the machine's
     /// (and its agent's) lines from the head's `authorized_keys`, forget its
     /// host key, end its ssh `ControlMaster` and drop its bootstrap row. The
-    /// machine is already out of the flock by the time this runs, so each
-    /// step is best-effort and logged rather than failing the request.
-    fn cleanup_removed_machine(&self, name: &str, ssh_target: Option<&str>) {
+    /// machine is already out of the flock by the time this runs, so a step
+    /// that fails does not fail the request; it comes back, with what to do
+    /// about it, for the reply.
+    fn cleanup_removed_machine(&self, name: &str, ssh_target: Option<&str>) -> Vec<String> {
+        let mut failed = Vec::new();
         if let Err(err) = crate::authkeys::remove_machine(&self.authorized_keys, name) {
             tracing::warn!(machine = %name, %err, "could not drop authorized_keys lines");
+            failed.push(format!(
+                "could not drop its authorized_keys lines: {err:#}; its key still logs in \
+                 until you delete the lines ending in `pastor:machine:{name}` and \
+                 `pastor:agent:{name}` from {} by hand",
+                self.authorized_keys.display()
+            ));
         }
         if let Some(target) = ssh_target {
-            // The host alone, as ssh-keygen's known_hosts keys it: `user@host`
-            // with no `@` keeps `target` unchanged.
-            let host = target.rsplit('@').next().unwrap_or(target);
-            let known_hosts = self.paths.known_hosts_file().to_string_lossy().into_owned();
-            let _ = self
-                .runner
-                .run("ssh-keygen", &["-R", host, "-f", known_hosts.as_str()]);
+            failed.extend(self.forget_host_key(target));
             if let Some(control_path) = crate::ssh::fitting_control_path(&self.paths, name) {
                 let control_path = control_path.to_string_lossy().into_owned();
-                // Ok to fail: a machine with no live master (already gone,
-                // or never connected) has nothing to exit.
-                let _ = self
-                    .runner
-                    .run("ssh", &["-S", control_path.as_str(), "-O", "exit", target]);
+                let args = ["-S", control_path.as_str(), "-O", "exit", "--", target];
+                match self.runner.run("ssh", &args) {
+                    Ok(out) if out.success => {}
+                    // No socket: no master to end (never connected, or gone).
+                    Ok(out) if out.stderr.contains("No such file or directory") => {}
+                    out => failed.push(format!(
+                        "could not end its ssh master: {}; run `ssh {}`",
+                        run_failure(out),
+                        args.join(" ")
+                    )),
+                }
             }
         }
         if let Err(err) = self.store.drop_machine_state(name) {
             tracing::warn!(machine = %name, %err, "could not drop machine_state");
+            failed.push(format!(
+                "could not drop its bootstrap record: {err:#}; a later `machine add` of \
+                 {name} starts from it"
+            ));
         }
+        for why in &failed {
+            tracing::warn!(machine = %name, "{why}");
+        }
+        failed
+    }
+
+    /// `ssh-keygen -R` of `target`'s host key from pastor's known_hosts,
+    /// under the host and port `ssh -G` resolves it to (an alias, a `Port`
+    /// in the ssh config): known_hosts keys a host on another port than 22
+    /// as `[host]:port`. Returns what failed.
+    fn forget_host_key(&self, target: &str) -> Vec<String> {
+        let mut failed = Vec::new();
+        let known_hosts = self.paths.known_hosts_file();
+        if !known_hosts.exists() {
+            return failed;
+        }
+        // The host alone: `user@host` with no `@` keeps `target` unchanged.
+        let fallback = target.rsplit('@').next().unwrap_or(target);
+        let (host, port) = match self.runner.run("ssh", &["-G", "--", target]) {
+            Ok(out) if out.success => resolved_host(&out.stdout)
+                .unwrap_or_else(|| (fallback.to_string(), "22".to_string())),
+            out => {
+                failed.push(format!(
+                    "could not resolve its host with `ssh -G {target}`: {}; forgot {fallback} only",
+                    run_failure(out)
+                ));
+                (fallback.to_string(), "22".to_string())
+            }
+        };
+        let mut names = vec![host.clone()];
+        if port != "22" {
+            names.push(format!("[{host}]:{port}"));
+        }
+        let known_hosts = known_hosts.to_string_lossy().into_owned();
+        for host in names {
+            let args = ["-f", known_hosts.as_str(), "-R", host.as_str()];
+            match self.runner.run("ssh-keygen", &args) {
+                Ok(out) if out.success => {}
+                out => failed.push(format!(
+                    "could not forget its host key {host}: {}; run `ssh-keygen {}`",
+                    run_failure(out),
+                    args.join(" ")
+                )),
+            }
+        }
+        failed
     }
 
     pub async fn handle(&self, req: IpcRequest) -> IpcResponse {
@@ -4265,10 +4323,18 @@ impl Daemon {
                     .await;
                 // Only once the flock edit itself landed: an unknown machine
                 // (or a refused edit) must leave its keys and state alone.
-                if matches!(resp, IpcResponse::Text(_)) {
-                    self.cleanup_removed_machine(&name, ssh_target.as_deref());
+                match resp {
+                    IpcResponse::Text(text) => {
+                        let failed = self.cleanup_removed_machine(&name, ssh_target.as_deref());
+                        IpcResponse::Text(
+                            std::iter::once(text)
+                                .chain(failed)
+                                .collect::<Vec<_>>()
+                                .join("; "),
+                        )
+                    }
+                    other => other,
                 }
-                resp
             }
             IpcRequest::MachineMove { name, flock } => {
                 self.edit_flock_file("; ", |file| {
@@ -5124,6 +5190,29 @@ pub async fn serve(paths: Paths) -> anyhow::Result<()> {
     drop(fleet_lock);
     tracing::info!(socket = %daemon.socket_path().display(), machines = daemon.fleet.machines().len(), "pastor serve");
     daemon.run_with_listener(listener).await
+}
+
+/// The `hostname` and `port` lines of `ssh -G`'s output.
+fn resolved_host(out: &str) -> Option<(String, String)> {
+    let field = |key: &str| {
+        out.lines()
+            .find_map(|l| l.strip_prefix(key))
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    Some((
+        field("hostname ")?,
+        field("port ").unwrap_or_else(|| "22".into()),
+    ))
+}
+
+/// Why a command run through a `setup::Runner` failed, for a reply.
+fn run_failure(out: std::io::Result<crate::setup::CmdOutput>) -> String {
+    match out {
+        Ok(o) if o.stderr.trim().is_empty() => "it exited non-zero".to_string(),
+        Ok(o) => o.stderr.trim().to_string(),
+        Err(err) => err.to_string(),
+    }
 }
 
 #[cfg(all(test, feature = "fake-herdr"))]
@@ -10176,16 +10265,32 @@ mod tests {
         assert_eq!(std::fs::read_to_string(paths.flock_file()).unwrap(), before);
     }
 
+    /// One scripted answer: `(success, stdout, stderr)`.
+    type Answer = (bool, &'static str, &'static str);
+
+    /// What a `RecordingRunner` answers a program and its args with.
+    type AnswerFn = Box<dyn Fn(&str, &[&str]) -> Option<Answer> + Send + Sync>;
+
     /// Scripts the answer to every `Runner::run` call, so a test can check
     /// what pastor asked for without running `ssh-keygen` or `ssh` for real.
+    /// `answer` sees the program and its args; a command it has no answer
+    /// for succeeds with no output.
     struct RecordingRunner {
         calls: std::sync::Mutex<Vec<(String, Vec<String>)>>,
+        answer: AnswerFn,
     }
 
     impl RecordingRunner {
         fn new() -> Self {
+            Self::answering(|_, _| None)
+        }
+
+        fn answering(
+            answer: impl Fn(&str, &[&str]) -> Option<Answer> + Send + Sync + 'static,
+        ) -> Self {
             RecordingRunner {
                 calls: std::sync::Mutex::new(Vec::new()),
+                answer: Box::new(answer),
             }
         }
 
@@ -10200,20 +10305,25 @@ mod tests {
                 program.to_string(),
                 args.iter().map(|a| a.to_string()).collect(),
             ));
+            let (success, stdout, stderr) = (self.answer)(program, args).unwrap_or((true, "", ""));
             Ok(crate::setup::CmdOutput {
-                success: true,
-                stdout: String::new(),
-                stderr: String::new(),
+                success,
+                stdout: stdout.into(),
+                stderr: stderr.into(),
             })
         }
     }
 
-    /// `MachineRemove` also drops the machine's (and its agent's)
-    /// `authorized_keys` lines, asks the runner to forget its host key and
-    /// end its ssh master, and clears its bootstrap row - all only once the
-    /// flock edit itself lands.
-    #[tokio::test]
-    async fn remove_cleans_keys_and_state() {
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
+    /// A daemon whose flock has `pi-9`, reached as `pastor-agent@pi-9`, with
+    /// its machine and agent lines in a test `authorized_keys` (beside a
+    /// foreign line), a known_hosts file and a bootstrap row.
+    async fn daemon_with_removable_machine(
+        runner: Arc<RecordingRunner>,
+    ) -> (Daemon, tempfile::TempDir) {
         let flock = Flock {
             flocks: vec![],
             machines: vec![MachineConfig {
@@ -10228,8 +10338,7 @@ mod tests {
         let authorized_keys = tmp.path().join("authorized_keys");
         std::fs::write(&authorized_keys, "ssh-ed25519 AAAA me@laptop\n").unwrap();
         d.authorized_keys = authorized_keys.clone();
-        let runner = Arc::new(RecordingRunner::new());
-        d.runner = runner.clone();
+        d.runner = runner;
 
         crate::authkeys::upsert(
             &authorized_keys,
@@ -10243,6 +10352,8 @@ mod tests {
             "restrict,command=\"/bin/pastor bridge --agent\" ssh-ed25519 KEY2 pastor:agent:pi-9",
         )
         .unwrap();
+        std::fs::create_dir_all(d.paths.known_hosts_file().parent().unwrap()).unwrap();
+        std::fs::write(d.paths.known_hosts_file(), "pi-9.lan ssh-ed25519 AAAA\n").unwrap();
 
         d.store
             .put_machine_state(&crate::store::MachineState {
@@ -10258,49 +10369,181 @@ mod tests {
                 updated_at: "2026-10-16T10:00:00+00:00".into(),
             })
             .unwrap();
+        (d, tmp)
+    }
+
+    /// What `ssh -G pi-9` prints for a host on port 2222 under another name.
+    fn resolves_to_port_2222(program: &str, args: &[&str]) -> Option<Answer> {
+        (program == "ssh" && args.first() == Some(&"-G")).then_some((
+            true,
+            "user pastor-agent\nhostname pi-9.lan\nport 2222\n",
+            "",
+        ))
+    }
+
+    /// `MachineRemove` also drops the machine's (and its agent's)
+    /// `authorized_keys` lines, forgets its host key under the name and port
+    /// `ssh -G` resolves it to, ends its ssh master and clears its bootstrap
+    /// row - all only once the flock edit itself lands.
+    #[tokio::test]
+    async fn remove_cleans_keys_and_state() {
+        let runner = Arc::new(RecordingRunner::answering(resolves_to_port_2222));
+        let (d, _tmp) = daemon_with_removable_machine(runner.clone()).await;
 
         let resp = d
             .handle(IpcRequest::MachineRemove {
                 name: "pi-9".into(),
             })
             .await;
-        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        let IpcResponse::Text(text) = resp else {
+            panic!("{resp:?}")
+        };
+        assert!(!text.contains("could not"), "{text}");
 
         // The foreign line survives; both marked lines are gone.
         assert_eq!(
-            std::fs::read_to_string(&authorized_keys).unwrap(),
+            std::fs::read_to_string(&d.authorized_keys).unwrap(),
             "ssh-ed25519 AAAA me@laptop\n"
         );
 
         let calls = runner.calls();
         let known_hosts = d.paths.known_hosts_file().to_string_lossy().into_owned();
         assert!(
-            calls.iter().any(|(p, a)| p == "ssh-keygen"
-                && a == &[
-                    "-R".to_string(),
-                    "pi-9".to_string(),
-                    "-f".to_string(),
-                    known_hosts.clone()
-                ]),
+            calls.contains(&("ssh".into(), strings(&["-G", "--", "pastor-agent@pi-9"]))),
             "{calls:?}"
         );
+        for host in ["pi-9.lan", "[pi-9.lan]:2222"] {
+            assert!(
+                calls.contains(&(
+                    "ssh-keygen".into(),
+                    strings(&["-f", &known_hosts, "-R", host])
+                )),
+                "no ssh-keygen -R {host} in {calls:?}"
+            );
+        }
         let control_path = crate::ssh::fitting_control_path(&d.paths, "pi-9")
             .unwrap()
             .to_string_lossy()
             .into_owned();
         assert!(
-            calls.iter().any(|(p, a)| p == "ssh"
-                && a == &[
-                    "-S".to_string(),
-                    control_path.clone(),
-                    "-O".to_string(),
-                    "exit".to_string(),
-                    "pastor-agent@pi-9".to_string(),
-                ]),
+            calls.contains(&(
+                "ssh".into(),
+                strings(&["-S", &control_path, "-O", "exit", "--", "pastor-agent@pi-9"])
+            )),
             "{calls:?}"
         );
 
         assert!(d.store.machine_state("pi-9").unwrap().is_none());
+    }
+
+    /// A host on port 22 is keyed by its bare name only, and ssh-keygen's
+    /// "not found" is no failure.
+    #[tokio::test]
+    async fn remove_on_port_22_forgets_the_bare_host() {
+        let runner = Arc::new(RecordingRunner::answering(|program, args| {
+            match (program, args.first()) {
+                ("ssh", Some(&"-G")) => Some((true, "hostname 10.0.0.9\nport 22\n", "")),
+                ("ssh-keygen", _) => {
+                    Some((true, "", "Host 10.0.0.9 not found in /x/known_hosts\n"))
+                }
+                _ => None,
+            }
+        }));
+        let (d, _tmp) = daemon_with_removable_machine(runner.clone()).await;
+        let resp = d
+            .handle(IpcRequest::MachineRemove {
+                name: "pi-9".into(),
+            })
+            .await;
+        let IpcResponse::Text(text) = resp else {
+            panic!("{resp:?}")
+        };
+        assert!(!text.contains("could not"), "{text}");
+        let keygen: Vec<_> = runner
+            .calls()
+            .into_iter()
+            .filter(|(p, _)| p == "ssh-keygen")
+            .collect();
+        assert_eq!(keygen.len(), 1, "{keygen:?}");
+        assert_eq!(keygen[0].1.last().unwrap(), "10.0.0.9");
+    }
+
+    /// Every cleanup step that fails is named in the reply with what to do
+    /// about it; none is only logged. The machine is still out of the flock.
+    #[tokio::test]
+    async fn remove_reports_each_failed_cleanup() {
+        let runner = Arc::new(RecordingRunner::answering(|program, args| {
+            match (program, args.first()) {
+                ("ssh", Some(&"-G")) => Some((true, "hostname pi-9.lan\nport 2222\n", "")),
+                ("ssh-keygen", _) => Some((false, "", "mkstemp: Permission denied\n")),
+                ("ssh", Some(&"-S")) => {
+                    Some((false, "", "Control socket connect: Connection refused\n"))
+                }
+                _ => None,
+            }
+        }));
+        let (mut d, tmp) = daemon_with_removable_machine(runner).await;
+        // A path whose parent is a file: no edit of it can work.
+        let not_a_dir = tmp.path().join("not-a-dir");
+        std::fs::write(&not_a_dir, "").unwrap();
+        d.authorized_keys = not_a_dir.join("authorized_keys");
+        d.store.execute_raw("DROP TABLE machine_state");
+
+        let resp = d
+            .handle(IpcRequest::MachineRemove {
+                name: "pi-9".into(),
+            })
+            .await;
+        let IpcResponse::Text(text) = resp else {
+            panic!("{resp:?}")
+        };
+        assert!(text.starts_with("removed pi-9"), "{text}");
+        assert!(
+            text.contains("could not drop its authorized_keys lines")
+                && text.contains("pastor:machine:pi-9")
+                && text.contains("pastor:agent:pi-9")
+                && text.contains("still logs in"),
+            "{text}"
+        );
+        assert!(
+            text.contains("could not forget its host key")
+                && text.contains("Permission denied")
+                && text.contains("ssh-keygen -f"),
+            "{text}"
+        );
+        assert!(
+            text.contains("could not end its ssh master") && text.contains("refused"),
+            "{text}"
+        );
+        assert!(
+            text.contains("could not drop its bootstrap record"),
+            "{text}"
+        );
+        let on_disk = Flock::load(&d.paths.flock_file()).unwrap();
+        assert!(on_disk.machines.iter().all(|m| m.name != "pi-9"));
+    }
+
+    /// A removal the flock edit refuses (an unknown machine) leaves every
+    /// machine's keys, host keys and bootstrap rows alone, and runs nothing.
+    #[tokio::test]
+    async fn remove_of_unknown_machine_touches_nothing() {
+        let runner = Arc::new(RecordingRunner::new());
+        let (d, _tmp) = daemon_with_removable_machine(runner.clone()).await;
+        let keys_before = std::fs::read_to_string(&d.authorized_keys).unwrap();
+
+        let resp = d
+            .handle(IpcRequest::MachineRemove {
+                name: "nope".into(),
+            })
+            .await;
+        assert!(matches!(resp, IpcResponse::Error { .. }), "{resp:?}");
+
+        assert_eq!(
+            std::fs::read_to_string(&d.authorized_keys).unwrap(),
+            keys_before
+        );
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+        assert!(d.store.machine_state("pi-9").unwrap().is_some());
     }
 
     /// `flock add --default` on a file with only the implicit flock keeps its

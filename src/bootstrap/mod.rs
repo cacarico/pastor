@@ -14,6 +14,7 @@ use std::path::PathBuf;
 
 pub use facts::{Facts, Init, Pkg, facts, target_for};
 pub use outcome::{Isolation, Mode, Outcome, StepResult, StepStatus};
+pub(crate) use steps::other_user_argv;
 
 use crate::cli::CliError;
 use crate::setup::Runner;
