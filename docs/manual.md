@@ -388,6 +388,9 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `job_name_taken` | a headless serve's job has the name of one of the head's |
 | `job_not_found` | no job by that name |
 | `job_task_refused` | the head would not queue a headless serve's job task |
+| `leave_incomplete` | `pastor leave` ran every step it could and one or more failed; each is printed, and the message lists them |
+| `leave_on_head` | `pastor leave` on a machine where `pastor serve` runs as the head for this login |
+| `leave_unsupported_platform` | `pastor leave` on a platform with neither systemd nor launchd units to remove |
 | `machine_exists` | `machine add` of a machine that exists |
 | `invalid_artifact` | a binary to fetch named with a part that is not a plain name |
 | `artifact_checksum_mismatch` | a downloaded pastor or herdr whose sha256 is not the published one; nothing is cached |
@@ -1067,6 +1070,23 @@ the flocks of tasks dispatched after them; tasks already on the machine keep
 running there, and its connection stays up. A queued task pinned to a machine
 that has moved to another flock stays queued for its own flock, and the head
 logs a warning once.
+
+`pastor machine remove <name>` on a head also revokes what let the
+machine in: the `pastor:machine:<name>` and `pastor:agent:<name>` lines of
+the head's `authorized_keys`, its host key in pastor's `known_hosts` (under
+the host and port `ssh -G` resolves its target to, `[host]:port` too off
+port 22), its ssh master and its bootstrap record. The machine is out of
+the flock either way; a step that fails is named in the reply with what to
+do by hand. A failed `authorized_keys` edit matters most: the machine's
+key still logs in until those two lines are gone.
+
+`pastor leave` is the other half, run on the machine itself. It stops,
+disables and removes the pastor and herdr user services (systemd units, or
+launchd agents on macOS) of this login and, in root mode, of pastor-agent,
+whose own pastor says where its agent key is; then it deletes the machine
+and agent keys and their `.pub` files. It checks every step, prints what it
+did and what failed, and ends in `leave_incomplete` if anything did. It
+refuses on the head (`leave_on_head`), and asks first unless `--yes`.
 
 With no head running, `flock add|join|leave|remove` and `machine remove`
 hold a lock (`fleet.lock` in the state dir) from their read of the queued

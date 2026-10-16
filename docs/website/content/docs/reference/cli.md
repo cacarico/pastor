@@ -788,3 +788,13 @@ Print the head this CLI uses
 ### pastor head unset
 
 Use the head on this machine again
+
+## leave
+
+A clean teardown of this machine: disable and remove its pastor and herdr services, and delete its keys
+
+Touches only this machine: the service user's and (in root mode) pastor-agent's pastor and herdr user units, and the machine and agent keys bootstrap left under the state dir. Run `pastor machine remove` on the head too, or a removed pull machine keeps trying to log in with a key that no longer works.
+
+| argument | does | default |
+|---|---|---|
+| `-y, --yes` | Skip the confirmation prompt; needed when stdin is not a terminal |  |

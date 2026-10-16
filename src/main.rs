@@ -137,6 +137,18 @@ enum Command {
         #[command(subcommand)]
         cmd: pastor::head::HeadCmd,
     },
+    /// A clean teardown of this machine: disable and remove its pastor and herdr services, and delete its keys
+    ///
+    /// Touches only this machine: the service user's and (in root mode)
+    /// pastor-agent's pastor and herdr user units, and the machine and
+    /// agent keys bootstrap left under the state dir. Run `pastor machine
+    /// remove` on the head too, or a removed pull machine keeps trying to
+    /// log in with a key that no longer works.
+    Leave {
+        /// Skip the confirmation prompt; needed when stdin is not a terminal
+        #[arg(short, long)]
+        yes: bool,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -796,6 +808,7 @@ fn main() {
                 unreachable!("handled before the runtime")
             }
             Command::Head { cmd } => pastor::head::run(&paths, cmd, remote.as_ref()).await,
+            Command::Leave { yes } => pastor::leave::cli(&paths, yes).await,
         }
     });
     if let Err(err) = result {
@@ -1132,6 +1145,7 @@ fn remote_route(command: &Command) -> RemoteRoute {
         | Command::Orchestrator { .. } => RemoteRoute::Head,
         Command::Completions { .. }
         | Command::Setup { .. }
+        | Command::Leave { .. }
         | Command::Head { .. }
         | Command::Bridge(_)
         | Command::Bootstrap(_)
@@ -1251,7 +1265,10 @@ fn changes_fleet(command: &Command) -> bool {
             ..
         }) => false,
         // Bootstrap makes users and services on this machine.
-        Command::Serve(_) | Command::Setup { .. } | Command::Bootstrap(_) => true,
+        Command::Serve(_)
+        | Command::Setup { .. }
+        | Command::Bootstrap(_)
+        | Command::Leave { .. } => true,
         Command::Trust { cmd } => pastor::trust_cli::changes_fleet(cmd),
         Command::Limit { cmd } => pastor::limit_cli::changes_fleet(cmd),
         Command::Queue(a) => pastor::queue_cli::changes_fleet(a),

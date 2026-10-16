@@ -46,6 +46,9 @@ _pastor() {
             pastor,job)
                 cmd="pastor__subcmd__job"
                 ;;
+            pastor,leave)
+                cmd="pastor__subcmd__leave"
+                ;;
             pastor,limit)
                 cmd="pastor__subcmd__limit"
                 ;;
@@ -273,6 +276,9 @@ _pastor() {
                 ;;
             pastor__subcmd__help,job)
                 cmd="pastor__subcmd__help__subcmd__job"
+                ;;
+            pastor__subcmd__help,leave)
+                cmd="pastor__subcmd__help__subcmd__leave"
                 ;;
             pastor__subcmd__help,limit)
                 cmd="pastor__subcmd__help__subcmd__limit"
@@ -845,7 +851,7 @@ _pastor() {
 
     case "${cmd}" in
         pastor)
-            opts="-h -V --skill --head --help --version serve task queue status machine flock tick job orchestrator config completions events watch setup connector profile limit trust bridge bootstrap head help"
+            opts="-h -V --skill --head --help --version serve task queue status machine flock tick job orchestrator config completions events watch setup connector profile limit trust bridge bootstrap head leave help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1895,7 +1901,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__help)
-            opts="serve task queue status machine flock tick job orchestrator config completions events watch setup connector profile limit trust bridge bootstrap head help"
+            opts="serve task queue status machine flock tick job orchestrator config completions events watch setup connector profile limit trust bridge bootstrap head leave help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2429,6 +2435,20 @@ _pastor() {
         pastor__subcmd__help__subcmd__job__subcmd__run)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__help__subcmd__leave)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -3395,6 +3415,24 @@ _pastor() {
         pastor__subcmd__job__subcmd__run)
             opts="-h --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --head)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__leave)
+            opts="-y -h --yes --head --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
