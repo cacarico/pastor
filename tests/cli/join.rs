@@ -136,12 +136,30 @@ impl Head {
     /// The joining machine's one request, through `bridge --join <id>`:
     /// the reply, parsed.
     fn join(&self, id: &str, name: &str) -> serde_json::Value {
+        // Keys of its own per name: a key already authorized is refused.
+        let hex: String = name.bytes().map(|b| format!("{b:02x}")).collect();
+        self.join_keys(
+            id,
+            name,
+            &format!("ssh-ed25519 AAAAMACHINE{hex} m"),
+            &format!("ssh-ed25519 AAAAAGENT{hex} a"),
+        )
+    }
+
+    /// `join` with the machine and agent keys given.
+    fn join_keys(
+        &self,
+        id: &str,
+        name: &str,
+        machine_key: &str,
+        agent_key: &str,
+    ) -> serde_json::Value {
         let line = serde_json::json!({
             "op": "join",
             "id": "0000000000000000",
             "name": name,
-            "machine_key": format!("ssh-ed25519 AAAAMACHINE{} m", name.len()),
-            "agent_key": "ssh-ed25519 AAAAAGENT a",
+            "machine_key": machine_key,
+            "agent_key": agent_key,
             "host_key": "ssh-ed25519 AAAAMACHINEHOST",
             "facts": {"os": "linux"},
         });
@@ -411,4 +429,70 @@ fn create_with_an_unknown_flock_is_refused() {
     let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
     assert_eq!(err["code"], "unknown_flock", "{err}");
     assert_eq!(h.keys_text(), format!("{FOREIGN}\n"));
+}
+
+#[test]
+fn a_name_that_reads_as_an_option_is_refused() {
+    let h = Head::start("1h");
+    let (id, _) = h.create(&[]);
+    assert_eq!(error_code(&h.join(&id, "-oops")), "invalid_machine");
+    assert!(machine(&h.flock(), "-oops").is_none());
+    assert_eq!(h.join(&id, "gpu-3")["kind"], "joined");
+}
+
+#[test]
+fn keys_of_an_unknown_type_or_already_authorized_are_refused() {
+    let h = Head::start("1h");
+    let (id, _) = h.create(&[]);
+    let good = "ssh-ed25519 AAAAGOODMACHINE m";
+    let agent = "ssh-ed25519 AAAAGOODAGENT a";
+    for (machine_key, agent_key, code) in [
+        ("ssh-dss AAAADSS m", agent, "invalid_key"),
+        (good, "x-nope AAAAX a", "invalid_key"),
+        // The user's own key, already in authorized_keys.
+        (FOREIGN, agent, "key_in_use"),
+        (good, FOREIGN, "key_in_use"),
+        // One key for both: sshd would only ever match the first line.
+        (good, good, "invalid_key"),
+    ] {
+        let r = h.join_keys(&id, "gpu-3", machine_key, agent_key);
+        assert_eq!(error_code(&r), code, "{machine_key} / {agent_key}: {r}");
+        assert!(machine(&h.flock(), "gpu-3").is_none());
+    }
+    assert!(!h.keys_text().contains("pastor:machine:gpu-3"));
+    // Refusals leave the token good.
+    let r = h.join_keys(&id, "gpu-3", "ecdsa-sha2-nistp256 AAAAEC m", agent);
+    assert_eq!(r["kind"], "joined", "{r}");
+}
+
+#[test]
+fn two_redeems_racing_add_one_machine() {
+    let h = Head::start("1h");
+    let (id, _) = h.create(&[]);
+    let gate = std::sync::Barrier::new(2);
+    let (a, b) = std::thread::scope(|s| {
+        let a = s.spawn(|| {
+            gate.wait();
+            h.join(&id, "gpu-3")
+        });
+        let b = s.spawn(|| {
+            gate.wait();
+            h.join(&id, "gpu-4")
+        });
+        (a.join().unwrap(), b.join().unwrap())
+    });
+    let joined: Vec<_> = [&a, &b]
+        .into_iter()
+        .filter(|r| r["kind"] == "joined")
+        .collect();
+    assert_eq!(joined.len(), 1, "{a}\n{b}");
+    let lost = if a["kind"] == "joined" { &b } else { &a };
+    assert_eq!(error_code(lost), "join_token_used", "{lost}");
+    let flock = h.flock();
+    let added = ["gpu-3", "gpu-4"]
+        .iter()
+        .filter(|n| machine(&flock, n).is_some())
+        .count();
+    assert_eq!(added, 1);
+    assert!(!has_join_line(&h.keys_text(), &id));
 }

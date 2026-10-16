@@ -3970,6 +3970,32 @@ impl Daemon {
         agent_key: &str,
         host_key: &str,
     ) -> anyhow::Result<()> {
+        let files = crate::join::HeadFiles::for_head(&self.paths)?;
+        self.join_with(
+            &files.pastor,
+            &files.authorized_keys,
+            id,
+            name,
+            machine_key,
+            agent_key,
+            host_key,
+        )
+        .await
+    }
+
+    /// `join` with the pastor its lines run and the authorized_keys it
+    /// edits as seams.
+    #[allow(clippy::too_many_arguments)]
+    async fn join_with(
+        &self,
+        pastor: &std::path::Path,
+        keys: &dyn crate::join::Keys,
+        id: &str,
+        name: &str,
+        machine_key: &str,
+        agent_key: &str,
+        host_key: &str,
+    ) -> anyhow::Result<()> {
         use crate::authkeys::{Marker, line};
         use crate::cli::CliError;
         let now = chrono::Utc::now();
@@ -3977,19 +4003,33 @@ impl Daemon {
         let as_machine = Marker::Machine(name.into());
         let as_agent = Marker::Agent(name.into());
         as_machine.check()?;
-        let files = crate::join::HeadFiles::for_head(&self.paths)?;
+        // The name goes on command lines (ssh, herdr): never an option.
+        if name.starts_with('-') {
+            return Err(CliError::err(
+                "invalid_machine",
+                format!("{name:?} cannot be a machine name: it must not start with '-'"),
+            ));
+        }
         let machine_line = line(
-            &files.pastor,
+            pastor,
             &format!("bridge --shepherd --machine {name}"),
             machine_key,
             &as_machine,
         )?;
         let agent_line = line(
-            &files.pastor,
+            pastor,
             &format!("bridge --agent --machine {name}"),
             agent_key,
             &as_agent,
         )?;
+        let machine_blob = crate::join::key_blob("the machine key", machine_key)?;
+        let agent_blob = crate::join::key_blob("the agent key", agent_key)?;
+        if machine_blob == agent_blob {
+            return Err(CliError::err(
+                "invalid_key",
+                "the machine key and the agent key must differ: sshd only ever matches the first line a key is on",
+            ));
+        }
         let host_key = host_key.trim();
         if host_key.is_empty() || host_key.contains('\n') {
             return Err(CliError::err(
@@ -4003,6 +4043,17 @@ impl Daemon {
             .edit_flock_file(&self.paths.flock_file(), |file| {
                 let edit = |e: EditError| CliError::err(e.code(), &e);
                 let row = crate::join::redeemable(store, id, now)?;
+                // A key already let in, other than by this name's own lines
+                // (which this join replaces), would log in as two things.
+                let own = [as_machine.clone(), as_agent.clone()];
+                for (what, blob) in [("machine", machine_blob), ("agent", agent_blob)] {
+                    if keys.holds(blob, &own)? {
+                        return Err(CliError::err(
+                            "key_in_use",
+                            format!("the {what} key is already in the head's authorized_keys; each machine brings keys of its own"),
+                        ));
+                    }
+                }
                 let mut doc = crate::config::flock::FlockDoc::open(file)?;
                 let exists = doc
                     .flock()
@@ -4026,19 +4077,33 @@ impl Daemon {
                 }
                 doc.add_machine(&m).map_err(edit)?;
                 crate::join::take(store, id, now)?;
-                if let Err(err) = doc.save(file) {
-                    // Nothing was added, so the token stays good.
+                // The token is spent, so its line goes before anything else
+                // is written: whatever fails after this, a used token gets
+                // no ssh session.
+                if let Err(err) = keys.remove(&Marker::Join(id.into())) {
+                    // Nothing was added and the line is still there, so the
+                    // token stays good.
                     let _ = store.put_join_token(&row);
-                    return Err(err);
+                    return Err(CliError::err(
+                        "join_failed",
+                        format!(
+                            "could not remove join token {id}'s line from the head's authorized_keys ({err:#}); nothing was added and the token is still good"
+                        ),
+                    ));
+                }
+                if let Err(err) = doc.save(file) {
+                    // Its line is gone, so the token stays spent.
+                    return Err(err.context(format!(
+                        "save flock.toml; nothing was added and join token {id} is spent: make a new one"
+                    )));
                 }
                 Ok(row)
             })
             .await?;
         // The machine is in flock.toml and the token is spent: from here on
         // a failure is reported, not undone.
-        crate::authkeys::upsert(&files.authorized_keys, &as_machine, &machine_line)?;
-        crate::authkeys::upsert(&files.authorized_keys, &as_agent, &agent_line)?;
-        crate::authkeys::remove(&files.authorized_keys, &Marker::Join(id.into()))?;
+        keys.upsert(&as_machine, &machine_line)?;
+        keys.upsert(&as_agent, &agent_line)?;
         self.store.put_machine_state(&crate::store::MachineState {
             machine: name.into(),
             bootstrap: crate::store::BootstrapState::Pending,
@@ -13921,5 +13986,111 @@ mod tests {
             matches!(err, PriorityError::InFlight(id) if id == t.id),
             "{err:?}"
         );
+    }
+
+    /// authorized_keys where the edits `fail` picks fail, as a full disk or
+    /// a lock error would.
+    struct FaultyKeys {
+        file: std::path::PathBuf,
+        fail: fn(&crate::authkeys::Marker) -> bool,
+    }
+
+    impl crate::join::Keys for FaultyKeys {
+        fn upsert(&self, m: &crate::authkeys::Marker, line: &str) -> anyhow::Result<()> {
+            if (self.fail)(m) {
+                anyhow::bail!("write {}: No space left on device", self.file.display());
+            }
+            crate::authkeys::upsert(&self.file, m, line)
+        }
+        fn remove(&self, m: &crate::authkeys::Marker) -> anyhow::Result<bool> {
+            if (self.fail)(m) {
+                anyhow::bail!("write {}: No space left on device", self.file.display());
+            }
+            crate::authkeys::remove(&self.file, m)
+        }
+        fn holds(&self, blob: &str, except: &[crate::authkeys::Marker]) -> anyhow::Result<bool> {
+            crate::authkeys::holds_key(&self.file, blob, except)
+        }
+    }
+
+    /// A daemon, an authorized_keys with the user's key and token `id`'s
+    /// line, and the token's row.
+    async fn join_head(id: &str) -> (Daemon, tempfile::TempDir, std::path::PathBuf) {
+        use crate::authkeys::Marker;
+        let (d, tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        let keys = tmp.path().join("authorized_keys");
+        std::fs::write(&keys, "ssh-ed25519 AAAA me@laptop\n").unwrap();
+        crate::authkeys::upsert(
+            &keys,
+            &Marker::Join(id.into()),
+            &format!(
+                "restrict,command=\"/usr/local/bin/pastor bridge --join {id}\" ssh-ed25519 AAAAJOIN pastor:join:{id}"
+            ),
+        )
+        .unwrap();
+        d.store()
+            .put_join_token(&crate::store::JoinToken {
+                id: id.into(),
+                flock: None,
+                tags: vec![],
+                replace: None,
+                expires_at: "2999-01-01T00:00:00.000000+00:00".into(),
+                used_at: None,
+            })
+            .unwrap();
+        (d, tmp, keys)
+    }
+
+    async fn join_through(d: &Daemon, keys: FaultyKeys, id: &str) -> anyhow::Result<()> {
+        d.join_with(
+            std::path::Path::new("/usr/local/bin/pastor"),
+            &keys,
+            id,
+            "gpu-3",
+            "ssh-ed25519 AAAAMACHINE m",
+            "ssh-ed25519 AAAAAGENT a",
+            "ssh-ed25519 AAAAHOST",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_join_that_fails_after_the_token_is_spent_still_drops_its_line() {
+        use crate::authkeys::Marker;
+        let id = "00112233445566aa";
+        let (d, _tmp, keys) = join_head(id).await;
+        let faulty = FaultyKeys {
+            file: keys.clone(),
+            fail: |m| matches!(m, Marker::Machine(_)),
+        };
+        let err = join_through(&d, faulty, id).await.unwrap_err();
+        assert!(format!("{err:#}").contains("No space left"), "{err:#}");
+        let text = std::fs::read_to_string(&keys).unwrap();
+        assert!(!text.contains("pastor:join:"), "{text}");
+        assert!(text.contains("me@laptop"), "{text}");
+        let row = d.store().join_token(id).unwrap().unwrap();
+        assert!(row.used_at.is_some(), "the token is spent");
+    }
+
+    #[tokio::test]
+    async fn a_join_whose_token_line_cannot_go_fails_and_adds_nothing() {
+        use crate::authkeys::Marker;
+        let id = "00112233445566bb";
+        let (d, tmp, keys) = join_head(id).await;
+        let faulty = FaultyKeys {
+            file: keys.clone(),
+            fail: |m| matches!(m, Marker::Join(_)),
+        };
+        let err = join_through(&d, faulty, id).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("authorized_keys"), "{msg}");
+        let text = std::fs::read_to_string(&keys).unwrap();
+        assert!(text.contains(&format!("pastor:join:{id}")), "{text}");
+        assert!(!text.contains("pastor:machine:gpu-3"), "{text}");
+        let flock = std::fs::read_to_string(tmp.path().join("c").join("flock.toml")).unwrap();
+        assert!(!flock.contains("gpu-3"), "{flock}");
+        // Its line is still there, so it is still good for a retry.
+        let row = d.store().join_token(id).unwrap().unwrap();
+        assert_eq!(row.used_at, None);
     }
 }

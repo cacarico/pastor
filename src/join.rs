@@ -151,6 +151,40 @@ fn stamp(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(SecondsFormat::Micros, false)
 }
 
+/// The key types a joining machine's keys may be: what sshd takes for a
+/// login. DSA and anything unknown are refused.
+const KEY_TYPES: &[&str] = &[
+    "ssh-ed25519",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+    "rsa-sha2-256",
+    "rsa-sha2-512",
+    "ssh-rsa",
+    "sk-ssh-ed25519@openssh.com",
+    "sk-ecdsa-sha2-nistp256@openssh.com",
+];
+
+/// The base64 word of public key line `key`, if its type is one of
+/// `KEY_TYPES`; `what` names the key in the error.
+pub fn key_blob<'a>(what: &str, key: &'a str) -> anyhow::Result<&'a str> {
+    let mut parts = key.split_whitespace();
+    match (parts.next(), parts.next()) {
+        (Some(kind), Some(blob)) if KEY_TYPES.contains(&kind) => Ok(blob),
+        (Some(kind), Some(_)) => Err(CliError::err(
+            "invalid_key",
+            format!(
+                "{what} is of type {kind:?}; pastor takes {}",
+                KEY_TYPES.join(", ")
+            ),
+        )),
+        _ => Err(CliError::err(
+            "invalid_key",
+            format!("{what} is not a public key line, like ssh-ed25519 AAAA..."),
+        )),
+    }
+}
+
 /// The files a token touches on the head.
 #[derive(Debug, Clone)]
 pub struct HeadFiles {
@@ -177,6 +211,27 @@ impl HeadFiles {
             pastor: std::env::current_exe().context("locate the pastor binary")?,
             work: paths.ssh_dir().join("join"),
         })
+    }
+}
+
+/// The head's authorized_keys as a join edits it. A seam, so a test can
+/// fail one write and see what the join left behind.
+pub trait Keys: Send + Sync {
+    fn upsert(&self, marker: &Marker, line: &str) -> anyhow::Result<()>;
+    fn remove(&self, marker: &Marker) -> anyhow::Result<bool>;
+    /// Whether a line not marked with one of `except` holds the key `blob`.
+    fn holds(&self, blob: &str, except: &[Marker]) -> anyhow::Result<bool>;
+}
+
+impl Keys for PathBuf {
+    fn upsert(&self, marker: &Marker, line: &str) -> anyhow::Result<()> {
+        authkeys::upsert(self, marker, line)
+    }
+    fn remove(&self, marker: &Marker) -> anyhow::Result<bool> {
+        authkeys::remove(self, marker)
+    }
+    fn holds(&self, blob: &str, except: &[Marker]) -> anyhow::Result<bool> {
+        authkeys::holds_key(self, blob, except)
     }
 }
 
@@ -274,8 +329,13 @@ pub fn create_with(
         Ok((key, public))
     })();
     // The private half lives on only in the token.
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(&tmp_pub);
+    for f in [&tmp, &tmp_pub] {
+        if let Err(err) = std::fs::remove_file(f)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(file = %f.display(), %err, "delete a join token's key file");
+        }
+    }
     let (key, public) = made?;
     let marker = Marker::Join(id.clone());
     let line = authkeys::line(
@@ -371,9 +431,14 @@ pub fn take(store: &Store, id: &str, now: DateTime<Utc>) -> anyhow::Result<()> {
     anyhow::bail!("join token {id} could not be marked used")
 }
 
+/// How long `join list` keeps showing a used token.
+const KEEP_USED: chrono::TimeDelta = chrono::TimeDelta::days(7);
+
 /// Drop the lines and rows of the tokens expired by `now`, announcing each
 /// as `machine.join_token_expired`. A token whose line cannot be removed
-/// stays, so the next pass tries it again. Returns how many went.
+/// stays, so the next pass tries it again. A used token's line goes too if
+/// a join left it behind, and its row once it is a week old. Returns how
+/// many expired.
 pub fn sweep(
     store: &Store,
     authorized_keys: &Path,
@@ -406,8 +471,43 @@ pub fn sweep(
         });
         swept += 1;
     }
+    sweep_used(store, authorized_keys, now);
     swept
 }
+
+/// The used half of `sweep`.
+fn sweep_used(store: &Store, authorized_keys: &Path, now: DateTime<Utc>) {
+    let rows = match store.join_tokens() {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::error!(%err, "list join tokens; trying again next pass");
+            return;
+        }
+    };
+    let old = stamp(now - KEEP_USED);
+    for row in rows {
+        let Some(used_at) = &row.used_at else {
+            continue;
+        };
+        match authkeys::remove(authorized_keys, &Marker::Join(row.id.clone())) {
+            Ok(true) => tracing::warn!(id = row.id, "removed a used join token's line"),
+            Ok(false) => {}
+            Err(err) => {
+                tracing::error!(id = row.id, %err, "remove a used join token's line; trying again next pass");
+                continue;
+            }
+        }
+        if *used_at <= old
+            && let Err(err) = store.drop_join_token(&row.id)
+        {
+            tracing::error!(id = row.id, %err, "forget a used join token; trying again next pass");
+        }
+    }
+}
+
+/// The longest join request line, newline excluded: two keys, a host key
+/// and a few facts fit many times over.
+pub const MAX_JOIN_LINE: usize = 64 * 1024;
 
 /// `bridge --join <id>`: one request line, which must be a `Join`; its `id`
 /// is replaced with the one the forced command names. Anything else gets
@@ -418,10 +518,21 @@ pub async fn bridge(
     mut input: impl AsyncBufRead + Unpin,
     mut output: impl AsyncWrite + Unpin,
 ) -> anyhow::Result<()> {
+    use tokio::io::AsyncReadExt;
     let mut line = Vec::new();
     loop {
         line.clear();
-        if input.read_until(b'\n', &mut line).await? == 0 {
+        let mut limited = (&mut input).take(MAX_JOIN_LINE as u64 + 1);
+        if limited.read_until(b'\n', &mut line).await? == 0 {
+            return Ok(());
+        }
+        if line.len() - usize::from(line.last() == Some(&b'\n')) > MAX_JOIN_LINE {
+            let reply = reply_line(&IpcResponse::error(
+                "request_too_large",
+                format!("a join request is at most {MAX_JOIN_LINE} bytes"),
+            ))?;
+            output.write_all(&reply).await?;
+            output.flush().await?;
             return Ok(());
         }
         if !line.iter().all(u8::is_ascii_whitespace) {
@@ -924,5 +1035,67 @@ mod tests {
         assert!(rx.try_recv().is_err());
         assert!(store.join_token(&old.id).unwrap().is_some());
         assert_eq!(sweep(&store, &f.authorized_keys, &tx, later), 1);
+    }
+
+    #[test]
+    fn a_used_token_whose_line_was_left_behind_loses_it_on_the_sweep() {
+        let d = tempfile::tempdir().unwrap();
+        let f = files(d.path());
+        let store = Store::open_in_memory().unwrap();
+        let now = chrono::Utc::now();
+        let made = create_with(
+            &FakeKeygen,
+            &f,
+            &store,
+            "me@h",
+            &ask(std::time::Duration::from_secs(3600)),
+            now,
+        )
+        .unwrap();
+        // A join spent it but could not drop its line.
+        assert!(store.use_join_token(&made.id, &stamp(now)).unwrap());
+        let marker = format!("pastor:join:{}", made.id);
+        assert!(
+            std::fs::read_to_string(&f.authorized_keys)
+                .unwrap()
+                .contains(&marker)
+        );
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let later = now + chrono::Duration::seconds(5);
+        assert_eq!(sweep(&store, &f.authorized_keys, &tx, later), 0);
+        let keys = std::fs::read_to_string(&f.authorized_keys).unwrap();
+        assert!(!keys.contains(&marker), "{keys}");
+        assert!(keys.contains("me@laptop"));
+        assert!(rx.try_recv().is_err(), "a used token did not expire");
+        // `join list` still shows it as used, for a while.
+        assert!(store.join_token(&made.id).unwrap().is_some());
+        let week = now + chrono::Duration::days(6);
+        sweep(&store, &f.authorized_keys, &tx, week);
+        assert!(store.join_token(&made.id).unwrap().is_some());
+        let past_a_week = now + chrono::Duration::days(8);
+        sweep(&store, &f.authorized_keys, &tx, past_a_week);
+        assert!(store.join_token(&made.id).unwrap().is_none());
+    }
+
+    fn reply_code(out: &[u8]) -> String {
+        let v: serde_json::Value = serde_json::from_slice(out).unwrap();
+        assert_eq!(v["kind"], "error", "{v}");
+        v["data"]["code"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn bridge_refuses_a_line_past_the_cap() {
+        let id = "0011223344556677";
+        let sock = Path::new("/nonexistent/pastor.sock");
+        let big = vec![b'x'; MAX_JOIN_LINE + 1];
+        let mut out = Vec::new();
+        bridge(sock, id, &big[..], &mut out).await.unwrap();
+        assert_eq!(reply_code(&out), "request_too_large");
+        // A line just at the cap is read and judged on what it says.
+        let mut at = vec![b'x'; MAX_JOIN_LINE];
+        at.push(b'\n');
+        let mut out = Vec::new();
+        bridge(sock, id, &at[..], &mut out).await.unwrap();
+        assert_eq!(reply_code(&out), INVALID);
     }
 }

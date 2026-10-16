@@ -265,6 +265,20 @@ pub fn remove(file: &Path, marker: &Marker) -> anyhow::Result<bool> {
     })
 }
 
+/// Whether a line not marked with one of `except` holds the key `blob` (the
+/// base64 word of a public key). A missing file holds none.
+pub fn holds_key(file: &Path, blob: &str, except: &[Marker]) -> anyhow::Result<bool> {
+    let text = match std::fs::read_to_string(file) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(anyhow::Error::from(e).context(format!("read {}", file.display()))),
+    };
+    let except: Vec<String> = except.iter().map(Marker::render).collect();
+    Ok(text.lines().any(|l| {
+        !except.iter().any(|m| has_marker(l, m)) && l.split_whitespace().any(|w| w == blob)
+    }))
+}
+
 /// Drop the Machine and Agent lines of `name`.
 pub fn remove_machine(file: &Path, name: &str) -> anyhow::Result<()> {
     let a = Marker::Machine(name.into());

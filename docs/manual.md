@@ -374,8 +374,8 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `invalid_dispatch` | a headless job submission has an invalid dispatch configuration |
 | `invalid_edit` | the edited file does not check; `edit` asks to reopen it, and the edit is kept either way |
 | `invalid_file` | a request for a file pastor does not edit (only flock, config or `job:<name>`) |
-| `invalid_key` | `bridge` was given something other than one public key line |
-| `invalid_machine` | `bridge`: a machine name that cannot go in authorized_keys unquoted |
+| `invalid_key` | `bridge` was given something other than one public key line; a join's machine or agent key of a type sshd does not log in with (DSA, unknown), or the same key for both |
+| `invalid_machine` | `bridge`: a machine name that cannot go in authorized_keys unquoted; a join's name starting with `-` |
 | `invalid_name` | a name (such as `watch --name`) with characters pastor refuses |
 | `invalid_path` | `bridge`: a pastor path that cannot go in authorized_keys unquoted |
 | `invalid_report` | a pull machine reported a state it may not set |
@@ -384,9 +384,11 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `job_name_taken` | a headless serve's job has the name of one of the head's |
 | `job_not_found` | no job by that name |
 | `job_task_refused` | the head would not queue a headless serve's job task |
+| `join_failed` | the head could not remove a join token's line from authorized_keys; nothing was added and the token is still good |
 | `join_token_expired` | a machine tried to join with a token past its `--ttl` |
 | `join_token_invalid` | not a join token, an unknown or revoked one, or a `bridge --join` line that is not one join request |
 | `join_token_used` | a machine tried to join with a token another join already used |
+| `key_in_use` | a join's machine or agent key is already in the head's authorized_keys |
 | `machine_exists` | `machine add` of a machine that exists |
 | `machine_name_taken` | a join named a machine already in flock.toml, with a token not made with `--replace` for that name |
 | `machine_not_connected` | `task run --now` on a machine that is not connected |
@@ -433,7 +435,7 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `read_failed` | `task read` could not read the agent's pane |
 | `remote_head_unsupported` | a command that runs on the head only, with a remote head set |
 | `reopen_failed` | reopening a closed task could not start its agent again |
-| `request_too_large` | a request over the daemon's size limit |
+| `request_too_large` | a request over the daemon's size limit, or a `bridge --join` line over 64 KiB |
 | `role_refused` | a task or a script asks for what only a person may, such as `--role orchestrator` |
 | `runtime_error` | any other failure; the message says what |
 | `scheduler_error` | the scheduler could not run, list or reload jobs |
@@ -3783,18 +3785,28 @@ pastor join create --flock builders --tag gpu --ttl 1h
   The joining machine chooses only its name. A name already in flock.toml
   is `machine_name_taken`, unless the token was made with `--replace` for
   that name, which replaces that machine's entry.
-- A join adds the machine with `pull = true`, writes its two lines to
-  `authorized_keys` (`pastor:machine:<name>` and `pastor:agent:<name>`),
-  removes the token's line and emits `machine.joined`. The same token again
-  gets no ssh session; at the head it is `join_token_used`.
+- The name must not start with `-`. The machine and agent keys must be
+  two different keys of a type sshd logs in with (ed25519, ECDSA, RSA, or
+  their security-key forms), and neither may already be in
+  `authorized_keys` (`key_in_use`) other than on that name's own lines.
+- A join marks the token used and removes its line first, so whatever
+  fails after that, the token gets no ssh session; if the line cannot be
+  removed the join fails (`join_failed`) and the token stays good. It then
+  adds the machine with `pull = true`, writes its two lines to
+  `authorized_keys` (`pastor:machine:<name>` and `pastor:agent:<name>`) and
+  emits `machine.joined`. The same token again gets no ssh session; at the
+  head it is `join_token_used`.
 - A token unused at the end of its `--ttl` (default `1h`) loses its line on
   the next scheduler pass (`machine.join_token_expired`); one redeemed
-  before that pass is `join_token_expired`.
+  before that pass is `join_token_expired`. The same pass removes the line
+  of a used token if one is still there, and forgets a used token a week
+  after its join.
 - `pastor join list` shows the tokens; `pastor join revoke <id>` removes one,
   line and all.
-- `bridge --join <id>` takes one line, which must be a join request; its
-  `id` is the one in the forced command, whatever the line says. Anything
-  else is `join_token_invalid`.
+- `bridge --join <id>` takes one line, at most 64 KiB, which must be a join
+  request; its `id` is the one in the forced command, whatever the line
+  says. A longer line is `request_too_large`; anything else is
+  `join_token_invalid`.
 
 ### Jobs on a shepherd
 
