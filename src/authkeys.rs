@@ -33,6 +33,53 @@ impl Marker {
             Marker::Join(id) => format!("pastor:join:{id}"),
         }
     }
+
+    /// The name or id this marker carries.
+    fn value(&self) -> &str {
+        match self {
+            Marker::Machine(n) | Marker::Agent(n) | Marker::Join(n) => n,
+        }
+    }
+
+    /// Fail unless the value is `[A-Za-z0-9._-]+` and not `.` or `..`. A
+    /// newline would start a second, unrestricted line; whitespace would
+    /// split the marker so `has_marker` never finds it again.
+    pub fn check(&self) -> anyhow::Result<()> {
+        let v = self.value();
+        if v.is_empty()
+            || v == "."
+            || v == ".."
+            || !v
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+        {
+            return Err(CliError::err(
+                "invalid_machine",
+                format!("{v:?} cannot be a pastor marker: use letters, digits, '.', '_' and '-'"),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The pastor path as it goes in `command="..."`, checked: absolute and
+/// `[A-Za-z0-9._/-]` only, since sshd runs the command through the user's
+/// shell. Shared with `bridge::authorized_key_line`.
+pub fn check_pastor_path(pastor: &Path) -> anyhow::Result<String> {
+    let pastor = pastor.display().to_string();
+    if !pastor.starts_with('/')
+        || !pastor
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._/-".contains(c))
+    {
+        return Err(CliError::err(
+            "invalid_path",
+            format!(
+                "{pastor:?} cannot go in an authorized_keys command: it must be absolute, with letters, digits, '.', '_', '/' and '-' only"
+            ),
+        ));
+    }
+    Ok(pastor)
 }
 
 /// The options that keep a key to its one command: no terminal, no rc
@@ -60,6 +107,7 @@ pub fn line(
     key: &str,
     marker: &Marker,
 ) -> anyhow::Result<String> {
+    marker.check()?;
     let lines: Vec<&str> = key.lines().filter(|l| !l.trim().is_empty()).collect();
     let [key] = lines.as_slice() else {
         return Err(CliError::err(
@@ -74,17 +122,18 @@ pub fn line(
             "a public key line is its type and its key, like ssh-ed25519 AAAA...",
         ));
     };
-    let pastor = pastor.display().to_string();
-    if pastor.contains(['"', '\\']) || pastor.chars().any(char::is_whitespace) {
+    let pastor = check_pastor_path(pastor)?;
+    // sshd hands command= to the user's shell, so anything it reads as
+    // syntax is live: only words, `=`, paths and spaces go through.
+    if !command_args
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "._ =/-".contains(c))
+    {
         return Err(CliError::err(
-            "invalid_path",
-            format!("{pastor} cannot go in an authorized_keys command unquoted"),
-        ));
-    }
-    if command_args.contains(['"', '\\', '\n']) {
-        return Err(CliError::err(
-            "invalid_machine",
-            format!("{command_args} cannot go in an authorized_keys command"),
+            "invalid_args",
+            format!(
+                "{command_args:?} cannot go in an authorized_keys command: use letters, digits, '.', '_', '=', '/', '-' and spaces"
+            ),
         ));
     }
     Ok(format!(
@@ -179,6 +228,7 @@ fn rewrite(
 /// Replace the line with `marker`, or append `line`. Other markers' lines
 /// with the same marker beyond the first are dropped.
 pub fn upsert(file: &Path, marker: &Marker, line: &str) -> anyhow::Result<()> {
+    marker.check()?;
     let _lock = lock(file)?;
     let m = marker.render();
     rewrite(file, |lines| {
@@ -204,6 +254,7 @@ pub fn upsert(file: &Path, marker: &Marker, line: &str) -> anyhow::Result<()> {
 
 /// Drop the line with `marker`. True if there was one.
 pub fn remove(file: &Path, marker: &Marker) -> anyhow::Result<bool> {
+    marker.check()?;
     let _lock = lock(file)?;
     let m = marker.render();
     rewrite(file, |lines| {
@@ -216,9 +267,11 @@ pub fn remove(file: &Path, marker: &Marker) -> anyhow::Result<bool> {
 
 /// Drop the Machine and Agent lines of `name`.
 pub fn remove_machine(file: &Path, name: &str) -> anyhow::Result<()> {
+    let a = Marker::Machine(name.into());
+    let b = Marker::Agent(name.into());
+    a.check()?;
     let _lock = lock(file)?;
-    let a = Marker::Machine(name.into()).render();
-    let b = Marker::Agent(name.into()).render();
+    let (a, b) = (a.render(), b.render());
     rewrite(file, |lines| {
         let n = lines.len();
         let out: Vec<String> = lines
@@ -256,6 +309,92 @@ mod tests {
         assert!(l.ends_with(" ssh-ed25519 KEY pastor:join:j1"));
         let e = line(Path::new("/p"), "x", "a b\nc d", &m).unwrap_err();
         assert_eq!(e.downcast_ref::<CliError>().unwrap().code, "invalid_key");
+    }
+
+    fn code(e: anyhow::Error) -> String {
+        e.downcast_ref::<CliError>().unwrap().code.clone()
+    }
+
+    /// Every entry point refuses the marker, so no edit ever runs with it.
+    fn marker_rejected_everywhere(value: &str) {
+        let (_d, f) = setup();
+        for m in [
+            Marker::Machine(value.into()),
+            Marker::Agent(value.into()),
+            Marker::Join(value.into()),
+        ] {
+            let e = line(Path::new("/bin/pastor"), "bridge", "ssh-ed25519 K", &m).unwrap_err();
+            assert_eq!(code(e), "invalid_machine", "{m:?}");
+            let e = upsert(&f, &m, "ssh-ed25519 K x").unwrap_err();
+            assert_eq!(code(e), "invalid_machine", "{m:?}");
+            let e = remove(&f, &m).unwrap_err();
+            assert_eq!(code(e), "invalid_machine", "{m:?}");
+        }
+        let e = remove_machine(&f, value).unwrap_err();
+        assert_eq!(code(e), "invalid_machine");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), format!("{FOREIGN}\n"));
+    }
+
+    #[test]
+    fn marker_with_newline_rejected() {
+        // A newline in the marker would be a second, unrestricted key line.
+        marker_rejected_everywhere("a\nssh-rsa X");
+    }
+
+    #[test]
+    fn marker_with_space_rejected() {
+        // A space would split the marker, so `remove` could never find it.
+        marker_rejected_everywhere("a b");
+        for bad in ["", ".", "..", "a\tb", "a/b", "a\"b", "a\\b"] {
+            marker_rejected_everywhere(bad);
+        }
+        for ok in ["pi-1", "a.b_c", "...", ".hidden", "9"] {
+            Marker::Machine(ok.into()).check().unwrap();
+        }
+    }
+
+    #[test]
+    fn args_with_shell_metachar_rejected() {
+        let m = Marker::Join("j".into());
+        for bad in [
+            "$(x)", "`x`", "a;b", "a|b", "a&b", "'", "a\"b", "a\\b", "a\nb", "a\rb", "a\tb",
+        ] {
+            let e = line(Path::new("/bin/pastor"), bad, "ssh-ed25519 K", &m).unwrap_err();
+            assert_eq!(code(e), "invalid_args", "{bad:?}");
+        }
+        let l = line(
+            Path::new("/bin/pastor"),
+            "bridge --agent --machine pi-1 --dir=/srv/x.y",
+            "ssh-ed25519 K",
+            &m,
+        )
+        .unwrap();
+        assert!(l.contains("--dir=/srv/x.y\","), "{l}");
+    }
+
+    #[test]
+    fn relative_or_tilde_path_rejected() {
+        let m = Marker::Join("j".into());
+        for bad in [
+            "~/bin/pastor",
+            "bin/pastor",
+            "pastor",
+            "/a b/pastor",
+            "/bin/$HOME/pastor",
+            "/bin/pastor;id",
+            "/bin/pa\"stor",
+            "/bin/pa\\stor",
+            "/bin/pa\nstor",
+        ] {
+            let p = Path::new(bad);
+            let e = line(p, "bridge", "ssh-ed25519 K", &m).unwrap_err();
+            assert_eq!(code(e), "invalid_path", "{bad:?}");
+            let e = crate::bridge::authorized_key_line(p, "pi-1", "ssh-ed25519 K").unwrap_err();
+            assert_eq!(code(e), "invalid_path", "{bad:?}");
+        }
+        for ok in ["/bin/pastor", "/opt/pastor-0.9/bin/pastor_x.y", "/pastor"] {
+            check_pastor_path(Path::new(ok)).unwrap();
+        }
     }
 
     #[test]

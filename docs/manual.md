@@ -370,6 +370,7 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `head_unresponsive` | something holds the socket but does not answer a ping |
 | `herdr_error` | herdr could not be run, or answered a request with an error |
 | `internal` | the daemon sent a reply of a kind the CLI did not expect |
+| `invalid_args` | an authorized_keys forced command's arguments with characters a shell could read as syntax |
 | `invalid_dispatch` | a headless job submission has an invalid dispatch configuration |
 | `invalid_edit` | the edited file does not check; `edit` asks to reopen it, and the edit is kept either way |
 | `invalid_file` | a request for a file pastor does not edit (only flock, config or `job:<name>`) |
