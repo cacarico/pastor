@@ -28,7 +28,7 @@ use crate::config::{PastorConfig, Paths};
 use crate::daemon::{Answer, Daemon, Fleet, answer_on, jobs_answer};
 use crate::events::{EventRecord, EventsPage};
 use crate::head::RemoteHead;
-use crate::herdr::{Connector, Endpoint};
+use crate::herdr::{Connector, ConnectorExt, Endpoint};
 use crate::ipc::{
     IPC_PROTOCOL, IpcRequest, IpcResponse, ProtocolGate, SHEPHERD_ROLE, request_line,
 };
@@ -46,6 +46,10 @@ const PAGE: u32 = 200;
 /// How many tasks one `TaskClaim` asks for. The head's `max_agents` for the
 /// machine is what bounds how many run here at once.
 const CLAIM_AT_ONCE: u32 = 4;
+
+/// How long the shepherd's herdr may take to answer the ping that reads its
+/// version (`Puller::read_herdr_version`).
+const VERSION_PING_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a request to the head may take. A `JobSubmit` waits for the
 /// head's dispatch pass, agent readiness included.
@@ -241,6 +245,11 @@ struct Puller {
     settings: MachineSettings,
     store: Arc<Store>,
     ask: Ask,
+    /// This machine's own versions, sent with every claim: herdr's as its
+    /// connector answers ping (`read_herdr_version`), `None` until then;
+    /// pastor's own always.
+    herdr_version: Option<String>,
+    pastor_version: Option<String>,
     /// The actor's events; any of them means a row may have changed.
     events: broadcast::Sender<PastorEvent>,
     heard: broadcast::Receiver<PastorEvent>,
@@ -273,6 +282,8 @@ impl Puller {
             settings,
             store,
             ask,
+            herdr_version: None,
+            pastor_version: Some(env!("CARGO_PKG_VERSION").into()),
             events,
             heard,
             actor: None,
@@ -427,12 +438,25 @@ impl Puller {
 
     /// Ask the head for tasks and keep each as a queued row here.
     async fn claim(&mut self) {
-        let req = IpcRequest::TaskClaim {
+        let req = |versions: bool| IpcRequest::TaskClaim {
             machine: self.machine.clone(),
             free_slots: CLAIM_AT_ONCE,
             flock_work: self.flock_work,
+            herdr_version: self.herdr_version.clone().filter(|_| versions),
+            pastor_version: self.pastor_version.clone().filter(|_| versions),
         };
-        let tasks = match (self.ask)(req).await {
+        let mut answer = (self.ask)(req(true)).await;
+        // A head from before `PULL_VERSIONS_PROTOCOL` refuses the versions
+        // (`head_too_old` before the send); it still hands out tasks to a
+        // claim without them, which matters more than its machine_state row.
+        if let Err(err) = &answer
+            && err
+                .downcast_ref::<CliError>()
+                .is_some_and(|e| e.code == "head_too_old")
+        {
+            answer = (self.ask)(req(false)).await;
+        }
+        let tasks = match answer {
             Ok(IpcResponse::Tasks(tasks)) => {
                 if self.refused.take().is_some() {
                     tracing::info!(machine = %self.machine, "the head gives this machine tasks again");
@@ -461,11 +485,27 @@ impl Puller {
             }
         };
         self.actor();
+        self.read_herdr_version().await;
         for t in tasks {
             match self.store.adopt_claimed(&t) {
                 Ok(_) => tracing::info!(task = %t.display_id(), "claimed from the head"),
                 Err(err) => tracing::error!(task = %t.display_id(), %err, "keep a claimed task"),
             }
+        }
+    }
+
+    /// Ask this machine's herdr, through the connector its tasks run on, for
+    /// its version, until it answers once; the next claim reports it. Only
+    /// after the head answered a claim, so a machine the head does not pull
+    /// never talks to its herdr.
+    async fn read_herdr_version(&mut self) {
+        if self.herdr_version.is_some() {
+            return;
+        }
+        match tokio::time::timeout(VERSION_PING_TIMEOUT, self.connector.ping()).await {
+            Ok(Ok(pong)) => self.herdr_version = Some(pong.version),
+            Ok(Err(err)) => tracing::debug!(%err, "read this machine's herdr version"),
+            Err(_) => tracing::debug!("read this machine's herdr version: timed out"),
         }
     }
 
@@ -1091,6 +1131,54 @@ mod tests {
         }
     }
 
+    /// The herdr version a claim reports is the one the shepherd's own
+    /// connector answers ping with, not whatever `herdr` is on the PATH. It
+    /// is asked only once the head has answered a claim (a machine the head
+    /// does not pull never talks to its herdr).
+    #[tokio::test]
+    async fn claim_reports_the_connectors_herdr_version() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = sent.clone();
+        let ask: Ask = Arc::new(move |req| {
+            log.lock().unwrap().push(req);
+            Box::pin(async { Ok(IpcResponse::Tasks(vec![])) })
+        });
+        let fake = crate::herdr::fake::FakeHerdr::new();
+        let mut p = Puller::new(
+            "laptop".into(),
+            false,
+            Arc::new(fake.clone()),
+            fast(),
+            Arc::new(Store::open_in_memory().unwrap()),
+            ask,
+        );
+        p.claim().await;
+        p.claim().await;
+        p.claim().await;
+        let versions: Vec<(Option<String>, Option<String>)> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| match r {
+                IpcRequest::TaskClaim {
+                    herdr_version,
+                    pastor_version,
+                    ..
+                } => (herdr_version.clone(), pastor_version.clone()),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        let pastor = Some(env!("CARGO_PKG_VERSION").to_string());
+        assert_eq!(
+            versions,
+            [
+                (None, pastor.clone()),
+                (Some("fake".into()), pastor.clone()),
+                (Some("fake".into()), pastor),
+            ]
+        );
+    }
+
     /// A shepherd that is a pull machine claims the task pinned to it, runs
     /// it with a machine actor on its own herdr and reports each change: the
     /// head's row and events follow it, as for a machine the head runs. A
@@ -1640,6 +1728,8 @@ mod tests {
                 machine: "laptop".into(),
                 free_slots: 1,
                 flock_work: false,
+                herdr_version: None,
+                pastor_version: None,
             })
             .await
         else {
@@ -1911,6 +2001,8 @@ mod tests {
             machine: "m".into(),
             free_slots: 1,
             flock_work: false,
+            herdr_version: None,
+            pastor_version: None,
         })
         .await
         .unwrap_err();

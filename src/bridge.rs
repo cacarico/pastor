@@ -6,6 +6,14 @@
 //! on another machine, locked by the `authorized_keys` line
 //! (`authorized_key_line`) to that machine's own tasks: it reads each request
 //! and passes on only what such an agent may ask (`answer_agent`).
+//!
+//! `pastor bridge --shepherd --machine <name>` is the way in for that
+//! machine's shepherd (a pull machine's headless `pastor serve`), locked by
+//! an `authorized_keys` line of its own (`authkeys::line` with
+//! `Marker::Machine`). It passes on everything `answer_agent` does, plus
+//! claiming and reporting that machine's tasks, its saved trust, job
+//! submits and its own events (`answer_shepherd`); it never lets the
+//! request choose another machine to act for.
 
 use std::path::Path;
 
@@ -19,6 +27,9 @@ use crate::ipc::{
 
 /// The code a request an agent's bridge will not pass on is answered with.
 pub const NOT_ALLOWED_FOR_AGENT: &str = "not_allowed_for_agent";
+
+/// The code a request a shepherd's bridge will not pass on is answered with.
+pub const NOT_ALLOWED_FOR_SHEPHERD: &str = "not_allowed_for_shepherd";
 
 /// Passes `input`'s lines to the head on `socket` and writes each reply to
 /// `output`, until `input` ends. A request the head cannot take stops the
@@ -42,6 +53,20 @@ pub async fn run_agent(
 ) -> anyhow::Result<()> {
     serve(input, output, async |line: &[u8]| {
         answer_agent(socket, machine, line).await
+    })
+    .await
+}
+
+/// `run` for the shepherd on `machine`: each line goes through
+/// `answer_shepherd`.
+pub async fn run_shepherd(
+    socket: &Path,
+    machine: &str,
+    input: impl AsyncBufRead + Unpin,
+    output: impl AsyncWrite + Unpin,
+) -> anyhow::Result<()> {
+    serve(input, output, async |line: &[u8]| {
+        answer_shepherd(socket, machine, line).await
     })
     .await
 }
@@ -90,32 +115,44 @@ fn reply_line(resp: &IpcResponse) -> anyhow::Result<Vec<u8>> {
     Ok(line)
 }
 
-fn refuse(message: impl std::fmt::Display) -> anyhow::Result<Vec<u8>> {
-    reply_line(&IpcResponse::error(NOT_ALLOWED_FOR_AGENT, message))
+fn refuse(code: &str, message: impl std::fmt::Display) -> anyhow::Result<Vec<u8>> {
+    reply_line(&IpcResponse::error(code, message))
 }
 
-/// The reply for one request line from an agent on `machine`, asking the
-/// head only what such an agent may ask. `Ping` always; `TaskShow`,
-/// `TaskRead` and `TaskDone` for a task placed on `machine`, as the head
-/// knows it; `List`, cut to the tasks of `machine`'s flock. Anything else is
-/// refused here and never reaches the head. The bridge names the task a
-/// request comes from itself (`ipc::FROM_TASK_FIELD`): the task the request
-/// is about, whatever the caller claimed, and none when it names no task.
-pub async fn answer_agent(socket: &Path, machine: &str, line: &[u8]) -> anyhow::Result<Vec<u8>> {
+/// `line` as a request, or the reply that answers it unread: not UTF-8, or
+/// not a request line (`invalid_request`).
+fn parse(line: &[u8]) -> Result<IpcRequest, anyhow::Result<Vec<u8>>> {
     let parsed = std::str::from_utf8(line)
         .map_err(|e| e.to_string())
         .and_then(|text| parse_request_line(text.trim()).map_err(|e| e.to_string()));
-    let req = match parsed {
-        Ok((req, _claimed)) => req,
-        Err(err) => return reply_line(&IpcResponse::error("invalid_request", err)),
-    };
-    match req {
-        IpcRequest::Ping => ask(socket, &req, None).await,
-        IpcRequest::List { mut filter } => {
+    match parsed {
+        Ok((req, _claimed)) => Ok(req),
+        Err(err) => Err(reply_line(&IpcResponse::error("invalid_request", err))),
+    }
+}
+
+/// What both `answer_agent` and `answer_shepherd` pass on as it is: `Ping`
+/// always; `List`, cut to `machine`'s flock; and `TaskShow`, `TaskRead` and
+/// `TaskDone` for a task placed on `machine`, as the head knows it. `None`
+/// for anything else, which each caller refuses in its own words, with its
+/// own code (`not_allowed`). The bridge names the task a request comes from
+/// itself (`ipc::FROM_TASK_FIELD`): the task the request is about, whatever
+/// the caller claimed, and none when it names no task.
+async fn answer_common(
+    socket: &Path,
+    machine: &str,
+    not_allowed: &str,
+    req: &IpcRequest,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    Ok(Some(match req {
+        IpcRequest::Ping => ask(socket, req, None).await?,
+        IpcRequest::List { filter } => {
+            let mut filter = filter.clone();
             let Some(flocks) = machine_flocks(socket, machine).await? else {
-                return refuse(format!(
-                    "the head has no machine {machine}, so its flocks are unknown"
-                ));
+                return Ok(Some(refuse(
+                    not_allowed,
+                    format!("the head has no machine {machine}, so its flocks are unknown"),
+                )?));
             };
             if let [one] = &flocks[..] {
                 filter.flock = Some(one.clone());
@@ -124,15 +161,21 @@ pub async fn answer_agent(socket: &Path, machine: &str, line: &[u8]) -> anyhow::
             match serde_json::from_slice::<IpcResponse>(&reply) {
                 Ok(IpcResponse::Tasks(mut tasks)) => {
                     tasks.retain(|t| t.flock.as_ref().is_some_and(|f| flocks.contains(f)));
-                    reply_line(&IpcResponse::Tasks(tasks))
+                    reply_line(&IpcResponse::Tasks(tasks))?
                 }
-                Ok(IpcResponse::Error { .. }) => Ok(reply),
-                _ => refuse("the head answered a task list with something else"),
+                Ok(IpcResponse::Error { .. }) => reply,
+                _ => {
+                    return Ok(Some(refuse(
+                        not_allowed,
+                        "the head answered a task list with something else",
+                    )?));
+                }
             }
         }
         IpcRequest::TaskShow { id }
         | IpcRequest::TaskRead { id, .. }
         | IpcRequest::TaskDone { id, .. } => {
+            let id = *id;
             let task = format!("t-{id}");
             let shown = ask(socket, &IpcRequest::TaskShow { id }, Some(&task)).await?;
             let on_machine = matches!(
@@ -140,18 +183,226 @@ pub async fn answer_agent(socket: &Path, machine: &str, line: &[u8]) -> anyhow::
                 Ok(IpcResponse::Task(t)) if t.machine.as_deref() == Some(machine)
             );
             if !on_machine {
-                return refuse(format!("{task} is not a task on machine {machine}"));
+                return Ok(Some(refuse(
+                    not_allowed,
+                    format!("{task} is not a task on machine {machine}"),
+                )?));
             }
             match req {
-                IpcRequest::TaskShow { .. } => Ok(shown),
-                _ => ask(socket, &req, Some(&task)).await,
+                IpcRequest::TaskShow { .. } => shown,
+                _ => ask(socket, req, Some(&task)).await?,
             }
         }
-        other => refuse(format!(
-            "an agent on {machine} may ping, list its flock's tasks, and show, read or end its machine's tasks; not {}",
-            op_name(&other)
-        )),
+        _ => return Ok(None),
+    }))
+}
+
+/// The reply for one request line from an agent on `machine`, asking the
+/// head only what such an agent may ask (`answer_common`). Anything else is
+/// refused here and never reaches the head.
+pub async fn answer_agent(socket: &Path, machine: &str, line: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let req = match parse(line) {
+        Ok(req) => req,
+        Err(reply) => return reply,
+    };
+    if let Some(reply) = answer_common(socket, machine, NOT_ALLOWED_FOR_AGENT, &req).await? {
+        return Ok(reply);
     }
+    refuse(
+        NOT_ALLOWED_FOR_AGENT,
+        format!(
+            "an agent on {machine} may ping, list its flock's tasks, and show, read or end its machine's tasks; not {}",
+            op_name(&req)
+        ),
+    )
+}
+
+/// The reply for one request line from the shepherd on `machine`: everything
+/// `answer_agent` allows (`answer_common`), plus claiming and reporting its
+/// own tasks, reading its saved trust, submitting jobs, and reading its own
+/// events. `TaskClaim`, `TaskReport` and `PullTrust` get `machine`
+/// overwritten with `machine`, whatever the request asked for, so a pull
+/// machine's shepherd can only ever claim and report for itself (a hijacked
+/// one cannot take another machine's tasks). A `JobSubmit`'s dispatch is
+/// pinned to `machine` the same way, and refused when it picks the agent's
+/// arguments or permissions or another flock (`pin_dispatch`). `EventsSince`
+/// is cut to the
+/// records about `machine`. Anything else is refused here and never reaches
+/// the head.
+pub async fn answer_shepherd(socket: &Path, machine: &str, line: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let req = match parse(line) {
+        Ok(req) => req,
+        Err(reply) => return reply,
+    };
+    if let Some(reply) = answer_common(socket, machine, NOT_ALLOWED_FOR_SHEPHERD, &req).await? {
+        return Ok(reply);
+    }
+    match req {
+        IpcRequest::TaskClaim {
+            free_slots,
+            flock_work,
+            herdr_version,
+            pastor_version,
+            ..
+        } => {
+            ask(
+                socket,
+                &IpcRequest::TaskClaim {
+                    machine: machine.to_string(),
+                    free_slots,
+                    flock_work,
+                    herdr_version,
+                    pastor_version,
+                },
+                None,
+            )
+            .await
+        }
+        IpcRequest::TaskReport {
+            id,
+            state,
+            pane,
+            detail,
+            limit,
+            trusted,
+            ..
+        } => {
+            ask(
+                socket,
+                &IpcRequest::TaskReport {
+                    machine: machine.to_string(),
+                    id,
+                    state,
+                    pane,
+                    detail,
+                    limit,
+                    trusted,
+                },
+                None,
+            )
+            .await
+        }
+        IpcRequest::PullTrust { .. } => {
+            ask(
+                socket,
+                &IpcRequest::PullTrust {
+                    machine: machine.to_string(),
+                },
+                None,
+            )
+            .await
+        }
+        IpcRequest::JobSubmit {
+            job,
+            dispatch,
+            prompt,
+            items,
+        } => {
+            let dispatch = match pin_dispatch(socket, machine, dispatch).await? {
+                Ok(dispatch) => dispatch,
+                Err(why) => return refuse(NOT_ALLOWED_FOR_SHEPHERD, why),
+            };
+            ask(
+                socket,
+                &IpcRequest::JobSubmit {
+                    job,
+                    dispatch,
+                    prompt,
+                    items,
+                },
+                None,
+            )
+            .await
+        }
+        IpcRequest::EventsSince { after, limit, task } => {
+            let reply = ask(
+                socket,
+                &IpcRequest::EventsSince { after, limit, task },
+                None,
+            )
+            .await?;
+            match serde_json::from_slice::<IpcResponse>(&reply) {
+                Ok(IpcResponse::Events(mut page)) => {
+                    page.events.retain(|e| event_machine(e) == Some(machine));
+                    reply_line(&IpcResponse::Events(page))
+                }
+                Ok(IpcResponse::Error { .. }) => Ok(reply),
+                _ => refuse(
+                    NOT_ALLOWED_FOR_SHEPHERD,
+                    "the head answered events with something else",
+                ),
+            }
+        }
+        other => refuse(
+            NOT_ALLOWED_FOR_SHEPHERD,
+            format!(
+                "the shepherd on {machine} may ping, list its flock's tasks, show, read or end its machine's tasks, claim and report its tasks, read its saved trust, submit jobs, and read its own events; not {}",
+                op_name(&other)
+            ),
+        ),
+    }
+}
+
+/// The `[dispatch]` keys a shepherd's `JobSubmit` may not set: they choose
+/// the agent's arguments or permissions (`agent_args`, `allow`, `deny`,
+/// `profile`, `agent_source`) or the machines its tasks may land on
+/// (`tags`, `tag`). `machine` is overwritten instead, and `flock` checked
+/// against the machine's own (`pin_dispatch`).
+const SHEPHERD_DISPATCH_REFUSED: &[&str] = &[
+    "agent_args",
+    "allow",
+    "deny",
+    "profile",
+    "agent_source",
+    "tags",
+    "tag",
+];
+
+/// A shepherd's job `dispatch` table, pinned to `machine`: `machine` set to
+/// it whatever was sent, and `Err` with the reason for a table that is not
+/// one, sets a key in `SHEPHERD_DISPATCH_REFUSED`, or names a `flock`
+/// `machine` is not in (as the head reports it, `machine_flocks`). A key set
+/// to null is left for the head, which reads it as unset.
+async fn pin_dispatch(
+    socket: &Path,
+    machine: &str,
+    dispatch: serde_json::Value,
+) -> anyhow::Result<Result<serde_json::Value, String>> {
+    let serde_json::Value::Object(mut table) = dispatch else {
+        return Ok(Err("a job's dispatch must be a table".into()));
+    };
+    let set = |v: &serde_json::Value| !v.is_null();
+    if let Some(key) = SHEPHERD_DISPATCH_REFUSED
+        .iter()
+        .find(|k| table.get(**k).is_some_and(set))
+    {
+        return Ok(Err(format!(
+            "the shepherd on {machine} may not set {key} in a job's dispatch"
+        )));
+    }
+    if let Some(flock) = table.get("flock").filter(|v| set(v)) {
+        let flocks = machine_flocks(socket, machine).await?.unwrap_or_default();
+        if !flock
+            .as_str()
+            .is_some_and(|f| flocks.iter().any(|m| m == f))
+        {
+            return Ok(Err(format!(
+                "the shepherd on {machine} may not send a job to flock {flock}, which {machine} is not in"
+            )));
+        }
+    }
+    table.insert("machine".into(), machine.into());
+    Ok(Ok(serde_json::Value::Object(table)))
+}
+
+/// The machine an event record is about, for `EventsSince` filtering: a
+/// `machine.*` event's own machine, else its task's. A record about neither
+/// (a job event with no task) matches no machine.
+fn event_machine(e: &crate::events::EventRecord) -> Option<&str> {
+    e.machine
+        .as_ref()
+        .map(|m| m.name.as_str())
+        .or_else(|| e.task.as_ref().and_then(|t| t.machine.as_deref()))
 }
 
 /// The request's `op`, as it crosses the socket.
@@ -186,6 +437,10 @@ async fn machine_flocks(socket: &Path, machine: &str) -> anyhow::Result<Option<V
 /// The `authorized_keys` line that lets `key` in only to run
 /// `<pastor> bridge --agent --machine <machine>`, with no terminal and no
 /// forwarding. `key` is one public key line (`ssh-ed25519 AAAA... comment`).
+/// `machine` is checked the same way a marker is
+/// (`authkeys::Marker::check`, code `invalid_machine`): `[A-Za-z0-9._-]+`
+/// only, so nothing that goes unquoted into `command="..."` can break out
+/// of it or run a second command (`$(id)`, `a;b`).
 pub fn authorized_key_line(pastor: &Path, machine: &str, key: &str) -> anyhow::Result<String> {
     let lines: Vec<&str> = key.lines().filter(|l| !l.trim().is_empty()).collect();
     let [key] = lines.as_slice() else {
@@ -202,15 +457,7 @@ pub fn authorized_key_line(pastor: &Path, machine: &str, key: &str) -> anyhow::R
         ));
     }
     let pastor = crate::authkeys::check_pastor_path(pastor)?;
-    if machine.is_empty()
-        || machine.contains(['"', '\\'])
-        || machine.chars().any(char::is_whitespace)
-    {
-        return Err(CliError::err(
-            "invalid_machine",
-            format!("{machine} cannot go in an authorized_keys command unquoted"),
-        ));
-    }
+    crate::authkeys::Marker::Agent(machine.to_string()).check()?;
     Ok(format!(
         "command=\"{pastor} bridge --agent --machine {machine}\",{} {key}",
         crate::authkeys::restrict_options()
@@ -239,6 +486,19 @@ mod tests {
             "spec": {"agent": "claude"}, "machine": machine, "state": "running",
             "flock": flock,
             "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+        })
+    }
+
+    /// One `EventRecord`, about `task` when given (a `task.*` event).
+    fn event_json(
+        seq: u64,
+        kind: &str,
+        task: Option<serde_json::Value>,
+        machine: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "seq": seq, "at": "2026-01-01T00:00:00Z", "type": kind,
+            "task": task, "job": null, "machine": machine,
         })
     }
 
@@ -314,9 +574,23 @@ mod tests {
                         serde_json::json!({"kind": "error", "data": {"code": "task_not_found", "message": "no"}})
                     }
                     "task_read" => serde_json::json!({"kind": "text", "data": "pane text"}),
+                    "task_report" if tasks[id as usize - 1]["machine"] != v["machine"] => {
+                        serde_json::json!({"kind": "error", "data": {"code": "not_on_machine", "message": "no"}})
+                    }
                     "task_done" => {
                         serde_json::json!({"kind": "task", "data": tasks[id as usize - 1]})
                     }
+                    "events_since" => serde_json::json!({"kind": "events", "data": {
+                        "events": [
+                            event_json(1, "task.done", Some(tasks[0].clone()), None),
+                            event_json(2, "task.done", Some(tasks[1].clone()), None),
+                            serde_json::json!({
+                                "seq": 3, "at": "2026-01-01T00:00:00Z", "type": "job.failed",
+                                "task": null, "job": "nightly", "machine": null,
+                            }),
+                        ],
+                        "gap": false, "oldest": 1, "newest": 3,
+                    }}),
                     op => serde_json::json!({"kind": "text", "data": format!("did {op}")}),
                 };
                 let mut out = serde_json::to_string(&reply).unwrap();
@@ -337,6 +611,16 @@ mod tests {
         async fn ask(&self, req: &IpcRequest, claimed: Option<&str>) -> IpcResponse {
             let line = request_line(req, claimed).unwrap();
             let reply = answer_agent(&self.socket, "pi-1", line.as_bytes())
+                .await
+                .unwrap();
+            assert!(reply.ends_with(b"\n"));
+            serde_json::from_slice(&reply).unwrap()
+        }
+
+        /// What the shepherd bridge for `machine` answers `req`.
+        async fn ask_as_shepherd(&self, machine: &str, req: &IpcRequest) -> IpcResponse {
+            let line = request_line(req, None).unwrap();
+            let reply = answer_shepherd(&self.socket, machine, line.as_bytes())
                 .await
                 .unwrap();
             assert!(reply.ends_with(b"\n"));
@@ -649,11 +933,248 @@ mod tests {
 
     #[test]
     fn the_authorized_key_line_rejects_a_machine_name_it_cannot_quote() {
-        for bad in ["", "pi 1", "pi\"1", "pi\\1", "pi\n1"] {
+        for bad in [
+            "", "pi 1", "pi\"1", "pi\\1", "pi\n1", "$(id)", "a;b", "`id`", "a|b", "..",
+        ] {
             assert!(
                 authorized_key_line(Path::new("/opt/pastor"), bad, "ssh-ed25519 A").is_err(),
                 "{bad:?}"
             );
         }
+    }
+
+    fn refused_shepherd(resp: &IpcResponse) -> bool {
+        matches!(resp, IpcResponse::Error { code, .. } if code == NOT_ALLOWED_FOR_SHEPHERD)
+    }
+
+    /// A pull machine's shepherd whose `TaskClaim` names another machine
+    /// claims only for itself: the bridge overwrites `machine` with its own
+    /// before the head ever sees the request, whatever the line asked for.
+    #[tokio::test]
+    async fn shepherd_machine_field_is_overwritten() {
+        let head = fake_head();
+        head.ask_as_shepherd(
+            "pi-1",
+            &IpcRequest::TaskClaim {
+                machine: "other".into(),
+                free_slots: 2,
+                flock_work: false,
+                herdr_version: None,
+                pastor_version: None,
+            },
+        )
+        .await;
+        assert_eq!(head.last()["op"], "task_claim");
+        assert_eq!(head.last()["machine"], "pi-1");
+        assert_eq!(head.last()["free_slots"], 2);
+    }
+
+    /// A shepherd may not start work: `task run` is a person's, never a
+    /// pull machine's.
+    #[tokio::test]
+    async fn shepherd_refuses_task_run() {
+        let head = fake_head();
+        let req: IpcRequest = serde_json::from_value(serde_json::json!({
+            "op": "run", "prompt": "hi", "spec": {"agent": "claude"},
+        }))
+        .unwrap();
+        let resp = head.ask_as_shepherd("pi-1", &req).await;
+        let IpcResponse::Error { code, message } = &resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(code, NOT_ALLOWED_FOR_SHEPHERD);
+        assert!(message.contains("run"), "{message}");
+        assert!(head.ops().is_empty(), "{:?}", head.ops());
+    }
+
+    /// `EventsSince` through a shepherd's bridge is cut to the records
+    /// about its own machine, whatever the head's log holds of others'.
+    #[tokio::test]
+    async fn shepherd_events_filtered() {
+        let head = fake_head();
+        let req = IpcRequest::EventsSince {
+            after: 0,
+            limit: 50,
+            task: None,
+        };
+        let IpcResponse::Events(page) = head.ask_as_shepherd("pi-1", &req).await else {
+            panic!()
+        };
+        assert_eq!(
+            page.events
+                .iter()
+                .map(|e| e.task.as_ref().unwrap().id)
+                .collect::<Vec<_>>(),
+            [1]
+        );
+        let IpcResponse::Events(page) = head.ask_as_shepherd("pi-2", &req).await else {
+            panic!()
+        };
+        assert_eq!(
+            page.events
+                .iter()
+                .map(|e| e.task.as_ref().unwrap().id)
+                .collect::<Vec<_>>(),
+            [2]
+        );
+    }
+
+    /// A pull machine runs its own jobs, so its shepherd may submit them.
+    #[tokio::test]
+    async fn shepherd_allows_job_submit() {
+        let head = fake_head();
+        let req = IpcRequest::JobSubmit {
+            job: "nightly".into(),
+            dispatch: serde_json::json!({}),
+            prompt: "p".into(),
+            items: vec![],
+        };
+        let resp = head.ask_as_shepherd("pi-1", &req).await;
+        assert!(!refused_shepherd(&resp), "{resp:?}");
+        assert_eq!(head.last()["op"], "job_submit");
+        assert_eq!(head.last()["job"], "nightly");
+    }
+
+    /// A shepherd's job runs on its own machine: whatever `machine` the
+    /// submitted `[dispatch]` names, the head sees the shepherd's own.
+    #[tokio::test]
+    async fn shepherd_job_submit_pinned_to_self() {
+        let head = fake_head();
+        let req = IpcRequest::JobSubmit {
+            job: "nightly".into(),
+            dispatch: serde_json::json!({"agent": "claude", "machine": "other"}),
+            prompt: "p".into(),
+            items: vec![],
+        };
+        let resp = head.ask_as_shepherd("pi-1", &req).await;
+        assert!(!refused_shepherd(&resp), "{resp:?}");
+        assert_eq!(head.last()["op"], "job_submit");
+        assert_eq!(head.last()["dispatch"]["machine"], "pi-1");
+        assert_eq!(head.last()["dispatch"]["agent"], "claude");
+        // No `machine` at all is pinned too.
+        let req = IpcRequest::JobSubmit {
+            job: "nightly".into(),
+            dispatch: serde_json::json!({}),
+            prompt: "p".into(),
+            items: vec![],
+        };
+        head.ask_as_shepherd("pi-2", &req).await;
+        assert_eq!(head.last()["dispatch"]["machine"], "pi-2");
+    }
+
+    /// A shepherd may not choose its job's agent arguments, permissions,
+    /// tags or another flock: each is refused before the head sees it.
+    #[tokio::test]
+    async fn shepherd_job_submit_refuses_agent_args() {
+        let head = fake_head();
+        for dispatch in [
+            serde_json::json!({"agent_args": ["--dangerously-skip-permissions"]}),
+            serde_json::json!({"agent_args": []}),
+            serde_json::json!({"allow": ["Bash(*)"]}),
+            serde_json::json!({"deny": ["Read"]}),
+            serde_json::json!({"profile": "yolo"}),
+            serde_json::json!({"agent_source": {"agent": "x"}}),
+            serde_json::json!({"tags": ["gpu"]}),
+            serde_json::json!({"tag": "gpu"}),
+            serde_json::json!({"flock": "work"}),
+            serde_json::json!("not a table"),
+        ] {
+            let req = IpcRequest::JobSubmit {
+                job: "nightly".into(),
+                dispatch: dispatch.clone(),
+                prompt: "p".into(),
+                items: vec![],
+            };
+            let resp = head.ask_as_shepherd("pi-1", &req).await;
+            assert!(refused_shepherd(&resp), "{dispatch}: {resp:?}");
+        }
+        assert!(
+            !head.ops().contains(&"job_submit".to_string()),
+            "{:?}",
+            head.ops()
+        );
+        // Its own flock is fine.
+        let req = IpcRequest::JobSubmit {
+            job: "nightly".into(),
+            dispatch: serde_json::json!({"flock": "home"}),
+            prompt: "p".into(),
+            items: vec![],
+        };
+        let resp = head.ask_as_shepherd("pi-1", &req).await;
+        assert!(!refused_shepherd(&resp), "{resp:?}");
+        assert_eq!(head.last()["dispatch"]["flock"], "home");
+        assert_eq!(head.last()["dispatch"]["machine"], "pi-1");
+    }
+
+    /// `TaskReport` and `PullTrust` act for the shepherd's own machine,
+    /// whatever `machine` the line names.
+    #[tokio::test]
+    async fn shepherd_report_and_trust_machine_overwritten() {
+        let head = fake_head();
+        head.ask_as_shepherd(
+            "pi-1",
+            &IpcRequest::TaskReport {
+                machine: "other".into(),
+                id: 1,
+                state: crate::task::TaskState::Running,
+                pane: None,
+                detail: None,
+                limit: None,
+                trusted: None,
+            },
+        )
+        .await;
+        assert_eq!(head.last()["op"], "task_report");
+        assert_eq!(head.last()["machine"], "pi-1");
+        head.ask_as_shepherd(
+            "pi-1",
+            &IpcRequest::PullTrust {
+                machine: "other".into(),
+            },
+        )
+        .await;
+        assert_eq!(head.last()["op"], "pull_trust");
+        assert_eq!(head.last()["machine"], "pi-1");
+    }
+
+    /// A report on another machine's task, even one that names that
+    /// machine, reaches the head as the shepherd's own and is refused.
+    #[tokio::test]
+    async fn shepherd_report_on_another_machines_task_is_not_on_machine() {
+        let head = fake_head();
+        let resp = head
+            .ask_as_shepherd(
+                "pi-1",
+                &IpcRequest::TaskReport {
+                    machine: "pi-2".into(),
+                    id: 2,
+                    state: crate::task::TaskState::Done,
+                    pane: None,
+                    detail: None,
+                    limit: None,
+                    trusted: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(&resp, IpcResponse::Error { code, .. } if code == "not_on_machine"),
+            "{resp:?}"
+        );
+    }
+
+    /// A job event names no machine, so no shepherd reads it.
+    #[tokio::test]
+    async fn shepherd_events_drop_a_job_event() {
+        let head = fake_head();
+        let req = IpcRequest::EventsSince {
+            after: 0,
+            limit: 50,
+            task: None,
+        };
+        let IpcResponse::Events(page) = head.ask_as_shepherd("pi-1", &req).await else {
+            panic!()
+        };
+        assert!(page.events.iter().all(|e| e.job.is_none()), "{page:?}");
+        assert_eq!(page.events.len(), 1);
     }
 }

@@ -407,6 +407,7 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `no_trust_keys` | `task send --trust` and the agent has no `trust_keys` |
 | `no_worktree` | `task close --remove-worktree` of a task with no worktree |
 | `not_allowed_for_agent` | an agent's bridge will not pass the request on |
+| `not_allowed_for_shepherd` | a shepherd's bridge will not pass the request on |
 | `not_an_orchestrator` | an orchestrator note from a task no orchestrator file started |
 | `not_at_trust_prompt` | `task send --trust` to a task not blocked on its startup prompt |
 | `not_exhausted` | `limit clear` of an account, or an account's model, with no limit kept |
@@ -3851,6 +3852,23 @@ To set it up for machine `pi-1`:
 Give each machine its own key: the machine named in the line is the only one
 whose tasks that key reaches. A work flock's machine then cannot even list a
 personal flock's tasks.
+
+A pull machine's shepherd gets a line of its own:
+`pastor machine authorized-key pi-1 --key <file> --shepherd` prints one that
+runs `<this pastor> bridge --shepherd --machine pi-1`, marked
+`pastor:machine:pi-1`. That bridge passes on what the agent's does, plus
+claiming and reporting `pi-1`'s tasks, reading its saved trust, job submits
+and the events about `pi-1`. It sets the machine of a claim, a report or a
+trust read to `pi-1` whatever the request said, and answers anything else
+`not_allowed_for_shepherd`. A job submit's `[dispatch]` gets `machine =
+"pi-1"` the same way, so a shepherd's jobs run only on its own machine; one
+that sets `agent_args`, `allow`, `deny`, `profile` or `tags`, or names a
+`flock` `pi-1` is not in, is refused `not_allowed_for_shepherd`, since those
+pick the agent's arguments and permissions or other machines. Each claim
+carries the shepherd's herdr version (as its herdr answers ping) and pastor
+version, which the head keeps for that machine; a version longer than 64
+characters or with anything but letters, digits, `.`, `+` and `-` is
+dropped.
 
 ### Moving the head
 

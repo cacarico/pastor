@@ -40,8 +40,9 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 /// (`DispatchSpec::keep_pane`, a job's `[dispatch] keep_pane`,
 /// `FlockEntry::keep_pane`). 30: usage limits (`LimitList`, `LimitClear`,
 /// `TaskReport::limit`). 31: saved trust on pull machines (`PullTrust`,
-/// `TaskReport::trusted`).
-pub const IPC_PROTOCOL: u32 = 31;
+/// `TaskReport::trusted`). 32: a pull machine's own versions
+/// (`TaskClaim::herdr_version`, `TaskClaim::pastor_version`).
+pub const IPC_PROTOCOL: u32 = 32;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -220,6 +221,11 @@ pub const LIMIT_PROTOCOL: u32 = 30;
 /// one refuses the first as unreadable and drops the second.
 pub const PULL_TRUST_PROTOCOL: u32 = 31;
 
+/// The first protocol whose head keeps a pull machine's own versions
+/// (`TaskClaim::herdr_version`, `TaskClaim::pastor_version`). An older one
+/// would drop them without a word.
+pub const PULL_VERSIONS_PROTOCOL: u32 = 32;
+
 /// The first protocol whose head honours `Run::priority` and knows
 /// `TaskPriority`. An older one would queue the task at its own level
 /// without a word, or refuse the request as unreadable.
@@ -340,6 +346,8 @@ const REPORT_LIMIT: &str = "predates usage limits, and would drop the limit the 
 const PULL_TRUST: &str = "predates saved trust on pull machines, and would refuse the request";
 const REPORT_TRUSTED: &str =
     "predates saved trust on pull machines, and would drop the trust answer the report carries";
+const PULL_VERSIONS: &str =
+    "predates a pull machine's own versions, and would drop the claim's herdr and pastor versions";
 
 /// How long a head's `Pong` settles the protocol check before it is asked
 /// again: a long-lived sender (a headless serve) sees a restarted head
@@ -719,6 +727,15 @@ pub enum IpcRequest {
         free_slots: u32,
         #[serde(default)]
         flock_work: bool,
+        /// This pull machine's own herdr, read locally
+        /// (`cli::herdr_version_from`). `Fleet::heard` keeps it on the
+        /// machine's `machine_state` row (`Store::set_versions`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        herdr_version: Option<String>,
+        /// This pull machine's own pastor (`CARGO_PKG_VERSION`), kept the
+        /// same way.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pastor_version: Option<String>,
     },
     /// A pull machine's serve says what became of a task it claimed: its
     /// state, its pane, and `detail`, the note the task carries there (why
@@ -1000,7 +1017,16 @@ impl IpcRequest {
             | R::TrustRemove { .. }
             | R::FlockDescribe { .. }
             | R::MachineDescribe { .. } => need.at(HEAD_READS_PROTOCOL, HEAD_READS),
-            R::TaskClaim { .. } => need.at(PULL_PROTOCOL, PULL),
+            R::TaskClaim {
+                herdr_version,
+                pastor_version,
+                ..
+            } => {
+                need.at(PULL_PROTOCOL, PULL);
+                if herdr_version.is_some() || pastor_version.is_some() {
+                    need.at(PULL_VERSIONS_PROTOCOL, PULL_VERSIONS);
+                }
+            }
             R::TaskReport { limit, trusted, .. } => {
                 need.at(PULL_PROTOCOL, PULL);
                 if limit.is_some() {
@@ -1773,6 +1799,8 @@ mod tests {
                 machine: "laptop".into(),
                 free_slots: 2,
                 flock_work: true,
+                herdr_version: Some("0.9.5".into()),
+                pastor_version: Some("1.2.3".into()),
             },
             IpcRequest::TaskReport {
                 machine: "laptop".into(),
@@ -2304,6 +2332,13 @@ mod tests {
             ),
             (
                 req(
+                    serde_json::json!({"op": "task_claim", "machine": "m", "free_slots": 1, "herdr_version": "0.9.5"}),
+                ),
+                PULL_VERSIONS_PROTOCOL,
+                "own versions",
+            ),
+            (
+                req(
                     serde_json::json!({"op": "task_report", "machine": "m", "id": 1, "state": "running", "trusted": ["Enter"]}),
                 ),
                 PULL_TRUST_PROTOCOL,
@@ -2388,6 +2423,7 @@ mod tests {
             FALLBACK_PROTOCOL,
             KEEP_PANE_PROTOCOL,
             PULL_TRUST_PROTOCOL,
+            PULL_VERSIONS_PROTOCOL,
         ] {
             assert!(covered.contains(&p), "no request needs protocol {p}");
         }
