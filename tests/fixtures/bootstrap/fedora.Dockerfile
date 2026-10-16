@@ -1,13 +1,17 @@
-# fedora:40: systemd and dnf are the default; current at the time of
-# writing. git, curl, tar and ca-certificates are installed here (not left
-# for bootstrap) so push_user_<distro> (no root, so it cannot install
-# anything) has something to find already there; push_rerun_<distro>
-# removes git by hand before it runs bootstrap, to exercise the install path
-# push_root_<distro> would otherwise skip over.
-FROM fedora:40
+# fedora:42: systemd and dnf are the default; a supported release at the
+# time of writing (40 is end of life). systemd-pam holds pam_systemd, which
+# gives an ssh login its systemd user session and XDG_RUNTIME_DIR, which
+# user mode's services step needs for `systemctl --user`; util-linux has the
+# runuser the tests check services with. git, curl, tar and ca-certificates
+# are installed here (not left for bootstrap) so push_user_<distro> (no
+# root, so it cannot install anything) has something to find already there;
+# push_rerun_<distro> removes git by hand before it runs bootstrap, to
+# exercise the install path push_root_<distro> would otherwise skip over.
+FROM fedora:42
 
 RUN dnf install -y \
-        systemd dbus-daemon openssh-server openssh-clients sudo \
+        systemd systemd-pam dbus-daemon openssh-server openssh-clients sudo \
+        util-linux \
         git curl tar ca-certificates \
     && dnf clean all
 
@@ -29,6 +33,7 @@ RUN ssh-keygen -A \
          echo 'PasswordAuthentication no'; \
          echo 'PermitRootLogin no'; \
          echo 'AuthorizedKeysFile .ssh/authorized_keys'; \
+         echo 'UsePAM yes'; \
        } >> /etc/ssh/sshd_config \
     && systemctl enable sshd
 

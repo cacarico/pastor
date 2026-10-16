@@ -1,7 +1,7 @@
 # Developer entry points. Every target maps to one cargo command so the
 # Makefile stays the single list of "what you can run here".
 
-.PHONY: help build release check changelog changelog-check fmt lint test test-machine test-ssh test-bootstrap portability coverage coverage-check coverage-run leaks smoke smoke-profiles smoke-rc mutants mutants-diff install install-completions completions cli-reference demo site site-serve links clean
+.PHONY: help build release check changelog changelog-check fmt lint test test-machine test-ssh test-bootstrap test-bootstrap-clean portability coverage coverage-check coverage-run leaks smoke smoke-profiles smoke-rc mutants mutants-diff install install-completions completions cli-reference demo site site-serve links clean
 
 help: ## list targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{ printf "  %-14s %s\n", $$1, $$2 }'
@@ -49,12 +49,23 @@ test-ssh: ## the CLI against a head over a real ssh, through a throwaway sshd
 
 # Builds debian, fedora and arch containers with systemd and sshd and runs
 # push and pull bootstrap against them for real; see tests/bootstrap_e2e.rs.
-# Needs docker (able to run --privileged) and a herdr binary on PATH (or
-# PASTOR_TEST_HERDR_BIN); each test checks for both and skips cleanly
-# without them.
+# Needs docker (able to run --privileged), OpenSSH's client and server, the
+# Rust target x86_64-unknown-linux-musl and cargo-zigbuild with zig, or a
+# musl gcc (the tests build a static pastor for the containers), and
+# PASTOR_TEST_HERDR_BIN naming a static linux-x86_64 herdr; each test checks for them and skips cleanly without them, or fails
+# with PASTOR_E2E_REQUIRE=1. The images and containers are removed after,
+# pass or fail.
 test-bootstrap: ## end-to-end push and pull bootstrap in debian, fedora and arch containers
-	cargo build --release
-	cargo test --features fake-herdr --test bootstrap_e2e -- --ignored --test-threads 1
+	@status=0; \
+	cargo test --features fake-herdr --test bootstrap_e2e -- --ignored --test-threads 1 || status=$$?; \
+	$(MAKE) --no-print-directory test-bootstrap-clean; \
+	exit $$status
+
+test-bootstrap-clean: ## remove the images and containers test-bootstrap made
+	@if command -v docker >/dev/null 2>&1; then \
+		docker ps -aq --filter label=pastor-bootstrap-test | xargs -r docker rm -f -v >/dev/null; \
+		docker images -q --filter label=pastor-bootstrap-test | sort -u | xargs -r docker rmi -f >/dev/null; \
+	fi
 
 # The release builds are static musl binaries and FreeBSD builds from source,
 # so code that only compiles against glibc on x86_64 has to fail before the

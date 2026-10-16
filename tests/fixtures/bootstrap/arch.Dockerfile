@@ -4,7 +4,9 @@
 # left for bootstrap) so push_user_<distro> (no root, so it cannot install
 # anything) has something to find already there; push_rerun_<distro>
 # removes git by hand before it runs bootstrap, to exercise the install path
-# push_root_<distro> would otherwise skip over.
+# push_root_<distro> would otherwise skip over. Arch's systemd package
+# carries pam_systemd itself, which gives an ssh login its systemd user
+# session and XDG_RUNTIME_DIR.
 FROM archlinux:latest
 
 RUN pacman -Syu --noconfirm \
@@ -30,6 +32,7 @@ RUN ssh-keygen -A \
          echo 'PasswordAuthentication no'; \
          echo 'PermitRootLogin no'; \
          echo 'AuthorizedKeysFile .ssh/authorized_keys'; \
+         echo 'UsePAM yes'; \
        } >> /etc/ssh/sshd_config \
     && systemctl enable sshd
 
