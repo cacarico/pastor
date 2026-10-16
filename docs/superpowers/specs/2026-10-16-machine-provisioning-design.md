@@ -224,12 +224,16 @@ Pull, on the head first, then on the machine (or in its cloud-init):
 
 ```sh
 pastor join create --flock builders --tag gpu --ttl 1h          # prints a token
-curl -fsSL https://…/install.sh | sudo sh -s -- join --token-stdin <<<"pjt_…"
+curl -fsSL https://…/install.sh | sudo sh -s -- join             # asks for the token
+sudo sh -c "$(curl -fsSL https://…/install.sh)" sh join --token-stdin < token   # automation
 ```
 
-The token can also come from `PASTOR_JOIN_TOKEN`. The positional
-`join <token>` form works too, but it shows the token in `ps`, so the docs
-lead with stdin.
+Under `curl | sh` the shell's stdin is the script, so it cannot also carry
+the token. That is why install.sh asks for it on `/dev/tty` with echo off,
+and why automation fetches the script first and pipes the token in. The token
+can also come from `PASTOR_JOIN_TOKEN`, which the same user and root can see.
+The positional `join <token>` form, and `sudo PASTOR_JOIN_TOKEN=…`, put the
+token in `ps`, so the docs never show them.
 
 Within a minute the machine shows up on the head. Its versions are
 reported by the machine itself, pull machines included:
