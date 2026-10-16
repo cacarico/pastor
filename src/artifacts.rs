@@ -91,13 +91,24 @@ pub trait Fetch: Sync {
 
 pub struct CurlFetch;
 
+/// curl's argv for one download. `--proto =https` also bars a redirect to
+/// anything else. The URL goes last and behind `--url`, so one that starts
+/// with `-` is never read as an option.
+fn curl_args(url: &str, to: &Path) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = ["-fsSL", "--proto", "=https", "-o"]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    args.push(to.into());
+    args.push("--url".into());
+    args.push(url.into());
+    args
+}
+
 impl Fetch for CurlFetch {
     fn get(&self, url: &str, to: &Path) -> anyhow::Result<()> {
-        // `--proto =https` also bars a redirect to anything else.
         let out = std::process::Command::new("curl")
-            .args(["-fsSL", "--proto", "=https", "-o"])
-            .arg(to)
-            .arg(url)
+            .args(curl_args(url, to))
             .output()
             .context("run curl")?;
         if !out.status.success() {
@@ -170,8 +181,8 @@ pub async fn ensure(
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     // Work beside the destination so the final rename stays on one
     // filesystem; a failed run leaves nothing but this dir, removed below.
-    let work = dir.join(format!(".tmp-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
+    // Each call gets its own, so two fetches of one artifact never share it.
+    let work = dir.join(work_dir_name());
     std::fs::create_dir(&work).with_context(|| format!("create {}", work.display()))?;
     let res = download(cfg, a, fetch, &work).await;
     let res = res.and_then(|(file, sum)| {
@@ -184,6 +195,17 @@ pub async fn ensure(
     });
     let _ = std::fs::remove_dir_all(&work);
     Ok((dest, res?))
+}
+
+/// A work dir name no other `ensure` uses at the same time: pid, a counter
+/// for calls in this process, and the clock for a pid reused after a crash.
+fn work_dir_name() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!(".tmp-{}-{n}-{nanos}", std::process::id())
 }
 
 /// Fetch and check `a` into `work`; the verified file and its sum.
@@ -292,6 +314,15 @@ fn herdr_source(
     let url = release["assets"][a.target.as_str()]
         .as_str()
         .with_context(|| format!("herdr {} has no {} asset", a.version, a.target))?;
+    // The URL comes from the network: only https, which also keeps one that
+    // starts with `-` away from curl.
+    if !url.starts_with("https://") {
+        return Err(ArtifactError::Invalid {
+            what: "asset url",
+            value: url.to_string(),
+        }
+        .into());
+    }
     let expected = release["sha256"][a.target.as_str()]
         .as_str()
         .with_context(|| format!("herdr {} has no {} sha256", a.version, a.target))?
@@ -369,7 +400,7 @@ mod tests {
         let asset_path = src.join("herdr-bin");
         std::fs::write(&asset_path, asset).unwrap();
         let index = serde_json::json!({"releases": {"0.9.5": {
-            "assets": {"linux-aarch64": format!("file://{}", asset_path.display())},
+            "assets": {"linux-aarch64": HERDR_ASSET_URL},
             "sha256": {"linux-aarch64": sum},
         }}});
         let index_path = src.join("latest.json");
@@ -384,10 +415,101 @@ mod tests {
             paths,
             cfg,
             fetch: MapFetch {
-                files: BTreeMap::new(),
+                files: BTreeMap::from([(HERDR_ASSET_URL.to_string(), asset_path)]),
                 calls: Mutex::new(vec![]),
             },
         }
+    }
+
+    const HERDR_ASSET_URL: &str = "https://herdr.example/herdr-linux-aarch64";
+
+    /// Writes an index whose asset URL is `url` over the rig's own.
+    fn set_asset_url(rig: &Rig, url: &str) {
+        let path = rig.cfg.herdr_index.as_deref().unwrap();
+        let path = path.strip_prefix("file://").unwrap();
+        let mut index: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        index["releases"]["0.9.5"]["assets"]["linux-aarch64"] = url.into();
+        std::fs::write(path, index.to_string()).unwrap();
+    }
+
+    /// A fetch that takes its time, so two calls overlap.
+    struct SlowFetch(MapFetch);
+
+    impl Fetch for SlowFetch {
+        fn get(&self, url: &str, to: &Path) -> anyhow::Result<()> {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            self.0.get(url, to)
+        }
+    }
+
+    #[test]
+    fn concurrent_ensure_same_artifact() {
+        let rig = herdr_rig(b"herdr-binary", &sha(b"herdr-binary"));
+        let fetch = SlowFetch(rig.fetch);
+        let a = Artifact::new("herdr", "0.9.5", "linux-aarch64").unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let results: Vec<_> = std::thread::scope(|s| {
+            let run = || {
+                barrier.wait();
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(ensure(&rig.paths, &rig.cfg, &a, &fetch))
+            };
+            let h = [s.spawn(run), s.spawn(run)];
+            h.map(|h| h.join().unwrap()).into_iter().collect()
+        });
+        for r in results {
+            let (_, sum) = r.unwrap();
+            assert_eq!(sum, sha(b"herdr-binary"));
+        }
+        let dest = cache_path(&rig.paths, &a);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"herdr-binary");
+        assert_eq!(cached_sum(&dest), Some(sha(b"herdr-binary")));
+        let mut left: Vec<_> = std::fs::read_dir(dest.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["herdr", "herdr.sha256"], "no work dir left");
+    }
+
+    #[tokio::test]
+    async fn herdr_rejects_non_https_asset() {
+        for url in ["-o/tmp/x", "http://herdr.example/herdr", "file:///bin/sh"] {
+            let rig = herdr_rig(b"herdr-binary", &sha(b"herdr-binary"));
+            set_asset_url(&rig, url);
+            let a = Artifact::new("herdr", "0.9.5", "linux-aarch64").unwrap();
+            let e = ensure(&rig.paths, &rig.cfg, &a, &rig.fetch)
+                .await
+                .unwrap_err();
+            assert_eq!(error_code(&e), Some("invalid_artifact"), "{url}");
+            assert!(
+                !rig.fetch.calls.lock().unwrap().iter().any(|c| c == url),
+                "{url} never fetched"
+            );
+            assert!(!cache_path(&rig.paths, &a).exists());
+        }
+    }
+
+    #[test]
+    fn curl_args_put_url_last_with_flag() {
+        let args = curl_args("-K/etc/passwd", Path::new("/w/out"));
+        let args: Vec<_> = args.iter().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(
+            args,
+            [
+                "-fsSL",
+                "--proto",
+                "=https",
+                "-o",
+                "/w/out",
+                "--url",
+                "-K/etc/passwd"
+            ]
+        );
     }
 
     #[test]
