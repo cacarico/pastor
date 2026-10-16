@@ -2537,6 +2537,12 @@ impl Fleet {
     /// into `why` as `"<why>; fix: <fix>"`, which `describe::bootstrap_line`
     /// prints back whole. True when the report made a pending or failed
     /// machine ready, so the caller dispatches what waited for it.
+    ///
+    /// A shepherd sends this through its bridge, which pins `machine` to
+    /// its own; so a shepherd may mark its own machine bootstrapped, and
+    /// only that one, which is accepted. What it reports is untrusted text
+    /// that `machine describe` and the events print, so it is cut to size
+    /// and stripped of control characters first (`sanitise_outcome`).
     pub fn report_bootstrap(
         &self,
         machine: &str,
@@ -2550,6 +2556,7 @@ impl Fleet {
                 format!("no machine {machine} in the flock"),
             ));
         }
+        let outcome = sanitise_outcome(outcome);
         let crate::bootstrap::Outcome {
             ok,
             mode,
@@ -2589,7 +2596,11 @@ impl Fleet {
                 .collect();
             (!parts.is_empty()).then(|| parts.join("; "))
         });
-        let missing: Vec<String> = steps.into_iter().flat_map(|s| s.missing).collect();
+        let missing: Vec<String> = steps
+            .into_iter()
+            .flat_map(|s| s.missing)
+            .take(MAX_REPORT_ITEMS)
+            .collect();
         let state = MachineState {
             machine: machine.to_string(),
             bootstrap: if ok {
@@ -3564,6 +3575,9 @@ pub struct Daemon {
     /// `ssh-keygen -R` and `ssh -O exit` for a removed machine go through
     /// this, so tests script the answer instead of touching the host.
     runner: Arc<dyn crate::setup::Runner + Send + Sync>,
+    /// Downloads into the artifact cache (`ArtifactLocate`) go through this,
+    /// so tests serve local files instead of the network.
+    fetch: Arc<dyn crate::artifacts::Fetch + Send + Sync>,
 }
 
 /// The longest IPC request line, newline excluded. The largest real one is a
@@ -3833,6 +3847,7 @@ impl Daemon {
             orchestrators,
             authorized_keys: crate::authkeys::default_file(),
             runner: Arc::new(crate::setup::SystemRunner),
+            fetch: Arc::new(crate::artifacts::CurlFetch),
         })
     }
 
@@ -4403,6 +4418,7 @@ impl Daemon {
             host_key: Some(host_key.into()),
             herdr_version: None,
             pastor_version: None,
+            service_user: None,
             updated_at: now.to_rfc3339(),
         })?;
         tracing::info!(machine = name, id, "machine joined");
@@ -5000,6 +5016,11 @@ impl Daemon {
                 Ok(task) => IpcResponse::Task(task),
                 Err(err) => cli_error(err),
             },
+            IpcRequest::ArtifactLocate {
+                name,
+                version,
+                target,
+            } => self.locate_artifact(&name, &version, &target).await,
             IpcRequest::BootstrapReport { machine, result } => {
                 match self.fleet.report_bootstrap(&machine, result) {
                     Ok(ready) => {
@@ -5129,6 +5150,36 @@ impl Daemon {
             tasks,
             skipped: out.skipped,
             refused: out.refused,
+        }
+    }
+
+    /// `ArtifactLocate`: the artifact in the cache, fetched and checked
+    /// first when it is not there. A download and the hashing block, so the
+    /// whole of it runs off the runtime's workers. pastor.toml is read here,
+    /// not at start, so an edited `[provision] herdr_index` counts at once.
+    async fn locate_artifact(&self, name: &str, version: &str, target: &str) -> IpcResponse {
+        let a = match crate::artifacts::Artifact::new(name, version, target) {
+            Ok(a) => a,
+            Err(err) => return IpcResponse::error(err.code(), err),
+        };
+        let paths = self.paths.clone();
+        let fetch = self.fetch.clone();
+        let rt = tokio::runtime::Handle::current();
+        let found = tokio::task::spawn_blocking(move || {
+            let cfg = PastorConfig::load(&paths.config_file())?.provision;
+            let (path, sha256) =
+                rt.block_on(crate::artifacts::ensure(&paths, &cfg, &a, fetch.as_ref()))?;
+            let size = std::fs::metadata(&path)?.len();
+            anyhow::Ok((path, sha256, size))
+        })
+        .await;
+        match found {
+            Ok(Ok((path, sha256, size))) => IpcResponse::Artifact { path, sha256, size },
+            Ok(Err(err)) => match crate::artifacts::error_code(&err) {
+                Some(code) => IpcResponse::error(code, format!("{err:#}")),
+                None => cli_error(err),
+            },
+            Err(err) => IpcResponse::error("runtime_error", err),
         }
     }
 
@@ -5692,6 +5743,50 @@ fn run_failure(out: std::io::Result<crate::setup::CmdOutput>) -> String {
 
 /// The longest version string a pull machine may report.
 const MAX_VERSION_LEN: usize = 64;
+
+/// The most characters kept of each text a bootstrap report carries: a
+/// step's name, why and fix, and each missing entry.
+const MAX_REPORT_TEXT: usize = 256;
+
+/// The most steps, and missing entries, kept of a bootstrap report.
+const MAX_REPORT_ITEMS: usize = 64;
+
+/// `s` with its control characters dropped (printable text and plain
+/// spaces stay, so a tab or a newline goes too) and cut to
+/// `MAX_REPORT_TEXT` characters.
+fn report_text(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_REPORT_TEXT)
+        .collect()
+}
+
+/// A bootstrap report as the head keeps it: at most `MAX_REPORT_ITEMS`
+/// steps (the first failed one kept, as the last, when it lies past them),
+/// at most `MAX_REPORT_ITEMS` missing entries per step, each text through
+/// `report_text`, and versions through `safe_version`.
+fn sanitise_outcome(mut o: crate::bootstrap::Outcome) -> crate::bootstrap::Outcome {
+    use crate::bootstrap::StepStatus;
+    let failed = o.steps.iter().position(|s| s.status == StepStatus::Failed);
+    if o.steps.len() > MAX_REPORT_ITEMS {
+        if let Some(i) = failed.filter(|i| *i >= MAX_REPORT_ITEMS) {
+            o.steps.swap(i, MAX_REPORT_ITEMS - 1);
+        }
+        o.steps.truncate(MAX_REPORT_ITEMS);
+    }
+    for step in &mut o.steps {
+        step.step = report_text(&step.step);
+        step.why = step.why.as_deref().map(report_text);
+        step.fix = step.fix.as_deref().map(report_text);
+        step.missing.truncate(MAX_REPORT_ITEMS);
+        for m in &mut step.missing {
+            *m = report_text(m);
+        }
+    }
+    o.herdr_version = safe_version(o.herdr_version.as_deref()).map(str::to_string);
+    o.pastor_version = safe_version(o.pastor_version.as_deref()).map(str::to_string);
+    o
+}
 
 /// A version a pull machine reported, if it is safe to keep and print later:
 /// at most `MAX_VERSION_LEN` characters of `[0-9A-Za-z.+-]`. Anything else
@@ -7395,6 +7490,159 @@ mod tests {
             pastor_version: None,
             service_user: None,
         }
+    }
+
+    /// `ArtifactLocate` fills the cache from the `[provision]` index and
+    /// answers where the checked file is, its sum and its size; a bad part
+    /// or a sum that does not match keeps its own code.
+    #[tokio::test]
+    async fn artifact_locate_returns_path_and_sum() {
+        let (mut d, tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("herdr-bin"), b"herdr-binary").unwrap();
+        let sum = |b: &[u8]| -> String {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(b)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        let index = |want: &str| {
+            serde_json::json!({"releases": {"0.9.5": {
+                "assets": {"linux-aarch64": format!("https://herdr.example/{}", src.join("herdr-bin").display())},
+                "sha256": {"linux-aarch64": want},
+            }}})
+        };
+        // The index is a `file://` fixture, as in `artifacts`' own tests;
+        // the asset URL must be https, so the fetch maps it back to a file.
+        struct HttpsToFile;
+        impl crate::artifacts::Fetch for HttpsToFile {
+            fn get(&self, url: &str, to: &std::path::Path) -> anyhow::Result<()> {
+                let path = url
+                    .strip_prefix("https://herdr.example")
+                    .or_else(|| url.strip_prefix("file://"))
+                    .unwrap_or(url);
+                std::fs::copy(path, to)?;
+                Ok(())
+            }
+        }
+        d.fetch = Arc::new(HttpsToFile);
+        let index_path = src.join("latest.json");
+        let mut config = test_config();
+        config.provision.herdr_index = Some(format!("file://{}", index_path.display()));
+        std::fs::write(d.paths.config_file(), toml::to_string(&config).unwrap()).unwrap();
+        let locate = |target: &str| IpcRequest::ArtifactLocate {
+            name: "herdr".into(),
+            version: "0.9.5".into(),
+            target: target.into(),
+        };
+
+        std::fs::write(&index_path, index(&sum(b"something else")).to_string()).unwrap();
+        let resp = d.handle(locate("linux-aarch64")).await;
+        assert!(
+            matches!(&resp, IpcResponse::Error { code, .. } if code == "artifact_checksum_mismatch"),
+            "{resp:?}"
+        );
+
+        std::fs::write(&index_path, index(&sum(b"herdr-binary")).to_string()).unwrap();
+        let resp = d.handle(locate("linux-aarch64")).await;
+        let IpcResponse::Artifact { path, sha256, size } = resp else {
+            panic!("{resp:?}")
+        };
+        let a = crate::artifacts::Artifact::new("herdr", "0.9.5", "linux-aarch64").unwrap();
+        assert_eq!(path, crate::artifacts::cache_path(&d.paths, &a));
+        assert_eq!(sha256, sum(b"herdr-binary"));
+        assert_eq!(size, 12);
+        assert_eq!(std::fs::read(&path).unwrap(), b"herdr-binary");
+
+        let resp = d.handle(locate("..")).await;
+        assert!(
+            matches!(&resp, IpcResponse::Error { code, .. } if code == "invalid_artifact"),
+            "{resp:?}"
+        );
+    }
+
+    /// A shepherd's report is cut to size and stripped of control
+    /// characters before it is stored or emitted; versions that are not
+    /// safe are dropped.
+    #[tokio::test]
+    async fn a_bootstrap_report_is_sanitised() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        let mut events = d.subscribe();
+        let long = "x".repeat(1000);
+        let mut steps: Vec<crate::bootstrap::StepResult> = (0..100)
+            .map(|i| crate::bootstrap::StepResult {
+                step: format!("s{i}"),
+                ..crate::bootstrap::StepResult::done()
+                    .with_missing((0..100).map(|j| format!("p{j}\u{1b}[31m")).collect())
+            })
+            .collect();
+        steps.insert(
+            0,
+            crate::bootstrap::StepResult {
+                step: format!("bad\u{1b}]0;title\u{7}\n{long}"),
+                ..crate::bootstrap::StepResult::failed(
+                    format!("why\r\n{long}"),
+                    format!("fix\t{long}"),
+                )
+            },
+        );
+        let mut outcome = failed_outcome();
+        outcome.steps = steps;
+        outcome.herdr_version = Some("0.9.5\u{1b}[2J".into());
+        outcome.pastor_version = Some("1".repeat(65));
+        let resp = d
+            .handle(IpcRequest::BootstrapReport {
+                machine: "a".into(),
+                result: outcome,
+            })
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        let state = d.store.machine_state("a").unwrap().unwrap();
+        let step = state.failed_step.unwrap();
+        assert!(step.chars().count() <= 256, "{}", step.len());
+        assert!(!step.chars().any(char::is_control), "{step:?}");
+        assert!(step.starts_with("bad]0;title"), "{step:?}");
+        let why = state.why.unwrap();
+        assert!(!why.chars().any(char::is_control), "{why:?}");
+        // `why` and `fix` are each capped before they are joined.
+        assert!(why.chars().count() <= 256 * 2 + 16, "{}", why.len());
+        assert_eq!(state.herdr_version, None);
+        assert_eq!(state.pastor_version, None);
+        let ev = events.try_recv().expect("machine.bootstrap_failed emitted");
+        let detail = ev.detail.expect("detail");
+        assert_eq!(detail["step"].as_str(), Some(step.as_str()));
+        assert_eq!(detail["why"].as_str(), Some(why.as_str()));
+    }
+
+    /// A report with more steps and missing entries than the caps keeps
+    /// only the first of each.
+    #[tokio::test]
+    async fn a_bootstrap_report_keeps_at_most_64_steps_and_missing() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        let mut events = d.subscribe();
+        let mut outcome = failed_outcome();
+        outcome.ok = true;
+        outcome.steps = (0..100)
+            .map(|i| crate::bootstrap::StepResult {
+                step: format!("s{i}"),
+                ..crate::bootstrap::StepResult::done()
+                    .with_missing((0..100).map(|j| format!("p{i}-{j}\u{7}")).collect())
+            })
+            .collect();
+        let resp = d
+            .handle(IpcRequest::BootstrapReport {
+                machine: "a".into(),
+                result: outcome,
+            })
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        let ev = events.try_recv().expect("machine.bootstrapped emitted");
+        assert_eq!(ev.kind, "machine.bootstrapped");
+        let missing = ev.detail.unwrap()["missing"].as_array().unwrap().clone();
+        assert_eq!(missing.len(), 64, "{missing:?}");
+        assert_eq!(missing[0], "p0-0");
     }
 
     #[tokio::test]

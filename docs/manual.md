@@ -348,6 +348,7 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `agy_permissions_missing` | a profiled agy task on a machine whose agy settings do not deny what the profile denies, or that pastor cannot read or write to make them (a `command` machine, a file that is not JSON, a symlink, a failed write); the message lists the rules to add |
 | `agy_profile_mismatch` | a profiled agy task on a machine whose own profile does not deny everything the task's does |
 | `already_seen` | a job's key was queued before and its task row is gone |
+| `artifact_checksum_mismatch` | a downloaded pastor or herdr whose sha256 is not the published one, nothing cached; or a cached file whose size or sha256 is not what the head answered, nothing streamed |
 | `bootstrap_missing` | `pastor bootstrap` found something the machine lacks and could not install it: a package in user mode, or herdr with no `--herdr-from` |
 | `bootstrap_needs_sudo` | `pastor bootstrap --sudo` where `sudo -n true` fails: sudo wants a password or is not allowed |
 | `bootstrap_unsupported_platform` | `pastor bootstrap` on a platform it does not set up: not Linux with systemd or macOS, macOS as root, or an arch herdr ships no build for |
@@ -374,6 +375,7 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `herdr_error` | herdr could not be run, or answered a request with an error |
 | `internal` | the daemon sent a reply of a kind the CLI did not expect |
 | `invalid_args` | an authorized_keys forced command's arguments with characters a shell could read as syntax |
+| `invalid_artifact` | a binary to fetch named with a part that is not a plain name, or a cached path outside `<state>/artifacts` |
 | `invalid_dispatch` | a headless job submission has an invalid dispatch configuration |
 | `invalid_edit` | the edited file does not check; `edit` asks to reopen it, and the edit is kept either way |
 | `invalid_file` | a request for a file pastor does not edit (only flock, config or `job:<name>`) |
@@ -397,8 +399,6 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `leave_on_head` | `pastor leave` on a machine where `pastor serve` runs as the head for this login |
 | `leave_unsupported_platform` | `pastor leave` on a platform with neither systemd nor launchd units to remove |
 | `machine_exists` | `machine add` of a machine that exists |
-| `invalid_artifact` | a binary to fetch named with a part that is not a plain name |
-| `artifact_checksum_mismatch` | a downloaded pastor or herdr whose sha256 is not the published one; nothing is cached |
 | `machine_name_taken` | a join named a machine already in flock.toml, with a token not made with `--replace` for that name |
 | `machine_not_connected` | `task run --now` on a machine that is not connected |
 | `machine_shutting_down` | the machine's actor is stopping; try again |
@@ -3909,14 +3909,45 @@ A pull machine's shepherd gets a line of its own:
 `pastor machine authorized-key pi-1 --key <file> --shepherd` prints one that
 runs `<this pastor> bridge --shepherd --machine pi-1`, marked
 `pastor:machine:pi-1`. That bridge passes on what the agent's does, plus
-claiming and reporting `pi-1`'s tasks, reading its saved trust, job submits
-and the events about `pi-1`. It sets the machine of a claim, a report or a
-trust read to `pi-1` whatever the request said, and answers anything else
+claiming and reporting `pi-1`'s tasks, reading its saved trust, job submits,
+the events about `pi-1`, its bootstrap report and artifact lookups. It sets
+the machine of a claim, a report, a trust read or a bootstrap report to
+`pi-1` whatever the request said, and answers anything else
 `not_allowed_for_shepherd`. A job submit's `[dispatch]` gets `machine =
 "pi-1"` the same way, so a shepherd's jobs run only on its own machine; one
-that sets `agent_args`, `allow`, `deny`, `profile` or `tags`, or names a
-`flock` `pi-1` is not in, is refused `not_allowed_for_shepherd`, since those
-pick the agent's arguments and permissions or other machines. Each claim
+that sets `agent_args`, `allow`, `deny`, `agent_source` or `tags`, or names
+a `flock` `pi-1` is not in, is refused `not_allowed_for_shepherd`, since
+those pick the agent's arguments and permissions or other machines. A
+`profile` may be set: the head never runs it past what `pi-1`'s own profile
+allows, so `unrestricted` still needs `pi-1` to be `unrestricted`. The job
+reaches the head as `pi-1.<job>`, so the head's seen keys of one pull
+machine's jobs are never another's or a head job's; a job name with a `.`
+of its own is refused `not_allowed_for_shepherd`, since `pi` with `1.x`
+would be `pi.1` with `x`. The shepherd keeps its own seen keys under the
+plain name.
+
+The same line fetches the binaries a pull machine installs:
+`pastor bridge --shepherd --machine pi-1 --fetch herdr 0.9.5 linux-x86_64`
+asks the head where its artifact cache (`<state>/artifacts`) keeps that
+file, filling the cache first when it is not there, and streams the file
+raw to stdout; only its path, sha256 and size cross the head's socket. The
+bridge refuses a path that does not resolve inside the cache
+(`invalid_artifact`) and checks the file's size and sha256 against the
+head's answer before it writes a byte (`artifact_checksum_mismatch`), and
+a stream that ends short of that size exits non-zero. A failure goes to
+stderr as JSON, since stdout is the binary. The machine key's forced
+command is the line without `--fetch`, so on the pull machine `ssh <head>
+pastor bridge --fetch herdr 0.9.5 linux-x86_64` arrives as
+`SSH_ORIGINAL_COMMAND`: split on whitespace, never run through a shell,
+exactly `[pastor] bridge --fetch NAME VERSION TARGET` (or `[pastor]
+bridge`, the line bridge itself), optionally wrapped in `sh -c '...'` as
+pastor's own ssh sends it, is run; anything else is refused
+`not_allowed_for_shepherd`. The head downloads one artifact once at a
+time (a second request waits for the first), each download bounded to 10
+minutes and 512 MB, and a download that fails leaves no empty
+`<version>/<target>` dir behind. A bootstrap report from a shepherd is
+cut to 64 steps and 64 missing entries, each text to 256 characters with
+its control characters dropped, before it is kept or printed. Each claim
 carries the shepherd's herdr version (as its herdr answers ping) and pastor
 version, which the head keeps for that machine; a version longer than 64
 characters or with anything but letters, digits, `.`, `+` and `-` is
