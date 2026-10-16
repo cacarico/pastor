@@ -384,15 +384,15 @@ not open.
 
 ### The join token
 
-- `pastor join create` makes 32 random bytes. They are the token's secret
-  and also the seed of a **per-token ed25519 key**.
-- The head writes that key's public half to its `authorized_keys` with
-  `restrict,command="pastor bridge --join --id <id>"`, and stores a hash of
-  the seed, the expiry, and the flock, tags and `--replace` target.
-- The token is `pjt_` + base64 of (head ssh destination, head host key,
-  seed): one word.
-- The machine derives the key from the seed and connects. sshd itself checks
-  the token.
+- `pastor join create` makes a **per-token ed25519 key** with `ssh-keygen`.
+  It writes the public half to the head's `authorized_keys` with
+  `restrict,command="pastor bridge --join <id>"`, and stores the expiry,
+  flock, tags and `--replace` target. The head keeps no copy of the private
+  half.
+- The token is `pjt_` + base64url of (head ssh destination, head host key,
+  the private key): one word, a few hundred characters. Using `ssh-keygen`
+  instead of deriving the key from a seed keeps crypto crates out of pastor.
+- The machine connects with that key. sshd itself checks the token.
 - `bridge --join --id` accepts exactly one request:
   `Join { name, machine key, agent key, facts }`.
 - On success, or at expiry (swept on each tick), the head deletes that
