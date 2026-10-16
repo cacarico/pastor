@@ -3838,38 +3838,54 @@ pastor join create --flock builders --tag gpu --ttl 1h
 #### Joining a machine
 
 On the new machine, `pastor join` takes the token on stdin
-(`--token-stdin`), from `PASTOR_JOIN_TOKEN`, or as its argument, which `ps`
-shows, so the first two are the ones to use. `install.sh join` installs
-pastor and runs it with the rest of its arguments, unchanged:
+(`--token-stdin`), from `PASTOR_JOIN_TOKEN`, or as its argument. `ps`
+shows an argument to every local user, and the variable can be read by the
+same user and root (`/proc/<pid>/environ`, and `ps` too when it is set on
+sudo's command line), so stdin is the one to use. `pastor join` takes the
+variable out of its environment before it runs anything, so no command it
+starts has it. `install.sh join` installs pastor and runs it with the rest
+of its arguments, unchanged:
 
 ```sh
 pastor join --token-stdin --name gpu-3 --sudo < token
-curl -fsSL https://cacari.co/pastor/install.sh | sudo PASTOR_JOIN_TOKEN=pjt_... sh -s -- join --name gpu-3 --sudo
+curl -fsSL https://cacari.co/pastor/install.sh | sudo sh -s -- join --name gpu-3 --sudo
+sudo sh -c "$(curl -fsSL https://cacari.co/pastor/install.sh)" sh join --token-stdin --name gpu-3 --sudo < token
 ```
 
 `curl | sh` gives the script on stdin, so it leaves `--token-stdin` nothing
-to read: there the variable carries the token. Run as root, `install.sh`
-first installs what is missing of openssh-client, curl, tar and
-ca-certificates with apt, dnf or pacman.
+to read. Given no token there (no `--token-stdin`, no `pjt_` argument, no
+`PASTOR_JOIN_TOKEN`), `install.sh` asks for it on the terminal with echo
+off and hands it to `pastor join --token-stdin` on a pipe, so it is never
+in an argument or the environment. With no terminal (cloud-init, a script),
+the third form passes the script as an argument instead, which leaves stdin
+for the token. Run as root, `install.sh` first installs what is missing of
+openssh-client, curl, tar and ca-certificates with apt, dnf or pacman.
 
 `--name` is the machine's name in the head's flock.toml (the hostname when
 unset); `--sudo` and `--service-user` are `pastor bootstrap`'s. The join:
 
 1. Pins the token's head host key in pastor's `known_hosts`, in this
-   user's state dir and in each pastor user's.
+   user's state dir and in each pastor user's. It must be one plain line
+   for the token's head, `host type key` or `[host]:port type key`, with a
+   key type sshd logs in with: a marker (`@cert-authority`, `@revoked`), a
+   pattern, a negation or a list is `join_token_invalid`.
 2. Makes the users and the keys, running bootstrap's `users` and `keys`
    steps alone.
 3. Writes the token's key to a 0600 file in a 0700 dir and joins over ssh
    with it alone, sending the name, both public keys, the sshd host key and
-   a few facts. The key file is deleted whatever happens, and neither the
-   token nor the key is printed or logged. An ssh `Permission denied` for
+   a few facts. The key file is deleted whatever happens (on SIGINT,
+   SIGTERM or SIGHUP too, and a dir a killed join left behind goes at the
+   start of the next), and neither the token nor the key is printed or
+   logged. An ssh `Permission denied` for
    it is `join_token_invalid`: the token was used, revoked or has expired.
 4. Writes `[shepherd] machine = "<name>"` to the service user's
    pastor.toml.
 5. Runs the rest of bootstrap with the herdr version the head names in its
    reply (`[provision] herdr`, else the one most of its machines run, else
    pastor's default), fetched over the machine key with `pastor bridge
-   --fetch` and checked against the size and sha256 the head answers. Its
+   --fetch` and checked against the size and sha256 the head answers. The
+   download stops at that size, and at 512 MiB whatever the head says; each
+   reply line from the head is read up to 64 KiB. Its
    last step, `shepherd`, installs and starts the shepherd's unit with
    `pastor setup systemd` (`setup launchd` on macOS) as the service user.
    In root mode it first waits for the user's `/run/user/<uid>`, which can
@@ -3879,8 +3895,12 @@ unset); `--sudo` and `--service-user` are `pastor bootstrap`'s. The join:
    prints it (`--json` for the object). The shepherd sends it to the head
    (`BootstrapReport`) after its first claim the head answers, deletes it
    once the head took it, and claims again in the same pass, so the tasks
-   held while the machine was pending start then. A failed bootstrap runs
-   no shepherd, so the join sends that report itself.
+   held while the machine was pending start then. A report that fails on
+   the way (no head, an unreachable one, a timeout, a dropped connection)
+   is sent again on the next claim; one the head refuses is logged once
+   with its code and renamed to `bootstrap.json.refused`, for a person to
+   read, and not sent again. A failed bootstrap runs no shepherd, so the
+   join sends that report itself.
 
 Once a machine key is in the state dir, the shepherd's ssh to the head
 uses it with `IdentitiesOnly=yes` and the pinned `known_hosts` with

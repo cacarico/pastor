@@ -761,7 +761,7 @@ One-time tokens a new machine joins the fleet with, as a pull machine
 
 | argument | does | default |
 |---|---|---|
-| `<TOKEN>` | On the new machine: the token `join create` printed; `ps` shows it, so prefer --token-stdin or PASTOR_JOIN_TOKEN |  |
+| `<TOKEN>` | On the new machine: the token `join create` printed; `ps` shows it, so prefer --token-stdin |  |
 | `--token-stdin` | Read the join token from stdin |  |
 | `--name <NAME>` | The name this machine takes in the head's flock.toml (default: its hostname) |  |
 | `--sudo` | Do root work (packages, users, lingering) through `sudo -n` |  |

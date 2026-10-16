@@ -29,10 +29,16 @@
   the head names fetched over the machine key, installs and starts the
   shepherd's unit, and leaves the outcome in `<state>/bootstrap.json`. The
   shepherd reports it after its first claim and claims again, so the
-  machine's tasks start in that pass. `install.sh join …` installs pastor,
-  then runs `pastor join` with the rest of its arguments; as root it first
-  installs what is missing of openssh-client, curl, tar and
-  ca-certificates.
+  machine's tasks start in that pass; a report the head refuses is kept
+  as `bootstrap.json.refused` and not sent again. `install.sh join …`
+  installs pastor, then runs `pastor join` with the rest of its arguments;
+  given no token it asks for one on the terminal with echo off and passes
+  it on a pipe, never in `ps`. As root it first installs what is missing
+  of openssh-client, curl, tar and ca-certificates. `pastor join` takes
+  `PASTOR_JOIN_TOKEN` out of its environment before it runs anything,
+  pins only a plain host key line for the token's head, removes its key
+  dir on SIGINT, SIGTERM and SIGHUP (and one a killed join left), and caps
+  the herdr download at the size the head answered and 512 MiB.
 
 ### Changed
 
