@@ -126,6 +126,12 @@ enum Command {
     },
     /// Pass request lines from stdin to this machine's head; for a remote CLI over ssh
     Bridge(BridgeArgs),
+    /// Set this machine up for a head: packages, users, pastor, herdr, services, keys (`--head DEST`)
+    ///
+    /// Run by `machine add --bootstrap` over ssh and by `pastor join`, not by
+    /// hand, so it is left out of the command list.
+    #[command(hide = true)]
+    Bootstrap(pastor::bootstrap::Args),
     /// Which head this CLI uses: this machine's, or one on another machine over ssh
     Head {
         #[command(subcommand)]
@@ -712,6 +718,18 @@ fn main() {
             fail("agent_refused", &pastor::daemon::script_refusal(o));
         }
     }
+    // After the guard, which keeps agents from running it: it makes users
+    // and services. --head names the head this machine is for, not one to
+    // talk to, so no head is asked.
+    if let Command::Bootstrap(args) = &command {
+        if let Err(err) = pastor::bootstrap::cli(args, head_flag.as_deref()) {
+            match err.downcast_ref::<CliError>() {
+                Some(e) => fail(&e.code, &e.message),
+                None => fail("runtime_error", &format!("{err:#}")),
+            }
+        }
+        return;
+    }
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let result = rt.block_on(async {
         // Commands that never talk to the head do not read `head`, and with a
@@ -786,7 +804,9 @@ fn main() {
             Command::Limit { cmd } => pastor::limit_cli::run(&client, cmd, head).await,
             Command::Queue(args) => pastor::queue_cli::run(&client, args, head).await,
             Command::Status(args) => status(&client, args, head).await,
-            Command::Bridge(_) => unreachable!("handled before the runtime"),
+            Command::Bridge(_) | Command::Bootstrap(_) => {
+                unreachable!("handled before the runtime")
+            }
             Command::Head { cmd } => pastor::head::run(&paths, cmd, remote.as_ref()).await,
             Command::Leave { yes } => leave(&paths, yes, &pastor::setup::SystemRunner),
         }
@@ -1128,6 +1148,7 @@ fn remote_route(command: &Command) -> RemoteRoute {
         | Command::Leave { .. }
         | Command::Head { .. }
         | Command::Bridge(_)
+        | Command::Bootstrap(_)
         | Command::Connector { .. } => RemoteRoute::Here,
         // Stop and status act on this machine's serve, head or headless.
         Command::Serve(ServeArgs { cmd: Some(_), .. }) => RemoteRoute::Here,
@@ -1243,7 +1264,9 @@ fn changes_fleet(command: &Command) -> bool {
             cmd: Some(pastor::serve_cli::ServeCmd::Status { .. }),
             ..
         }) => false,
-        Command::Serve(_) | Command::Setup { .. } | Command::Leave { .. } => true,
+        // Bootstrap makes users and services on this machine.
+        Command::Serve(_) | Command::Setup { .. } | Command::Bootstrap(_)
+        | Command::Leave { .. } => true,
         Command::Trust { cmd } => pastor::trust_cli::changes_fleet(cmd),
         Command::Limit { cmd } => pastor::limit_cli::changes_fleet(cmd),
         Command::Queue(a) => pastor::queue_cli::changes_fleet(a),

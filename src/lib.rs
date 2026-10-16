@@ -1,4 +1,6 @@
+pub mod artifacts;
 pub mod authkeys;
+pub mod bootstrap;
 pub mod bridge;
 pub mod cli;
 pub mod cli_reference;

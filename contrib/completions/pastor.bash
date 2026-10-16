@@ -16,6 +16,9 @@ _pastor() {
             ",$1")
                 cmd="pastor"
                 ;;
+            pastor,bootstrap)
+                cmd="pastor__subcmd__bootstrap"
+                ;;
             pastor,bridge)
                 cmd="pastor__subcmd__bridge"
                 ;;
@@ -243,6 +246,9 @@ _pastor() {
                 ;;
             pastor__subcmd__head__subcmd__help,unset)
                 cmd="pastor__subcmd__head__subcmd__help__subcmd__unset"
+                ;;
+            pastor__subcmd__help,bootstrap)
+                cmd="pastor__subcmd__help__subcmd__bootstrap"
                 ;;
             pastor__subcmd__help,bridge)
                 cmd="pastor__subcmd__help__subcmd__bridge"
@@ -845,12 +851,46 @@ _pastor() {
 
     case "${cmd}" in
         pastor)
-            opts="-h -V --skill --head --help --version serve task queue status machine flock tick job orchestrator config completions events watch setup connector profile limit trust bridge head leave help"
+            opts="-h -V --skill --head --help --version serve task queue status machine flock tick job orchestrator config completions events watch setup connector profile limit trust bridge bootstrap head leave help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
+                --head)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__bootstrap)
+            opts="-h --sudo --service-user --head-key --herdr-from --json --write-client --print-state-dir --head --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --service-user)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --head-key)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --herdr-from)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --write-client)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 --head)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
@@ -1861,8 +1901,22 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__help)
-            opts="serve task queue status machine flock tick job orchestrator config completions events watch setup connector profile limit trust bridge head leave help"
+            opts="serve task queue status machine flock tick job orchestrator config completions events watch setup connector profile limit trust bridge bootstrap head leave help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__help__subcmd__bootstrap)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -4535,7 +4589,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__setup__subcmd__systemd)
-            opts="-y -h --herdr --enable --start --now --stop --yes --head --help"
+            opts="-y -h --herdr --enable --start --now --stop --yes --require-linger --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
