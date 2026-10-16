@@ -41,7 +41,8 @@ pub(super) struct Ctx<'a> {
     /// Users already looked up, with their state dirs.
     pub known: RefCell<Vec<User>>,
     /// Root mode's staging dir: root-owned and 0755, so every user can read
-    /// what root copies there, and none can change it.
+    /// what root copies there, and none can change it. Under /var/tmp, since
+    /// /tmp may be noexec and the staged pastor runs from it.
     pub stage: RefCell<Option<String>>,
     /// The files staged there so far.
     pub staged: RefCell<Vec<String>>,
@@ -149,7 +150,7 @@ impl Ctx<'_> {
         let dir = match made {
             Some(dir) => dir,
             None => {
-                let args = ["-d", "/tmp/pastor-bootstrap.XXXXXX"];
+                let args = ["-d", "/var/tmp/pastor-bootstrap.XXXXXX"];
                 let dir = must(self.as_root(r, "mktemp", &args), "mktemp", &args, "rerun")?
                     .stdout
                     .trim()
@@ -208,8 +209,8 @@ impl Ctx<'_> {
     }
 
     /// Run as `u`. Another user's command runs with that user's home and
-    /// runtime dir, so `systemctl --user` reaches its own manager: through
-    /// runuser (util-linux) as root, which needs no sudo, else through sudo.
+    /// runtime dir, so `systemctl --user` reaches its own manager, and
+    /// nothing else of the caller's (`other_user_argv`).
     fn as_user(
         &self,
         r: &dyn Runner,
@@ -220,16 +221,10 @@ impl Ctx<'_> {
         if u.name == self.login {
             return r.run(program, args);
         }
-        let runtime = format!("XDG_RUNTIME_DIR=/run/user/{}", u.uid);
-        if self.facts.uid == 0 {
-            let home = format!("HOME={}", path(&u.home));
-            let mut full = vec!["-u", &u.name, "--", "env", &home, &runtime, program];
-            full.extend_from_slice(args);
-            return r.run("runuser", &full);
-        }
-        let mut full = vec!["-n", "-u", &u.name, "-H", "env", &runtime, program];
-        full.extend_from_slice(args);
-        r.run("sudo", &full)
+        let (wrapper, full) =
+            other_user_argv(self.facts.uid == 0, &u.name, &u.home, u.uid, program, args);
+        let full: Vec<&str> = full.iter().map(String::as_str).collect();
+        r.run(wrapper, &full)
     }
 
     fn as_root(&self, r: &dyn Runner, program: &str, args: &[&str]) -> std::io::Result<CmdOutput> {
@@ -240,6 +235,47 @@ impl Ctx<'_> {
         full.extend_from_slice(args);
         r.run("sudo", &full)
     }
+}
+
+/// The system dirs every command run as another user searches, before that
+/// user's own `~/.local/bin`.
+const SAFE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// The program and argv that run `program args` as user `name`: through
+/// runuser when bootstrap is root, else `sudo -n`. `env -i` hands it an
+/// environment of only PATH, HOME and XDG_RUNTIME_DIR from the user
+/// database, and LANG=C, so nothing of the caller's (PASTOR_STATE_DIR,
+/// XDG_STATE_HOME, an operator's `sudo sh` env) reaches that user's
+/// pastor. `setsid -w` starts it in a session of its own with no
+/// controlling tty, so it cannot push input into the caller's terminal
+/// (TIOCSTI), and waits for its exit status; stdin is /dev/null
+/// (`SystemRunner`).
+pub(super) fn other_user_argv(
+    root: bool,
+    name: &str,
+    home: &std::path::Path,
+    uid: u32,
+    program: &str,
+    args: &[&str],
+) -> (&'static str, Vec<String>) {
+    let mut full: Vec<String> = vec!["-w".into()];
+    if root {
+        full.extend(["runuser".into(), "-u".into(), name.into()]);
+    } else {
+        full.extend(["sudo".into(), "-n".into(), "-u".into(), name.into()]);
+    }
+    full.extend([
+        "--".into(),
+        "env".into(),
+        "-i".into(),
+        format!("PATH={SAFE_PATH}:{}", path(&home.join(".local/bin"))),
+        format!("HOME={}", path(home)),
+        format!("XDG_RUNTIME_DIR=/run/user/{uid}"),
+        "LANG=C".into(),
+        program.into(),
+    ]);
+    full.extend(args.iter().map(|a| a.to_string()));
+    ("setsid", full)
 }
 
 fn succeeded(out: std::io::Result<CmdOutput>) -> bool {

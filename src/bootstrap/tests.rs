@@ -5,9 +5,33 @@ use super::*;
 use crate::cli::CliError;
 use crate::setup::CmdOutput;
 
+/// The wrapper another user's command runs under: no controlling tty
+/// (`setsid -w`), and an environment of nothing but these (`env -i`).
+macro_rules! sudo_pastor {
+    () => {
+        "setsid -w sudo -n -u pastor -- env -i \
+         PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/pastor/.local/bin \
+         HOME=/home/pastor XDG_RUNTIME_DIR=/run/user/991 LANG=C"
+    };
+}
+macro_rules! sudo_agent {
+    () => {
+        "setsid -w sudo -n -u pastor-agent -- env -i \
+         PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/pastor-agent/.local/bin \
+         HOME=/home/pastor-agent XDG_RUNTIME_DIR=/run/user/990 LANG=C"
+    };
+}
+macro_rules! runuser_agent {
+    () => {
+        "setsid -w runuser -u pastor-agent -- env -i \
+         PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/pastor-agent/.local/bin \
+         HOME=/home/pastor-agent XDG_RUNTIME_DIR=/run/user/990 LANG=C"
+    };
+}
+
 /// Answers each call by the first rule whose prefix it starts with, after
-/// the `sudo -n [-u U -H env XDG_RUNTIME_DIR=D]` or `runuser -u U -- env
-/// HOME=H XDG_RUNTIME_DIR=D` wrapper is taken off, so a rule reads the same
+/// the `sudo -n` or `setsid -w sudo -n -u U -- env -i …` or `setsid -w
+/// runuser -u U -- env -i …` wrapper is taken off, so a rule reads the same
 /// in user and root mode. `bootstrap --print-state-dir` no rule names prints
 /// the usual dir in the home of the user it runs as (`me` unwrapped), and a
 /// `stat` no rule names finds a dir that user owns at mode 755. Any other
@@ -39,7 +63,7 @@ impl FakeRunner {
                 true,
                 "me:x:1000:1000::/home/me:/bin/bash",
             ),
-            ("mktemp -d", true, "/tmp/pastor-bootstrap.X"),
+            ("mktemp -d", true, "/var/tmp/pastor-bootstrap.X"),
             ("test -L", false, ""),
             ("printenv XDG_RUNTIME_DIR", true, "/run/user/1000"),
             (
@@ -97,24 +121,20 @@ impl FakeRunner {
 
 /// `call` without its sudo wrapper.
 fn unwrapped(call: &str) -> &str {
-    if let Some(rest) = call.strip_prefix("runuser -u ") {
-        // `U -- env HOME=H XDG_RUNTIME_DIR=D <command>`
-        return rest.splitn(6, ' ').nth(5).unwrap_or(rest);
+    let other = call
+        .strip_prefix("setsid -w runuser -u ")
+        .or_else(|| call.strip_prefix("setsid -w sudo -n -u "));
+    if let Some(rest) = other {
+        // `U -- env -i PATH=P HOME=H XDG_RUNTIME_DIR=D LANG=C <command>`
+        return rest.splitn(9, ' ').nth(8).unwrap_or(rest);
     }
-    let Some(rest) = call.strip_prefix("sudo -n ") else {
-        return call;
-    };
-    let Some(as_user) = rest.strip_prefix("-u ") else {
-        return rest;
-    };
-    // `-u U -H env XDG_RUNTIME_DIR=D <command>`
-    as_user.splitn(5, ' ').nth(4).unwrap_or(as_user)
+    call.strip_prefix("sudo -n ").unwrap_or(call)
 }
 
 /// The user a call runs as: `-u U` of its wrapper, else `me`.
 fn runs_as(call: &str) -> &str {
-    call.strip_prefix("sudo -n -u ")
-        .or_else(|| call.strip_prefix("runuser -u "))
+    call.strip_prefix("setsid -w sudo -n -u ")
+        .or_else(|| call.strip_prefix("setsid -w runuser -u "))
         .and_then(|rest| rest.split(' ').next())
         .unwrap_or("me")
 }
@@ -322,39 +342,47 @@ fn root_mode_creates_both_users() {
         assert!(r.called(&format!("sudo -n loginctl enable-linger {user}")));
     }
     // Each user's own work runs as that user, on its own bus.
-    assert!(r.called(
-        "sudo -n -u pastor -H env XDG_RUNTIME_DIR=/run/user/991 \
+    assert!(r.called(concat!(
+        sudo_pastor!(),
+        " \
          ssh-keygen -t ed25519 -N  -f /home/pastor/.local/state/pastor/machine_key"
-    ));
-    assert!(r.called(
-        "sudo -n -u pastor-agent -H env XDG_RUNTIME_DIR=/run/user/990 \
+    )));
+    assert!(r.called(concat!(
+        sudo_agent!(),
+        " \
          ssh-keygen -t ed25519 -N  -f /home/pastor-agent/.local/state/pastor/agent_key"
-    ));
-    assert!(r.called(
-        "sudo -n -u pastor-agent -H env XDG_RUNTIME_DIR=/run/user/990 \
+    )));
+    assert!(r.called(concat!(
+        sudo_agent!(),
+        " \
          /home/pastor-agent/.local/bin/pastor setup systemd --herdr --yes --require-linger"
-    ));
+    )));
     // The head's key goes to the agent user, the one the head reaches.
     assert!(r.called_containing("/home/pastor-agent/.ssh/authorized_keys"));
     assert!(!r.called_containing("/home/me/.ssh/authorized_keys"));
     // pastor for both users, herdr for the agent user only: root stages
     // each binary in its own dir, and each user installs its own copy.
-    assert!(r.called("sudo -n mktemp -d /tmp/pastor-bootstrap.XXXXXX"));
-    assert!(r.called("sudo -n chmod 755 /tmp/pastor-bootstrap.X"));
-    assert!(r.called("sudo -n install -m 0755 /tmp/cache/pastor /tmp/pastor-bootstrap.X/pastor"));
-    assert!(r.called("sudo -n install -m 0755 /tmp/cache/herdr /tmp/pastor-bootstrap.X/herdr"));
-    assert!(r.called(
-        "sudo -n -u pastor -H env XDG_RUNTIME_DIR=/run/user/991 \
-         install -m 0755 /tmp/pastor-bootstrap.X/pastor /home/pastor/.local/bin/pastor"
-    ));
-    assert!(r.called(
-        "sudo -n -u pastor-agent -H env XDG_RUNTIME_DIR=/run/user/990 \
-         install -m 0755 /tmp/pastor-bootstrap.X/pastor /home/pastor-agent/.local/bin/pastor"
-    ));
-    assert!(r.called(
-        "sudo -n -u pastor-agent -H env XDG_RUNTIME_DIR=/run/user/990 \
-         install -m 0755 /tmp/pastor-bootstrap.X/herdr /home/pastor-agent/.local/bin/herdr"
-    ));
+    assert!(r.called("sudo -n mktemp -d /var/tmp/pastor-bootstrap.XXXXXX"));
+    assert!(r.called("sudo -n chmod 755 /var/tmp/pastor-bootstrap.X"));
+    assert!(
+        r.called("sudo -n install -m 0755 /tmp/cache/pastor /var/tmp/pastor-bootstrap.X/pastor")
+    );
+    assert!(r.called("sudo -n install -m 0755 /tmp/cache/herdr /var/tmp/pastor-bootstrap.X/herdr"));
+    assert!(r.called(concat!(
+        sudo_pastor!(),
+        " \
+         install -m 0755 /var/tmp/pastor-bootstrap.X/pastor /home/pastor/.local/bin/pastor"
+    )));
+    assert!(r.called(concat!(
+        sudo_agent!(),
+        " \
+         install -m 0755 /var/tmp/pastor-bootstrap.X/pastor /home/pastor-agent/.local/bin/pastor"
+    )));
+    assert!(r.called(concat!(
+        sudo_agent!(),
+        " \
+         install -m 0755 /var/tmp/pastor-bootstrap.X/herdr /home/pastor-agent/.local/bin/herdr"
+    )));
     assert!(!r.called_containing("/home/pastor/.local/bin/herdr"));
     // Root never writes into, or reads through, another user's paths.
     assert!(
@@ -366,7 +394,7 @@ fn root_mode_creates_both_users() {
         "{:#?}",
         r.calls()
     );
-    assert!(r.called("sudo -n rm -rf -- /tmp/pastor-bootstrap.X"));
+    assert!(r.called("sudo -n rm -rf -- /var/tmp/pastor-bootstrap.X"));
 }
 
 #[test]
@@ -439,7 +467,7 @@ fn service_state_dir_is_0700_and_owned() {
     );
     assert!(o.ok, "{:#?}", o.steps);
     // Each user closes its own state dir; root touches neither.
-    let as_pastor = "sudo -n -u pastor -H env XDG_RUNTIME_DIR=/run/user/991";
+    let as_pastor = sudo_pastor!();
     assert!(
         r.called(&format!(
             "{as_pastor} chmod 700 /home/pastor/.local/state/pastor"
@@ -489,10 +517,11 @@ fn state_dir_already_right_is_already_there() {
     assert_eq!(step(&o, "users").status, StepStatus::AlreadyThere);
     assert!(!r.called_containing("chmod 700"), "{:#?}", r.calls());
     // The owner looks, since only it can enter its 0700 home.
-    assert!(r.called(
-        "sudo -n -u pastor -H env XDG_RUNTIME_DIR=/run/user/991 \
+    assert!(r.called(concat!(
+        sudo_pastor!(),
+        " \
          stat -c %U %a /home/pastor/.local/state/pastor"
-    ));
+    )));
 }
 
 #[test]
@@ -534,13 +563,16 @@ fn root_without_sudo_uses_runuser() {
         ),
         ("stat -c %U %a /root/.local/state/pastor", true, "root 700"),
         (
-            "runuser -u pastor-agent -- env HOME=/home/pastor-agent XDG_RUNTIME_DIR=/run/user/990 \
-             /tmp/pastor-bootstrap.X/pastor bootstrap --print-state-dir",
+            concat!(
+                runuser_agent!(),
+                " \
+             /var/tmp/pastor-bootstrap.X/pastor bootstrap --print-state-dir"
+            ),
             true,
             "/home/pastor-agent/.local/state/pastor",
         ),
         (
-            "/tmp/pastor-bootstrap.X/pastor bootstrap --print-state-dir",
+            "/var/tmp/pastor-bootstrap.X/pastor bootstrap --print-state-dir",
             true,
             "/root/.local/state/pastor",
         ),
@@ -555,8 +587,7 @@ fn root_without_sudo_uses_runuser() {
         "{:#?}",
         r.calls()
     );
-    let as_agent =
-        "runuser -u pastor-agent -- env HOME=/home/pastor-agent XDG_RUNTIME_DIR=/run/user/990";
+    let as_agent = runuser_agent!();
     assert!(r.called(&format!(
         "{as_agent} ssh-keygen -t ed25519 -N  -f /home/pastor-agent/.local/state/pastor/agent_key"
     )), "{:#?}", r.calls());
@@ -583,28 +614,31 @@ fn home_from_getent_not_env() {
 #[test]
 fn state_dir_from_users_pastor() {
     let r = both_users(&[(
-        "sudo -n -u pastor -H env XDG_RUNTIME_DIR=/run/user/991 \
-         /tmp/pastor-bootstrap.X/pastor bootstrap --print-state-dir",
+        concat!(
+            sudo_pastor!(),
+            " \
+         /var/tmp/pastor-bootstrap.X/pastor bootstrap --print-state-dir"
+        ),
         true,
         "/srv/pastor-state",
     )]);
     let o = run(&r, &service_pastor(true));
     assert!(o.ok, "{:#?}", o.steps);
     assert!(
-        r.called(
-            "sudo -n -u pastor -H env XDG_RUNTIME_DIR=/run/user/991 \
+        r.called(concat!(
+            sudo_pastor!(),
+            " \
          ssh-keygen -t ed25519 -N  -f /srv/pastor-state/machine_key"
-        ),
+        )),
         "{:#?}",
         r.calls()
     );
-    assert!(r.called(
-        "sudo -n -u pastor -H env XDG_RUNTIME_DIR=/run/user/991 chmod 700 /srv/pastor-state"
-    ));
-    assert!(r.called(
-        "sudo -n -u pastor-agent -H env XDG_RUNTIME_DIR=/run/user/990 \
+    assert!(r.called(concat!(sudo_pastor!(), " chmod 700 /srv/pastor-state")));
+    assert!(r.called(concat!(
+        sudo_agent!(),
+        " \
          ssh-keygen -t ed25519 -N  -f /home/pastor-agent/.local/state/pastor/agent_key"
-    ));
+    )));
 }
 
 #[test]
@@ -806,4 +840,101 @@ fn write_client_writes_once_and_keeps_the_rest() {
     assert!(text.contains("# mine\n"), "{text}");
     assert_eq!(crate::head::load(&file).unwrap().unwrap().ssh, "me@head");
     assert!(write_client(&file, "-oProxyCommand=x").is_err());
+}
+
+#[test]
+fn another_users_command_has_a_clean_env_and_no_tty() {
+    for (root, runner) in [(true, "runuser"), (false, "sudo")] {
+        let (program, argv) = steps::other_user_argv(
+            root,
+            "pastor-agent",
+            std::path::Path::new("/home/pastor-agent"),
+            990,
+            "/var/tmp/pastor-bootstrap.X/pastor",
+            &["bootstrap", "--print-state-dir"],
+        );
+        assert_eq!(program, "setsid");
+        let call = std::iter::once(program)
+            .chain(argv.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let head = if root {
+            "setsid -w runuser -u pastor-agent -- env -i"
+        } else {
+            "setsid -w sudo -n -u pastor-agent -- env -i"
+        };
+        assert!(call.starts_with(head), "{runner}: {call}");
+        // The only variables set are the ones bootstrap names.
+        let env = argv.iter().position(|a| a == "-i").unwrap();
+        let vars: Vec<&str> = argv[env + 1..]
+            .iter()
+            .take_while(|a| a.contains('='))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            vars,
+            [
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\
+                 /home/pastor-agent/.local/bin",
+                "HOME=/home/pastor-agent",
+                "XDG_RUNTIME_DIR=/run/user/990",
+                "LANG=C",
+            ],
+            "{runner}"
+        );
+        assert_eq!(
+            &argv[env + 1 + vars.len()..],
+            [
+                "/var/tmp/pastor-bootstrap.X/pastor",
+                "bootstrap",
+                "--print-state-dir"
+            ],
+        );
+    }
+}
+
+#[test]
+fn callers_pastor_state_dir_never_reaches_another_user() {
+    // `env -i` drops whatever the caller has, so only argv can carry a
+    // variable to the other user; run the real wrapper through a real
+    // `env` to prove it.
+    let (_, argv) = steps::other_user_argv(
+        true,
+        "pastor-agent",
+        std::path::Path::new("/home/pastor-agent"),
+        990,
+        "printenv",
+        &[],
+    );
+    assert!(
+        !argv
+            .iter()
+            .any(|a| a.contains("PASTOR_") || a.contains("XDG_STATE"))
+    );
+    let env = argv.iter().position(|a| a == "env").unwrap();
+    let out = std::process::Command::new("env")
+        .args(&argv[env + 1..])
+        .env("PASTOR_STATE_DIR", "/tmp/evil")
+        .env("PASTOR_CONFIG_DIR", "/tmp/evil")
+        .env("XDG_STATE_HOME", "/tmp/evil")
+        .output()
+        .unwrap();
+    let printed = String::from_utf8(out.stdout).unwrap();
+    assert!(out.status.success());
+    assert!(!printed.contains("/tmp/evil"), "{printed}");
+    assert!(printed.contains("HOME=/home/pastor-agent\n"), "{printed}");
+}
+
+#[test]
+fn root_stages_under_var_tmp() {
+    // /tmp may be noexec; the staged pastor has to run.
+    let r = FakeRunner::new(&[]);
+    let o = run(&r, &options(true));
+    assert!(o.ok, "{:#?}", o.steps);
+    assert!(
+        r.called("sudo -n mktemp -d /var/tmp/pastor-bootstrap.XXXXXX"),
+        "{:#?}",
+        r.calls()
+    );
+    assert!(!r.called_containing(" /tmp/pastor-bootstrap"));
 }
