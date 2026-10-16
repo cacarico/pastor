@@ -41,7 +41,8 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 /// `FlockEntry::keep_pane`). 30: usage limits (`LimitList`, `LimitClear`,
 /// `TaskReport::limit`). 31: saved trust on pull machines (`PullTrust`,
 /// `TaskReport::trusted`). 32: a pull machine's own versions
-/// (`TaskClaim::herdr_version`, `TaskClaim::pastor_version`).
+/// (`TaskClaim::herdr_version`, `TaskClaim::pastor_version`) and join
+/// tokens (`JoinCreate`, `JoinList`, `JoinRevoke`, `Join`).
 pub const IPC_PROTOCOL: u32 = 32;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
@@ -226,6 +227,11 @@ pub const PULL_TRUST_PROTOCOL: u32 = 31;
 /// would drop them without a word.
 pub const PULL_VERSIONS_PROTOCOL: u32 = 32;
 
+/// The first protocol whose head makes, lists, revokes and redeems join
+/// tokens (`JoinCreate`, `JoinList`, `JoinRevoke`, `Join`). An older one
+/// refuses them as unreadable.
+pub const JOIN_TOKEN_PROTOCOL: u32 = 32;
+
 /// The first protocol whose head honours `Run::priority` and knows
 /// `TaskPriority`. An older one would queue the task at its own level
 /// without a word, or refuse the request as unreadable.
@@ -344,6 +350,7 @@ const SESSION: &str = "predates session orchestrators, and would refuse the requ
 const LIMITS: &str = "predates usage limits, and would refuse the request";
 const REPORT_LIMIT: &str = "predates usage limits, and would drop the limit the report carries";
 const PULL_TRUST: &str = "predates saved trust on pull machines, and would refuse the request";
+const JOIN_TOKENS: &str = "predates join tokens, and would refuse the request";
 const REPORT_TRUSTED: &str =
     "predates saved trust on pull machines, and would drop the trust answer the report carries";
 const PULL_VERSIONS: &str =
@@ -812,6 +819,39 @@ pub enum IpcRequest {
         name: Option<String>,
         text: String,
     },
+    /// `join create`: a one-time token for a new pull machine, with the
+    /// flock, tags and `--replace` target fixed now. Answers `JoinCreated`.
+    JoinCreate {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        flock: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replace: Option<String>,
+        ttl_secs: u64,
+    },
+    /// `join list`. Answers `JoinTokens`.
+    JoinList,
+    /// `join revoke`: the token's line and row go. Answers `Text`.
+    JoinRevoke {
+        id: String,
+    },
+    /// A joining machine's one request, through `bridge --join <id>`, which
+    /// sets `id` from its forced command whatever the machine sent. Answers
+    /// `Joined`.
+    Join {
+        id: String,
+        name: String,
+        /// The public key its shepherd reaches the head with.
+        machine_key: String,
+        /// The public key its agents reach the head with.
+        agent_key: String,
+        /// Its sshd host key.
+        host_key: String,
+        /// What it says about itself (os, arch, ...); kept for later use.
+        #[serde(default)]
+        facts: serde_json::Value,
+    },
 }
 
 impl IpcRequest {
@@ -1046,6 +1086,9 @@ impl IpcRequest {
             | R::OrchestratorRun { .. }
             | R::OrchestratorSetEnabled { .. }
             | R::OrchestratorNote { .. } => need.at(ORCHESTRATOR_PROTOCOL, ORCHESTRATOR),
+            R::JoinCreate { .. } | R::JoinList | R::JoinRevoke { .. } | R::Join { .. } => {
+                need.at(JOIN_TOKEN_PROTOCOL, JOIN_TOKENS);
+            }
         }
         need.0
     }
@@ -1071,6 +1114,7 @@ impl IpcRequest {
             | IpcRequest::OrchestratorList
             | IpcRequest::OrchestratorDescribe { .. }
             | IpcRequest::LimitList
+            | IpcRequest::JoinList
             | IpcRequest::Queue { .. } => false,
             IpcRequest::FileGet { .. } | IpcRequest::JobDescribe { .. } => false,
             IpcRequest::Reload
@@ -1105,7 +1149,10 @@ impl IpcRequest {
             | IpcRequest::OrchestratorStart { .. }
             | IpcRequest::OrchestratorStop { .. }
             | IpcRequest::OrchestratorSetEnabled { .. }
-            | IpcRequest::OrchestratorNote { .. } => true,
+            | IpcRequest::OrchestratorNote { .. }
+            | IpcRequest::JoinCreate { .. }
+            | IpcRequest::JoinRevoke { .. }
+            | IpcRequest::Join { .. } => true,
         }
     }
 
@@ -1242,6 +1289,17 @@ pub enum IpcResponse {
     Orchestrators(Vec<crate::orchestrator::OrchestratorStatus>),
     Orchestrator(crate::orchestrator::OrchestratorDescription),
     Limits(Vec<crate::limit::AccountLimit>),
+    /// `JoinCreate`'s token, which only this reply carries.
+    JoinCreated {
+        id: String,
+        token: String,
+        expires_at: String,
+    },
+    JoinTokens(Vec<crate::store::JoinToken>),
+    /// `Join`: the machine is in flock.toml under `name`.
+    Joined {
+        name: String,
+    },
 }
 
 /// One of the head's config files as `FileGet` found it.
@@ -1874,6 +1932,7 @@ mod tests {
             IpcRequest::OrchestratorList,
             IpcRequest::OrchestratorDescribe { name: "o".into() },
             IpcRequest::LimitList,
+            IpcRequest::JoinList,
         ];
         for req in reads {
             assert!(!req.changes_fleet(), "{req:?}");
@@ -2016,6 +2075,23 @@ mod tests {
             IpcRequest::OrchestratorNote {
                 name: None,
                 text: "n".into(),
+            },
+            IpcRequest::JoinCreate {
+                flock: None,
+                tags: vec![],
+                replace: None,
+                ttl_secs: 60,
+            },
+            IpcRequest::JoinRevoke {
+                id: "0123456789abcdef".into(),
+            },
+            IpcRequest::Join {
+                id: "0123456789abcdef".into(),
+                name: "m".into(),
+                machine_key: "ssh-ed25519 K".into(),
+                agent_key: "ssh-ed25519 A".into(),
+                host_key: "ssh-ed25519 H".into(),
+                facts: serde_json::Value::Null,
             },
         ]
     }
