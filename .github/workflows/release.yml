@@ -18,9 +18,10 @@
 # is never published there; cut one to crates.io by hand if that's ever
 # wanted (see CONTRIBUTING.md).
 #
-# Every job runs only in cacarico/pastor. Work happens in a private copy
-# that carries the same tags; a tag pushed there must not draft a release
-# or reach crates.io.
+# Every job runs only in cacarico/pastor, upstream and the source of
+# truth: this is where tags get pushed and releases drafted. A fork may
+# carry the same tags for its own reasons; a tag pushed there must not
+# draft a release or reach crates.io.
 name: release
 
 on:

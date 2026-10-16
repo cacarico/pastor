@@ -5,7 +5,10 @@ small ones with tests.
 
 ## Before you start
 
-- Work on a branch and open a pull request. Do not push to `main`.
+- Work on a branch and open a pull request against cacarico/pastor, the
+  source of truth. Do not push to `main`. A fork may keep work of its own
+  that never goes upstream; a change meant for upstream goes on its own
+  branch based on upstream `main` and becomes one pull request there.
 - Read `AGENTS.md`, `README.md` and `docs/manual.md` before changing
   behavior.
 - Keep vocabulary consistent: machine, flock, head, job, task, connector,
@@ -76,6 +79,9 @@ exit 1. Clap usage errors should stay plain text and exit 2.
 
 ## Releases
 
+- cacarico/pastor is the source of truth. The release pull request is
+  opened and merged there, and the tag is pushed there; a fork that keeps
+  its own copy only sees the release once it syncs.
 - SemVer. While pastor is 0.x, a minor bump (0.4 to 0.5) may break and a
   patch never does. From 1.0 the usual rules apply.
 - What "break" covers: the CLI (command names, flags, exit codes and the

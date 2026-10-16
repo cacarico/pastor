@@ -110,10 +110,8 @@ down here because getting them wrong cost a day.
 - Dependabot (`.github/dependabot.yml`) opens weekly version updates for
   cargo and GitHub Actions, minor and patch grouped into one pull request per
   ecosystem, plus security updates; malware alerts and private vulnerability
-  reporting are repository settings. Its pull requests pass CI like any other.
-  The file is the same in the public repo, which gets the same pull requests;
-  there `.github/workflows/dependabot-close.yml` closes them with a note,
-  since the update arrives with the sync.
+  reporting are repository settings. Its pull requests pass CI and merge
+  like any other.
 - Nothing in the suite talks to a real herdr. `make smoke SESSION=s` runs the
   opt-in test against one on the same host; do it on a fleet machine before
   trusting a change to the transport or dispatch. `make smoke-profiles`
