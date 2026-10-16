@@ -5323,7 +5323,10 @@ mod tests {
             );
         }
         assert!(text.contains("\npull = true"), "no pull machine example");
-        let flag = ["--", "shepherd"].concat();
+        // A pull machine is set up in pastor.toml, never with a serve flag;
+        // `--shepherd` itself is real, on `bridge` and `machine
+        // authorized-key`.
+        let flag = ["serve --", "shepherd"].concat();
         assert!(!text.contains(&flag), "the manual names {flag}");
     }
 

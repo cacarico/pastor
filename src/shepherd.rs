@@ -47,6 +47,22 @@ const PAGE: u32 = 200;
 /// machine is what bounds how many run here at once.
 const CLAIM_AT_ONCE: u32 = 4;
 
+/// This machine's own herdr and pastor, read once at startup: what every
+/// `TaskClaim` reports, so the head's `machine_state` (`Store::set_versions`)
+/// stays current without asking herdr on every tick. Pastor's own version is
+/// always known; herdr's is `None` when it cannot be run.
+fn local_versions() -> (Option<String>, Option<String>) {
+    let herdr = std::process::Command::new("herdr")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| crate::cli::herdr_version_from(&String::from_utf8_lossy(&o.stdout)));
+    (herdr, Some(env!("CARGO_PKG_VERSION").into()))
+}
+
 /// How long a request to the head may take. A `JobSubmit` waits for the
 /// head's dispatch pass, agent readiness included.
 const HEAD_TIMEOUT: Duration = Duration::from_secs(60);
@@ -241,6 +257,10 @@ struct Puller {
     settings: MachineSettings,
     store: Arc<Store>,
     ask: Ask,
+    /// This machine's own versions (`local_versions`), sent with every
+    /// claim.
+    herdr_version: Option<String>,
+    pastor_version: Option<String>,
     /// The actor's events; any of them means a row may have changed.
     events: broadcast::Sender<PastorEvent>,
     heard: broadcast::Receiver<PastorEvent>,
@@ -266,6 +286,7 @@ impl Puller {
         ask: Ask,
     ) -> Puller {
         let (events, heard) = broadcast::channel(256);
+        let (herdr_version, pastor_version) = local_versions();
         Puller {
             machine,
             flock_work,
@@ -273,6 +294,8 @@ impl Puller {
             settings,
             store,
             ask,
+            herdr_version,
+            pastor_version,
             events,
             heard,
             actor: None,
@@ -427,12 +450,25 @@ impl Puller {
 
     /// Ask the head for tasks and keep each as a queued row here.
     async fn claim(&mut self) {
-        let req = IpcRequest::TaskClaim {
+        let req = |versions: bool| IpcRequest::TaskClaim {
             machine: self.machine.clone(),
             free_slots: CLAIM_AT_ONCE,
             flock_work: self.flock_work,
+            herdr_version: self.herdr_version.clone().filter(|_| versions),
+            pastor_version: self.pastor_version.clone().filter(|_| versions),
         };
-        let tasks = match (self.ask)(req).await {
+        let mut answer = (self.ask)(req(true)).await;
+        // A head from before `PULL_VERSIONS_PROTOCOL` refuses the versions
+        // (`head_too_old` before the send); it still hands out tasks to a
+        // claim without them, which matters more than its machine_state row.
+        if let Err(err) = &answer
+            && err
+                .downcast_ref::<CliError>()
+                .is_some_and(|e| e.code == "head_too_old")
+        {
+            answer = (self.ask)(req(false)).await;
+        }
+        let tasks = match answer {
             Ok(IpcResponse::Tasks(tasks)) => {
                 if self.refused.take().is_some() {
                     tracing::info!(machine = %self.machine, "the head gives this machine tasks again");
@@ -1640,6 +1676,8 @@ mod tests {
                 machine: "laptop".into(),
                 free_slots: 1,
                 flock_work: false,
+                herdr_version: None,
+                pastor_version: None,
             })
             .await
         else {
@@ -1911,6 +1949,8 @@ mod tests {
             machine: "m".into(),
             free_slots: 1,
             flock_work: false,
+            herdr_version: None,
+            pastor_version: None,
         })
         .await
         .unwrap_err();

@@ -196,7 +196,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand machine; and not __fish_se
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and not __fish_seen_subcommand_from add remove move list describe open authorized-key help" -f -a "list" -d 'A line about the head, then each machine: host, flock, channel, herdr, agents'
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and not __fish_seen_subcommand_from add remove move list describe open authorized-key help" -f -a "describe" -d 'One machine in full: host, flock, channel, versions, agents, recent errors'
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and not __fish_seen_subcommand_from add remove move list describe open authorized-key help" -f -a "open" -d 'Open the full herdr UI on a machine'
-complete -c pastor -n "__fish_pastor_using_subcommand machine; and not __fish_seen_subcommand_from add remove move list describe open authorized-key help" -f -a "authorized-key" -d 'Print the authorized_keys line that lets a machine\'s agents reach this head'
+complete -c pastor -n "__fish_pastor_using_subcommand machine; and not __fish_seen_subcommand_from add remove move list describe open authorized-key help" -f -a "authorized-key" -d 'Print the authorized_keys line that lets a machine\'s agents (or, with --shepherd, its shepherd) reach this head'
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and not __fish_seen_subcommand_from add remove move list describe open authorized-key help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from add" -l command -d 'Developer option: the bridge command as one string, split on whitespace (`--command "fake-herdr --connect /tmp/h.sock"`). Words containing spaces go in flock.toml by hand' -r
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from add" -l session -d 'The herdr session on the machine that agents run in' -r
@@ -227,6 +227,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_s
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from open" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from authorized-key" -l key -d 'The public key of the machine\'s user: a .pub file, or - for stdin' -r
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from authorized-key" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
+complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from authorized-key" -l shepherd -d 'Print the shepherd\'s line (bridge --shepherd --machine NAME) instead of the agent\'s'
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from authorized-key" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from help" -f -a "add" -d 'Add a machine to flock.toml, reached over ssh, locally or by a command'
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from help" -f -a "remove" -d 'Remove a machine from flock.toml; tasks already on it keep their rows'
@@ -234,7 +235,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_s
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from help" -f -a "list" -d 'A line about the head, then each machine: host, flock, channel, herdr, agents'
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from help" -f -a "describe" -d 'One machine in full: host, flock, channel, versions, agents, recent errors'
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from help" -f -a "open" -d 'Open the full herdr UI on a machine'
-complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from help" -f -a "authorized-key" -d 'Print the authorized_keys line that lets a machine\'s agents reach this head'
+complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from help" -f -a "authorized-key" -d 'Print the authorized_keys line that lets a machine\'s agents (or, with --shepherd, its shepherd) reach this head'
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand flock; and not __fish_seen_subcommand_from list add join leave remove default edit describe help" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand flock; and not __fish_seen_subcommand_from list add join leave remove default edit describe help" -s h -l help -d 'Print help'
@@ -494,9 +495,10 @@ complete -c pastor -n "__fish_pastor_using_subcommand trust; and __fish_seen_sub
 complete -c pastor -n "__fish_pastor_using_subcommand trust; and __fish_seen_subcommand_from help" -f -a "add" -d 'Save a trust, so the repo\'s tasks on that machine are answered'
 complete -c pastor -n "__fish_pastor_using_subcommand trust; and __fish_seen_subcommand_from help" -f -a "remove" -d 'Forget a saved trust; the repo\'s next task asks again'
 complete -c pastor -n "__fish_pastor_using_subcommand trust; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
-complete -c pastor -n "__fish_pastor_using_subcommand bridge" -l machine -d 'The machine whose agents this bridge serves, as flock.toml names it' -r
+complete -c pastor -n "__fish_pastor_using_subcommand bridge" -l machine -d 'The machine this bridge serves (needs --agent or --shepherd), as flock.toml names it' -r
 complete -c pastor -n "__fish_pastor_using_subcommand bridge" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand bridge" -l agent -d 'Pass on only what an agent on --machine may ask: its machine\'s tasks'
+complete -c pastor -n "__fish_pastor_using_subcommand bridge" -l shepherd -d 'Pass on only what the shepherd on --machine may ask: claiming and reporting its own tasks, its saved trust, job submits and its events'
 complete -c pastor -n "__fish_pastor_using_subcommand bridge" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand head; and not __fish_seen_subcommand_from set show unset help" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand head; and not __fish_seen_subcommand_from set show unset help" -s h -l help -d 'Print help'
@@ -558,7 +560,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from machine" -f -a "list" -d 'A line about the head, then each machine: host, flock, channel, herdr, agents'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from machine" -f -a "describe" -d 'One machine in full: host, flock, channel, versions, agents, recent errors'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from machine" -f -a "open" -d 'Open the full herdr UI on a machine'
-complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from machine" -f -a "authorized-key" -d 'Print the authorized_keys line that lets a machine\'s agents reach this head'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from machine" -f -a "authorized-key" -d 'Print the authorized_keys line that lets a machine\'s agents (or, with --shepherd, its shepherd) reach this head'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from flock" -f -a "list" -d 'Every flock: default or not, its machines, live agents, queued tasks'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from flock" -f -a "add" -d 'Declare a flock; with --default, new tasks and jobs go to it'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from flock" -f -a "join" -d 'Put a machine in a flock, or change its number there; it stays in its other flocks'

@@ -143,12 +143,17 @@ struct ServeArgs {
 }
 
 #[derive(Args, Debug)]
+#[command(group(ArgGroup::new("bridge_mode").args(["agent", "shepherd"])))]
 struct BridgeArgs {
     /// Pass on only what an agent on --machine may ask: its machine's tasks
     #[arg(long, requires = "machine")]
     agent: bool,
-    /// The machine whose agents this bridge serves, as flock.toml names it
-    #[arg(long, requires = "agent")]
+    /// Pass on only what the shepherd on --machine may ask: claiming and
+    /// reporting its own tasks, its saved trust, job submits and its events
+    #[arg(long, requires = "machine")]
+    shepherd: bool,
+    /// The machine this bridge serves (needs --agent or --shepherd), as flock.toml names it
+    #[arg(long)]
     machine: Option<String>,
 }
 
@@ -494,13 +499,16 @@ enum MachineCmd {
         /// The machine, as flock.toml names it
         name: String,
     },
-    /// Print the authorized_keys line that lets a machine's agents reach this head
+    /// Print the authorized_keys line that lets a machine's agents (or, with --shepherd, its shepherd) reach this head
     AuthorizedKey {
         /// The machine, as flock.toml names it
         name: String,
         /// The public key of the machine's user: a .pub file, or - for stdin
         #[arg(long, value_name = "FILE")]
         key: String,
+        /// Print the shepherd's line (bridge --shepherd --machine NAME) instead of the agent's
+        #[arg(long)]
+        shepherd: bool,
     },
 }
 
@@ -628,6 +636,14 @@ fn main() {
     // Plumbing, before the legacy migration and the fleet guard: it reads no
     // config, and the head checks each request it carries.
     if let Command::Bridge(args) = &command {
+        if args.machine.is_some() && !args.agent && !args.shepherd {
+            <Cli as clap::CommandFactory>::command()
+                .error(
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "--machine needs --agent or --shepherd",
+                )
+                .exit();
+        }
         bridge(&paths, args);
     }
     if let Some(legacy) = pastor::config::legacy_macos_dir() {
@@ -890,9 +906,12 @@ fn bridge(paths: &Paths, args: &BridgeArgs) -> ! {
     let socket = paths.socket_file();
     let input = tokio::io::BufReader::new(tokio::io::stdin());
     let result = rt.block_on(async {
-        match (args.agent, &args.machine) {
-            (true, Some(machine)) => {
+        match (args.agent, args.shepherd, &args.machine) {
+            (true, _, Some(machine)) => {
                 pastor::bridge::run_agent(&socket, machine, input, tokio::io::stdout()).await
+            }
+            (_, true, Some(machine)) => {
+                pastor::bridge::run_shepherd(&socket, machine, input, tokio::io::stdout()).await
             }
             _ => pastor::bridge::run(&socket, input, tokio::io::stdout()).await,
         }
@@ -2256,7 +2275,11 @@ async fn machine(client: &pastor::ipc::Client, cmd: MachineCmd, head: Head) -> a
         }
         MachineCmd::Describe { name, json } => machine_describe(client, &name, json, head).await?,
         MachineCmd::Open { name } => open(client, &name).await?,
-        MachineCmd::AuthorizedKey { name, key } => authorized_key(&path, &name, &key)?,
+        MachineCmd::AuthorizedKey {
+            name,
+            key,
+            shepherd,
+        } => authorized_key(&path, &name, &key, shepherd)?,
     }
     Ok(())
 }
@@ -2753,8 +2776,15 @@ async fn attach(client: &pastor::ipc::Client, task: &str) -> anyhow::Result<()> 
 }
 
 /// `pastor machine authorized-key`: prints the line, and never edits
-/// `authorized_keys` or any other file.
-fn authorized_key(flock: &std::path::Path, machine: &str, key: &str) -> anyhow::Result<()> {
+/// `authorized_keys` or any other file. `--shepherd` prints the line for
+/// that machine's shepherd (`bridge --shepherd --machine NAME`, marker
+/// `pastor:machine:NAME`) instead of its agents'.
+fn authorized_key(
+    flock: &std::path::Path,
+    machine: &str,
+    key: &str,
+    shepherd: bool,
+) -> anyhow::Result<()> {
     if Flock::load(flock)?.get(machine).is_none() {
         fail("unknown_machine", machine);
     }
@@ -2766,10 +2796,17 @@ fn authorized_key(flock: &std::path::Path, machine: &str, key: &str) -> anyhow::
         })?
     };
     let pastor = std::env::current_exe()?;
-    println!(
-        "{}",
+    let line = if shepherd {
+        pastor::authkeys::line(
+            &pastor,
+            &format!("bridge --shepherd --machine {machine}"),
+            &key,
+            &pastor::authkeys::Marker::Machine(machine.to_string()),
+        )?
+    } else {
         pastor::bridge::authorized_key_line(&pastor, machine, &key)?
-    );
+    };
+    println!("{line}");
     Ok(())
 }
 

@@ -857,7 +857,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__bridge)
-            opts="-h --agent --machine --head --help"
+            opts="-h --agent --shepherd --machine --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3539,7 +3539,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__machine__subcmd__authorized__subcmd__key)
-            opts="-h --key --head --help"
+            opts="-h --key --shepherd --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

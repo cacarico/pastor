@@ -311,12 +311,13 @@ Open the full herdr UI on a machine
 
 ### pastor machine authorized-key
 
-Print the authorized_keys line that lets a machine's agents reach this head
+Print the authorized_keys line that lets a machine's agents (or, with --shepherd, its shepherd) reach this head
 
 | argument | does | default |
 |---|---|---|
 | `<NAME>` | The machine, as flock.toml names it |  |
 | `--key <FILE>` | The public key of the machine's user: a .pub file, or - for stdin (required) |  |
+| `--shepherd` | Print the shepherd's line (bridge --shepherd --machine NAME) instead of the agent's |  |
 
 ## flock
 
@@ -761,7 +762,8 @@ Pass request lines from stdin to this machine's head; for a remote CLI over ssh
 | argument | does | default |
 |---|---|---|
 | `--agent` | Pass on only what an agent on --machine may ask: its machine's tasks |  |
-| `--machine <MACHINE>` | The machine whose agents this bridge serves, as flock.toml names it |  |
+| `--shepherd` | Pass on only what the shepherd on --machine may ask: claiming and reporting its own tasks, its saved trust, job submits and its events |  |
+| `--machine <MACHINE>` | The machine this bridge serves (needs --agent or --shepherd), as flock.toml names it |  |
 
 ## head
 

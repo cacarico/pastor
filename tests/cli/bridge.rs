@@ -59,6 +59,33 @@ fn bridge_passes_each_line_to_the_head_and_its_reply_back() {
     assert!(!tmp.path().join("c").exists());
 }
 
+/// `--machine` needs `--agent` or `--shepherd`, and the two are mutually
+/// exclusive: both are clap usage errors, caught before any socket is
+/// touched.
+#[test]
+fn bridge_machine_needs_a_mode_and_the_modes_exclude_each_other() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("s");
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", tmp.path().join("c"))
+            .env("PASTOR_STATE_DIR", &state)
+            .output()
+            .unwrap()
+    };
+    let out = run(&["bridge", "--machine", "pi-1"]);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--agent or --shepherd"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run(&["bridge", "--agent", "--shepherd", "--machine", "pi-1"]);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(!state.join("pastor.sock").exists());
+}
+
 /// With no head on the socket the bridge answers one `no_head` line on
 /// stdout, where the remote CLI reads, and exits non-zero. It never starts a
 /// head.
