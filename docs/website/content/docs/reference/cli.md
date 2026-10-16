@@ -754,6 +754,38 @@ Forget a saved trust; the repo's next task asks again
 | `<MACHINE>` | The machine, as flock.toml names it |  |
 | `<REPO>` | The repo's path on that machine, as `trust list` shows it |  |
 
+## join
+
+One-time tokens a new machine joins the fleet with, as a pull machine
+
+### pastor join create
+
+Make a one-time token a new machine joins the fleet with, as a pull machine; prints the token
+
+| argument | does | default |
+|---|---|---|
+| `--flock <FLOCK>` | The flock the machine joins (default: the default flock) |  |
+| `--tag <TAGS>` | A tag the machine gets; repeat for more |  |
+| `--replace <REPLACE>` | The one machine name already in flock.toml the token may take over |  |
+| `--ttl <TTL>` | How long the token works, like 30m or 1h | `1h` |
+| `--json` | Print as a JSON object: the id, the token and its expiry |  |
+
+### pastor join list
+
+The join tokens the head knows: id, flock, tags, expiry, whether used
+
+| argument | does | default |
+|---|---|---|
+| `--json` | Print as a JSON array |  |
+
+### pastor join revoke
+
+Remove a join token's key from authorized_keys and forget it
+
+| argument | does | default |
+|---|---|---|
+| `<ID>` | The token's id, as `join list` shows it |  |
+
 ## bridge
 
 Pass request lines from stdin to this machine's head; for a remote CLI over ssh
@@ -762,6 +794,7 @@ Pass request lines from stdin to this machine's head; for a remote CLI over ssh
 |---|---|---|
 | `--agent` | Pass on only what an agent on --machine may ask: its machine's tasks |  |
 | `--machine <MACHINE>` | The machine whose agents this bridge serves, as flock.toml names it |  |
+| `--join <ID>` | Take one join request for the join token with this id, then exit; what a token's authorized_keys line runs |  |
 
 ## head
 

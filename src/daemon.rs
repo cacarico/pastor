@@ -3913,6 +3913,164 @@ impl Daemon {
         }
     }
 
+    /// `JoinCreate`: a token whose flock exists, for the head at
+    /// `head_address` (else `user@hostname`).
+    fn join_create(
+        &self,
+        flock: Option<String>,
+        tags: Vec<String>,
+        replace: Option<String>,
+        ttl_secs: u64,
+    ) -> IpcResponse {
+        if let Some(f) = &flock
+            && !self.fleet.flock().has_flock(f)
+        {
+            return IpcResponse::error("unknown_flock", format!("flock {f} does not exist"));
+        }
+        let made = (|| {
+            let config = PastorConfig::load(&self.paths.config_file())?;
+            let files = crate::join::HeadFiles::for_head(&self.paths)?;
+            let ask = crate::join::Ask {
+                flock,
+                tags,
+                replace,
+                ttl: Duration::from_secs(ttl_secs),
+            };
+            crate::join::create(
+                &files,
+                &self.store,
+                &crate::join::head_destination(&config),
+                &ask,
+            )
+        })();
+        match made {
+            Ok(made) => {
+                tracing::info!(id = made.id, "join token made");
+                IpcResponse::JoinCreated {
+                    id: made.id,
+                    token: made.token.encode(),
+                    expires_at: made.row.expires_at,
+                }
+            }
+            Err(err) => cli_error(err),
+        }
+    }
+
+    /// `Join`: redeem token `id` for machine `name`. Everything that can
+    /// refuse the join (the name, the keys, the token, a name already in
+    /// flock.toml) is checked before the token is marked used, so a refused
+    /// try leaves it good for the next. The token is checked, taken and the
+    /// machine added under the dispatch lock, so two machines racing one
+    /// token add one machine.
+    async fn join(
+        &self,
+        id: &str,
+        name: &str,
+        machine_key: &str,
+        agent_key: &str,
+        host_key: &str,
+    ) -> anyhow::Result<()> {
+        use crate::authkeys::{Marker, line};
+        use crate::cli::CliError;
+        let now = chrono::Utc::now();
+        crate::join::redeemable(&self.store, id, now)?;
+        let as_machine = Marker::Machine(name.into());
+        let as_agent = Marker::Agent(name.into());
+        as_machine.check()?;
+        let files = crate::join::HeadFiles::for_head(&self.paths)?;
+        let machine_line = line(
+            &files.pastor,
+            &format!("bridge --shepherd --machine {name}"),
+            machine_key,
+            &as_machine,
+        )?;
+        let agent_line = line(
+            &files.pastor,
+            &format!("bridge --agent --machine {name}"),
+            agent_key,
+            &as_agent,
+        )?;
+        let host_key = host_key.trim();
+        if host_key.is_empty() || host_key.contains('\n') {
+            return Err(CliError::err(
+                "invalid_key",
+                "the host key must be one public key line",
+            ));
+        }
+        let store = &self.store;
+        let row = self
+            .fleet
+            .edit_flock_file(&self.paths.flock_file(), |file| {
+                let edit = |e: EditError| CliError::err(e.code(), &e);
+                let row = crate::join::redeemable(store, id, now)?;
+                let mut doc = crate::config::flock::FlockDoc::open(file)?;
+                let exists = doc
+                    .flock()
+                    .map_err(anyhow::Error::msg)?
+                    .get(name)
+                    .is_some();
+                if exists && row.replace.as_deref() != Some(name) {
+                    return Err(CliError::err(
+                        "machine_name_taken",
+                        format!(
+                            "machine {name} is already in flock.toml; only a token made with --replace {name} may take it over"
+                        ),
+                    ));
+                }
+                let mut m: MachineConfig =
+                    serde_json::from_value(serde_json::json!({ "name": name, "pull": true }))?;
+                m.flock = row.flock.clone();
+                m.tags = row.tags.clone();
+                if exists {
+                    doc.remove_machine(name).map_err(edit)?;
+                }
+                doc.add_machine(&m).map_err(edit)?;
+                crate::join::take(store, id, now)?;
+                if let Err(err) = doc.save(file) {
+                    // Nothing was added, so the token stays good.
+                    let _ = store.put_join_token(&row);
+                    return Err(err);
+                }
+                Ok(row)
+            })
+            .await?;
+        // The machine is in flock.toml and the token is spent: from here on
+        // a failure is reported, not undone.
+        crate::authkeys::upsert(&files.authorized_keys, &as_machine, &machine_line)?;
+        crate::authkeys::upsert(&files.authorized_keys, &as_agent, &agent_line)?;
+        crate::authkeys::remove(&files.authorized_keys, &Marker::Join(id.into()))?;
+        self.store.put_machine_state(&crate::store::MachineState {
+            machine: name.into(),
+            bootstrap: crate::store::BootstrapState::Pending,
+            mode: None,
+            isolation: None,
+            failed_step: None,
+            why: None,
+            host_key: Some(host_key.into()),
+            herdr_version: None,
+            pastor_version: None,
+            updated_at: now.to_rfc3339(),
+        })?;
+        tracing::info!(machine = name, id, "machine joined");
+        let _ = self.events.send(PastorEvent {
+            kind: "machine.joined".into(),
+            task_id: None,
+            machine: Some(name.into()),
+            job: None,
+            detail: Some(serde_json::json!({
+                "id": id,
+                "flock": row.flock,
+                "tags": row.tags,
+                "replaced": row.replace.as_deref() == Some(name),
+            })),
+            summary: None,
+        });
+        if let Err(err) = self.scheduler.reload().await {
+            tracing::warn!(machine = name, %err, "reload after a join; the next pass picks it up");
+        }
+        Ok(())
+    }
+
     pub async fn handle(&self, req: IpcRequest) -> IpcResponse {
         match req {
             IpcRequest::Ping => IpcResponse::Pong {
@@ -4347,6 +4505,38 @@ impl Daemon {
                     )),
                 }
             }
+            IpcRequest::JoinCreate {
+                flock,
+                tags,
+                replace,
+                ttl_secs,
+            } => self.join_create(flock, tags, replace, ttl_secs),
+            IpcRequest::JoinList => match self.store.join_tokens() {
+                Ok(list) => IpcResponse::JoinTokens(list),
+                Err(err) => IpcResponse::error("store_error", err),
+            },
+            IpcRequest::JoinRevoke { id } => {
+                let revoked = crate::join::HeadFiles::for_head(&self.paths)
+                    .and_then(|files| crate::join::revoke(&files, &self.store, &id));
+                match revoked {
+                    Ok(()) => IpcResponse::Text(format!("revoked join token {id}")),
+                    Err(err) => cli_error(err),
+                }
+            }
+            IpcRequest::Join {
+                id,
+                name,
+                machine_key,
+                agent_key,
+                host_key,
+                facts: _,
+            } => match self
+                .join(&id, &name, &machine_key, &agent_key, &host_key)
+                .await
+            {
+                Ok(()) => IpcResponse::Joined { name },
+                Err(err) => cli_error(err),
+            },
             IpcRequest::LimitList => match self.store.limits() {
                 Ok(list) => IpcResponse::Limits(list),
                 Err(err) => IpcResponse::error("store_error", err),

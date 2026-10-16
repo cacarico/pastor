@@ -2036,6 +2036,37 @@ impl Store {
         })
     }
 
+    /// Every token, oldest expiry first (`join list`).
+    pub fn join_tokens(&self) -> anyhow::Result<Vec<JoinToken>> {
+        let ids: Vec<String> = blocking(|| {
+            let conn = self.conn.lock().recover();
+            let mut stmt = conn.prepare("SELECT id FROM join_tokens ORDER BY expires_at, id")?;
+            let ids = stmt
+                .query_map([], |r| r.get(0))?
+                .collect::<Result<Vec<String>, _>>()?;
+            anyhow::Ok(ids)
+        })?;
+        Ok(ids
+            .iter()
+            .map(|id| self.join_token(id))
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect())
+    }
+
+    /// Forget a token (`join revoke`, the sweep). True if there was one.
+    pub fn drop_join_token(&self, id: &str) -> anyhow::Result<bool> {
+        blocking(|| {
+            let n = self
+                .conn
+                .lock()
+                .recover()
+                .execute("DELETE FROM join_tokens WHERE id = ?1", params![id])?;
+            Ok(n == 1)
+        })
+    }
+
     /// Mark the token used at `now`. False when it is unknown, already
     /// used or expired; one statement, so two callers cannot both win.
     pub fn use_join_token(&self, id: &str, now: &str) -> anyhow::Result<bool> {

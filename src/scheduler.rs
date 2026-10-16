@@ -1350,6 +1350,13 @@ impl Scheduler {
         self.fleet
             .check_pull_lost(self.config.pull_lost_after_duration())
             .await;
+        // An expired token's line goes, so its key gets no ssh session.
+        crate::join::sweep(
+            &self.store,
+            &crate::authkeys::default_file(),
+            &self.events,
+            now,
+        );
         self.warn_long_queued(now);
     }
 

@@ -384,7 +384,11 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `job_name_taken` | a headless serve's job has the name of one of the head's |
 | `job_not_found` | no job by that name |
 | `job_task_refused` | the head would not queue a headless serve's job task |
+| `join_token_expired` | a machine tried to join with a token past its `--ttl` |
+| `join_token_invalid` | not a join token, an unknown or revoked one, or a `bridge --join` line that is not one join request |
+| `join_token_used` | a machine tried to join with a token another join already used |
 | `machine_exists` | `machine add` of a machine that exists |
+| `machine_name_taken` | a join named a machine already in flock.toml, with a token not made with `--replace` for that name |
 | `machine_not_connected` | `task run --now` on a machine that is not connected |
 | `machine_shutting_down` | the machine's actor is stopping; try again |
 | `model_kind_mismatch` | the task's model is for another kind of agent |
@@ -2450,6 +2454,10 @@ A record, which is also what connector event hooks get on stdin:
   machine's serve), `task.answered` (the head answered another of the
   agent's startup dialogs), `job.failed`, `connector.finish_failed` (a connector's
   `[finish]` command failed), `machine.connected`, `machine.lost`,
+  `machine.joined` (a pull machine joined with a token; the detail has the
+  token `id`, `flock`, `tags` and `replaced`), `machine.join_token_expired`
+  (a token's time ran out unused and its key left authorized_keys; the
+  detail has its `id`),
   `agent.exhausted` and `agent.reset` (see Usage limits), and
   `orchestrator.started|skipped|held|quota|failed|restarted|stopping|stopped`
   (see Orchestrators).
@@ -3755,6 +3763,38 @@ runs no actor for it; `machine list` shows its HOST as `pull`.
   its agent ended with `task done` is closed, its finish kept, since the
   machine may never report its pane closed. The clock starts when the head
   does.
+
+#### Join tokens
+
+A pull machine can add itself to the head's flock.toml with a one-time
+token, made on the head with `pastor join create`:
+
+```sh
+pastor join create --flock builders --tag gpu --ttl 1h
+```
+
+- The head makes an ed25519 key pair for the token with `ssh-keygen`. The
+  public half goes in the head's `authorized_keys`, marked
+  `pastor:join:<id>` and locked to `pastor bridge --join <id>`. The private
+  half goes into the token only (`pjt_...`, one word); the head keeps no copy.
+- The token also carries the head's ssh destination (`head_address`, else
+  `user@hostname`) and its ed25519 host key, for the machine to pin.
+- The flock, the tags and `--replace` are fixed when the token is made.
+  The joining machine chooses only its name. A name already in flock.toml
+  is `machine_name_taken`, unless the token was made with `--replace` for
+  that name, which replaces that machine's entry.
+- A join adds the machine with `pull = true`, writes its two lines to
+  `authorized_keys` (`pastor:machine:<name>` and `pastor:agent:<name>`),
+  removes the token's line and emits `machine.joined`. The same token again
+  gets no ssh session; at the head it is `join_token_used`.
+- A token unused at the end of its `--ttl` (default `1h`) loses its line on
+  the next scheduler pass (`machine.join_token_expired`); one redeemed
+  before that pass is `join_token_expired`.
+- `pastor join list` shows the tokens; `pastor join revoke <id>` removes one,
+  line and all.
+- `bridge --join <id>` takes one line, which must be a join request; its
+  `id` is the one in the forced command, whatever the line says. Anything
+  else is `join_token_invalid`.
 
 ### Jobs on a shepherd
 

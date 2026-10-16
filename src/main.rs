@@ -124,6 +124,8 @@ enum Command {
         #[command(subcommand)]
         cmd: pastor::trust_cli::TrustCmd,
     },
+    /// One-time tokens a new machine joins the fleet with, as a pull machine
+    Join(pastor::join::JoinArgs),
     /// Pass request lines from stdin to this machine's head; for a remote CLI over ssh
     Bridge(BridgeArgs),
     /// Which head this CLI uses: this machine's, or one on another machine over ssh
@@ -150,6 +152,9 @@ struct BridgeArgs {
     /// The machine whose agents this bridge serves, as flock.toml names it
     #[arg(long, requires = "agent")]
     machine: Option<String>,
+    /// Take one join request for the join token with this id, then exit; what a token's authorized_keys line runs
+    #[arg(long, value_name = "ID", conflicts_with_all = ["agent", "machine"])]
+    join: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -772,6 +777,7 @@ fn main() {
             Command::Profile { cmd } => pastor::profile_cli::run(&head_config(&client).await?, cmd),
             Command::Trust { cmd } => pastor::trust_cli::run(&client, cmd, head).await,
             Command::Limit { cmd } => pastor::limit_cli::run(&client, cmd, head).await,
+            Command::Join(args) => pastor::join::run(&client, args).await,
             Command::Queue(args) => pastor::queue_cli::run(&client, args, head).await,
             Command::Status(args) => status(&client, args, head).await,
             Command::Bridge(_) => unreachable!("handled before the runtime"),
@@ -891,6 +897,10 @@ fn bridge(paths: &Paths, args: &BridgeArgs) -> ! {
     let input = tokio::io::BufReader::new(tokio::io::stdin());
     let result = rt.block_on(async {
         match (args.agent, &args.machine) {
+            _ if args.join.is_some() => {
+                let id = args.join.as_deref().unwrap_or_default();
+                pastor::join::bridge(&socket, id, input, tokio::io::stdout()).await
+            }
             (true, Some(machine)) => {
                 pastor::bridge::run_agent(&socket, machine, input, tokio::io::stdout()).await
             }
@@ -1046,7 +1056,7 @@ fn head_use(command: &Command) -> Option<bool> {
         },
         Command::Tick(_) | Command::Job { .. } | Command::Config { .. } => Some(false),
         Command::Orchestrator { .. } => Some(false),
-        Command::Trust { .. } | Command::Limit { .. } => Some(false),
+        Command::Trust { .. } | Command::Limit { .. } | Command::Join(_) => Some(false),
         Command::Queue(a) => Some(a.flock.is_some()),
         Command::Status(_) => Some(false),
         Command::Connector { cmd } => {
@@ -1102,6 +1112,8 @@ fn remote_route(command: &Command) -> RemoteRoute {
         | Command::Flock { .. }
         | Command::Trust { .. }
         | Command::Limit { .. }
+        // Tokens are made and redeemed against the head's authorized_keys.
+        | Command::Join(_)
         | Command::Profile { .. }
         | Command::Config { .. }
         | Command::Events(_)
@@ -1232,6 +1244,7 @@ fn changes_fleet(command: &Command) -> bool {
         Command::Serve(_) | Command::Setup { .. } => true,
         Command::Trust { cmd } => pastor::trust_cli::changes_fleet(cmd),
         Command::Limit { cmd } => pastor::limit_cli::changes_fleet(cmd),
+        Command::Join(args) => pastor::join::changes_fleet(args),
         Command::Queue(a) => pastor::queue_cli::changes_fleet(a),
         _ => false,
     }

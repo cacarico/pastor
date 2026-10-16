@@ -12,6 +12,7 @@ mod edit;
 mod flock;
 mod helpers;
 mod jobs_and_pull_machines;
+mod join;
 mod machine;
 mod orchestrators;
 mod queue;
