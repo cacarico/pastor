@@ -1992,6 +1992,29 @@ pub struct PastorConfig {
     /// `[limits]`: how the head treats an agent that ran out of usage.
     #[serde(skip_serializing_if = "LimitsConfig::is_default")]
     pub limits: LimitsConfig,
+    /// `[provision]`: where the head fetches the binaries it puts on a machine.
+    #[serde(skip_serializing_if = "ProvisionConfig::is_empty")]
+    pub provision: ProvisionConfig,
+}
+
+/// `[provision]` in pastor.toml: what the head installs on a machine it
+/// bootstraps. Unset keys take the built-in defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProvisionConfig {
+    /// The herdr version to install; unset, the version most of the fleet
+    /// already runs, else `artifacts::DEFAULT_HERDR_VERSION`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub herdr: Option<String>,
+    /// The URL of herdr's release index; unset, `https://herdr.dev/latest.json`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub herdr_index: Option<String>,
+}
+
+impl ProvisionConfig {
+    pub fn is_empty(&self) -> bool {
+        self == &ProvisionConfig::default()
+    }
 }
 
 /// `[limits]` in pastor.toml: what the head does about usage limits. Every
@@ -2174,6 +2197,7 @@ impl Default for PastorConfig {
             watch: WatchConfig::default(),
             shepherd: ShepherdConfig::default(),
             limits: LimitsConfig::default(),
+            provision: ProvisionConfig::default(),
         }
     }
 }
@@ -2540,6 +2564,21 @@ mod tests {
         assert!(!PastorConfig::default().agents_change_fleet);
         let cfg: PastorConfig = toml::from_str("agents_change_fleet = true").unwrap();
         assert!(cfg.agents_change_fleet);
+    }
+
+    /// `[provision]` reads both keys, round-trips, and refuses a stray one.
+    #[test]
+    fn provision_parses_and_refuses_unknown_keys() {
+        let cfg: PastorConfig =
+            toml::from_str("[provision]\nherdr = \"0.9.5\"\nherdr_index = \"https://x/y.json\"\n")
+                .unwrap();
+        assert_eq!(cfg.provision.herdr.as_deref(), Some("0.9.5"));
+        assert_eq!(
+            cfg.provision.herdr_index.as_deref(),
+            Some("https://x/y.json")
+        );
+        assert!(PastorConfig::default().provision.is_empty());
+        assert!(toml::from_str::<PastorConfig>("[provision]\nnope = 1\n").is_err());
     }
 
     /// `[limits]` takes every key, each checked as it loads; unset keys keep

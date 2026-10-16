@@ -1,3 +1,4 @@
+pub mod artifacts;
 pub mod authkeys;
 pub mod bridge;
 pub mod cli;

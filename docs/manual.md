@@ -385,6 +385,8 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `job_not_found` | no job by that name |
 | `job_task_refused` | the head would not queue a headless serve's job task |
 | `machine_exists` | `machine add` of a machine that exists |
+| `invalid_artifact` | a binary to fetch named with a part that is not a plain name |
+| `artifact_checksum_mismatch` | a downloaded pastor or herdr whose sha256 is not the published one; nothing is cached |
 | `machine_not_connected` | `task run --now` on a machine that is not connected |
 | `machine_shutting_down` | the machine's actor is stopping; try again |
 | `model_kind_mismatch` | the task's model is for another kind of agent |
