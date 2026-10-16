@@ -26,10 +26,10 @@
 - Runtime CLI errors are `{"code","message"}` on stderr with exit 1. Every new code goes in the table in `docs/manual.md` (`tests/error_codes.rs` enforces this).
 - New error codes, exactly:
   - `join_token_invalid`, `join_token_used`, `join_token_expired`
-  - `machine_name_taken`
+  - `machine_name_taken`, `machine_name_invalid`
   - `bootstrap_unsupported_platform`, `bootstrap_missing`, `bootstrap_needs_sudo`
   - `artifact_checksum_mismatch`
-  - `not_allowed_for_shepherd`
+  - `not_allowed_for_shepherd`, `machine_revoked`
 - New events, exactly:
   - `machine.joined`
   - `machine.bootstrapped` (detail: `mode`, `isolation`, `missing`)
@@ -57,6 +57,8 @@
 - **A bootstrap rerun after a failed step:** no duplicate user, unit or key, and no `machine_exists`. The pin is in Task 9, `rerun_after_failure_resumes`.
 - **A hijacked agent on a root-mode machine:** `pastor-agent` cannot read the service user's key. The pin is in Task 8, `service_state_dir_is_0700_and_owned`, and in Task 12's container test.
 - **A pull machine whose shepherd sends `TaskClaim` with another machine's name:** it claims only for itself. The pin is in Task 4, `shepherd_machine_field_is_overwritten`.
+- **A joining machine naming itself `x; rm -rf /` or similar:** the join is refused before any state changes, never reaches `authorized_keys`. The pin is in Task 5, `name_rejects_shell_metacharacters`.
+- **A replaced machine's old key, still live on an open mux socket:** its next request is refused once the generation no longer matches, even though the socket is still authenticated. The pin is in Task 4, `shepherd_stale_generation_refused`.
 
 ---
 
@@ -69,7 +71,7 @@
 **Interfaces:**
 - Produces:
   - `pub enum BootstrapState { Pending, Ok, Failed }`, serde snake_case.
-  - `pub struct MachineState { pub machine: String, pub bootstrap: BootstrapState, pub mode: Option<String>, pub isolation: Option<String>, pub failed_step: Option<String>, pub why: Option<String>, pub host_key: Option<String>, pub herdr_version: Option<String>, pub pastor_version: Option<String>, pub updated_at: String }`
+  - `pub struct MachineState { pub machine: String, pub bootstrap: BootstrapState, pub mode: Option<String>, pub isolation: Option<String>, pub failed_step: Option<String>, pub why: Option<String>, pub host_key: Option<String>, pub herdr_version: Option<String>, pub pastor_version: Option<String>, pub bootstrap_login: Option<String>, pub generation: u64, pub updated_at: String }`. `generation` starts at 1 on enrollment and is bumped on `--replace`; `bootstrap_login` is the ssh destination a push bootstrap last connected with, kept separately from the flock entry's `ssh` (which bootstrap rewrites to the agent user), so a later `--sudo` rerun still has a sudo-capable login to connect as.
   - `Store::machine_state(&self, machine: &str) -> anyhow::Result<Option<MachineState>>`
   - `Store::put_machine_state(&self, s: &MachineState) -> anyhow::Result<()>`, an upsert.
   - `Store::set_versions(&self, machine: &str, herdr: Option<&str>, pastor: Option<&str>) -> anyhow::Result<()>`
@@ -135,6 +137,7 @@
 - Produces:
   - `pub enum Marker { Machine(String), Agent(String), Join(String) }`, rendered `pastor:machine:<n>`, `pastor:agent:<n>`, `pastor:join:<id>`.
   - `pub fn line(pastor: &Path, command_args: &str, key: &str, marker: &Marker) -> anyhow::Result<String>` gives `restrict,command="<pastor> <args>" <key-type> <key-b64> <marker>`. It uses `restrict` plus today's options, and rejects a key that is not one line, with `invalid_key`.
+  - `pub fn valid_name(s: &str) -> bool` checks `^[A-Za-z0-9][A-Za-z0-9._-]*$`. Every caller that embeds a machine name in `command_args` calls this first: `line()`'s own rejection of quotes, backslashes and whitespace guards the key and the pastor path, not a name crafted with `;`, backticks or `$(...)`, which only this charset check rules out.
   - `pub fn upsert(file: &Path, marker: &Marker, line: &str) -> anyhow::Result<()>` replaces the line with that marker or appends one.
   - `pub fn remove(file: &Path, marker: &Marker) -> anyhow::Result<bool>`.
   - `pub fn remove_machine(file: &Path, name: &str) -> anyhow::Result<()>` removes the Machine and Agent lines of that name.
@@ -147,6 +150,7 @@
   - `remove_machine_drops_both`.
   - `concurrent_edits_keep_every_line`: 50 threads each upsert a distinct marker, and the end file has 50 marked lines plus the foreign one.
   - `file_mode_is_0600`.
+  - `valid_name_rejects_shell_metacharacters`: `;`, `` ` ``, `$(...)`, `|`, `&` and whitespace all fail; `pi-1`, `gpu_3.local` pass.
 - [ ] **Step 2: Run** `cargo test --features fake-herdr --lib authkeys`. Expected: FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run** the same command. Expected: PASS.
@@ -164,18 +168,24 @@
 **Interfaces:**
 - Consumes: `authkeys::line` (Task 3) and `Store::set_versions` (Task 1).
 - Produces:
-  - `pub async fn answer_shepherd(socket: &Path, machine: &str, line: &[u8]) -> anyhow::Result<Vec<u8>>`.
+  - `pub async fn answer_shepherd(socket: &Path, machine: &str, gen: u64, line: &[u8]) -> anyhow::Result<Vec<u8>>`.
+  - It first checks `gen` against `Store::machine_state(machine).generation`: no row, or a mismatch, gets `machine_revoked` and nothing is forwarded. `answer_agent` is unchanged — it has no `--gen`, same as today — because an agent key's actions (Ping, List, TaskShow, TaskRead, TaskDone) are read-only or self-scoped already, and giving it `--gen` would also break every already-deployed agent line, which carries no such argument.
   - It allows: everything `answer_agent` allows, plus `TaskClaim`, `TaskReport`, `PullTrust`, `JobSubmit`, `EventsSince`, `BootstrapReport` (Task 6) and `ArtifactLocate` (Task 7).
   - It overwrites `machine` in `TaskClaim`, `TaskReport`, `PullTrust` and `BootstrapReport` with `X`.
-  - It filters an `EventsSince` reply to records whose `machine == X`.
+  - It overwrites `JobSubmit`'s `dispatch.machine` with `X` and clears `dispatch.flock`, so a machine key can submit work for itself only.
+  - `EventsSince` is answered by a store query filtered to `machine == X` before pagination, not by filtering the daemon's already-paginated reply: the query's own cursor always reflects how far it scanned, so a page that happens to hold none of `X`'s events still advances past it instead of being requested again forever.
   - Anything else gets `not_allowed_for_shepherd`.
-  - `pastor machine authorized-key NAME --key F --shepherd` prints the shepherd line, marker `pastor:machine:NAME`.
+  - `pastor machine authorized-key NAME --key F --shepherd` prints the shepherd line, marker `pastor:machine:NAME`, with `--gen` from the current `machine_state.generation` (1 if there is no row yet).
 
 - [ ] **Step 1: Write failing tests** in `src/bridge.rs`, against a fake head socket like the existing `answer_agent` tests:
   - `shepherd_machine_field_is_overwritten`: `TaskClaim{machine:"other"}` arrives at the head as `machine:"pi"`.
   - `shepherd_refuses_task_run` gives code `not_allowed_for_shepherd`.
   - `shepherd_events_filtered`.
+  - `shepherd_events_cursor_advances_past_a_page_of_other_machines_events`: several pages of unrelated events, then one for `X`; the cursor reaches it on the next poll instead of replaying the same empty-for-`X` page.
   - `shepherd_allows_job_submit`.
+  - `shepherd_job_submit_is_scoped_to_self`: `JobSubmit{dispatch:{machine:"other"}}` from machine `pi`'s key arrives at the head targeting `pi`, not `other`.
+  - `shepherd_stale_generation_refused`: after a `--replace` bumps the generation, a request carrying the old `--gen`, replayed on the same fake connection, gets `machine_revoked`.
+  - `shepherd_unknown_machine_refused`: no `machine_state` row at all gets `machine_revoked`.
 
   In `src/daemon.rs` tests: `claim_versions_stored`.
 - [ ] **Step 2: Run** `cargo test --features fake-herdr shepherd_ claim_versions_stored`. Expected: FAIL.
@@ -206,13 +216,16 @@
     5. `head_host_key` comes from `ssh-keyscan`-format lines of `/etc/ssh/ssh_host_ed25519_key.pub`. `head` is `head_address`, else `user@hostname()`.
   - `IpcRequest::Join { id: String, name: String, machine_key: String, agent_key: String, host_key: String, facts: serde_json::Value }`. The bridge sets `id` from `--join <ID>`; a request's own `id` is ignored. The reply is `IpcResponse::Joined { name: String }`.
   - The `Join` handler:
-    1. `use_join_token`. Already used gives `join_token_used`; expired gives `join_token_expired`.
-    2. The name check gives `machine_name_taken`, unless `replace == Some(name)`.
-    3. Add `MachineConfig { pull: true, flock, tags, .. }`.
-    4. Upsert the Machine line (`bridge --shepherd --machine <name>`) and the Agent line (`bridge --agent --machine <name>`).
-    5. Remove the Join line.
-    6. `put_machine_state(Pending, host_key)`.
-    7. Emit `machine.joined`.
+    1. `authkeys::valid_name(name)`, before anything else below: an invalid
+       name gives `machine_name_invalid` without consuming the token or
+       touching any state.
+    2. `use_join_token`. Already used gives `join_token_used`; expired gives `join_token_expired`.
+    3. The name check gives `machine_name_taken`, unless `replace == Some(name)`.
+    4. Add `MachineConfig { pull: true, flock, tags, .. }`.
+    5. Upsert the Machine line (`bridge --shepherd --machine <name> --gen <n>`) and the Agent line (`bridge --agent --machine <name>`, unchanged), where `n` is 1 for a fresh name or the existing row's `generation + 1` for `--replace`.
+    6. Remove the Join line.
+    7. `put_machine_state(Pending, host_key, generation: n)`.
+    8. Emit `machine.joined`.
   - The scheduler `pass` removes the lines of expired tokens and emits `machine.join_token_expired`.
   - `bridge --join <ID>` accepts exactly one line, which must parse as `Join`. Anything else gets `join_token_invalid`. Then it exits.
 
@@ -224,6 +237,8 @@
   - `second_join_refused` gives `join_token_used`.
   - `expired_swept`.
   - `name_taken_refused`, and `replace_allows_same_name_only`.
+  - `name_rejects_shell_metacharacters`: `name = "x; rm -rf /"` gives `machine_name_invalid`, and neither marks the token used nor adds a machine — a second, valid join on the same token still succeeds.
+  - `replace_bumps_generation`: the new Machine line carries `--gen 2` after a first join at `--gen 1`.
   - `bridge_join_refuses_other_requests`.
 
   Use `PASTOR_AUTHORIZED_KEYS` pointed at a temp file.
@@ -270,7 +285,7 @@
 - Modify: `Cargo.toml` (add `sha2`; the reason goes in the commit body: checksums of downloaded binaries must not depend on which sha tool a box has)
 - Modify: `src/config/mod.rs` (`[provision]` table: `herdr: Option<String>`, `herdr_index: Option<String>`)
 - Modify: `src/ipc.rs` (`ArtifactLocate { name, version, target }` → `IpcResponse::Artifact { path: PathBuf, sha256: String, size: u64 }`)
-- Modify: `src/bridge.rs` (`--fetch NAME VERSION TARGET` in shepherd mode: locate, then stream the file to stdout raw)
+- Modify: `src/bridge.rs` (shepherd mode handles `ArtifactLocate { name, version, target }` as a request line like any other: locate and check it through the daemon, write the JSON reply line, then stream the file's raw bytes straight to stdout. The request travels on stdin, never as extra argv — sshd replaces whatever command a client asks for with the forced one, so argv the client appends after `bridge` never reaches the process)
 
 **Interfaces:**
 - Produces:
@@ -293,7 +308,9 @@
   - `cached_not_downloaded_twice`, which counts calls through an injected fetch fn.
   - `herdr_version_falls_back` (config, then fleet mode, then the default).
   - `target_mapping` (linux x86_64 and aarch64, darwin arm64; armv7 → error).
-- [ ] **Step 2: Run** `cargo test --features fake-herdr --lib artifacts`. Expected: FAIL.
+
+  In `src/bridge.rs`: `shepherd_fetch_reads_request_from_stdin_not_argv`: a shepherd session sent only `ArtifactLocate{..}` on stdin, with no extra argv at all (modelling what sshd actually hands the process), gets the JSON reply followed by the file's bytes.
+- [ ] **Step 2: Run** `cargo test --features fake-herdr --lib artifacts` and `cargo test --features fake-herdr --lib bridge::`. Expected: FAIL.
 - [ ] **Step 3: Implement.** `ensure` takes the fetch as a `&dyn Fetch` trait (`fn get(&self, url: &str, to: &Path) -> anyhow::Result<()>`). The real one shells out to curl; tests use a copy from `file://`.
 - [ ] **Step 4: Run** `cargo test --features fake-herdr`. Expected: PASS.
 - [ ] **Step 5: Commit** `feat(artifacts): a checked cache of pastor and herdr on the head`.
@@ -315,16 +332,17 @@
   - `pub fn facts(r: &dyn Runner) -> Facts`
   - `pub struct Options { pub sudo: bool, pub service_user: Option<String>, pub head: String, pub head_key: Option<String>, pub herdr_from: Option<PathBuf>, pub pastor_from: PathBuf }`
   - `pub fn run(r: &dyn Runner, o: &Options) -> Outcome`. It never panics; it stops at the first failed step.
-  - The steps, in order: `facts`, `platform`, `packages`, `users`, `pastor`, `herdr`, `services`, `keys`, `client`. Each is `fn(&dyn Runner, &Ctx) -> StepResult` and checks before it acts.
+  - The steps, in order: `facts`, `platform`, `packages`, `users`, `pastor`, `herdr`, `keys`, `client`, `services`. Each is `fn(&dyn Runner, &Ctx) -> StepResult` and checks before it acts. `services` runs last, after `keys` and `client`, because starting the unit is what picks the process's role (head client or shepherd) from the config those two steps just wrote; starting it any earlier risks it coming up as the wrong role.
   - Root work goes through `sudo -n` when not uid 0. Without sudo or root, user mode. `--sudo` with `sudo -n true` failing gives `bootstrap_needs_sudo`.
   - Root mode:
     - `useradd --system --create-home --shell /bin/sh pastor-agent` when missing (and the service user if asked).
     - `loginctl enable-linger` for both.
     - The service user's state dir is 0700.
     - Every per-user action runs as `sudo -n -u <user> -H env XDG_RUNTIME_DIR=/run/user/<uid> …`.
+    - A scoped `/etc/sudoers.d/pastor-<name>` (NOPASSWD, naming exactly one command: running herdr as `pastor-agent`), so the service user's shepherd can reach the agent user's herdr. Without it, `shepherd_connector`'s default local session resolves a socket under the service user's own home, which in root mode is the wrong home for herdr entirely.
   - The head key goes into `pastor-agent`'s `~/.ssh/authorized_keys`. In user mode it goes into the login user's file (it is usually there already).
   - The `keys` step runs `ssh-keygen -t ed25519 -N "" -f <state>/machine_key` as the service user and `.../agent_key` as the agent user, only when missing. It reads the public halves and `/etc/ssh/ssh_host_ed25519_key.pub` into the Outcome.
-  - The `client` step writes `client.toml` `[head] ssh = <head>` for both users (`head::save`).
+  - The `client` step writes `client.toml` `[head] ssh = <head>` for both users (`head::save`), and, in root mode only, `[shepherd] command = ["sudo", "-n", "-u", "pastor-agent", "-H", "herdr", "attach", "default"]` for the service user, matching the sudoers rule above, so the shepherd reaches the agent's herdr instead of its own missing local session.
   - When the `herdr` step finds a running herdr at another version, it does the following. With no `t-N` agent live (`herdr agent list`), it swaps the binary and restarts the unit. Otherwise it leaves both alone and reports `Skipped`, with why `herdr <old> runs agents; rerun when idle`.
 
 - [ ] **Step 1: Write failing tests** in `src/bootstrap/`, with a FakeRunner that answers by command prefix:
@@ -336,6 +354,9 @@
   - `linger_off_fails_services_step`: status `Failed`, and `fix` mentions `loginctl enable-linger`.
   - `keys_not_regenerated`.
   - `service_state_dir_is_0700_and_owned`: a `chmod 700` and `chown <service>` call is recorded.
+  - `services_step_runs_after_keys_and_client`: the recorded command order has `client.toml` written before the service unit starts.
+  - `root_mode_writes_shepherd_command_and_sudoers`: `[shepherd] command` in the service user's `pastor.toml`, and a sudoers drop-in naming only the one herdr command, as `pastor-agent`.
+  - `user_mode_writes_no_shepherd_command`: `[shepherd] command` is absent; login and agent user are the same.
   - `macos_root_unsupported`.
   - `hostname_falls_back_to_gethostname`.
 - [ ] **Step 2: Run** `cargo test --features fake-herdr --lib bootstrap`. Expected: FAIL.
@@ -347,22 +368,22 @@
 
 **Files:**
 - Create: `src/bootstrap/push.rs`
-- Modify: `src/main.rs` (`MachineCmd::Add` gains `--bootstrap`, `--sudo`, `--service-user`, `--host-key`; new `MachineCmd::Bootstrap { name, --sudo, --service-user }`)
+- Modify: `src/main.rs` (`MachineCmd::Add` gains `--bootstrap`, `--sudo`, `--service-user`, `--host-key`; new `MachineCmd::Bootstrap { name, --sudo, --service-user, --login }`)
 - Modify: `src/daemon.rs` (a `MachineBootstrap` request runs the push off the dispatch lock)
 - Modify: `src/ipc.rs` (`MachineBootstrap { name: String, sudo: bool, service_user: Option<String>, host_key: Option<String> }`)
 
 **Interfaces:**
 - Consumes: Tasks 1, 2, 3, 6, 7 and 8.
 - Produces: `pub async fn push(paths, store, fleet, name: &str, login: &str, opts: PushOpts) -> anyhow::Result<Outcome>`. It runs these steps:
-  1. **Record the attempt.** `put_machine_state(Pending)` and write the flock entry with `ssh = login`. When the entry exists with the same login and state Pending or Failed, go on instead of failing `machine_exists`.
-  2. **Pin the host key.** `ssh-keyscan -t ed25519 <host>` into `known_hosts_file()`, with `accept_new`. `--host-key` means it must match, else stop.
+  1. **Record the attempt.** `put_machine_state(Pending, bootstrap_login: Some(login), generation: existing.map(|s| s.generation).unwrap_or(1))` and write the flock entry with `ssh = login`. When the entry exists with the same login and state Pending or Failed, go on instead of failing `machine_exists`. `bootstrap_login` is kept separate from the flock entry's `ssh`, which step 6 below rewrites to the agent user in root mode: a later `machine bootstrap NAME --sudo` rerun connects with this stored login (or `--login` when given), not with whatever `ssh` currently says, so it still has a sudo-capable user to connect as.
+  2. **Pin the host key.** Only when `known_hosts_file()` has no entry for `<host>` yet: `ssh-keyscan -t ed25519 <host>`, checked against `--host-key <fp>` when given, then written with `accept_new`. A rerun against a host already pinned skips the scan and connects with `StrictHostKeyChecking=accept-new` against that existing entry, so a changed key stops the rerun instead of being re-trusted on the strength of an unauthenticated scan.
   3. **Read the platform.** `ssh <login> uname -sm; getconf LONG_BIT`, then `target_for`.
   4. **Copy the binaries.** `artifacts::ensure` pastor and herdr, then copy them to `~/.cache/pastor-bootstrap/` over ssh (`ssh … 'cat > f'` with stdin from the file), and check the sha256 there with `sha256sum` or `shasum`.
   5. **Run bootstrap.** `ssh <login> ~/.cache/pastor-bootstrap/pastor bootstrap --json --head <head> --head-key "<head_key.pub>" --herdr-from … [--sudo] [--service-user …]`, then parse the Outcome.
   6. **Finish on success.**
      - Upsert the Agent line for the machine (agents reach the head with `bridge --agent`).
      - Store the host key.
-     - Rewrite the entry's `ssh` to `pastor-agent@<host>` in root mode (`fleet_edit` replace).
+     - Rewrite the entry's `ssh` to `pastor-agent@<host>` in root mode (`fleet_edit` replace). `machine_state.bootstrap_login` is left as `login`, untouched by this rewrite.
      - Set the state to Ok, emit `machine.bootstrapped`, and close the old ControlMaster (`ssh -O exit`).
   7. **On failure.** State Failed with the step, why and fix, then emit `machine.bootstrap_failed`.
 - The head makes `head_key()` with `ssh-keygen` on first use.
@@ -371,7 +392,9 @@
   - `push_writes_pending_then_ok`.
   - `rerun_after_failure_resumes`: the first run fails at `packages`; the second, with sudo, gets no `machine_exists` and ends Ok.
   - `host_key_mismatch_stops` (`--host-key` differs).
+  - `rerun_keeps_pinned_host_key_and_rejects_a_changed_one`: a second push, no `--host-key` given, against a host whose key changed since the first push, fails instead of re-trusting it.
   - `root_mode_rewrites_ssh_to_agent_user`.
+  - `sudo_rerun_after_rewrite_uses_stored_login`: `machine bootstrap NAME --sudo` after root-mode push connects with `bootstrap_login`, not the rewritten `pastor-agent@host`.
   - `user_mode_keeps_login`.
   - `agent_line_installed`.
 - [ ] **Step 2: Run** `cargo test --features fake-herdr --lib push`. Expected: FAIL.
@@ -384,7 +407,7 @@
 **Files:**
 - Create: `src/bootstrap/pull.rs`
 - Modify: `src/main.rs` (`pastor join` with `<TOKEN>`, or `--token-stdin`, or `PASTOR_JOIN_TOKEN`; `--name`, `--sudo`, `--service-user`; it lives under the same `join` command as `create|list|revoke`, which take a subcommand word)
-- Modify: `src/shepherd.rs` (sends a `BootstrapReport` right after the first claim when `<state>/bootstrap.json` exists, then deletes it)
+- Modify: `src/shepherd.rs` (sends a `BootstrapReport` right after the first claim when `<state>/bootstrap.json` exists; deletes it only once the head's reply acknowledges receipt, and retries on every claim attempt until then)
 - Modify: `install.sh` (`sh -s -- join [args…]` runs the installed pastor's `join` with the rest of the args; with `id -u` 0 and ssh-keygen/curl/tar missing, install `openssh-client curl tar ca-certificates` via apt/dnf/pacman first)
 
 **Interfaces:**
@@ -394,8 +417,8 @@
   2. **Make the identities.** Make the service user's machine key and the agent user's key, using bootstrap's `users` and `keys` steps first, run alone.
   3. **Join.** Write `token.key` to a 0600 temp file and `ssh -i tmp -o IdentitiesOnly=yes … <head> bridge` (the forced command decides the mode). Send `Join { name, machine_key, agent_key, host_key, facts }`, read `Joined { name }`, then delete the temp file whatever happens.
   4. **Name the shepherd.** Write `[shepherd] machine = "<name>"` to the service user's `pastor.toml`.
-  5. **Bootstrap.** Run `bootstrap::run` with herdr fetched through `ssh -i machine_key … <head> bridge --fetch herdr <ver> <target>`. The forced command is `bridge --shepherd --machine X`, and `--fetch` is allowed there.
-  6. **Report.** Write the Outcome to `<state>/bootstrap.json` for the shepherd to report, and print it.
+  5. **Bootstrap.** Run `bootstrap::run` with herdr fetched through `ssh -i machine_key … <head> bridge` (the forced command is always `bridge --shepherd --machine X --gen N`; sshd replaces whatever command the client asked for, so there is no argv to carry a fetch request). The fetch travels as an `ArtifactLocate { name: "herdr", version, target }` line on that session's stdin, the same as every other shepherd request; the reply is the JSON line followed immediately by the file's raw bytes on the same stdout.
+  6. **Report.** Whatever happens — success, a failure at any step, even one before `services` ever starts and so before any shepherd exists to report it later — send a `BootstrapReport` directly over one more `ssh -i machine_key … <head> bridge` session, using the machine key step 2 already made. On success, delete `<state>/bootstrap.json` if it exists. If the head cannot be reached, write/keep the Outcome at `<state>/bootstrap.json` instead and print it; the shepherd, once it does start, retries the report on every claim and deletes the file only once the head's reply acknowledges it, never merely after sending it.
 
 - [ ] **Step 1: Write failing tests:**
   - In `tests/real_ssh.rs` (ignored, `make test-ssh`): `pull_join_end_to_end`:
@@ -408,6 +431,10 @@
   - `temp_join_key_deleted_on_error`.
   - `token_from_stdin`.
   - `shepherd_name_written`.
+  - `failure_before_services_is_reported_directly`: `bootstrap::run` fails at `packages`, before any shepherd service exists; the head still gets `machine.bootstrap_failed`, sent over the machine key `join` just made.
+  - `unreachable_head_keeps_report_file`: the direct report's `ssh` fails; `<state>/bootstrap.json` survives for the shepherd to retry later.
+
+  In `src/shepherd.rs`: `bootstrap_report_file_kept_until_acknowledged`: the head's reply errors; the file is still there on the next claim, and the report is sent again.
 - [ ] **Step 2: Run** `cargo test --features fake-herdr --lib pull` and `make test-ssh`. Expected: FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run** both again. Expected: PASS.

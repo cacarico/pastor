@@ -272,6 +272,17 @@ user's `authorized_keys`. The head keeps the shell access it has today, as
 that user. The login user is used only for bootstrap and for later reruns
 of it.
 
+**Shepherd to agent, in root mode.** The shepherd claims tasks and must run
+them through the agent user's herdr, not a session of its own: its default
+local connector resolves a socket under its own home, and in root mode that
+is a different user's home than the one herdr actually runs under, so
+there is nothing there to connect to. Root mode installs a scoped sudoers
+drop-in (`/etc/sudoers.d/pastor-<name>`), NOPASSWD, naming exactly one
+command — running herdr as `pastor-agent` — and nothing else, and the
+`client` step writes `[shepherd] command = [...]` for that one command so
+the shepherd uses it instead of its own, absent, local session. User mode
+needs none of this: the login and agent user are the same person there.
+
 **User mode** (no root, no sudo) cannot create users. Everything runs as
 the login user and the machine key is readable by agents. Bootstrap still
 works, and it says so plainly: `isolation: none` in `machine describe`, and
@@ -327,22 +338,27 @@ there, so a rerun after a fix carries on where it stopped.
    - The version is `[provision] herdr` in the head's `pastor.toml`.
    - Without it, the version most of the head's machines report.
    - Without any, a version compiled into pastor (`DEFAULT_HERDR_VERSION`).
-7. **Services** (`pastor setup systemd|launchd`, run with `--yes` since
+7. **Keys.** The service user makes the machine key, and the agent user
+   makes the agent key. Each is ed25519, 0600, in its user's state dir.
+   Each user gets a `client.toml` naming the head, so `PASTOR_HEAD` no
+   longer depends on `head_address`. Pastor's ssh to the head then passes
+   `-i <key> -o IdentitiesOnly=yes -o UserKnownHostsFile=<state>/known_hosts`
+   whenever that key exists.
+8. **Services** (`pastor setup systemd|launchd`, run with `--yes` since
    nothing is a terminal):
    - herdr as the agent user;
    - on pull machines, the shepherd as the service user.
+
+   This comes after keys and `client.toml`, not before: the unit starts the
+   moment this step runs, and the role it starts as (head client versus
+   shepherd) is decided only at that startup, from the config the previous
+   step just wrote. Starting it any earlier would start the wrong role.
 
    `setup` learns to find herdr in `~/.local/bin` next to its own binary,
    not only on `PATH`. With lingering off and no way to turn it on, the step
    fails rather than reporting a machine that dies at logout. It also fails
    when there is no user bus (`XDG_RUNTIME_DIR` unset); the fix is to rerun
    with `--sudo`.
-8. **Keys.** The service user makes the machine key, and the agent user
-   makes the agent key. Each is ed25519, 0600, in its user's state dir.
-   Each user gets a `client.toml` naming the head, so `PASTOR_HEAD` no
-   longer depends on `head_address`. Pastor's ssh to the head then passes
-   `-i <key> -o IdentitiesOnly=yes -o UserKnownHostsFile=<state>/known_hosts`
-   whenever that key exists.
 9. **Shepherd name** (pull): `pastor join` writes `[shepherd] machine =
    "<name>"` to the service user's `pastor.toml`, so the name survives
    restarts.
@@ -360,7 +376,13 @@ there, so a rerun after a fix carries on where it stopped.
 
 `machine add` again on a pending or failed machine with the same target
 reruns bootstrap instead of failing with `machine_exists`.
-`pastor machine bootstrap NAME [--sudo]` does the same by name.
+`pastor machine bootstrap NAME [--sudo] [--login USER@HOST]` does the same
+by name, connecting as the login bootstrap stored for this machine
+(`machine_state.bootstrap_login`), or `--login` when given. That login is
+kept separately from the flock entry's `ssh`, which bootstrap rewrites to
+`pastor-agent@host` in root mode: without a login of its own, a later
+`--sudo` rerun would otherwise connect as the unprivileged agent user
+instead of the sudo-capable one bootstrap originally used.
 
 **Pull.**
 1. `pastor join` joins **first**, then bootstraps. Join registers the
@@ -408,12 +430,21 @@ not open.
   take over another machine's name.
 - A name already in `flock.toml` is refused, unless the token was made with
   `--replace` for that exact name.
+- A joining machine's `name` must match `^[A-Za-z0-9][A-Za-z0-9._-]*$`, the
+  same charset the artifact cache already requires. The head checks this
+  before it marks the token used or changes any state, because this name
+  ends up inside a shell command line in `authorized_keys`: rejecting
+  quotes, backslashes and whitespace there (as today's locked agent line
+  already does) is not enough on its own, since `;` and `$(...)` pass that
+  check and still reach the shell.
 
 ### The head's `authorized_keys` and `known_hosts`
 
 **`authorized_keys`.**
 - Every pastor-written line carries a marker comment,
   `pastor:machine:<name>` or `pastor:join:<id>`.
+- A machine's forced command also carries `--gen <n>`, the enrollment
+  generation that was current when the line was last written (below).
 - Edits take a lock, write a 0600 temp file, fsync it and rename it, so
   100 machines joining at once lose nothing.
 - Pastor never touches a line without its marker.
@@ -422,27 +453,54 @@ not open.
 - Pastor keeps its own, at `<state>/known_hosts`, and passes
   `UserKnownHostsFile` on every ssh it runs. Recycled cloud IPs and the
   user's own file then never collide.
-- Push bootstrap accepts a new host key once (`accept-new`), or checks it
-  against `--host-key <fp>` when given.
+- Push bootstrap pins a host key once: `ssh-keyscan` runs only the first
+  time it sees a host with no existing entry, checked against
+  `--host-key <fp>` when given. A rerun against an already-pinned host
+  skips `ssh-keyscan` and connects with `StrictHostKeyChecking=accept-new`
+  against that existing entry, so a changed key stops the rerun instead of
+  being silently re-trusted — `ssh-keyscan` alone proves nothing, since it
+  neither authenticates its answer nor goes through the client's own
+  host-key check.
 - A pull machine's host key arrives with `Join`.
-- `machine remove` and `--replace` delete the entry, and close the ssh
-  ControlMaster for that machine (`ssh -O exit`), so a live mux socket does
-  not skip the check.
+- `machine remove` and `--replace` delete the entry, drop `machine_state`
+  (remove) or bump its `generation` (replace), and close the ssh
+  ControlMaster the **head** holds outward to that machine (`ssh -O exit`).
+  That closes only the head's own outbound connection; it cannot close a
+  pull machine's own master into the head, and rewriting `authorized_keys`
+  does not either, because OpenSSH freezes a connection's forced command at
+  the moment it authenticates and never re-reads the file for channels
+  opened later on that same connection. What actually cuts an old
+  connection off is the generation check below.
 
 ### Bridge modes
 
 | Mode | Who uses it | May send |
 |---|---|---|
 | `--join --id` | a joining machine, once | `Join` only |
-| `--shepherd --machine X` (new) | the service user's machine key | Ping, the agent set, `TaskClaim`, `TaskReport`, `PullTrust`, `JobSubmit`, `EventsSince`, the bootstrap report, and artifact fetches |
-| `--agent --machine X` (today) | the agent user's agent key | Ping, List, TaskShow, TaskRead, TaskDone |
+| `--shepherd --machine X --gen N` (new) | the service user's machine key | Ping, the agent set, `TaskClaim`, `TaskReport`, `PullTrust`, `JobSubmit`, `EventsSince`, the bootstrap report, and artifact fetches |
+| `--agent --machine X` (today, unchanged) | the agent user's agent key | Ping, List, TaskShow, TaskRead, TaskDone |
 | plain | a person's own key | everything, as today |
 
 Rules for `--shepherd`:
+- The bridge refuses with `machine_revoked` when `N` does not match
+  `machine_state.generation` for `X`, or when `X` has no `machine_state` row
+  at all. Enrollment sets the generation, `--replace` bumps it, `remove`
+  drops the row. This check runs on every request, not only at ssh
+  authentication, so it is the one thing that reaches a connection that
+  authenticated before a replace or removal: that connection keeps sending
+  whatever `--gen` was frozen into it, and the mismatch refuses it even
+  though the mux socket underneath is still live and still authenticated.
 - The bridge sets the `machine` field of every claim, report and trust
   request to `X` before forwarding. A machine can only act for itself.
-- `EventsSince` is filtered to records about `X` and its tasks.
-- `JobSubmit` is allowed, because pull machines run their own jobs today.
+- `EventsSince` is filtered to records about `X` and its tasks by the query
+  itself, before pagination — not by discarding rows from an
+  already-paginated reply. A page that turns out to hold only other
+  machines' events still advances the cursor, so a shepherd polling for its
+  own machine's events never stalls behind a page that has none of them.
+- `JobSubmit` is allowed, because pull machines run their own jobs today,
+  but the bridge overwrites its `dispatch.machine` with `X` and clears
+  `dispatch.flock`, the same way it overwrites `machine` everywhere else. A
+  machine key can submit work for its own machine only, never for another.
 
 Existing pull machines keep working on plain bridge. `pastor machine
 authorized-key --shepherd` prints the new locked line, for moving them over.
@@ -493,12 +551,12 @@ later builds.
 
 - New stable error codes:
   - `join_token_invalid`, `join_token_used`, `join_token_expired`
-  - `machine_name_taken`
+  - `machine_name_taken`, `machine_name_invalid`
   - `bootstrap_unsupported_platform`
   - `bootstrap_missing`, which lists what is missing
   - `bootstrap_needs_sudo`
   - `artifact_checksum_mismatch`
-  - `not_allowed_for_shepherd`
+  - `not_allowed_for_shepherd`, `machine_revoked`
 - New events:
   - `machine.joined`
   - `machine.bootstrapped`, with the mode, isolation and missing items
@@ -511,14 +569,23 @@ later builds.
   and loginctl.
 - Bridge modes:
   - each request allowed or refused per mode;
-  - a forged `machine` field gets overwritten.
+  - a forged `machine` field gets overwritten;
+  - a forged `JobSubmit` dispatch target is overwritten too;
+  - a request replayed with a stale `--gen`, on the same fake connection a
+    `--replace` already moved past, gets `machine_revoked`;
+  - a page of only other machines' events still advances an `EventsSince`
+    cursor.
 - Tokens:
   - used twice, expired, wrong head host key;
   - a name clash, and `--replace`;
+  - a name with a shell metacharacter (`;`, `` ` ``, `$(...)`) is refused
+    before the token is marked used or any state changes;
   - the line is removed after use and at expiry.
 - `authorized_keys`:
   - concurrent joins lose no line;
   - pastor never edits a line without its marker.
+- Host keys: a push rerun against a host whose key changed, with no
+  `--host-key` given, stops instead of re-trusting the new key.
 - End-to-end in containers with sshd and systemd, next to `tests/real_ssh.rs`:
   - Debian, Fedora and Arch;
   - push and pull;
