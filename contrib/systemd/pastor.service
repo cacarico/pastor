@@ -34,6 +34,8 @@ NoNewPrivileges=yes
 UMask=0077
 LockPersonality=yes
 RestrictRealtime=yes
+# A child killed for memory (the merge gate's rustc, say) must not stop the head.
+OOMPolicy=continue
 
 [Install]
 WantedBy=default.target

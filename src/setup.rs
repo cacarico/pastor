@@ -912,6 +912,7 @@ mod tests {
             "UMask=0077",
             "LockPersonality=yes",
             "RestrictRealtime=yes",
+            "OOMPolicy=continue",
         ] {
             assert!(
                 PASTOR_UNIT.lines().any(|l| l == line),
