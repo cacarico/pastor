@@ -269,6 +269,17 @@ struct Puller {
     report_file: Option<PathBuf>,
 }
 
+/// Whether a `BootstrapReport` that failed with `code` failed on the way
+/// (no head, an unreachable or restarting one, a timeout, a dropped
+/// connection), so the next claim sends it again; any other code is the
+/// head refusing it.
+fn report_failed_on_the_way(code: &str) -> bool {
+    matches!(
+        code,
+        "head_unreachable" | "no_head" | "timeout" | "runtime_error" | "daemon_not_running"
+    )
+}
+
 impl Puller {
     fn new(
         machine: String,
@@ -447,7 +458,9 @@ impl Puller {
 
     /// Send what `pastor join` left in `<state>/bootstrap.json` and delete
     /// it once the head took it; one that does not parse is logged and
-    /// deleted, since no later pass could parse it either. Returns whether a
+    /// deleted, since no later pass could parse it either. One that fails on
+    /// the way is sent again next claim; one the head refuses is logged and
+    /// renamed to bootstrap.json.refused, for a person. Returns whether a
     /// report went.
     async fn send_bootstrap_report(&mut self) -> bool {
         let Some(file) = self.report_file.clone() else {
@@ -482,7 +495,27 @@ impl Puller {
                 true
             }
             Err(err) => {
-                tracing::warn!(machine = %self.machine, err = %format!("{err:#}"), "report this machine's bootstrap; trying again next claim");
+                let refused = err
+                    .downcast_ref::<CliError>()
+                    .filter(|e| !report_failed_on_the_way(&e.code));
+                let Some(e) = refused else {
+                    tracing::warn!(machine = %self.machine, err = %format!("{err:#}"), "report this machine's bootstrap; trying again next claim");
+                    return false;
+                };
+                // The head would refuse it again every claim: it is kept
+                // for a person, out of the next pass's way.
+                let aside = file.with_extension("json.refused");
+                tracing::warn!(
+                    machine = %self.machine,
+                    code = %e.code,
+                    file = %aside.display(),
+                    "the head refused this machine's bootstrap report, so it is not sent again: {}",
+                    e.message
+                );
+                if let Err(err) = std::fs::rename(&file, &aside) {
+                    tracing::warn!(file = %file.display(), %err, "keep the refused bootstrap report aside; removed instead");
+                    let _ = std::fs::remove_file(&file);
+                }
                 false
             }
         }
@@ -1324,12 +1357,13 @@ mod tests {
         assert_eq!(reports, 1);
     }
 
-    /// A head that cannot take the report leaves the file for the next
-    /// claim; one that is not there yet is no report at all.
-    #[tokio::test]
-    async fn a_refused_bootstrap_report_is_kept_for_the_next_claim() {
-        let tmp = tempfile::tempdir().unwrap();
-        let file = crate::bootstrap::pull::report_file(tmp.path());
+    /// A puller whose head answers every `BootstrapReport` with `code`,
+    /// counting them, and a report in `dir`.
+    fn reporting_to(
+        dir: &std::path::Path,
+        code: &'static str,
+    ) -> (Puller, PathBuf, Arc<std::sync::atomic::AtomicUsize>) {
+        let file = crate::bootstrap::pull::report_file(dir);
         std::fs::write(&file, serde_json::to_string(&joined_outcome()).unwrap()).unwrap();
         let reports = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let n = reports.clone();
@@ -1339,7 +1373,7 @@ mod tests {
                 match req {
                     IpcRequest::BootstrapReport { .. } => {
                         n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        Err(CliError::err("head_unreachable", "ssh: timed out"))
+                        Err(CliError::err(code, "no"))
                     }
                     _ => Ok(IpcResponse::Tasks(vec![])),
                 }
@@ -1354,13 +1388,53 @@ mod tests {
             ask,
         );
         p.report_file = Some(file.clone());
-        p.pass().await;
-        p.pass().await;
-        assert_eq!(reports.load(std::sync::atomic::Ordering::SeqCst), 2);
-        assert!(file.exists(), "kept until the head takes it");
-        std::fs::remove_file(&file).unwrap();
-        p.pass().await;
-        assert_eq!(reports.load(std::sync::atomic::Ordering::SeqCst), 2);
+        (p, file, reports)
+    }
+
+    /// A head that cannot take the report now (unreachable, a timeout, a
+    /// dropped connection) leaves the file for the next claim; one that is
+    /// not there yet is no report at all.
+    #[tokio::test]
+    async fn a_report_that_fails_on_the_way_is_kept_for_the_next_claim() {
+        for code in ["head_unreachable", "no_head", "timeout", "runtime_error"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut p, file, reports) = reporting_to(tmp.path(), code);
+            p.pass().await;
+            p.pass().await;
+            assert_eq!(
+                reports.load(std::sync::atomic::Ordering::SeqCst),
+                2,
+                "{code}"
+            );
+            assert!(file.exists(), "{code}: kept until the head takes it");
+            std::fs::remove_file(&file).unwrap();
+            p.pass().await;
+            assert_eq!(reports.load(std::sync::atomic::Ordering::SeqCst), 2);
+        }
+    }
+
+    /// A head that refuses the report (it does not know this machine, or
+    /// the report itself) would refuse it every claim: it is sent once,
+    /// then kept as bootstrap.json.refused for a person, and not sent again.
+    #[tokio::test]
+    async fn a_refused_bootstrap_report_is_kept_aside_not_resent() {
+        for code in ["unknown_machine", "not_pull_machine", "invalid_args"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut p, file, reports) = reporting_to(tmp.path(), code);
+            p.pass().await;
+            p.pass().await;
+            p.pass().await;
+            assert_eq!(
+                reports.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{code}"
+            );
+            assert!(!file.exists(), "{code}");
+            let refused = tmp.path().join("bootstrap.json.refused");
+            let kept: crate::bootstrap::Outcome =
+                serde_json::from_str(&std::fs::read_to_string(&refused).unwrap()).unwrap();
+            assert_eq!(kept, joined_outcome());
+        }
     }
 
     /// A shepherd that is a pull machine claims the task pinned to it, runs

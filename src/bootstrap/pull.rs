@@ -43,7 +43,8 @@ pub trait HeadLink: Send + Sync {
         remote: &[&str],
         line: &str,
     ) -> anyhow::Result<String>;
-    /// `remote` on `head`, its stdout written to `dest`.
+    /// `remote` on `head`, its stdout written to `dest`, and refused once
+    /// it passes `max` bytes.
     fn download(
         &self,
         head: &str,
@@ -51,6 +52,7 @@ pub trait HeadLink: Send + Sync {
         known_hosts: &Path,
         remote: &[&str],
         dest: &Path,
+        max: u64,
     ) -> anyhow::Result<()>;
 }
 
@@ -149,16 +151,50 @@ pub fn write_report(state_dir: &Path, json: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Pin `line` (`host type key`) in the known_hosts `file`, once. Returns
-/// whether it wrote.
-fn pin(file: &Path, line: &str) -> anyhow::Result<bool> {
+/// Whether `line` is one plain known_hosts line for `head` (`user@host`):
+/// `host type key` or `[host]:port type key`, no marker (`@cert-authority`,
+/// `@revoked`), pattern, negation or list, and a key type sshd logs in
+/// with. Anything more would pin other hosts, or another kind of trust.
+fn pinnable(line: &str, head: &str) -> bool {
+    let host = head.rsplit_once('@').map_or(head, |(_, h)| h);
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let [name, kind, key] = words[..] else {
+        return false;
+    };
+    let plain = |h: &str| {
+        !h.is_empty()
+            && !h.starts_with('-')
+            && h.bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'_' | b':'))
+    };
+    let named = name == host
+        || name
+            .strip_prefix('[')
+            .and_then(|r| r.split_once("]:"))
+            .is_some_and(|(h, port)| {
+                h == host && !port.is_empty() && port.bytes().all(|c| c.is_ascii_digit())
+            });
+    named
+        && plain(host)
+        && crate::join::KEY_TYPES.contains(&kind)
+        && !key.is_empty()
+        && key
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'/' | b'='))
+}
+
+/// Pin `line` (`host type key`) for `head` in the known_hosts `file`,
+/// once. Returns whether it wrote.
+fn pin(file: &Path, line: &str, head: &str) -> anyhow::Result<bool> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let line = line.trim();
-    if line.contains(['\n', '\r']) || line.split_whitespace().count() < 3 {
+    if line.contains(['\n', '\r']) || !pinnable(line, head) {
         return Err(CliError::err(
             crate::join::INVALID,
-            "the token's head host key is not one known_hosts line",
+            format!(
+                "the token's head host key is not one known_hosts line for {head}: `host type key`, with no marker, pattern or list"
+            ),
         ));
     }
     if let Some(dir) = file.parent() {
@@ -184,6 +220,21 @@ fn pin(file: &Path, line: &str) -> anyhow::Result<bool> {
     Ok(true)
 }
 
+/// The prefixes of the dirs a join makes in the state dir.
+const DIR_PREFIXES: [&str; 2] = ["join", "join-herdr"];
+
+/// The [`PrivateDir`]s that exist now, for a signal to remove: a killed
+/// process runs no `Drop`.
+static LIVE_DIRS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Remove every [`PrivateDir`] there is, on the way out of a signal.
+fn remove_live_dirs() {
+    let dirs = LIVE_DIRS.lock().map(|l| l.clone()).unwrap_or_default();
+    for dir in dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
 /// A 0700 dir of this user's, removed with all in it when dropped, so the
 /// token's key and a fetched herdr never outlive the join, whatever fails.
 struct PrivateDir(PathBuf);
@@ -197,6 +248,9 @@ impl PrivateDir {
             .map_or(0, |d| d.subsec_nanos());
         let dir = state_dir.join(format!("{prefix}-{}-{nanos}", std::process::id()));
         std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        if let Ok(mut live) = LIVE_DIRS.lock() {
+            live.push(dir.clone());
+        }
         Ok(PrivateDir(dir))
     }
 
@@ -222,14 +276,74 @@ impl PrivateDir {
 impl Drop for PrivateDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+        if let Ok(mut live) = LIVE_DIRS.lock() {
+            live.retain(|d| *d != self.0);
+        }
     }
+}
+
+/// The pid in `name` when it is a [`PrivateDir`]'s: a prefix, then
+/// `-<pid>-<nanos>`.
+fn private_dir_pid(name: &str) -> Option<i32> {
+    DIR_PREFIXES.iter().find_map(|prefix| {
+        let rest = name.strip_prefix(prefix)?.strip_prefix('-')?;
+        let (pid, nanos) = rest.split_once('-')?;
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
+        (digits(pid) && digits(nanos)).then(|| pid.parse().ok())?
+    })
+}
+
+/// Remove the [`PrivateDir`]s an earlier join left in `state_dir` when it
+/// was killed: only dirs (not links) named as pastor names them, owned by
+/// this user, of a process that is gone, so a join running beside this one
+/// keeps its own.
+fn remove_stale_dirs(state_dir: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(entries) = std::fs::read_dir(state_dir) else {
+        return;
+    };
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(private_dir_pid) else {
+            continue;
+        };
+        let Ok(meta) = entry.path().symlink_metadata() else {
+            continue;
+        };
+        if !meta.is_dir() || meta.uid() != me || process_alive(pid) {
+            continue;
+        }
+        if let Err(err) = std::fs::remove_dir_all(entry.path()) {
+            tracing::warn!(dir = %entry.path().display(), %err, "remove a dir an interrupted join left");
+        }
+    }
+}
+
+/// Whether a process `pid` is there: one of another user's counts.
+fn process_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 sends nothing; it only checks that pid exists.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// `ssh` to the head with one key, the pinned known_hosts and nothing else:
 /// no master to share (each join's few connections are not worth one),
 /// no other key, and the remote command as plain words, which the head's
-/// forced command reads.
-pub struct SshLink;
+/// forced command reads. `ssh` is the program, `ssh` but in tests.
+pub struct SshLink {
+    ssh: PathBuf,
+}
+
+impl Default for SshLink {
+    fn default() -> SshLink {
+        SshLink { ssh: "ssh".into() }
+    }
+}
 
 fn ssh_argv(head: &str, key: &Path, known_hosts: &Path, remote: &[&str]) -> Vec<String> {
     let mut argv = vec!["-o".to_string(), "ConnectTimeout=30".to_string()];
@@ -253,13 +367,71 @@ fn ssh_argv(head: &str, key: &Path, known_hosts: &Path, remote: &[&str]) -> Vec<
     argv
 }
 
-/// What ssh wrote on stderr, or that it wrote nothing.
-fn stderr_of(out: &std::process::Output) -> String {
-    let text = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    if text.is_empty() {
-        format!("ssh exited with {}", out.status)
-    } else {
+/// The longest reply line read from the head, as the head caps a request
+/// line.
+const MAX_REPLY: u64 = 64 * 1024;
+
+/// The first line of `r` that is not blank, read no further than `max`
+/// bytes in all; `None` when there is none.
+fn read_reply(r: impl std::io::Read, max: u64) -> anyhow::Result<Option<String>> {
+    use std::io::BufRead;
+    let mut r = std::io::BufReader::new(r.take(max + 1));
+    let mut total = 0;
+    loop {
+        let mut line = Vec::new();
+        let n = r.read_until(b'\n', &mut line)?;
+        total += n as u64;
+        if total > max {
+            anyhow::bail!("the head's reply is longer than {} KiB", max / 1024);
+        }
+        if n == 0 {
+            return Ok(None);
+        }
+        let text = String::from_utf8_lossy(&line);
+        if !text.trim().is_empty() {
+            return Ok(Some(text.trim_end_matches(['\n', '\r']).to_string()));
+        }
+    }
+}
+
+/// Copy `r` to `w`, failing once more than `max` bytes come; returns the
+/// count.
+fn copy_capped(
+    r: impl std::io::Read,
+    w: &mut impl std::io::Write,
+    max: u64,
+) -> anyhow::Result<u64> {
+    let n = std::io::copy(&mut r.take(max + 1), w)?;
+    if n > max {
+        return Err(CliError::err(
+            "artifact_checksum_mismatch",
+            format!("the head sent more than the {max} bytes it answered"),
+        ));
+    }
+    Ok(n)
+}
+
+/// What ssh writes on stderr, read beside its stdout (so neither pipe
+/// fills and stalls it), at most 64 KiB.
+fn drain_stderr(child: &mut std::process::Child) -> std::thread::JoinHandle<String> {
+    let stderr = child.stderr.take();
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(e) = stderr {
+            let mut bytes = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut std::io::Read::take(e, MAX_REPLY), &mut bytes);
+            text = String::from_utf8_lossy(&bytes).trim().to_string();
+        }
         text
+    })
+}
+
+/// What ssh wrote on stderr, or that it wrote nothing.
+fn failure(stderr: String, status: std::process::ExitStatus) -> String {
+    if stderr.is_empty() {
+        format!("ssh exited with {status}")
+    } else {
+        stderr
     }
 }
 
@@ -274,7 +446,7 @@ impl HeadLink for SshLink {
     ) -> anyhow::Result<String> {
         use std::io::Write;
         use std::process::{Command, Stdio};
-        let mut child = Command::new("ssh")
+        let mut child = Command::new(&self.ssh)
             .args(ssh_argv(head, key, known_hosts, remote))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -287,11 +459,20 @@ impl HeadLink for SshLink {
             let _ = stdin.write_all(line.trim_end().as_bytes());
             let _ = stdin.write_all(b"\n");
         }
-        let out = child.wait_with_output()?;
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        match stdout.lines().find(|l| !l.trim().is_empty()) {
-            Some(reply) => Ok(reply.to_string()),
-            None => anyhow::bail!("{}", stderr_of(&out)),
+        let stderr = drain_stderr(&mut child);
+        let reply = match child.stdout.take() {
+            Some(out) => read_reply(out, MAX_REPLY),
+            None => Ok(None),
+        };
+        // A reply too long to read is not waited out.
+        if reply.is_err() {
+            let _ = child.kill();
+        }
+        let status = child.wait()?;
+        let stderr = stderr.join().unwrap_or_default();
+        match reply? {
+            Some(reply) => Ok(reply),
+            None => anyhow::bail!("{}", failure(stderr, status)),
         }
     }
 
@@ -302,21 +483,35 @@ impl HeadLink for SshLink {
         known_hosts: &Path,
         remote: &[&str],
         dest: &Path,
+        max: u64,
     ) -> anyhow::Result<()> {
         use std::process::{Command, Stdio};
-        let file = std::fs::File::create(dest)?;
-        let out = Command::new("ssh")
+        let mut file = std::fs::File::create(dest)?;
+        let mut child = Command::new(&self.ssh)
             .args(ssh_argv(head, key, known_hosts, remote))
             .stdin(Stdio::null())
-            .stdout(file)
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
+            .spawn()
             .map_err(|e| anyhow::anyhow!("run ssh: {e}"))?;
-        if out.status.success() {
+        let stderr = drain_stderr(&mut child);
+        let copied = match child.stdout.take() {
+            Some(out) => copy_capped(out, &mut file, max),
+            None => Ok(0),
+        };
+        if copied.is_err() {
+            let _ = child.kill();
+            // Nothing past the cap stays on disk.
+            drop(file);
+            let _ = std::fs::remove_file(dest);
+        }
+        let status = child.wait()?;
+        let err = stderr.join().unwrap_or_default();
+        copied?;
+        if status.success() {
             return Ok(());
         }
         // The bridge writes its own failure on stderr as `{code, message}`.
-        let err = String::from_utf8_lossy(&out.stderr);
         if let Some(e) = err
             .lines()
             .find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
@@ -327,9 +522,12 @@ impl HeadLink for SshLink {
                 e["message"].as_str().unwrap_or_default().to_string(),
             ));
         }
-        anyhow::bail!("{}", stderr_of(&out))
+        anyhow::bail!("{}", failure(err, status))
     }
 }
+
+/// The most herdr may be, whatever size the head answers.
+const MAX_HERDR: u64 = 512 * 1024 * 1024;
 
 /// The variable `pastor join` reads the token from when neither the
 /// argument nor `--token-stdin` gives one.
@@ -338,10 +536,16 @@ pub const TOKEN_ENV: &str = "PASTOR_JOIN_TOKEN";
 /// Entry point for `pastor join` with a token: join, bootstrap, print the
 /// outcome.
 pub fn cli(args: &crate::join::JoinArgs) -> anyhow::Result<()> {
+    let env = std::env::var(TOKEN_ENV).ok();
+    // Out of the environment before anything runs, so no child (the
+    // bootstrap's commands, ssh) has it in /proc/<pid>/environ.
+    // SAFETY: no other thread runs yet: the tokio runtime starts below,
+    // and main starts none before it calls this.
+    unsafe { std::env::remove_var(TOKEN_ENV) };
     let token = read_token(
         args.token.as_deref(),
         args.token_stdin,
-        std::env::var(TOKEN_ENV).ok(),
+        env,
         &mut std::io::stdin(),
     )?;
     let paths = Paths::from_env()?;
@@ -366,13 +570,31 @@ pub fn cli(args: &crate::join::JoinArgs) -> anyhow::Result<()> {
 }
 
 /// `pastor join` on this machine. The ssh and the bootstrap block, so they
-/// run off the async threads.
+/// run off the async threads. SIGINT, SIGTERM or SIGHUP removes the
+/// token's key and a fetched herdr, which no `Drop` would, then exits.
 pub async fn join(paths: &Paths, token: Token, o: JoinOpts) -> anyhow::Result<Outcome> {
+    use tokio::signal::unix::{SignalKind, signal};
     let paths = paths.clone();
-    tokio::task::spawn_blocking(move || {
-        join_with(&paths, &token, &o, &crate::setup::SystemRunner, &SshLink)
-    })
-    .await?
+    let mut int = signal(SignalKind::interrupt())?;
+    let mut term = signal(SignalKind::terminate())?;
+    let mut hup = signal(SignalKind::hangup())?;
+    let work = tokio::task::spawn_blocking(move || {
+        join_with(
+            &paths,
+            &token,
+            &o,
+            &crate::setup::SystemRunner,
+            &SshLink::default(),
+        )
+    });
+    let code = tokio::select! {
+        done = work => return done?,
+        _ = int.recv() => 130,
+        _ = term.recv() => 143,
+        _ = hup.recv() => 129,
+    };
+    remove_live_dirs();
+    std::process::exit(code);
 }
 
 /// The steps that make the users and their keys, run alone before the join
@@ -458,9 +680,11 @@ pub fn join_with(
         name: None,
     };
 
+    remove_stale_dirs(&paths.state_dir);
+
     // 1. The head's host key, before the first ssh to it.
     let known_hosts = paths.known_hosts_file();
-    pin(&known_hosts, &pull.head_host_key)?;
+    pin(&known_hosts, &pull.head_host_key, &token.head)?;
 
     // 2. The users and their keys, and the head pinned for each.
     let ids = super::run_steps(r, &opts, Some(&pull), &identity_steps());
@@ -627,6 +851,15 @@ fn fetch_herdr(
                 "the head answered an artifact request with something else: {other:?}"
             ),
         };
+    if size > MAX_HERDR {
+        return Err(CliError::err(
+            "artifact_checksum_mismatch",
+            format!(
+                "the head answered herdr {version} {target} is {size} bytes, over the {} MiB pastor fetches",
+                MAX_HERDR / 1024 / 1024
+            ),
+        ));
+    }
     let dest = dir.join("herdr");
     link.download(
         head,
@@ -634,15 +867,16 @@ fn fetch_herdr(
         known_hosts,
         &["bridge", "--fetch", "herdr", version, &target],
         &dest,
+        size,
     )?;
-    let bytes = std::fs::read(&dest)?;
-    let got = format!("{:x}", Sha256::digest(&bytes));
-    if bytes.len() as u64 != size || !got.eq_ignore_ascii_case(sha256.trim()) {
+    let mut hasher = Sha256::new();
+    let got_size = std::io::copy(&mut std::fs::File::open(&dest)?, &mut hasher)?;
+    let got = format!("{:x}", hasher.finalize());
+    if got_size != size || !got.eq_ignore_ascii_case(sha256.trim()) {
         return Err(CliError::err(
             "artifact_checksum_mismatch",
             format!(
-                "herdr {version} {target} from the head is {} bytes with sha256 {got}, not the {size} bytes with sha256 {sha256} the head answered",
-                bytes.len()
+                "herdr {version} {target} from the head is {got_size} bytes with sha256 {got}, not the {size} bytes with sha256 {sha256} the head answered"
             ),
         ));
     }
@@ -797,6 +1031,8 @@ mod tests {
         joined: Result<String, String>,
         herdr: Vec<u8>,
         sum: Option<String>,
+        /// The size the head answers, when not `herdr`'s.
+        size: Option<u64>,
         seen: Mutex<Vec<Seen>>,
     }
 
@@ -806,6 +1042,7 @@ mod tests {
                 joined,
                 herdr: b"HERDR".to_vec(),
                 sum: None,
+                size: None,
                 seen: Mutex::new(Vec::new()),
             }
         }
@@ -864,7 +1101,7 @@ mod tests {
                     IpcResponse::Artifact {
                         path: "/head/artifacts/herdr".into(),
                         sha256: sum,
-                        size: self.herdr.len() as u64,
+                        size: self.size.unwrap_or(self.herdr.len() as u64),
                     }
                 }
                 IpcRequest::BootstrapReport { machine, .. } => {
@@ -882,8 +1119,9 @@ mod tests {
             _known_hosts: &Path,
             remote: &[&str],
             dest: &Path,
+            max: u64,
         ) -> anyhow::Result<()> {
-            self.record(key, remote, "");
+            self.record(key, remote, &max.to_string());
             std::fs::write(dest, &self.herdr)?;
             Ok(())
         }
@@ -1172,5 +1410,191 @@ mod tests {
             "{:#?}",
             r.calls()
         );
+    }
+
+    /// The token's host key line is pinned only when it is one plain line
+    /// for the token's own head: `host type key`, or `[host]:port`, with a
+    /// key type sshd logs in with. A marker, a pattern, a negation or a
+    /// list would pin more than the head, or something else.
+    #[test]
+    fn the_pinned_line_is_the_heads_alone() {
+        let good = [
+            "head ssh-ed25519 AAAAHEAD",
+            "[head]:2222 ssh-ed25519 AAAAHEAD",
+            "head ecdsa-sha2-nistp256 AAAAHEAD",
+        ];
+        for line in good {
+            let (_tmp, p) = paths();
+            let r = FakeRunner::new(&[]);
+            let link = FakeLink::new(Err("down".into()));
+            let t = Token {
+                head_host_key: line.into(),
+                ..token()
+            };
+            let _ = join_with(&p, &t, &opts(), &r, &link);
+            let text = std::fs::read_to_string(p.known_hosts_file()).unwrap();
+            assert_eq!(text, format!("{line}\n"));
+        }
+        let bad = [
+            "@cert-authority head ssh-ed25519 AAAAHEAD",
+            "@revoked head ssh-ed25519 AAAAHEAD",
+            "* ssh-ed25519 AAAAHEAD",
+            "hea? ssh-ed25519 AAAAHEAD",
+            "*.example ssh-ed25519 AAAAHEAD",
+            "!other ssh-ed25519 AAAAHEAD",
+            "head,other ssh-ed25519 AAAAHEAD",
+            "other ssh-ed25519 AAAAHEAD",
+            "[other]:2222 ssh-ed25519 AAAAHEAD",
+            "[head]:x ssh-ed25519 AAAAHEAD",
+            "head ssh-dss AAAAHEAD",
+            "head ssh-ed25519 AAAAHEAD comment",
+            "head ssh-ed25519",
+            "head ssh-ed25519 AAAAHEAD\nother ssh-ed25519 AAAAOTHER",
+        ];
+        for line in bad {
+            let (_tmp, p) = paths();
+            let r = FakeRunner::new(&[]);
+            let link = FakeLink::joins("gpu-3", None);
+            let t = Token {
+                head_host_key: line.into(),
+                ..token()
+            };
+            let err = join_with(&p, &t, &opts(), &r, &link).unwrap_err();
+            assert_eq!(code(&err), "join_token_invalid", "{line:?}: {err:#}");
+            assert!(!p.known_hosts_file().exists(), "{line:?}");
+            assert!(link.seen().is_empty(), "{line:?}");
+        }
+    }
+
+    /// A pid no process has: one that ran and was reaped.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    /// The key dir of a join that was killed (no Drop ran) is removed by
+    /// the next join; only pastor's own dirs go: named as it names them,
+    /// real dirs of this user's, of a process that is gone.
+    #[test]
+    fn a_join_removes_the_dirs_an_interrupted_one_left() {
+        let (_tmp, p) = paths();
+        std::fs::create_dir_all(&p.state_dir).unwrap();
+        let dead = dead_pid();
+        let stale = [
+            format!("join-{dead}-12345"),
+            format!("join-herdr-{dead}-678"),
+        ];
+        for d in &stale {
+            std::fs::create_dir(p.state_dir.join(d)).unwrap();
+            std::fs::write(p.state_dir.join(d).join("join_key"), "SECRET").unwrap();
+        }
+        let live = format!("join-{}-1", std::process::id());
+        let kept = ["join-notes", "joined", live.as_str()];
+        for d in kept {
+            std::fs::create_dir(p.state_dir.join(d)).unwrap();
+        }
+        // Not a dir: a file, and a link to a dir elsewhere.
+        let file = format!("join-{dead}-2");
+        std::fs::write(p.state_dir.join(&file), "x").unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let link_name = format!("join-{dead}-3");
+        std::os::unix::fs::symlink(elsewhere.path(), p.state_dir.join(&link_name)).unwrap();
+
+        let r = FakeRunner::new(&[]);
+        let link = FakeLink::new(Err("down".into()));
+        let _ = join_with(&p, &token(), &opts(), &r, &link);
+        for d in &stale {
+            assert!(!p.state_dir.join(d).exists(), "{d} removed");
+        }
+        for d in kept.iter().chain([&file.as_str(), &link_name.as_str()]) {
+            assert!(p.state_dir.join(d).symlink_metadata().is_ok(), "{d} kept");
+        }
+        assert!(elsewhere.path().exists());
+    }
+
+    /// The download is capped at the size the head answered, and a size
+    /// over the absolute cap is refused before anything is fetched.
+    #[test]
+    fn the_herdr_download_is_capped() {
+        let (_tmp, p) = paths();
+        let r = FakeRunner::new(&[]);
+        let link = FakeLink::joins("gpu-3", None);
+        join_with(&p, &token(), &opts(), &r, &link).unwrap();
+        let fetch = link
+            .seen()
+            .into_iter()
+            .find(|s| s.remote.get(1).is_some_and(|a| a == "--fetch"))
+            .expect("a fetch");
+        assert_eq!(fetch.line, "5", "capped at the head's size");
+
+        let (_tmp, p) = paths();
+        let mut link = FakeLink::joins("gpu-3", None);
+        link.size = Some(MAX_HERDR + 1);
+        let out = join_with(&p, &token(), &opts(), &r, &link).unwrap();
+        let failed = step(&out, "herdr");
+        assert_eq!(failed.status, StepStatus::Failed);
+        assert!(
+            failed.why.as_deref().unwrap_or("").contains("MiB"),
+            "{failed:?}"
+        );
+        assert!(
+            !link
+                .seen()
+                .iter()
+                .any(|s| s.remote.get(1).is_some_and(|a| a == "--fetch")),
+            "nothing fetched: {:#?}",
+            link.seen()
+        );
+    }
+
+    /// An `ssh` for SshLink: a script in `dir` with `body`.
+    fn fake_ssh(dir: &Path, body: &str) -> SshLink {
+        use std::os::unix::fs::PermissionsExt;
+        let ssh = dir.join("ssh");
+        std::fs::write(&ssh, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        SshLink { ssh }
+    }
+
+    /// A reply longer than 64 KiB is refused, read no further than that,
+    /// as the head refuses a request line; a shorter one is read.
+    #[test]
+    fn a_reply_line_is_capped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let k = tmp.path().join("k");
+        let link = fake_ssh(tmp.path(), "cat >/dev/null; printf '\\n{\"ok\":1}\\n'");
+        let got = link.request("h", &k, &k, &["bridge"], "{}").unwrap();
+        assert_eq!(got, "{\"ok\":1}");
+        // 1 MiB, no newline, from a head that never stops.
+        let link = fake_ssh(
+            tmp.path(),
+            "cat >/dev/null; head -c 1048576 /dev/zero | tr '\\0' x; sleep 30",
+        );
+        let started = std::time::Instant::now();
+        let err = link.request("h", &k, &k, &["bridge"], "{}").unwrap_err();
+        assert!(format!("{err:#}").contains("64 KiB"), "{err:#}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    }
+
+    /// A download that passes its cap stops there, and fails: what is on
+    /// disk is never more than the cap.
+    #[test]
+    fn a_download_stops_at_its_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let k = tmp.path().join("k");
+        let dest = tmp.path().join("herdr");
+        let link = fake_ssh(tmp.path(), "printf 12345");
+        link.download("h", &k, &k, &["bridge"], &dest, 5).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"12345");
+        let link = fake_ssh(tmp.path(), "head -c 10485760 /dev/zero; sleep 30");
+        let started = std::time::Instant::now();
+        let err = link
+            .download("h", &k, &k, &["bridge"], &dest, 1024)
+            .unwrap_err();
+        assert_eq!(code(&err), "artifact_checksum_mismatch", "{err:#}");
+        assert!(std::fs::metadata(&dest).map_or(0, |m| m.len()) <= 1024);
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
     }
 }

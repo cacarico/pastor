@@ -4,9 +4,19 @@
 #   curl -fsSL https://cacari.co/pastor/install.sh | sh
 #
 # With `join` first, it then runs `pastor join` with the rest of its
-# arguments, as they are, to make this a pull machine of a head:
+# arguments, as they are, to make this a pull machine of a head. Given no
+# token, it asks for one on the terminal with echo off and hands it to
+# `pastor join --token-stdin` on a pipe, so `ps` never shows it:
 #
-#   curl -fsSL https://cacari.co/pastor/install.sh | sudo PASTOR_JOIN_TOKEN=pjt_... sh -s -- join
+#   curl -fsSL https://cacari.co/pastor/install.sh | sudo sh -s -- join
+#
+# With no terminal (automation, cloud-init), the token goes on stdin, so
+# the script comes as an argument instead:
+#
+#   sudo sh -c "$(curl -fsSL https://cacari.co/pastor/install.sh)" sh join --token-stdin <tokenfile
+#
+# PASTOR_JOIN_TOKEN works too, but the same user and root can read it in
+# /proc/<pid>/environ, and on sudo's command line `ps` shows it to all.
 #
 # PASTOR_VERSION      the version to install (default: the latest release)
 # PASTOR_INSTALL_DIR  where the binary goes (default: ~/.local/bin)
@@ -128,6 +138,30 @@ case ":$PATH:" in
     *) echo "note: $dir is not on your PATH" >&2 ;;
 esac
 if [ "$mode" = join ]; then
+    # Asked for only when nothing gives a token (an argument, stdin, the
+    # variable) and nothing else is asked (a subcommand, help).
+    ask=yes
+    [ -n "${PASTOR_JOIN_TOKEN:-}" ] && ask=no
+    for a in "$@"; do
+        case "$a" in
+            --token-stdin | -h | --help | create | list | revoke | pjt_*) ask=no ;;
+        esac
+    done
+    # A /dev/tty that opens: the node is there even with no terminal.
+    if [ "$ask" = yes ] && (: </dev/tty) 2>/dev/null; then
+        trap 'stty echo </dev/tty 2>/dev/null; rm -rf "$tmp"' EXIT
+        trap 'exit 130' INT TERM HUP
+        stty -echo </dev/tty
+        printf 'join token: ' >/dev/tty
+        IFS= read -r token </dev/tty || token=
+        stty echo </dev/tty
+        printf '\n' >/dev/tty
+        [ -n "$token" ] || fail "no join token given"
+        # printf is a builtin: the token reaches pastor on a pipe, never in
+        # an argument or the environment.
+        printf '%s\n' "$token" | "$dir/pastor" join --token-stdin "$@"
+        exit
+    fi
     # The arguments may hold the token: they are passed on, never printed.
     exec "$dir/pastor" join "$@"
 fi

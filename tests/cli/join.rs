@@ -497,23 +497,26 @@ fn two_redeems_racing_add_one_machine() {
     assert!(!has_join_line(&h.keys_text(), &id));
 }
 
-/// `install.sh join …` installs pastor, then runs its `join` with the rest
-/// of the arguments exactly as given: a space stays inside its argument,
-/// and nothing is evaluated by the shell on the way.
-#[test]
-fn install_sh_join_passes_its_args_through() {
+/// A release of one fake pastor for x86_64 Linux in `dir`, as install.sh
+/// fetches it: the tarball and SHA256SUMS. The fake prints `pastor 1.0.0`
+/// for `--version`, else each argument as `[arg]`, then what it was given
+/// in PASTOR_JOIN_TOKEN and, with `--token-stdin`, on stdin, upper-cased
+/// (so a test can tell a token echoed by the terminal from the one the
+/// fake got).
+fn fake_release(dir: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
-    if !cfg!(target_os = "linux") || std::env::consts::ARCH != "x86_64" {
-        return;
-    }
-    let tmp = tempfile::tempdir().unwrap();
-    let release = tmp.path().join("release");
+    let release = dir.join("release");
     let name = "pastor-1.0.0-x86_64-unknown-linux-musl";
     std::fs::create_dir_all(release.join(name)).unwrap();
     let fake = release.join(name).join("pastor");
     std::fs::write(
         &fake,
-        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'pastor 1.0.0'; exit 0; fi\nfor a in \"$@\"; do printf '[%s]\\n' \"$a\"; done\n",
+        "#!/bin/sh\n\
+         if [ \"$1\" = --version ]; then echo 'pastor 1.0.0'; exit 0; fi\n\
+         stdin=no\n\
+         for a in \"$@\"; do printf '[%s]\\n' \"$a\"; [ \"$a\" = --token-stdin ] && stdin=yes; done\n\
+         printf 'env=[%s]\\n' \"${PASTOR_JOIN_TOKEN-unset}\"\n\
+         if [ $stdin = yes ]; then printf 'stdin=[%s]\\n' \"$(tr a-z A-Z)\"; fi\n",
     )
     .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -533,38 +536,286 @@ fn install_sh_join_passes_its_args_through() {
         .output()
         .unwrap();
     std::fs::write(release.join("SHA256SUMS"), &sums.stdout).unwrap();
+    release
+}
 
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh");
-    let out = std::process::Command::new("sh")
-        .arg(&script)
-        .args(["join", "--name", "a b", "$(touch pwned)", "--token-stdin"])
-        .current_dir(tmp.path())
+/// `program` with install.sh's environment: the fake release in `dir`,
+/// installed under `dir`/bin, and no gh login (the attestation check is
+/// not these tests').
+fn install_sh_env(program: &str, dir: &Path, release: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    cmd.current_dir(dir)
         .env("PASTOR_VERSION", "1.0.0")
         .env(
             "PASTOR_DOWNLOAD_URL",
             format!("file://{}", release.display()),
         )
-        .env("PASTOR_INSTALL_DIR", tmp.path().join("bin"))
-        // No gh login: the attestation check is not this test's.
-        .env("GH_CONFIG_DIR", tmp.path().join("gh"))
+        .env("PASTOR_INSTALL_DIR", dir.join("bin"))
+        .env("GH_CONFIG_DIR", dir.join("gh"))
         .env_remove("GH_TOKEN")
         .env_remove("GITHUB_TOKEN")
+        .env_remove("PASTOR_JOIN_TOKEN");
+    cmd
+}
+
+fn install_sh() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh")
+}
+
+/// The lines the fake pastor printed: its arguments, env and stdin.
+fn fake_said(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .map(|l| l.trim_end_matches('\r'))
+        .filter(|l| l.starts_with('[') || l.starts_with("env=") || l.starts_with("stdin="))
+        .map(str::to_string)
+        .collect()
+}
+
+/// `install.sh join …` installs pastor, then runs its `join` with the rest
+/// of the arguments exactly as given: a space stays inside its argument,
+/// and nothing is evaluated by the shell on the way.
+#[test]
+fn install_sh_join_passes_its_args_through() {
+    if !cfg!(target_os = "linux") || std::env::consts::ARCH != "x86_64" {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let release = fake_release(tmp.path());
+    let out = install_sh_env("sh", tmp.path(), &release)
+        .arg(install_sh())
+        .args(["join", "--name", "a b", "$(touch pwned)", "--token-stdin"])
+        .stdin(Stdio::null())
         .output()
         .unwrap();
     assert!(out.status.success(), "{out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let passed: Vec<&str> = stdout.lines().filter(|l| l.starts_with('[')).collect();
     assert_eq!(
-        passed,
+        fake_said(&stdout),
         [
             "[join]",
             "[--name]",
             "[a b]",
             "[$(touch pwned)]",
-            "[--token-stdin]"
+            "[--token-stdin]",
+            "env=[unset]",
+            "stdin=[]",
         ],
         "{stdout}"
     );
     assert!(!tmp.path().join("pwned").exists());
     assert!(!stdout.contains("next:"), "{stdout}");
+
+    // No token and no terminal to ask on (a new session, so no /dev/tty):
+    // `pastor join` gets the arguments as they are and says what is
+    // missing itself.
+    let out = install_sh_env("setsid", tmp.path(), &release)
+        .args(["-w", "sh"])
+        .arg(install_sh())
+        .args(["join", "--name", "gpu-3"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        fake_said(&stdout),
+        ["[join]", "[--name]", "[gpu-3]", "env=[unset]"],
+        "{stdout}"
+    );
+}
+
+/// `curl … | sudo sh -s -- join` with no token anywhere asks for it on the
+/// terminal with echo off, and hands it to `pastor join --token-stdin` on a
+/// pipe: never in an argument or the environment, where `ps` and
+/// /proc/<pid>/environ show it. `script` gives the run a real terminal.
+#[test]
+fn install_sh_join_asks_for_the_token_on_the_terminal() {
+    use std::io::{Read, Write};
+    if !cfg!(target_os = "linux") || std::env::consts::ARCH != "x86_64" {
+        return;
+    }
+    if std::process::Command::new("script")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("no util-linux script here to give install.sh a terminal; skipped");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let release = fake_release(tmp.path());
+    let token = "pjt_secret-token";
+    let mut child = install_sh_env("script", tmp.path(), &release)
+        .args(["-qec"])
+        .arg(format!("sh {} join --name gpu-3", install_sh().display()))
+        .arg("/dev/null")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = stdout.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            let _ = tx.send(buf[..n].to_vec());
+        }
+    });
+    let mut seen = Vec::new();
+    let deadline = Instant::now() + WAIT;
+    // Typed only once the prompt shows, so echo is already off.
+    while !String::from_utf8_lossy(&seen).contains("join token: ") {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(chunk) => seen.extend(chunk),
+            Err(_) => {
+                let _ = child.kill();
+                panic!(
+                    "no prompt for the token: {}",
+                    String::from_utf8_lossy(&seen)
+                );
+            }
+        }
+    }
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(format!("{token}\n").as_bytes()).unwrap();
+    stdin.flush().unwrap();
+    while let Ok(chunk) = rx.recv_timeout(WAIT) {
+        seen.extend(chunk);
+    }
+    let status = child.wait().unwrap();
+    drop(stdin);
+    let stdout = String::from_utf8_lossy(&seen);
+    assert!(status.success(), "{status:?}: {stdout}");
+    assert_eq!(
+        fake_said(&stdout),
+        [
+            "[join]",
+            "[--token-stdin]",
+            "[--name]",
+            "[gpu-3]",
+            "env=[unset]",
+            &format!("stdin=[{}]", token.to_uppercase()),
+        ],
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains(token),
+        "the terminal echoed the token: {stdout}"
+    );
+}
+
+/// `pastor join` takes PASTOR_JOIN_TOKEN out of its environment before it
+/// runs anything, so no child (the bootstrap's commands, ssh) has it in
+/// /proc/<pid>/environ; and a join killed while its ssh runs removes the
+/// token's key dir on the way out.
+#[test]
+fn join_hides_the_token_env_and_cleans_up_when_killed() {
+    use std::os::unix::fs::PermissionsExt;
+    if !Path::new("/etc/ssh/ssh_host_ed25519_key.pub").exists() {
+        eprintln!("no sshd host key here for the join to send; skipped");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (config, state, data, bin) = (
+        tmp.path().join("c"),
+        tmp.path().join("s"),
+        tmp.path().join("d"),
+        tmp.path().join("bin"),
+    );
+    std::fs::create_dir_all(&bin).unwrap();
+    let exec = |name: &str, text: String| {
+        let p = bin.join(name);
+        std::fs::write(&p, text).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    let real_uname = String::from_utf8(
+        std::process::Command::new("sh")
+            .args(["-c", "command -v uname"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let t = tmp.path().display();
+    exec(
+        "uname",
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"${{PASTOR_JOIN_TOKEN-unset}}\" >> {t}/uname.env\nexec {} \"$@\"\n",
+            real_uname.trim()
+        ),
+    );
+    exec(
+        "ssh",
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"${{PASTOR_JOIN_TOKEN-unset}}\" > {t}/ssh.env\necho $$ > {t}/ssh.pid\nexec sleep 60\n"
+        ),
+    );
+    let token = pastor::join::Token {
+        head: "me@head.invalid".into(),
+        head_host_key: "head.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHEAD".into(),
+        key: "-----BEGIN OPENSSH PRIVATE KEY-----\nSECRET\n-----END OPENSSH PRIVATE KEY-----\n"
+            .into(),
+    }
+    .encode();
+    let mut path = std::ffi::OsString::from(&bin);
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    let mut child = pastor()
+        .args(["join", "--name", "gpu-3", "--skip-bootstrap"])
+        .env("PASTOR_CONFIG_DIR", &config)
+        .env("PASTOR_STATE_DIR", &state)
+        .env("PASTOR_DATA_DIR", &data)
+        .env("PATH", &path)
+        .env("PASTOR_JOIN_TOKEN", &token)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid_file = tmp.path().join("ssh.pid");
+    let deadline = Instant::now() + WAIT;
+    while !pid_file.exists() {
+        if child.try_wait().unwrap().is_some() || Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("the join never ran ssh: {:?}", child.wait_with_output());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let key_dirs = || -> Vec<String> {
+        std::fs::read_dir(&state)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("join-"))
+            .collect()
+    };
+    assert_eq!(key_dirs().len(), 1, "the key dir while ssh runs");
+    let ok = std::process::Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(ok.success());
+    let deadline = Instant::now() + WAIT;
+    while child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the join did not end on SIGTERM");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let ssh_pid = std::fs::read_to_string(&pid_file).unwrap();
+    let _ = std::process::Command::new("kill")
+        .arg(ssh_pid.trim())
+        .status();
+    let out = child.wait_with_output().unwrap();
+    assert!(!out.status.success());
+    assert!(key_dirs().is_empty(), "{:?}", key_dirs());
+    let ssh_env = std::fs::read_to_string(tmp.path().join("ssh.env")).unwrap();
+    assert_eq!(ssh_env, "unset\n");
+    let uname_env = std::fs::read_to_string(tmp.path().join("uname.env")).unwrap();
+    assert!(!uname_env.is_empty());
+    assert!(uname_env.lines().all(|l| l == "unset"), "{uname_env}");
 }

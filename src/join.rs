@@ -153,7 +153,7 @@ fn stamp(t: DateTime<Utc>) -> String {
 
 /// The key types a joining machine's keys may be: what sshd takes for a
 /// login. DSA and anything unknown are refused.
-const KEY_TYPES: &[&str] = &[
+pub(crate) const KEY_TYPES: &[&str] = &[
     "ssh-ed25519",
     "ecdsa-sha2-nistp256",
     "ecdsa-sha2-nistp384",
@@ -603,7 +603,7 @@ fn reply_line(resp: &IpcResponse) -> anyhow::Result<Vec<u8>> {
 pub struct JoinArgs {
     #[command(subcommand)]
     pub cmd: Option<JoinCmd>,
-    /// On the new machine: the token `join create` printed; `ps` shows it, so prefer --token-stdin or PASTOR_JOIN_TOKEN
+    /// On the new machine: the token `join create` printed; `ps` shows it, so prefer --token-stdin
     #[arg(value_name = "TOKEN", conflicts_with = "token_stdin")]
     pub token: Option<String>,
     /// Read the join token from stdin
