@@ -2002,30 +2002,37 @@ impl Store {
         })
     }
 
-    pub fn join_token(&self, id: &str) -> Option<JoinToken> {
+    pub fn join_token(&self, id: &str) -> anyhow::Result<Option<JoinToken>> {
         blocking(|| {
             let conn = self.conn.lock().recover();
-            conn.query_row(
-                "SELECT id, flock, tags, replace, expires_at, used_at
-                 FROM join_tokens WHERE id = ?1",
-                params![id],
-                |r| {
-                    let tags: Option<String> = r.get(2)?;
-                    Ok(JoinToken {
-                        id: r.get(0)?,
-                        flock: r.get(1)?,
-                        tags: tags
-                            .and_then(|t| serde_json::from_str(&t).ok())
-                            .unwrap_or_default(),
-                        replace: r.get(3)?,
-                        expires_at: r.get(4)?,
-                        used_at: r.get(5)?,
-                    })
-                },
-            )
-            .optional()
-            .ok()
-            .flatten()
+            let row = conn
+                .query_row(
+                    "SELECT id, flock, tags, replace, expires_at, used_at
+                     FROM join_tokens WHERE id = ?1",
+                    params![id],
+                    |r| {
+                        Ok((
+                            r.get::<_, Option<String>>(2)?,
+                            JoinToken {
+                                id: r.get(0)?,
+                                flock: r.get(1)?,
+                                tags: Vec::new(),
+                                replace: r.get(3)?,
+                                expires_at: r.get(4)?,
+                                used_at: r.get(5)?,
+                            },
+                        ))
+                    },
+                )
+                .optional()?;
+            row.map(|(tags, mut t)| {
+                if let Some(tags) = tags {
+                    t.tags = serde_json::from_str(&tags)
+                        .with_context(|| format!("join token {id}: tags are not JSON"))?;
+                }
+                Ok(t)
+            })
+            .transpose()
         })
     }
 
@@ -2043,18 +2050,17 @@ impl Store {
     }
 
     /// Ids of the unused tokens whose time ran out before `now`.
-    pub fn expired_join_tokens(&self, now: &str) -> Vec<String> {
+    pub fn expired_join_tokens(&self, now: &str) -> anyhow::Result<Vec<String>> {
         blocking(|| {
             let conn = self.conn.lock().recover();
-            let Ok(mut stmt) = conn.prepare(
+            let mut stmt = conn.prepare(
                 "SELECT id FROM join_tokens
                  WHERE used_at IS NULL AND expires_at <= ?1 ORDER BY id",
-            ) else {
-                return Vec::new();
-            };
-            stmt.query_map(params![now], |r| r.get(0))
-                .map(|rows| rows.flatten().collect())
-                .unwrap_or_default()
+            )?;
+            let ids = stmt
+                .query_map(params![now], |r| r.get(0))?
+                .collect::<Result<Vec<String>, _>>()?;
+            Ok(ids)
         })
     }
 
@@ -2621,17 +2627,29 @@ mod tests {
         let s = Store::open_in_memory().unwrap();
         let t = token("a", "2026-10-16T12:00:00+00:00");
         s.put_join_token(&t).unwrap();
-        assert_eq!(s.join_token("a"), Some(t));
-        assert!(s.join_token("b").is_none());
+        assert_eq!(s.join_token("a").unwrap(), Some(t));
+        assert!(s.join_token("b").unwrap().is_none());
         let now = "2026-10-16T11:00:00+00:00";
         assert!(s.use_join_token("a", now).unwrap());
         assert!(!s.use_join_token("a", now).unwrap());
-        assert_eq!(s.join_token("a").unwrap().used_at.as_deref(), Some(now));
+        assert_eq!(
+            s.join_token("a").unwrap().unwrap().used_at.as_deref(),
+            Some(now)
+        );
         // an expired token cannot be used, nor an unknown one
         s.put_join_token(&token("old", "2026-10-16T10:00:00+00:00"))
             .unwrap();
         assert!(!s.use_join_token("old", now).unwrap());
         assert!(!s.use_join_token("nope", now).unwrap());
+    }
+
+    #[test]
+    fn corrupt_token_tags_are_an_error() {
+        let s = Store::open_in_memory().unwrap();
+        s.put_join_token(&token("bad", "2026-10-16T12:00:00+00:00"))
+            .unwrap();
+        s.execute_raw("UPDATE join_tokens SET tags = 'not json' WHERE id = 'bad'");
+        assert!(s.join_token("bad").is_err());
     }
 
     #[test]
@@ -2642,7 +2660,7 @@ mod tests {
         s.put_join_token(&token("live", "2026-10-16T12:00:00+00:00"))
             .unwrap();
         assert_eq!(
-            s.expired_join_tokens("2026-10-16T11:00:00+00:00"),
+            s.expired_join_tokens("2026-10-16T11:00:00+00:00").unwrap(),
             vec!["old".to_string()]
         );
     }

@@ -1440,7 +1440,7 @@ fn migrates_from_18() {
     old_database(&path, 18);
     let store = Store::open(&path).unwrap();
     assert!(store.machine_state("pi-1").unwrap().is_none());
-    assert!(store.join_token("none").is_none());
+    assert!(store.join_token("none").unwrap().is_none());
     assert!(store.get_task(7).unwrap().is_some());
     drop(store);
     let conn = Connection::open(&path).unwrap();
