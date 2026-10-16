@@ -223,7 +223,10 @@ pub async fn answer_agent(socket: &Path, machine: &str, line: &[u8]) -> anyhow::
 /// events. `TaskClaim`, `TaskReport` and `PullTrust` get `machine`
 /// overwritten with `machine`, whatever the request asked for, so a pull
 /// machine's shepherd can only ever claim and report for itself (a hijacked
-/// one cannot take another machine's tasks). `EventsSince` is cut to the
+/// one cannot take another machine's tasks). A `JobSubmit`'s dispatch is
+/// pinned to `machine` the same way, and refused when it picks the agent's
+/// arguments or permissions or another flock (`pin_dispatch`). `EventsSince`
+/// is cut to the
 /// records about `machine`. Anything else is refused here and never reaches
 /// the head.
 pub async fn answer_shepherd(socket: &Path, machine: &str, line: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -289,7 +292,28 @@ pub async fn answer_shepherd(socket: &Path, machine: &str, line: &[u8]) -> anyho
             )
             .await
         }
-        IpcRequest::JobSubmit { .. } => ask(socket, &req, None).await,
+        IpcRequest::JobSubmit {
+            job,
+            dispatch,
+            prompt,
+            items,
+        } => {
+            let dispatch = match pin_dispatch(socket, machine, dispatch).await? {
+                Ok(dispatch) => dispatch,
+                Err(why) => return refuse(NOT_ALLOWED_FOR_SHEPHERD, why),
+            };
+            ask(
+                socket,
+                &IpcRequest::JobSubmit {
+                    job,
+                    dispatch,
+                    prompt,
+                    items,
+                },
+                None,
+            )
+            .await
+        }
         IpcRequest::EventsSince { after, limit, task } => {
             let reply = ask(
                 socket,
@@ -317,6 +341,58 @@ pub async fn answer_shepherd(socket: &Path, machine: &str, line: &[u8]) -> anyho
             ),
         ),
     }
+}
+
+/// The `[dispatch]` keys a shepherd's `JobSubmit` may not set: they choose
+/// the agent's arguments or permissions (`agent_args`, `allow`, `deny`,
+/// `profile`, `agent_source`) or the machines its tasks may land on
+/// (`tags`, `tag`). `machine` is overwritten instead, and `flock` checked
+/// against the machine's own (`pin_dispatch`).
+const SHEPHERD_DISPATCH_REFUSED: &[&str] = &[
+    "agent_args",
+    "allow",
+    "deny",
+    "profile",
+    "agent_source",
+    "tags",
+    "tag",
+];
+
+/// A shepherd's job `dispatch` table, pinned to `machine`: `machine` set to
+/// it whatever was sent, and `Err` with the reason for a table that is not
+/// one, sets a key in `SHEPHERD_DISPATCH_REFUSED`, or names a `flock`
+/// `machine` is not in (as the head reports it, `machine_flocks`). A key set
+/// to null is left for the head, which reads it as unset.
+async fn pin_dispatch(
+    socket: &Path,
+    machine: &str,
+    dispatch: serde_json::Value,
+) -> anyhow::Result<Result<serde_json::Value, String>> {
+    let serde_json::Value::Object(mut table) = dispatch else {
+        return Ok(Err("a job's dispatch must be a table".into()));
+    };
+    let set = |v: &serde_json::Value| !v.is_null();
+    if let Some(key) = SHEPHERD_DISPATCH_REFUSED
+        .iter()
+        .find(|k| table.get(**k).is_some_and(set))
+    {
+        return Ok(Err(format!(
+            "the shepherd on {machine} may not set {key} in a job's dispatch"
+        )));
+    }
+    if let Some(flock) = table.get("flock").filter(|v| set(v)) {
+        let flocks = machine_flocks(socket, machine).await?.unwrap_or_default();
+        if !flock
+            .as_str()
+            .is_some_and(|f| flocks.iter().any(|m| m == f))
+        {
+            return Ok(Err(format!(
+                "the shepherd on {machine} may not send a job to flock {flock}, which {machine} is not in"
+            )));
+        }
+    }
+    table.insert("machine".into(), machine.into());
+    Ok(Ok(serde_json::Value::Object(table)))
 }
 
 /// The machine an event record is about, for `EventsSince` filtering: a
@@ -498,6 +574,9 @@ mod tests {
                         serde_json::json!({"kind": "error", "data": {"code": "task_not_found", "message": "no"}})
                     }
                     "task_read" => serde_json::json!({"kind": "text", "data": "pane text"}),
+                    "task_report" if tasks[id as usize - 1]["machine"] != v["machine"] => {
+                        serde_json::json!({"kind": "error", "data": {"code": "not_on_machine", "message": "no"}})
+                    }
                     "task_done" => {
                         serde_json::json!({"kind": "task", "data": tasks[id as usize - 1]})
                     }
@@ -505,8 +584,12 @@ mod tests {
                         "events": [
                             event_json(1, "task.done", Some(tasks[0].clone()), None),
                             event_json(2, "task.done", Some(tasks[1].clone()), None),
+                            serde_json::json!({
+                                "seq": 3, "at": "2026-01-01T00:00:00Z", "type": "job.failed",
+                                "task": null, "job": "nightly", "machine": null,
+                            }),
                         ],
-                        "gap": false, "oldest": 1, "newest": 2,
+                        "gap": false, "oldest": 1, "newest": 3,
                     }}),
                     op => serde_json::json!({"kind": "text", "data": format!("did {op}")}),
                 };
@@ -950,5 +1033,148 @@ mod tests {
         assert!(!refused_shepherd(&resp), "{resp:?}");
         assert_eq!(head.last()["op"], "job_submit");
         assert_eq!(head.last()["job"], "nightly");
+    }
+
+    /// A shepherd's job runs on its own machine: whatever `machine` the
+    /// submitted `[dispatch]` names, the head sees the shepherd's own.
+    #[tokio::test]
+    async fn shepherd_job_submit_pinned_to_self() {
+        let head = fake_head();
+        let req = IpcRequest::JobSubmit {
+            job: "nightly".into(),
+            dispatch: serde_json::json!({"agent": "claude", "machine": "other"}),
+            prompt: "p".into(),
+            items: vec![],
+        };
+        let resp = head.ask_as_shepherd("pi-1", &req).await;
+        assert!(!refused_shepherd(&resp), "{resp:?}");
+        assert_eq!(head.last()["op"], "job_submit");
+        assert_eq!(head.last()["dispatch"]["machine"], "pi-1");
+        assert_eq!(head.last()["dispatch"]["agent"], "claude");
+        // No `machine` at all is pinned too.
+        let req = IpcRequest::JobSubmit {
+            job: "nightly".into(),
+            dispatch: serde_json::json!({}),
+            prompt: "p".into(),
+            items: vec![],
+        };
+        head.ask_as_shepherd("pi-2", &req).await;
+        assert_eq!(head.last()["dispatch"]["machine"], "pi-2");
+    }
+
+    /// A shepherd may not choose its job's agent arguments, permissions,
+    /// tags or another flock: each is refused before the head sees it.
+    #[tokio::test]
+    async fn shepherd_job_submit_refuses_agent_args() {
+        let head = fake_head();
+        for dispatch in [
+            serde_json::json!({"agent_args": ["--dangerously-skip-permissions"]}),
+            serde_json::json!({"agent_args": []}),
+            serde_json::json!({"allow": ["Bash(*)"]}),
+            serde_json::json!({"deny": ["Read"]}),
+            serde_json::json!({"profile": "yolo"}),
+            serde_json::json!({"agent_source": {"agent": "x"}}),
+            serde_json::json!({"tags": ["gpu"]}),
+            serde_json::json!({"tag": "gpu"}),
+            serde_json::json!({"flock": "work"}),
+            serde_json::json!("not a table"),
+        ] {
+            let req = IpcRequest::JobSubmit {
+                job: "nightly".into(),
+                dispatch: dispatch.clone(),
+                prompt: "p".into(),
+                items: vec![],
+            };
+            let resp = head.ask_as_shepherd("pi-1", &req).await;
+            assert!(refused_shepherd(&resp), "{dispatch}: {resp:?}");
+        }
+        assert!(
+            !head.ops().contains(&"job_submit".to_string()),
+            "{:?}",
+            head.ops()
+        );
+        // Its own flock is fine.
+        let req = IpcRequest::JobSubmit {
+            job: "nightly".into(),
+            dispatch: serde_json::json!({"flock": "home"}),
+            prompt: "p".into(),
+            items: vec![],
+        };
+        let resp = head.ask_as_shepherd("pi-1", &req).await;
+        assert!(!refused_shepherd(&resp), "{resp:?}");
+        assert_eq!(head.last()["dispatch"]["flock"], "home");
+        assert_eq!(head.last()["dispatch"]["machine"], "pi-1");
+    }
+
+    /// `TaskReport` and `PullTrust` act for the shepherd's own machine,
+    /// whatever `machine` the line names.
+    #[tokio::test]
+    async fn shepherd_report_and_trust_machine_overwritten() {
+        let head = fake_head();
+        head.ask_as_shepherd(
+            "pi-1",
+            &IpcRequest::TaskReport {
+                machine: "other".into(),
+                id: 1,
+                state: crate::task::TaskState::Running,
+                pane: None,
+                detail: None,
+                limit: None,
+                trusted: None,
+            },
+        )
+        .await;
+        assert_eq!(head.last()["op"], "task_report");
+        assert_eq!(head.last()["machine"], "pi-1");
+        head.ask_as_shepherd(
+            "pi-1",
+            &IpcRequest::PullTrust {
+                machine: "other".into(),
+            },
+        )
+        .await;
+        assert_eq!(head.last()["op"], "pull_trust");
+        assert_eq!(head.last()["machine"], "pi-1");
+    }
+
+    /// A report on another machine's task, even one that names that
+    /// machine, reaches the head as the shepherd's own and is refused.
+    #[tokio::test]
+    async fn shepherd_report_on_another_machines_task_is_not_on_machine() {
+        let head = fake_head();
+        let resp = head
+            .ask_as_shepherd(
+                "pi-1",
+                &IpcRequest::TaskReport {
+                    machine: "pi-2".into(),
+                    id: 2,
+                    state: crate::task::TaskState::Done,
+                    pane: None,
+                    detail: None,
+                    limit: None,
+                    trusted: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(&resp, IpcResponse::Error { code, .. } if code == "not_on_machine"),
+            "{resp:?}"
+        );
+    }
+
+    /// A job event names no machine, so no shepherd reads it.
+    #[tokio::test]
+    async fn shepherd_events_drop_a_job_event() {
+        let head = fake_head();
+        let req = IpcRequest::EventsSince {
+            after: 0,
+            limit: 50,
+            task: None,
+        };
+        let IpcResponse::Events(page) = head.ask_as_shepherd("pi-1", &req).await else {
+            panic!()
+        };
+        assert!(page.events.iter().all(|e| e.job.is_none()), "{page:?}");
+        assert_eq!(page.events.len(), 1);
     }
 }

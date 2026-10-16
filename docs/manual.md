@@ -3834,8 +3834,15 @@ runs `<this pastor> bridge --shepherd --machine pi-1`, marked
 claiming and reporting `pi-1`'s tasks, reading its saved trust, job submits
 and the events about `pi-1`. It sets the machine of a claim, a report or a
 trust read to `pi-1` whatever the request said, and answers anything else
-`not_allowed_for_shepherd`. Each claim carries the shepherd's herdr and
-pastor versions, which the head keeps for that machine.
+`not_allowed_for_shepherd`. A job submit's `[dispatch]` gets `machine =
+"pi-1"` the same way, so a shepherd's jobs run only on its own machine; one
+that sets `agent_args`, `allow`, `deny`, `profile` or `tags`, or names a
+`flock` `pi-1` is not in, is refused `not_allowed_for_shepherd`, since those
+pick the agent's arguments and permissions or other machines. Each claim
+carries the shepherd's herdr version (as its herdr answers ping) and pastor
+version, which the head keeps for that machine; a version longer than 64
+characters or with anything but letters, digits, `.`, `+` and `-` is
+dropped.
 
 ### Moving the head
 

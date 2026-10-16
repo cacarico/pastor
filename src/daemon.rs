@@ -2389,6 +2389,8 @@ impl Fleet {
             s.channel = crate::machine::ChannelState::Connected;
             s.error = None;
         }
+        let herdr_version = safe_version(herdr_version);
+        let pastor_version = safe_version(pastor_version);
         if (herdr_version.is_some() || pastor_version.is_some())
             && let Err(err) = self
                 .store
@@ -5101,6 +5103,25 @@ pub async fn serve(paths: Paths) -> anyhow::Result<()> {
     daemon.run_with_listener(listener).await
 }
 
+/// The longest version string a pull machine may report.
+const MAX_VERSION_LEN: usize = 64;
+
+/// A version a pull machine reported, if it is safe to keep and print later:
+/// at most `MAX_VERSION_LEN` characters of `[0-9A-Za-z.+-]`. Anything else
+/// (an escape sequence, a newline) is dropped with a warning, as if the
+/// machine had reported none.
+fn safe_version(v: Option<&str>) -> Option<&str> {
+    let v = v?;
+    let ok = !v.is_empty()
+        && v.len() <= MAX_VERSION_LEN
+        && v.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-'));
+    if !ok {
+        tracing::warn!(version = ?v, "drop a pull machine's reported version");
+    }
+    ok.then_some(v)
+}
+
 #[cfg(all(test, feature = "fake-herdr"))]
 mod tests {
     use super::*;
@@ -5897,6 +5918,45 @@ mod tests {
         let state = d.store().machine_state("laptop").unwrap().unwrap();
         assert_eq!(state.herdr_version.as_deref(), Some("0.9.5"), "kept");
         assert_eq!(state.pastor_version.as_deref(), Some("1.2.4"), "updated");
+    }
+
+    /// A reported version that is too long or holds anything past
+    /// `[0-9A-Za-z.+-]` (an escape sequence a later `machine show` would
+    /// print) is dropped, not stored; the other version still is.
+    #[tokio::test]
+    async fn claim_versions_unsafe_dropped() {
+        let (d, _tmp) = pull_daemon(1).await;
+        d.store()
+            .put_machine_state(&crate::store::MachineState {
+                machine: "laptop".into(),
+                bootstrap: crate::store::BootstrapState::Ok,
+                mode: None,
+                isolation: None,
+                failed_step: None,
+                why: None,
+                host_key: None,
+                herdr_version: None,
+                pastor_version: None,
+                updated_at: "2026-10-16T10:00:00+00:00".into(),
+            })
+            .unwrap();
+        for bad in ["0.9.5\u{1b}[2J", &"1".repeat(65), "", "1 2"] {
+            d.handle(IpcRequest::TaskClaim {
+                machine: "laptop".into(),
+                free_slots: 1,
+                flock_work: false,
+                herdr_version: Some(bad.to_string()),
+                pastor_version: Some("1.2.3+g4f5-dirty".into()),
+            })
+            .await;
+            let state = d.store().machine_state("laptop").unwrap().unwrap();
+            assert_eq!(state.herdr_version, None, "{bad:?}");
+            assert_eq!(state.pastor_version.as_deref(), Some("1.2.3+g4f5-dirty"));
+        }
+        assert_eq!(
+            safe_version(Some(&"1".repeat(64))),
+            Some("1".repeat(64).as_str())
+        );
     }
 
     /// Reading, typing into or removing the worktree of a pull machine's
