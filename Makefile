@@ -1,7 +1,7 @@
 # Developer entry points. Every target maps to one cargo command so the
 # Makefile stays the single list of "what you can run here".
 
-.PHONY: help build release check changelog changelog-check fmt lint test test-machine test-ssh portability coverage coverage-check coverage-run leaks smoke smoke-profiles smoke-rc mutants mutants-diff install install-completions completions cli-reference demo site site-serve links clean
+.PHONY: help build release check changelog changelog-check fmt lint test test-machine test-ssh test-bootstrap portability coverage coverage-check coverage-run leaks smoke smoke-profiles smoke-rc mutants mutants-diff install install-completions completions cli-reference demo site site-serve links clean
 
 help: ## list targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{ printf "  %-14s %s\n", $$1, $$2 }'
@@ -46,6 +46,15 @@ test-machine: ## the machine actor tests on their own
 # see tests/real_ssh.rs. Needs OpenSSH's server (sshd) and ssh-keygen.
 test-ssh: ## the CLI against a head over a real ssh, through a throwaway sshd
 	cargo test --features fake-herdr --test real_ssh -- --ignored
+
+# Builds debian, fedora and arch containers with systemd and sshd and runs
+# push and pull bootstrap against them for real; see tests/bootstrap_e2e.rs.
+# Needs docker (able to run --privileged) and a herdr binary on PATH (or
+# PASTOR_TEST_HERDR_BIN); each test checks for both and skips cleanly
+# without them.
+test-bootstrap: ## end-to-end push and pull bootstrap in debian, fedora and arch containers
+	cargo build --release
+	cargo test --features fake-herdr --test bootstrap_e2e -- --ignored --test-threads 1
 
 # The release builds are static musl binaries and FreeBSD builds from source,
 # so code that only compiles against glibc on x86_64 has to fail before the
