@@ -91,14 +91,38 @@ pub trait Fetch: Sync {
 
 pub struct CurlFetch;
 
+/// The longest one download may take, in seconds. A shepherd's fetch waits
+/// on the head's download, so a server that trickles bytes must not hold it
+/// (and the single-flight lock behind it) forever; a release binary over a
+/// slow link is well inside ten minutes.
+const CURL_MAX_TIME: &str = "600";
+/// Seconds to wait for the connection itself: a host that never answers is
+/// given up on early, not after `CURL_MAX_TIME`.
+const CURL_CONNECT_TIMEOUT: &str = "20";
+/// The largest file curl will write. pastor and herdr are a few tens of MB;
+/// the cap keeps a wrong or hostile URL from filling the head's disk before
+/// the sum check can refuse it.
+const CURL_MAX_FILESIZE: &str = "512M";
+
 /// curl's argv for one download. `--proto =https` also bars a redirect to
 /// anything else. The URL goes last and behind `--url`, so one that starts
 /// with `-` is never read as an option.
 fn curl_args(url: &str, to: &Path) -> Vec<std::ffi::OsString> {
-    let mut args: Vec<std::ffi::OsString> = ["-fsSL", "--proto", "=https", "-o"]
-        .into_iter()
-        .map(Into::into)
-        .collect();
+    let mut args: Vec<std::ffi::OsString> = [
+        "-fsSL",
+        "--proto",
+        "=https",
+        "--max-time",
+        CURL_MAX_TIME,
+        "--connect-timeout",
+        CURL_CONNECT_TIMEOUT,
+        "--max-filesize",
+        CURL_MAX_FILESIZE,
+        "-o",
+    ]
+    .into_iter()
+    .map(Into::into)
+    .collect();
     args.push(to.into());
     args.push("--url".into());
     args.push(url.into());
@@ -177,8 +201,84 @@ pub async fn ensure(
     if let Some(sum) = cached_sum(&dest) {
         return Ok((dest, sum));
     }
+    // One download per artifact at a time: a second request waits here for
+    // the first, then finds the file cached instead of starting another curl.
+    let lock = artifact_lock(&dest);
+    let guard = lock.lock().await;
+    let res = ensure_locked(cfg, a, fetch, &dest).await;
+    drop(guard);
+    release_artifact_lock(&dest, lock);
+    res
+}
+
+type ArtifactLocks =
+    std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>>;
+
+/// The in-process locks of artifacts being fetched, by cache path.
+fn artifact_locks() -> &'static ArtifactLocks {
+    static LOCKS: std::sync::OnceLock<ArtifactLocks> = std::sync::OnceLock::new();
+    LOCKS.get_or_init(Default::default)
+}
+
+fn artifact_lock(dest: &Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    let mut locks = artifact_locks().lock().unwrap_or_else(|e| e.into_inner());
+    locks.entry(dest.to_path_buf()).or_default().clone()
+}
+
+/// Drops `dest`'s lock from the map once no one else holds or waits on it,
+/// so made-up versions a shepherd asks for do not pile up entries.
+fn release_artifact_lock(dest: &Path, lock: std::sync::Arc<tokio::sync::Mutex<()>>) {
+    let mut locks = artifact_locks().lock().unwrap_or_else(|e| e.into_inner());
+    drop(lock);
+    if locks
+        .get(dest)
+        .is_some_and(|l| std::sync::Arc::strong_count(l) == 1)
+    {
+        locks.remove(dest);
+    }
+}
+
+/// `ensure` under the artifact's lock.
+async fn ensure_locked(
+    cfg: &ProvisionConfig,
+    a: &Artifact,
+    fetch: &dyn Fetch,
+    dest: &Path,
+) -> anyhow::Result<(PathBuf, String)> {
+    // The request before this one may have just cached it.
+    if let Some(sum) = cached_sum(dest) {
+        return Ok((dest.to_path_buf(), sum));
+    }
     let dir = dest.parent().context("cache path has no parent")?;
+    // The dirs this call makes, deepest first, so a failure removes them
+    // again: a made-up version leaves no `<version>/<target>` behind.
+    let made: Vec<PathBuf> = dir
+        .ancestors()
+        .take_while(|d| !d.exists())
+        .map(Path::to_path_buf)
+        .collect();
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let res = fill(cfg, a, fetch, dir, dest).await;
+    if res.is_err() {
+        // `remove_dir` only removes an empty dir, so one another artifact
+        // has since put a file under stays.
+        for d in &made {
+            if std::fs::remove_dir(d).is_err() {
+                break;
+            }
+        }
+    }
+    Ok((dest.to_path_buf(), res?))
+}
+
+/// Downloads `a` beside `dest` in `dir`, checks it and places it.
+async fn fill(
+    cfg: &ProvisionConfig,
+    a: &Artifact,
+    fetch: &dyn Fetch,
+    dir: &Path,
+    dest: &Path,
+) -> anyhow::Result<String> {
     // Work beside the destination so the final rename stays on one
     // filesystem; a failed run leaves nothing but this dir, removed below.
     // Each call gets its own, so two fetches of one artifact never share it.
@@ -187,14 +287,14 @@ pub async fn ensure(
     let res = download(cfg, a, fetch, &work).await;
     let res = res.and_then(|(file, sum)| {
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755))?;
-        std::fs::rename(&file, &dest).with_context(|| format!("place {}", dest.display()))?;
+        std::fs::rename(&file, dest).with_context(|| format!("place {}", dest.display()))?;
         // The sum goes last: a crash before it leaves a file that does not
         // count as cached.
-        std::fs::write(sha_file(&dest), format!("{sum}\n"))?;
+        std::fs::write(sha_file(dest), format!("{sum}\n"))?;
         Ok(sum)
     });
     let _ = std::fs::remove_dir_all(&work);
-    Ok((dest, res?))
+    res
 }
 
 /// A work dir name no other `ensure` uses at the same time: pid, a counter
@@ -476,6 +576,71 @@ mod tests {
         assert_eq!(left, ["herdr", "herdr.sha256"], "no work dir left");
     }
 
+    /// Two requests for one artifact at once download it once: the second
+    /// waits for the first and finds it cached.
+    #[test]
+    fn concurrent_ensure_downloads_once() {
+        let rig = herdr_rig(b"herdr-binary", &sha(b"herdr-binary"));
+        let fetch = SlowFetch(rig.fetch);
+        let a = Artifact::new("herdr", "0.9.5", "linux-aarch64").unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|s| {
+            let run = || {
+                barrier.wait();
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(ensure(&rig.paths, &rig.cfg, &a, &fetch))
+                    .unwrap()
+            };
+            let h = [s.spawn(run), s.spawn(run)];
+            for h in h {
+                h.join().unwrap();
+            }
+        });
+        // One run fetches the index and the asset.
+        let calls = fetch.0.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+    }
+
+    /// A version the index does not know leaves no `<ver>/<target>` dir
+    /// behind, nor the `<name>` one when `ensure` made it.
+    #[tokio::test]
+    async fn a_made_up_version_leaves_no_dir() {
+        let rig = herdr_rig(b"herdr-binary", &sha(b"herdr-binary"));
+        let a = Artifact::new("herdr", "7.7.7", "linux-aarch64").unwrap();
+        ensure(&rig.paths, &rig.cfg, &a, &rig.fetch)
+            .await
+            .unwrap_err();
+        let cache = rig.paths.state_dir.join("artifacts");
+        assert!(!cache.join("herdr/7.7.7").exists());
+        assert!(!cache.join("herdr").exists());
+
+        // A dir that was already there, or holds another artifact, stays.
+        let ok = Artifact::new("herdr", "0.9.5", "linux-aarch64").unwrap();
+        ensure(&rig.paths, &rig.cfg, &ok, &rig.fetch).await.unwrap();
+        ensure(&rig.paths, &rig.cfg, &a, &rig.fetch)
+            .await
+            .unwrap_err();
+        assert!(!cache.join("herdr/7.7.7").exists());
+        assert!(cache_path(&rig.paths, &ok).exists());
+    }
+
+    #[test]
+    fn curl_args_bound_time_and_size() {
+        let args = curl_args("https://x", Path::new("/w/out"));
+        let args: Vec<_> = args.iter().map(|a| a.to_str().unwrap()).collect();
+        for pair in [
+            ["--max-time", "600"],
+            ["--connect-timeout", "20"],
+            ["--max-filesize", "512M"],
+        ] {
+            assert!(args.windows(2).any(|w| w == pair), "{pair:?} in {args:?}");
+        }
+        assert_eq!(&args[args.len() - 2..], ["--url", "https://x"]);
+    }
+
     #[tokio::test]
     async fn herdr_rejects_non_https_asset() {
         for url in ["-o/tmp/x", "http://herdr.example/herdr", "file:///bin/sh"] {
@@ -504,6 +669,12 @@ mod tests {
                 "-fsSL",
                 "--proto",
                 "=https",
+                "--max-time",
+                "600",
+                "--connect-timeout",
+                "20",
+                "--max-filesize",
+                "512M",
                 "-o",
                 "/w/out",
                 "--url",

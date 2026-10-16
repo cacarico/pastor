@@ -3881,8 +3881,21 @@ file, filling the cache first when it is not there, and streams the file
 raw to stdout; only its path, sha256 and size cross the head's socket. The
 bridge refuses a path that does not resolve inside the cache
 (`invalid_artifact`) and checks the file's size and sha256 against the
-head's answer before it writes a byte (`artifact_checksum_mismatch`). A
-failure goes to stderr as JSON, since stdout is the binary. Each claim
+head's answer before it writes a byte (`artifact_checksum_mismatch`), and
+a stream that ends short of that size exits non-zero. A failure goes to
+stderr as JSON, since stdout is the binary. The machine key's forced
+command is the line without `--fetch`, so on the pull machine `ssh <head>
+pastor bridge --fetch herdr 0.9.5 linux-x86_64` arrives as
+`SSH_ORIGINAL_COMMAND`: split on whitespace, never run through a shell,
+exactly `[pastor] bridge --fetch NAME VERSION TARGET` (or `[pastor]
+bridge`, the line bridge itself), optionally wrapped in `sh -c '...'` as
+pastor's own ssh sends it, is run; anything else is refused
+`not_allowed_for_shepherd`. The head downloads one artifact once at a
+time (a second request waits for the first), each download bounded to 10
+minutes and 512 MB, and a download that fails leaves no empty
+`<version>/<target>` dir behind. A bootstrap report from a shepherd is
+cut to 64 steps and 64 missing entries, each text to 256 characters with
+its control characters dropped, before it is kept or printed. Each claim
 carries the shepherd's herdr version (as its herdr answers ping) and pastor
 version, which the head keeps for that machine; a version longer than 64
 characters or with anything but letters, digits, `.`, `+` and `-` is

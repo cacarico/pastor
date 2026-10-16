@@ -19,6 +19,7 @@ use std::path::Path;
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::artifacts::Artifact;
 use crate::cli::{CliError, request_error};
 use crate::ipc::{
     IpcRequest, IpcResponse, RequestError, connect_error_means_no_daemon, parse_request_line,
@@ -376,7 +377,7 @@ pub async fn fetch(
     name: &str,
     version: &str,
     target: &str,
-    mut output: impl AsyncWrite + Unpin,
+    output: impl AsyncWrite + Unpin,
 ) -> anyhow::Result<()> {
     let req = IpcRequest::ArtifactLocate {
         name: name.into(),
@@ -399,20 +400,90 @@ pub async fn fetch(
     let file =
         tokio::task::spawn_blocking(move || checked_file(&cache, &path, &sha256, size, &what))
             .await??;
+    stream_exact(file, size, output).await
+}
+
+/// Writes exactly `size` bytes of `file` to `output`; a file that ends
+/// sooner (cut short after it was hashed) is `artifact_checksum_mismatch`,
+/// so the fetch exits non-zero instead of passing a short binary for the
+/// whole one.
+async fn stream_exact(
+    file: impl std::io::Read,
+    size: u64,
+    mut output: impl AsyncWrite + Unpin,
+) -> anyhow::Result<()> {
     // Plain std reads, a chunk at a time: tokio's `fs` is not built in, and
     // this process serves only this one stream, so a short blocking read
     // holds up nothing else.
     let mut file = std::io::Read::take(file, size);
     let mut buf = vec![0u8; 64 * 1024];
+    let mut written = 0u64;
     loop {
         let n = std::io::Read::read(&mut file, &mut buf)?;
         if n == 0 {
             break;
         }
         output.write_all(&buf[..n]).await?;
+        written += n as u64;
     }
     output.flush().await?;
+    if written != size {
+        return Err(CliError::err(
+            "artifact_checksum_mismatch",
+            format!("the head said {size} bytes, only {written} were sent"),
+        ));
+    }
     Ok(())
+}
+
+/// Opens `path` for reading, refusing a symlink in its last component: the
+/// path was resolved first, so one swapped in since is never followed.
+fn open_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+/// What a pull machine's key runs. Its forced command is the fixed `bridge
+/// --shepherd --machine X`, so whatever the shepherd asked for arrives in
+/// `SSH_ORIGINAL_COMMAND` (`original`), split on whitespace and never run
+/// through a shell. `Ok(None)` is the line bridge: `original` unset or
+/// blank, or `bridge` alone. `Ok(Some)` is a fetch: exactly `bridge --fetch
+/// NAME VERSION TARGET`, each part checked by `Artifact::new`. Either may
+/// start with the pastor program (`pastor`, or a path ending `/pastor`) and
+/// come wrapped as `sh -c '...'`, which is how the shepherd's own ssh sends
+/// them (`ssh::Ssh::args`, `posix_command`); the program is never run, the
+/// forced command picks it. Anything else is `Err` with the reason.
+pub fn forced_fetch(original: Option<&str>) -> Result<Option<Artifact>, String> {
+    let Some(original) = original.map(str::trim).filter(|o| !o.is_empty()) else {
+        return Ok(None);
+    };
+    let inner = original
+        .strip_prefix("sh -c '")
+        .and_then(|rest| rest.strip_suffix('\''))
+        .filter(|inner| !inner.contains('\''))
+        .unwrap_or(original);
+    let words: Vec<&str> = inner.split_whitespace().collect();
+    let is_pastor = |w: &str| {
+        (w == "pastor" || w.ends_with("/pastor"))
+            && w.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/' | b'~'))
+    };
+    let words = match words.as_slice() {
+        [first, rest @ ..] if is_pastor(first) => rest,
+        all => all,
+    };
+    match words {
+        ["bridge"] => Ok(None),
+        ["bridge", "--fetch", name, version, target] => Artifact::new(name, version, target)
+            .map(Some)
+            .map_err(|e| e.to_string()),
+        _ => Err(format!(
+            "a shepherd's key runs only the bridge or `bridge --fetch NAME VERSION TARGET`, not {original:?}"
+        )),
+    }
 }
 
 /// The file at `path`, opened and rewound, once it is known to resolve under
@@ -440,8 +511,7 @@ fn checked_file(
             cache.display()
         )));
     }
-    let mut file =
-        std::fs::File::open(&real).map_err(|e| invalid(format!("{}: {e}", real.display())))?;
+    let mut file = open_nofollow(&real).map_err(|e| invalid(format!("{}: {e}", real.display())))?;
     let mismatch =
         |why: String| CliError::err("artifact_checksum_mismatch", format!("{what}: {why}"));
     let mut hasher = Sha256::new();
@@ -1509,6 +1579,79 @@ mod tests {
             let err = err.downcast::<CliError>().unwrap();
             assert_eq!(err.code, "invalid_artifact", "{path:?}: {}", err.message);
             assert!(out.is_empty(), "{path:?}");
+        }
+    }
+
+    /// A stream that ends before `size` bytes is an error, so a file cut
+    /// short after it was hashed never passes for the whole artifact.
+    #[tokio::test]
+    async fn a_short_stream_is_an_error() {
+        let mut out = Vec::new();
+        let err = stream_exact(&b"abc"[..], 10, &mut out).await.unwrap_err();
+        let err = err.downcast::<CliError>().unwrap();
+        assert_eq!(err.code, "artifact_checksum_mismatch", "{}", err.message);
+        let mut out = Vec::new();
+        stream_exact(&b"abcdef"[..], 3, &mut out).await.unwrap();
+        assert_eq!(out, b"abc");
+    }
+
+    /// The cached file is opened without following a symlink, so one
+    /// swapped in after the path was resolved is refused.
+    #[test]
+    fn the_cached_file_is_opened_without_following_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("real"), b"x").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("link")).unwrap();
+        assert!(open_nofollow(&dir.path().join("real")).is_ok());
+        assert!(open_nofollow(&dir.path().join("link")).is_err());
+    }
+
+    /// SSH_ORIGINAL_COMMAND under the shepherd's forced command: unset or
+    /// blank runs the line bridge, exactly `[pastor] bridge --fetch NAME
+    /// VERSION TARGET` a fetch, and anything else is refused.
+    #[test]
+    fn forced_fetch_parses_only_the_fetch_line() {
+        assert_eq!(forced_fetch(None), Ok(None));
+        assert_eq!(forced_fetch(Some(" \t")), Ok(None));
+        let want = Some(Artifact::new("herdr", "0.9.5", "linux-x86_64").unwrap());
+        assert_eq!(
+            forced_fetch(Some("bridge --fetch herdr 0.9.5 linux-x86_64")),
+            Ok(want.clone())
+        );
+        assert_eq!(
+            forced_fetch(Some("pastor bridge --fetch herdr 0.9.5 linux-x86_64")),
+            Ok(want.clone())
+        );
+        assert_eq!(
+            forced_fetch(Some(
+                "sh -c '/opt/bin/pastor bridge --fetch herdr 0.9.5 linux-x86_64'"
+            )),
+            Ok(want)
+        );
+        // The shepherd's own line bridge, as its ssh sends it.
+        for line in [
+            "bridge",
+            "pastor bridge",
+            "sh -c 'pastor bridge'",
+            "sh -c '~/.cargo/bin/pastor bridge'",
+        ] {
+            assert_eq!(forced_fetch(Some(line)), Ok(None), "{line}");
+        }
+        for bad in [
+            "bridge --fetch herdr 0.9.5 linux-x86_64 x",
+            "bridge --fetch herdr 0.9.5",
+            "bridge --agent --machine pi-1",
+            "bridge --machine pi-2 --fetch herdr 0.9.5",
+            "bridge --fetch herdr .. linux-x86_64",
+            "bridge --fetch herdr 0.9.5 x;id",
+            "sh -c 'pastor bridge;id'",
+            "sh -c 'pastor bridge' ; id",
+            "sh -c 'pastor bridge' 'x'",
+            "pastor pastor bridge",
+            "/bin/sh bridge",
+            "tick",
+        ] {
+            assert!(forced_fetch(Some(bad)).is_err(), "{bad}");
         }
     }
 }

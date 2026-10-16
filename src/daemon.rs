@@ -2529,6 +2529,12 @@ impl Fleet {
     /// The table has no column for a step's `fix`, so a failure folds it
     /// into `why` as `"<why>; fix: <fix>"`, which `describe::bootstrap_line`
     /// prints back whole.
+    ///
+    /// A shepherd sends this through its bridge, which pins `machine` to
+    /// its own; so a shepherd may mark its own machine bootstrapped, and
+    /// only that one, which is accepted. What it reports is untrusted text
+    /// that `machine describe` and the events print, so it is cut to size
+    /// and stripped of control characters first (`sanitise_outcome`).
     pub fn report_bootstrap(
         &self,
         machine: &str,
@@ -2542,6 +2548,7 @@ impl Fleet {
                 format!("no machine {machine} in the flock"),
             ));
         }
+        let outcome = sanitise_outcome(outcome);
         let crate::bootstrap::Outcome {
             ok,
             mode,
@@ -2566,7 +2573,11 @@ impl Fleet {
             Some(fix) => format!("{}; fix: {fix}", s.why.as_deref().unwrap_or("")),
             None => s.why.clone().unwrap_or_default(),
         });
-        let missing: Vec<String> = steps.into_iter().flat_map(|s| s.missing).collect();
+        let missing: Vec<String> = steps
+            .into_iter()
+            .flat_map(|s| s.missing)
+            .take(MAX_REPORT_ITEMS)
+            .collect();
         let state = MachineState {
             machine: machine.to_string(),
             bootstrap: if ok {
@@ -5429,6 +5440,50 @@ fn run_failure(out: std::io::Result<crate::setup::CmdOutput>) -> String {
 /// The longest version string a pull machine may report.
 const MAX_VERSION_LEN: usize = 64;
 
+/// The most characters kept of each text a bootstrap report carries: a
+/// step's name, why and fix, and each missing entry.
+const MAX_REPORT_TEXT: usize = 256;
+
+/// The most steps, and missing entries, kept of a bootstrap report.
+const MAX_REPORT_ITEMS: usize = 64;
+
+/// `s` with its control characters dropped (printable text and plain
+/// spaces stay, so a tab or a newline goes too) and cut to
+/// `MAX_REPORT_TEXT` characters.
+fn report_text(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_REPORT_TEXT)
+        .collect()
+}
+
+/// A bootstrap report as the head keeps it: at most `MAX_REPORT_ITEMS`
+/// steps (the first failed one kept, as the last, when it lies past them),
+/// at most `MAX_REPORT_ITEMS` missing entries per step, each text through
+/// `report_text`, and versions through `safe_version`.
+fn sanitise_outcome(mut o: crate::bootstrap::Outcome) -> crate::bootstrap::Outcome {
+    use crate::bootstrap::StepStatus;
+    let failed = o.steps.iter().position(|s| s.status == StepStatus::Failed);
+    if o.steps.len() > MAX_REPORT_ITEMS {
+        if let Some(i) = failed.filter(|i| *i >= MAX_REPORT_ITEMS) {
+            o.steps.swap(i, MAX_REPORT_ITEMS - 1);
+        }
+        o.steps.truncate(MAX_REPORT_ITEMS);
+    }
+    for step in &mut o.steps {
+        step.step = report_text(&step.step);
+        step.why = step.why.as_deref().map(report_text);
+        step.fix = step.fix.as_deref().map(report_text);
+        step.missing.truncate(MAX_REPORT_ITEMS);
+        for m in &mut step.missing {
+            *m = report_text(m);
+        }
+    }
+    o.herdr_version = safe_version(o.herdr_version.as_deref()).map(str::to_string);
+    o.pastor_version = safe_version(o.pastor_version.as_deref()).map(str::to_string);
+    o
+}
+
 /// A version a pull machine reported, if it is safe to keep and print later:
 /// at most `MAX_VERSION_LEN` characters of `[0-9A-Za-z.+-]`. Anything else
 /// (an escape sequence, a newline) is dropped with a warning, as if the
@@ -7197,6 +7252,88 @@ mod tests {
             matches!(&resp, IpcResponse::Error { code, .. } if code == "invalid_artifact"),
             "{resp:?}"
         );
+    }
+
+    /// A shepherd's report is cut to size and stripped of control
+    /// characters before it is stored or emitted; versions that are not
+    /// safe are dropped.
+    #[tokio::test]
+    async fn a_bootstrap_report_is_sanitised() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        let mut events = d.subscribe();
+        let long = "x".repeat(1000);
+        let mut steps: Vec<crate::bootstrap::StepResult> = (0..100)
+            .map(|i| crate::bootstrap::StepResult {
+                step: format!("s{i}"),
+                ..crate::bootstrap::StepResult::done()
+                    .with_missing((0..100).map(|j| format!("p{j}\u{1b}[31m")).collect())
+            })
+            .collect();
+        steps.insert(
+            0,
+            crate::bootstrap::StepResult {
+                step: format!("bad\u{1b}]0;title\u{7}\n{long}"),
+                ..crate::bootstrap::StepResult::failed(
+                    format!("why\r\n{long}"),
+                    format!("fix\t{long}"),
+                )
+            },
+        );
+        let mut outcome = failed_outcome();
+        outcome.steps = steps;
+        outcome.herdr_version = Some("0.9.5\u{1b}[2J".into());
+        outcome.pastor_version = Some("1".repeat(65));
+        let resp = d
+            .handle(IpcRequest::BootstrapReport {
+                machine: "a".into(),
+                result: outcome,
+            })
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        let state = d.store.machine_state("a").unwrap().unwrap();
+        let step = state.failed_step.unwrap();
+        assert!(step.chars().count() <= 256, "{}", step.len());
+        assert!(!step.chars().any(char::is_control), "{step:?}");
+        assert!(step.starts_with("bad]0;title"), "{step:?}");
+        let why = state.why.unwrap();
+        assert!(!why.chars().any(char::is_control), "{why:?}");
+        // `why` and `fix` are each capped before they are joined.
+        assert!(why.chars().count() <= 256 * 2 + 16, "{}", why.len());
+        assert_eq!(state.herdr_version, None);
+        assert_eq!(state.pastor_version, None);
+        let ev = events.try_recv().expect("machine.bootstrap_failed emitted");
+        let detail = ev.detail.expect("detail");
+        assert_eq!(detail["step"].as_str(), Some(step.as_str()));
+        assert_eq!(detail["why"].as_str(), Some(why.as_str()));
+    }
+
+    /// A report with more steps and missing entries than the caps keeps
+    /// only the first of each.
+    #[tokio::test]
+    async fn a_bootstrap_report_keeps_at_most_64_steps_and_missing() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        let mut events = d.subscribe();
+        let mut outcome = failed_outcome();
+        outcome.ok = true;
+        outcome.steps = (0..100)
+            .map(|i| crate::bootstrap::StepResult {
+                step: format!("s{i}"),
+                ..crate::bootstrap::StepResult::done()
+                    .with_missing((0..100).map(|j| format!("p{i}-{j}\u{7}")).collect())
+            })
+            .collect();
+        let resp = d
+            .handle(IpcRequest::BootstrapReport {
+                machine: "a".into(),
+                result: outcome,
+            })
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        let ev = events.try_recv().expect("machine.bootstrapped emitted");
+        assert_eq!(ev.kind, "machine.bootstrapped");
+        let missing = ev.detail.unwrap()["missing"].as_array().unwrap().clone();
+        assert_eq!(missing.len(), 64, "{missing:?}");
+        assert_eq!(missing[0], "p0-0");
     }
 
     #[tokio::test]
