@@ -496,3 +496,75 @@ fn two_redeems_racing_add_one_machine() {
     assert_eq!(added, 1);
     assert!(!has_join_line(&h.keys_text(), &id));
 }
+
+/// `install.sh join …` installs pastor, then runs its `join` with the rest
+/// of the arguments exactly as given: a space stays inside its argument,
+/// and nothing is evaluated by the shell on the way.
+#[test]
+fn install_sh_join_passes_its_args_through() {
+    use std::os::unix::fs::PermissionsExt;
+    if !cfg!(target_os = "linux") || std::env::consts::ARCH != "x86_64" {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let name = "pastor-1.0.0-x86_64-unknown-linux-musl";
+    std::fs::create_dir_all(release.join(name)).unwrap();
+    let fake = release.join(name).join("pastor");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'pastor 1.0.0'; exit 0; fi\nfor a in \"$@\"; do printf '[%s]\\n' \"$a\"; done\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let tarball = format!("{name}.tar.gz");
+    let ok = std::process::Command::new("tar")
+        .arg("-czf")
+        .arg(release.join(&tarball))
+        .arg("-C")
+        .arg(&release)
+        .arg(name)
+        .status()
+        .unwrap();
+    assert!(ok.success());
+    let sums = std::process::Command::new("sha256sum")
+        .arg(&tarball)
+        .current_dir(&release)
+        .output()
+        .unwrap();
+    std::fs::write(release.join("SHA256SUMS"), &sums.stdout).unwrap();
+
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh");
+    let out = std::process::Command::new("sh")
+        .arg(&script)
+        .args(["join", "--name", "a b", "$(touch pwned)", "--token-stdin"])
+        .current_dir(tmp.path())
+        .env("PASTOR_VERSION", "1.0.0")
+        .env(
+            "PASTOR_DOWNLOAD_URL",
+            format!("file://{}", release.display()),
+        )
+        .env("PASTOR_INSTALL_DIR", tmp.path().join("bin"))
+        // No gh login: the attestation check is not this test's.
+        .env("GH_CONFIG_DIR", tmp.path().join("gh"))
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let passed: Vec<&str> = stdout.lines().filter(|l| l.starts_with('[')).collect();
+    assert_eq!(
+        passed,
+        [
+            "[join]",
+            "[--name]",
+            "[a b]",
+            "[$(touch pwned)]",
+            "[--token-stdin]"
+        ],
+        "{stdout}"
+    );
+    assert!(!tmp.path().join("pwned").exists());
+    assert!(!stdout.contains("next:"), "{stdout}");
+}

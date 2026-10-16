@@ -4226,21 +4226,7 @@ impl Daemon {
             ));
         }
         if let Some(target) = ssh_target {
-            failed.extend(self.forget_host_key(target));
-            if let Some(control_path) = crate::ssh::fitting_control_path(&self.paths, name) {
-                let control_path = control_path.to_string_lossy().into_owned();
-                let args = ["-S", control_path.as_str(), "-O", "exit", "--", target];
-                match self.runner.run("ssh", &args) {
-                    Ok(out) if out.success => {}
-                    // No socket: no master to end (never connected, or gone).
-                    Ok(out) if out.stderr.contains("No such file or directory") => {}
-                    out => failed.push(format!(
-                        "could not end its ssh master: {}; run `ssh {}`",
-                        run_failure(out),
-                        args.join(" ")
-                    )),
-                }
-            }
+            failed.extend(self.forget_ssh(name, target));
         }
         if let Err(err) = self.store.drop_machine_state(name) {
             tracing::warn!(machine = %name, %err, "could not drop machine_state");
@@ -4367,6 +4353,28 @@ impl Daemon {
         ))
     }
 
+    /// Forget machine `name`'s host key at `target` and end its ssh
+    /// master, for a machine removed or taken over by a join. Returns what
+    /// failed.
+    fn forget_ssh(&self, name: &str, target: &str) -> Vec<String> {
+        let mut failed = self.forget_host_key(target);
+        if let Some(control_path) = crate::ssh::fitting_control_path(&self.paths, name) {
+            let control_path = control_path.to_string_lossy().into_owned();
+            let args = ["-S", control_path.as_str(), "-O", "exit", "--", target];
+            match self.runner.run("ssh", &args) {
+                Ok(out) if out.success => {}
+                // No socket: no master to end (never connected, or gone).
+                Ok(out) if out.stderr.contains("No such file or directory") => {}
+                out => failed.push(format!(
+                    "could not end its ssh master: {}; run `ssh {}`",
+                    run_failure(out),
+                    args.join(" ")
+                )),
+            }
+        }
+        failed
+    }
+
     /// `ssh-keygen -R` of `target`'s host key from pastor's known_hosts,
     /// under the host and port `ssh -G` resolves it to (an alias, a `Port`
     /// in the ssh config): known_hosts keys a host on another port than 22
@@ -4479,6 +4487,18 @@ impl Daemon {
         .await
     }
 
+    /// The herdr a machine that just joined fetches: `[provision] herdr`,
+    /// else the one most machines run, else pastor's default.
+    fn join_herdr_version(&self, config: &PastorConfig) -> String {
+        let fleet: Vec<String> = self
+            .fleet
+            .statuses()
+            .into_iter()
+            .filter_map(|s| s.herdr_version)
+            .collect();
+        crate::artifacts::herdr_version(&config.provision, &fleet)
+    }
+
     /// `join` with the pastor its lines run and the authorized_keys it
     /// edits as seams.
     #[allow(clippy::too_many_arguments)]
@@ -4534,7 +4554,7 @@ impl Daemon {
             ));
         }
         let store = &self.store;
-        let row = self
+        let (row, replaced_ssh) = self
             .fleet
             .edit_flock_file(&self.paths.flock_file(), |file| {
                 let edit = |e: EditError| CliError::err(e.code(), &e);
@@ -4551,11 +4571,12 @@ impl Daemon {
                     }
                 }
                 let mut doc = crate::config::flock::FlockDoc::open(file)?;
-                let exists = doc
+                let old = doc
                     .flock()
                     .map_err(anyhow::Error::msg)?
                     .get(name)
-                    .is_some();
+                    .map(|m| m.ssh.clone());
+                let exists = old.is_some();
                 if exists && row.replace.as_deref() != Some(name) {
                     return Err(CliError::err(
                         "machine_name_taken",
@@ -4579,7 +4600,9 @@ impl Daemon {
                 if let Err(err) = keys.remove(&Marker::Join(id.into())) {
                     // Nothing was added and the line is still there, so the
                     // token stays good.
-                    let _ = store.put_join_token(&row);
+                    if let Err(restore) = store.put_join_token(&row) {
+                        tracing::warn!(id, err = %format!("{restore:#}"), "could not mark the join token unused again; its line is still in authorized_keys, so `pastor join revoke {id}` removes it");
+                    }
                     return Err(CliError::err(
                         "join_failed",
                         format!(
@@ -4593,26 +4616,45 @@ impl Daemon {
                         "save flock.toml; nothing was added and join token {id} is spent: make a new one"
                     )));
                 }
-                Ok(row)
+                Ok((row, old.flatten()))
             })
             .await?;
         // The machine is in flock.toml and the token is spent: from here on
-        // a failure is reported, not undone.
-        keys.upsert(&as_machine, &machine_line)?;
-        keys.upsert(&as_agent, &agent_line)?;
-        self.store.put_machine_state(&crate::store::MachineState {
-            machine: name.into(),
-            bootstrap: crate::store::BootstrapState::Pending,
-            mode: None,
-            isolation: None,
-            failed_step: None,
-            why: None,
-            host_key: Some(host_key.into()),
-            herdr_version: None,
-            pastor_version: None,
-            service_user: None,
-            updated_at: now.to_rfc3339(),
-        })?;
+        // a failure is reported, not undone, with what to run.
+        let after_save = |what: &str, err: anyhow::Error| {
+            CliError::err(
+                "join_failed",
+                format!(
+                    "machine {name} is in flock.toml and join token {id} is spent, but writing {what} failed ({err:#}); make a new token with `pastor join create --replace {name}` and join the machine again with it"
+                ),
+            )
+        };
+        // The machine this join took over was reached over ssh: its host
+        // key and master must not vouch for whoever has its name now.
+        if let Some(target) = &replaced_ssh {
+            for why in self.forget_ssh(name, target) {
+                tracing::warn!(machine = name, "{why}");
+            }
+        }
+        keys.upsert(&as_machine, &machine_line)
+            .map_err(|e| after_save("its machine line to authorized_keys", e))?;
+        keys.upsert(&as_agent, &agent_line)
+            .map_err(|e| after_save("its agent line to authorized_keys", e))?;
+        self.store
+            .put_machine_state(&crate::store::MachineState {
+                machine: name.into(),
+                bootstrap: crate::store::BootstrapState::Pending,
+                mode: None,
+                isolation: None,
+                failed_step: None,
+                why: None,
+                host_key: Some(host_key.into()),
+                herdr_version: None,
+                pastor_version: None,
+                updated_at: now.to_rfc3339(),
+                service_user: None,
+            })
+            .map_err(|e| after_save("its bootstrap record to the store", e))?;
         tracing::info!(machine = name, id, "machine joined");
         let _ = self.events.send(PastorEvent {
             kind: "machine.joined".into(),
@@ -5139,7 +5181,13 @@ impl Daemon {
                 .join(&id, &name, &machine_key, &agent_key, &host_key)
                 .await
             {
-                Ok(()) => IpcResponse::Joined { name },
+                Ok(()) => {
+                    let config = PastorConfig::load(&self.paths.config_file()).unwrap_or_default();
+                    IpcResponse::Joined {
+                        name,
+                        herdr_version: Some(self.join_herdr_version(&config)),
+                    }
+                }
                 Err(err) => cli_error(err),
             },
             IpcRequest::LimitList => match self.store.limits() {
@@ -15694,12 +15742,108 @@ mod tests {
             fail: |m| matches!(m, Marker::Machine(_)),
         };
         let err = join_through(&d, faulty, id).await.unwrap_err();
-        assert!(format!("{err:#}").contains("No space left"), "{err:#}");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("No space left"), "{msg}");
+        // Past the save nothing is undone, so the message says where that
+        // leaves things and what to run.
+        assert!(msg.contains("gpu-3 is in flock.toml"), "{msg}");
+        assert!(msg.contains(&format!("join token {id} is spent")), "{msg}");
+        assert!(msg.contains("pastor join create --replace gpu-3"), "{msg}");
         let text = std::fs::read_to_string(&keys).unwrap();
         assert!(!text.contains("pastor:join:"), "{text}");
         assert!(text.contains("me@laptop"), "{text}");
         let row = d.store().join_token(id).unwrap().unwrap();
         assert!(row.used_at.is_some(), "the token is spent");
+    }
+
+    /// The agent line failing after the save reads the same way.
+    #[tokio::test]
+    async fn a_join_whose_agent_line_fails_after_the_save_says_what_to_run() {
+        use crate::authkeys::Marker;
+        let id = "00112233445566cc";
+        let (d, _tmp, keys) = join_head(id).await;
+        let faulty = FaultyKeys {
+            file: keys.clone(),
+            fail: |m| matches!(m, Marker::Agent(_)),
+        };
+        let err = join_through(&d, faulty, id).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("its agent line"), "{msg}");
+        assert!(msg.contains("pastor join create --replace gpu-3"), "{msg}");
+        assert_eq!(
+            err.downcast_ref::<crate::cli::CliError>()
+                .map(|e| e.code.as_str()),
+            Some("join_failed"),
+            "{msg}"
+        );
+    }
+
+    /// A token made with `--replace` for a machine the head reached over
+    /// ssh forgets that machine's host key and ends its ssh master, as a
+    /// removal does, so the old host is never trusted through them again.
+    #[tokio::test]
+    async fn a_replacing_join_forgets_the_old_host_key_and_master() {
+        let runner = Arc::new(RecordingRunner::answering(resolves_to_port_2222));
+        let (d, _tmp) = daemon_with_removable_machine(runner.clone()).await;
+        let id = "00112233445566dd";
+        d.store()
+            .put_join_token(&crate::store::JoinToken {
+                id: id.into(),
+                flock: None,
+                tags: vec![],
+                replace: Some("pi-9".into()),
+                expires_at: "2999-01-01T00:00:00.000000+00:00".into(),
+                used_at: None,
+            })
+            .unwrap();
+        d.join_with(
+            std::path::Path::new("/usr/local/bin/pastor"),
+            &d.authorized_keys.clone(),
+            id,
+            "pi-9",
+            "ssh-ed25519 AAAAMACHINE m",
+            "ssh-ed25519 AAAAAGENT a",
+            "ssh-ed25519 AAAAHOST",
+        )
+        .await
+        .unwrap();
+        let calls = runner.calls();
+        let known_hosts = d.paths.known_hosts_file().to_string_lossy().into_owned();
+        assert!(
+            calls.contains(&(
+                "ssh-keygen".into(),
+                strings(&["-f", &known_hosts, "-R", "pi-9.lan"])
+            )),
+            "{calls:?}"
+        );
+        let control_path = crate::ssh::fitting_control_path(&d.paths, "pi-9")
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            calls.contains(&(
+                "ssh".into(),
+                strings(&["-S", &control_path, "-O", "exit", "--", "pastor-agent@pi-9"])
+            )),
+            "{calls:?}"
+        );
+        let flock = std::fs::read_to_string(d.paths.flock_file()).unwrap();
+        assert!(flock.contains("pull = true"), "{flock}");
+    }
+
+    /// The herdr a joined machine fetches is the head's choice: `[provision]
+    /// herdr`, else the one its machines run, else pastor's default.
+    #[tokio::test]
+    async fn a_join_names_the_herdr_to_fetch() {
+        let (d, _tmp) = daemon(&[]).await;
+        let mut config = test_config();
+        assert_eq!(
+            d.join_herdr_version(&config),
+            crate::artifacts::DEFAULT_HERDR_VERSION,
+            "no machine reports one"
+        );
+        config.provision.herdr = Some("1.2.3".into());
+        assert_eq!(d.join_herdr_version(&config), "1.2.3");
     }
 
     #[tokio::test]

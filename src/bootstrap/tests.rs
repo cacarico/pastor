@@ -36,7 +36,7 @@ macro_rules! runuser_agent {
 /// the usual dir in the home of the user it runs as (`me` unwrapped), and a
 /// `stat` no rule names finds a dir that user owns at mode 755. Any other
 /// call no rule names succeeds with no output.
-struct FakeRunner {
+pub(super) struct FakeRunner {
     rules: Vec<(String, bool, String)>,
     calls: Mutex<Vec<String>>,
 }
@@ -45,7 +45,7 @@ impl FakeRunner {
     /// A Debian x86_64 box with systemd and apt, logged in as `me` (uid
     /// 1000) with passwordless sudo, with every package there and nothing of
     /// pastor's yet. `over` rules come first, so they win.
-    fn new(over: &[(&str, bool, &str)]) -> FakeRunner {
+    pub(super) fn new(over: &[(&str, bool, &str)]) -> FakeRunner {
         let base: &[(&str, bool, &str)] = &[
             ("uname -s", true, "Linux"),
             ("uname -m", true, "x86_64"),
@@ -106,7 +106,7 @@ impl FakeRunner {
         }
     }
 
-    fn calls(&self) -> Vec<String> {
+    pub(super) fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
     }
 
@@ -120,7 +120,7 @@ impl FakeRunner {
 }
 
 /// `call` without its sudo wrapper.
-fn unwrapped(call: &str) -> &str {
+pub(super) fn unwrapped(call: &str) -> &str {
     let other = call
         .strip_prefix("setsid -w runuser -u ")
         .or_else(|| call.strip_prefix("setsid -w sudo -n -u "));
@@ -132,7 +132,7 @@ fn unwrapped(call: &str) -> &str {
 }
 
 /// The user a call runs as: `-u U` of its wrapper, else `me`.
-fn runs_as(call: &str) -> &str {
+pub(super) fn runs_as(call: &str) -> &str {
     call.strip_prefix("setsid -w sudo -n -u ")
         .or_else(|| call.strip_prefix("setsid -w runuser -u "))
         .and_then(|rest| rest.split(' ').next())
@@ -190,7 +190,7 @@ fn options(sudo: bool) -> Options {
     }
 }
 
-fn step<'a>(o: &'a Outcome, name: &str) -> &'a StepResult {
+pub(super) fn step<'a>(o: &'a Outcome, name: &str) -> &'a StepResult {
     o.steps
         .iter()
         .find(|s| s.step == name)
@@ -655,6 +655,8 @@ fn service_user_rejects_option_like_name() {
             json: true,
             write_client: None,
             print_state_dir: false,
+            write_shepherd: None,
+            write_report: None,
         };
         let err = cli(&args, Some("me@head")).unwrap_err();
         assert_eq!(code(&err), "invalid_user", "{name:?}");

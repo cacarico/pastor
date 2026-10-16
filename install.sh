@@ -3,14 +3,21 @@
 #
 #   curl -fsSL https://cacari.co/pastor/install.sh | sh
 #
+# With `join` first, it then runs `pastor join` with the rest of its
+# arguments, as they are, to make this a pull machine of a head:
+#
+#   curl -fsSL https://cacari.co/pastor/install.sh | sudo PASTOR_JOIN_TOKEN=pjt_... sh -s -- join
+#
 # PASTOR_VERSION      the version to install (default: the latest release)
 # PASTOR_INSTALL_DIR  where the binary goes (default: ~/.local/bin)
 # PASTOR_DOWNLOAD_URL where the tarball and SHA256SUMS are fetched from
 #                     (default: the GitHub release for that version; a
 #                     mirror, or file:///path for an offline copy)
 #
-# It needs curl, tar and sha256sum or shasum, and nothing else: no sudo,
-# no Rust. Every download is checked against SHA256SUMS from the same
+# It needs curl, tar and sha256sum or shasum (and ssh-keygen to join), and
+# nothing else: no sudo, no Rust. Run as root, it installs what is missing
+# of openssh-client, curl, tar and ca-certificates with apt, dnf or pacman
+# first, under the names each gives them. Every download is checked against SHA256SUMS from the same
 # release, and the provenance attestation is verified when a logged-in gh
 # is around. Completions and the systemd unit are the binary's own job
 # afterwards: `pastor completions <shell>` and `pastor setup systemd` (or
@@ -26,7 +33,35 @@ fail() {
     exit 1
 }
 
-for tool in curl tar; do
+# `join` and what follows are for pastor, so "$@" keeps them as they came:
+# never split again, never evaluated.
+mode="install"
+if [ "${1:-}" = join ]; then
+    mode="join"
+    shift
+fi
+
+tools="curl tar"
+[ "$mode" = join ] && tools="$tools ssh-keygen"
+missing=
+for tool in $tools; do
+    command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+done
+# Only root installs packages, and only these four.
+if [ -n "$missing" ] && [ "$(id -u)" = 0 ]; then
+    echo "installing what is missing:$missing" >&2
+    if command -v apt-get >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get update -q
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -q openssh-client curl tar ca-certificates
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y openssh-clients curl tar ca-certificates
+    elif command -v pacman >/dev/null 2>&1; then
+        pacman -S --noconfirm --needed openssh curl tar ca-certificates
+    else
+        fail "missing:$missing, and there is no apt-get, dnf or pacman to install it with"
+    fi
+fi
+for tool in $tools; do
     command -v "$tool" >/dev/null 2>&1 || fail "$tool is needed"
 done
 if command -v sha256sum >/dev/null 2>&1; then
@@ -92,4 +127,8 @@ case ":$PATH:" in
     *":$dir:"*) ;;
     *) echo "note: $dir is not on your PATH" >&2 ;;
 esac
+if [ "$mode" = join ]; then
+    # The arguments may hold the token: they are passed on, never printed.
+    exec "$dir/pastor" join "$@"
+fi
 echo "next: pastor completions bash|fish|zsh, then pastor setup systemd (setup launchd on macOS)"

@@ -780,6 +780,19 @@ fn main() {
     // After the guard, which keeps agents from running it: it makes users
     // and services. --head names the head this machine is for, not one to
     // talk to, so no head is asked.
+    // `pastor join <token>` on a new machine: it bootstraps this machine,
+    // and its head is the token's, so none is asked first.
+    if let Command::Join(args) = &command
+        && args.cmd.is_none()
+    {
+        if let Err(err) = pastor::bootstrap::pull::cli(args) {
+            match err.downcast_ref::<CliError>() {
+                Some(e) => fail(&e.code, &e.message),
+                None => fail("runtime_error", &format!("{err:#}")),
+            }
+        }
+        return;
+    }
     if let Command::Bootstrap(args) = &command {
         if let Err(err) = pastor::bootstrap::cli(args, head_flag.as_deref()) {
             match err.downcast_ref::<CliError>() {

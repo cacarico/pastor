@@ -35,3 +35,24 @@
   a machine that stops answering; a `machine remove` during a push gets
   `machine_busy`; a rerun of an ok machine keeps it ok until `pastor
   bootstrap` starts there. Gated at IPC protocol 32 (`MachineBootstrap`).
+- `pastor join` on a new machine, with the token on stdin
+  (`--token-stdin`), in `PASTOR_JOIN_TOKEN` or as its argument, plus
+  `--name`, `--sudo` and `--service-user`: it pins the head's host key,
+  makes the users and keys, joins with the token's key (written 0600 and
+  deleted whatever happens), names the shepherd, bootstraps with the herdr
+  the head names fetched over the machine key, installs and starts the
+  shepherd's unit, and leaves the outcome in `<state>/bootstrap.json`. The
+  shepherd reports it after its first claim and claims again, so the
+  machine's tasks start in that pass. `install.sh join …` installs pastor,
+  then runs `pastor join` with the rest of its arguments; as root it first
+  installs what is missing of openssh-client, curl, tar and
+  ca-certificates.
+
+### Changed
+
+- A head's `Joined` reply names the herdr version for the machine to
+  fetch. A failure on the head after flock.toml is saved says the machine
+  is in and the token spent, and what to run; a join that replaces a
+  machine reached over ssh forgets its host key and ends its ssh master.
+- The ssh to a remote head uses pastor's `known_hosts` only beside a
+  pastor machine or agent key, so a person's CLI keeps their own.
