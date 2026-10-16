@@ -348,6 +348,9 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `agy_permissions_missing` | a profiled agy task on a machine whose agy settings do not deny what the profile denies, or that pastor cannot read or write to make them (a `command` machine, a file that is not JSON, a symlink, a failed write); the message lists the rules to add |
 | `agy_profile_mismatch` | a profiled agy task on a machine whose own profile does not deny everything the task's does |
 | `already_seen` | a job's key was queued before and its task row is gone |
+| `bootstrap_missing` | `pastor bootstrap` found something the machine lacks and could not install it: a package in user mode, or herdr with no `--herdr-from` |
+| `bootstrap_needs_sudo` | `pastor bootstrap --sudo` where `sudo -n true` fails: sudo wants a password or is not allowed |
+| `bootstrap_unsupported_platform` | `pastor bootstrap` on a platform it does not set up: not Linux with systemd or macOS, macOS as root, or an arch herdr ships no build for |
 | `branch_gone` | reopening a closed task: its worktree and its branch are both gone |
 | `close_failed` | `task close` could not close one or more of the tasks |
 | `config_error` | a config file (pastor.toml, flock.toml, a job, the head file) does not read |
@@ -380,6 +383,7 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `invalid_path` | `bridge`: a pastor path that cannot go in authorized_keys unquoted |
 | `invalid_report` | a pull machine reported a state it may not set |
 | `invalid_request` | a line that is not a request, on the daemon socket or the bridge; a headless job submission with an invalid job name or an item with no string key |
+| `invalid_user` | `bootstrap --service-user` names something that is not a user name |
 | `item_rejected` | a job item has no usable key or prompt |
 | `job_name_taken` | a headless serve's job has the name of one of the head's |
 | `job_not_found` | no job by that name |
