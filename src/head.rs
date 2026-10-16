@@ -68,6 +68,11 @@ pub struct RemoteHead {
     /// than `sun_path` (104 bytes on macOS) fails every request. `None` when
     /// even a bare `-%C` does not fit; ssh then runs without multiplexing.
     control_path: Option<PathBuf>,
+    /// Pastor's own key for the head, when bootstrap made one: the machine
+    /// key, else the agent key.
+    identity: Option<PathBuf>,
+    /// Pastor's `known_hosts`, when it exists.
+    known_hosts: Option<PathBuf>,
 }
 
 pub fn client_file(paths: &Paths) -> PathBuf {
@@ -163,6 +168,10 @@ impl RemoteHead {
             pastor: pastor.unwrap_or_else(|| DEFAULT_PASTOR.to_string()),
             source,
             control_path: crate::ssh::fitting_control_path(paths, "head"),
+            identity: [paths.machine_key(), paths.agent_key()]
+                .into_iter()
+                .find(|k| k.exists()),
+            known_hosts: Some(paths.known_hosts_file()).filter(|k| k.exists()),
         }
     }
 
@@ -176,6 +185,10 @@ impl RemoteHead {
             control_persist: "60s",
             keepalive: false,
             no_tty: false,
+            identity: self.identity.as_deref(),
+            extra_identity: None,
+            known_hosts: self.known_hosts.as_deref(),
+            accept_new: false,
         }
         .args(&format!("{} bridge", self.pastor))
     }
@@ -417,6 +430,33 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
         (tmp, p)
+    }
+
+    /// Pastor's own keys and known_hosts join the argv only once they exist,
+    /// the machine key before the agent key.
+    #[test]
+    fn ssh_args_use_pastors_own_key_and_known_hosts_when_present() {
+        let (_t, p) = paths();
+        let plain = RemoteHead::new(&p, "user@pi-1", None, HeadSource::File).ssh_args();
+        assert!(!plain.iter().any(|a| a == "-i" || a.contains("KnownHosts")));
+        std::fs::create_dir_all(p.known_hosts_file().parent().unwrap()).unwrap();
+        std::fs::write(p.agent_key(), "k").unwrap();
+        std::fs::write(p.known_hosts_file(), "").unwrap();
+        let args = RemoteHead::new(&p, "user@pi-1", None, HeadSource::File).ssh_args();
+        let agent = p.agent_key().display().to_string();
+        assert!(
+            args.windows(2).any(|w| w == ["-i", agent.as_str()]),
+            "{args:?}"
+        );
+        assert!(args.contains(&"IdentitiesOnly=yes".to_string()));
+        assert!(args.contains(&"StrictHostKeyChecking=yes".to_string()));
+        std::fs::write(p.machine_key(), "k").unwrap();
+        let args = RemoteHead::new(&p, "user@pi-1", None, HeadSource::File).ssh_args();
+        let machine = p.machine_key().display().to_string();
+        assert!(
+            args.windows(2).any(|w| w == ["-i", machine.as_str()]),
+            "{args:?}"
+        );
     }
 
     /// A misspelt key under `[head]` fails the load, naming the file and
