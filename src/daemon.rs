@@ -6804,7 +6804,6 @@ mod tests {
                 pastor_version: None,
                 service_user: None,
                 updated_at: "2026-10-16T10:00:00+00:00".into(),
-                service_user: None,
             })
             .unwrap();
         claim_with(Some("0.9.5"), Some("1.2.3")).await;
@@ -6836,7 +6835,6 @@ mod tests {
                 pastor_version: None,
                 service_user: None,
                 updated_at: "2026-10-16T10:00:00+00:00".into(),
-                service_user: None,
             })
             .unwrap();
         for bad in ["0.9.5\u{1b}[2J", &"1".repeat(65), "", "1 2"] {
@@ -11828,7 +11826,6 @@ mod tests {
                 pastor_version: None,
                 service_user: None,
                 updated_at: "2026-10-16T10:00:00+00:00".into(),
-                service_user: None,
             })
             .unwrap();
         (d, tmp)
