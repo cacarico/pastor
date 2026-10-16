@@ -908,7 +908,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__bootstrap)
-            opts="-h --sudo --service-user --head-key --herdr-from --json --write-client --print-state-dir --head --help"
+            opts="-h --sudo --service-user --head-key --herdr-from --json --write-client --print-state-dir --write-shepherd --write-report --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -927,6 +927,14 @@ _pastor() {
                     return 0
                     ;;
                 --write-client)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --write-shepherd)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --write-report)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -3534,12 +3542,20 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__join)
-            opts="-h --head --help create list revoke help"
+            opts="-h --token-stdin --name --sudo --service-user --json --skip-bootstrap --head --help create list revoke help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
+                --name)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --service-user)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 --head)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0

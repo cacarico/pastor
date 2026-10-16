@@ -388,7 +388,7 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `job_name_taken` | a headless serve's job has the name of one of the head's |
 | `job_not_found` | no job by that name |
 | `job_task_refused` | the head would not queue a headless serve's job task |
-| `join_failed` | the head could not remove a join token's line from authorized_keys; nothing was added and the token is still good |
+| `join_failed` | the head could not remove a join token's line from authorized_keys, so nothing was added and the token is still good; or a write after flock.toml was saved failed, so the machine is in and the token spent: join again with `join create --replace` |
 | `join_token_expired` | a machine tried to join with a token past its `--ttl` |
 | `join_token_invalid` | not a join token, an unknown or revoked one, or a `bridge --join` line that is not one join request |
 | `join_token_used` | a machine tried to join with a token another join already used |
@@ -3834,6 +3834,65 @@ pastor join create --flock builders --tag gpu --ttl 1h
   request; its `id` is the one in the forced command, whatever the line
   says. A longer line is `request_too_large`; anything else is
   `join_token_invalid`.
+
+#### Joining a machine
+
+On the new machine, `pastor join` takes the token on stdin
+(`--token-stdin`), from `PASTOR_JOIN_TOKEN`, or as its argument, which `ps`
+shows, so the first two are the ones to use. `install.sh join` installs
+pastor and runs it with the rest of its arguments, unchanged:
+
+```sh
+pastor join --token-stdin --name gpu-3 --sudo < token
+curl -fsSL https://cacari.co/pastor/install.sh | sudo PASTOR_JOIN_TOKEN=pjt_... sh -s -- join --name gpu-3 --sudo
+```
+
+`curl | sh` gives the script on stdin, so it leaves `--token-stdin` nothing
+to read: there the variable carries the token. Run as root, `install.sh`
+first installs what is missing of openssh-client, curl, tar and
+ca-certificates with apt, dnf or pacman.
+
+`--name` is the machine's name in the head's flock.toml (the hostname when
+unset); `--sudo` and `--service-user` are `pastor bootstrap`'s. The join:
+
+1. Pins the token's head host key in pastor's `known_hosts`, in this
+   user's state dir and in each pastor user's.
+2. Makes the users and the keys, running bootstrap's `users` and `keys`
+   steps alone.
+3. Writes the token's key to a 0600 file in a 0700 dir and joins over ssh
+   with it alone, sending the name, both public keys, the sshd host key and
+   a few facts. The key file is deleted whatever happens, and neither the
+   token nor the key is printed or logged. An ssh `Permission denied` for
+   it is `join_token_invalid`: the token was used, revoked or has expired.
+4. Writes `[shepherd] machine = "<name>"` to the service user's
+   pastor.toml.
+5. Runs the rest of bootstrap with the herdr version the head names in its
+   reply (`[provision] herdr`, else the one most of its machines run, else
+   pastor's default), fetched over the machine key with `pastor bridge
+   --fetch` and checked against the size and sha256 the head answers. Its
+   last step, `shepherd`, installs and starts the shepherd's unit with
+   `pastor setup systemd` (`setup launchd` on macOS) as the service user.
+   In root mode it first waits for the user's `/run/user/<uid>`, which can
+   lag `loginctl enable-linger`, then starts `user@<uid>.service` and waits
+   again before it fails.
+6. Leaves the outcome in the service user's `<state>/bootstrap.json` and
+   prints it (`--json` for the object). The shepherd sends it to the head
+   (`BootstrapReport`) after its first claim the head answers, deletes it
+   once the head took it, and claims again in the same pass, so the tasks
+   held while the machine was pending start then. A failed bootstrap runs
+   no shepherd, so the join sends that report itself.
+
+Once a machine key is in the state dir, the shepherd's ssh to the head
+uses it with `IdentitiesOnly=yes` and the pinned `known_hosts` with
+`StrictHostKeyChecking=yes`. Without a pastor key, pastor's `known_hosts`
+is not used for the head, so a person's CLI keeps their own.
+
+On the head, a failure after flock.toml is saved (the machine's
+`authorized_keys` lines, its bootstrap record) is `join_failed` and says
+the machine is in flock.toml and the token spent, and to join again with a
+token from `pastor join create --replace <name>`. A join that replaces a
+machine the head reached over ssh forgets that machine's host key and ends
+its ssh master, as `machine remove` does.
 
 ### Jobs on a shepherd
 

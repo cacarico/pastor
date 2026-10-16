@@ -1338,6 +1338,12 @@ pub enum IpcResponse {
     /// `Join`: the machine is in flock.toml under `name`.
     Joined {
         name: String,
+        /// The herdr the head puts on its machines (`[provision] herdr`,
+        /// else the one most of them run, else pastor's default), for the
+        /// machine to fetch next. Absent from a head that leaves it to the
+        /// machine.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        herdr_version: Option<String>,
     },
     /// `ArtifactLocate`: the checked file in the head's cache.
     Artifact {

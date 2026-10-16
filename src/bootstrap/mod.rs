@@ -8,6 +8,7 @@
 
 pub mod facts;
 pub mod outcome;
+pub mod pull;
 mod steps;
 
 use std::path::PathBuf;
@@ -40,6 +41,57 @@ pub struct Options {
 
 /// Run the steps in order, stopping at the first that fails.
 pub fn run(r: &dyn Runner, o: &Options) -> Outcome {
+    run_steps(r, o, None, &steps::STEPS)
+}
+
+/// `list` in order, stopping at the first that fails: all of
+/// [`steps::STEPS`] for `pastor bootstrap`, a few of them and pull's own for
+/// `pastor join`.
+fn run_steps(
+    r: &dyn Runner,
+    o: &Options,
+    pull: Option<&pull::Pull>,
+    list: &[(&str, steps::Step)],
+) -> Outcome {
+    with_ctx(r, o, pull, |ctx| {
+        let mut results = Vec::new();
+        for (name, step) in list {
+            let mut result = step(r, ctx);
+            result.step = name.to_string();
+            let failed = result.status == StepStatus::Failed;
+            results.push(result);
+            if failed {
+                break;
+            }
+        }
+        let service_user = Some(ctx.service_name()).filter(|u| !u.is_empty());
+        let found = std::mem::take(&mut *ctx.found.borrow_mut());
+        Outcome {
+            ok: results.iter().all(|s| s.status != StepStatus::Failed),
+            mode: ctx.mode,
+            isolation: match ctx.mode {
+                Mode::Root => Isolation::Users,
+                Mode::User => Isolation::None,
+            },
+            steps: results,
+            machine_key: found.machine_key,
+            agent_key: found.agent_key,
+            host_key: found.host_key,
+            herdr_version: found.herdr_version,
+            pastor_version: found.pastor_version,
+            service_user,
+        }
+    })
+}
+
+/// `f` with the steps' context: the facts, the mode and the users, and
+/// root mode's staging dir removed after it.
+fn with_ctx<T>(
+    r: &dyn Runner,
+    o: &Options,
+    pull: Option<&pull::Pull>,
+    f: impl FnOnce(&steps::Ctx) -> T,
+) -> T {
     let facts = facts::facts(r);
     // Root work only when asked for or already root: an ssh user with sudo
     // still gets user mode unless --sudo says otherwise.
@@ -54,6 +106,7 @@ pub fn run(r: &dyn Runner, o: &Options) -> Outcome {
         || facts::stdout(r, "printenv", &["XDG_RUNTIME_DIR"]).is_some_and(|d| !d.is_empty());
     let ctx = steps::Ctx {
         o,
+        pull,
         facts,
         mode,
         login,
@@ -63,34 +116,9 @@ pub fn run(r: &dyn Runner, o: &Options) -> Outcome {
         stage: Default::default(),
         staged: Default::default(),
     };
-    let mut results = Vec::new();
-    for (name, step) in steps::STEPS {
-        let mut result = step(r, &ctx);
-        result.step = name.to_string();
-        let failed = result.status == StepStatus::Failed;
-        results.push(result);
-        if failed {
-            break;
-        }
-    }
+    let out = f(&ctx);
     ctx.unstage(r);
-    let service_user = Some(ctx.service_name()).filter(|u| !u.is_empty());
-    let found = ctx.found.into_inner();
-    Outcome {
-        ok: results.iter().all(|s| s.status != StepStatus::Failed),
-        mode,
-        isolation: match mode {
-            Mode::Root => Isolation::Users,
-            Mode::User => Isolation::None,
-        },
-        steps: results,
-        machine_key: found.machine_key,
-        agent_key: found.agent_key,
-        host_key: found.host_key,
-        herdr_version: found.herdr_version,
-        pastor_version: found.pastor_version,
-        service_user,
-    }
+    out
 }
 
 /// The CLI error for a failed outcome, `None` when it is ok.
@@ -152,6 +180,22 @@ pub struct Args {
         conflicts_with_all = ["sudo", "service_user", "head_key", "herdr_from", "json", "write_client"]
     )]
     pub print_state_dir: bool,
+    /// Write pastor.toml's [shepherd] machine for this user and print `written` or `unchanged`; `pastor join` runs it as the service user
+    #[arg(
+        long,
+        value_name = "NAME",
+        hide = true,
+        conflicts_with_all = ["sudo", "service_user", "head_key", "herdr_from", "json", "write_client", "print_state_dir"]
+    )]
+    pub write_shepherd: Option<String>,
+    /// Leave this bootstrap outcome (JSON) in this user's state dir for its shepherd to report; `pastor join` runs it as the service user
+    #[arg(
+        long,
+        value_name = "JSON",
+        hide = true,
+        conflicts_with_all = ["sudo", "service_user", "head_key", "herdr_from", "json", "write_client", "print_state_dir", "write_shepherd"]
+    )]
+    pub write_report: Option<String>,
 }
 
 /// Entry point for `pastor bootstrap`; `head` is the global `--head`.
@@ -165,6 +209,24 @@ pub fn cli(args: &Args, head: Option<&str>) -> anyhow::Result<()> {
     if args.print_state_dir {
         let paths = crate::config::Paths::from_env()?;
         println!("{}", paths.state_dir.display());
+        return Ok(());
+    }
+    if let Some(name) = &args.write_shepherd {
+        // It goes on ssh and herdr command lines: never an option.
+        if name.starts_with('-') || name.trim().is_empty() {
+            return Err(CliError::err(
+                "invalid_machine",
+                format!("{name:?} cannot be a machine name"),
+            ));
+        }
+        let paths = crate::config::Paths::from_env()?;
+        let wrote = pull::write_shepherd(&paths.config_file(), name)?;
+        println!("{}", if wrote { "written" } else { "unchanged" });
+        return Ok(());
+    }
+    if let Some(json) = &args.write_report {
+        let paths = crate::config::Paths::from_env()?;
+        pull::write_report(&paths.state_dir, json)?;
         return Ok(());
     }
     if let Some(user) = &args.service_user {
