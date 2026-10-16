@@ -6589,6 +6589,7 @@ mod tests {
                 host_key: None,
                 herdr_version: None,
                 pastor_version: None,
+                service_user: None,
                 updated_at: "2026-10-16T10:00:00+00:00".into(),
             })
             .unwrap();
@@ -6619,6 +6620,7 @@ mod tests {
                 host_key: None,
                 herdr_version: None,
                 pastor_version: None,
+                service_user: None,
                 updated_at: "2026-10-16T10:00:00+00:00".into(),
             })
             .unwrap();
@@ -11529,6 +11531,7 @@ mod tests {
                 host_key: Some("ssh-ed25519 AAAA".into()),
                 herdr_version: Some("0.9.5".into()),
                 pastor_version: None,
+                service_user: None,
                 updated_at: "2026-10-16T10:00:00+00:00".into(),
             })
             .unwrap();

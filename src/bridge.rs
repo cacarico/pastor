@@ -1396,6 +1396,7 @@ mod tests {
             host_key: None,
             herdr_version: Some("0.9.5".into()),
             pastor_version: None,
+            service_user: None,
         }
     }
 
