@@ -41,8 +41,9 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 /// `FlockEntry::keep_pane`). 30: usage limits (`LimitList`, `LimitClear`,
 /// `TaskReport::limit`). 31: saved trust on pull machines (`PullTrust`,
 /// `TaskReport::trusted`). 32: a pull machine's own versions
-/// (`TaskClaim::herdr_version`, `TaskClaim::pastor_version`) and join
-/// tokens (`JoinCreate`, `JoinList`, `JoinRevoke`, `Join`).
+/// (`TaskClaim::herdr_version`, `TaskClaim::pastor_version`), join tokens
+/// (`JoinCreate`, `JoinList`, `JoinRevoke`, `Join`), and bootstrap reports
+/// (`BootstrapReport`) and the machine state they record.
 pub const IPC_PROTOCOL: u32 = 32;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
@@ -232,6 +233,12 @@ pub const PULL_VERSIONS_PROTOCOL: u32 = 32;
 /// refuses them as unreadable.
 pub const JOIN_TOKEN_PROTOCOL: u32 = 32;
 
+/// The first protocol whose head answers `BootstrapReport` and keeps
+/// `machine_state`: a `Pending` or `Failed` machine takes no tasks. An
+/// older one refuses the request as unreadable, so the report is lost and
+/// dispatch never learns to skip the machine.
+pub const BOOTSTRAP_PROTOCOL: u32 = 32;
+
 /// The first protocol whose head honours `Run::priority` and knows
 /// `TaskPriority`. An older one would queue the task at its own level
 /// without a word, or refuse the request as unreadable.
@@ -355,6 +362,7 @@ const REPORT_TRUSTED: &str =
     "predates saved trust on pull machines, and would drop the trust answer the report carries";
 const PULL_VERSIONS: &str =
     "predates a pull machine's own versions, and would drop the claim's herdr and pastor versions";
+const BOOTSTRAP: &str = "predates bootstrap reports, and would refuse the request without recording the machine's state";
 
 /// How long a head's `Pong` settles the protocol check before it is asked
 /// again: a long-lived sender (a headless serve) sees a restarted head
@@ -777,6 +785,14 @@ pub enum IpcRequest {
     PullTrust {
         machine: String,
     },
+    /// What `pastor bootstrap` found on `machine`, once it has run the
+    /// setup steps: saved as the machine's `machine_state`, which dispatch
+    /// reads before placing a task there. The head emits `machine.bootstrapped`
+    /// or `machine.bootstrap_failed`. Answers `Text`.
+    BootstrapReport {
+        machine: String,
+        result: crate::bootstrap::Outcome,
+    },
     /// Every usage limit the head keeps. Answers `Limits`.
     LimitList,
     /// Forget `account`'s limits, only `model`'s when given. Answers
@@ -1077,6 +1093,7 @@ impl IpcRequest {
                 }
             }
             R::PullTrust { .. } => need.at(PULL_TRUST_PROTOCOL, PULL_TRUST),
+            R::BootstrapReport { .. } => need.at(BOOTSTRAP_PROTOCOL, BOOTSTRAP),
             R::LimitList | R::LimitClear { .. } => need.at(LIMIT_PROTOCOL, LIMITS),
             R::OrchestratorStart { .. } | R::OrchestratorStop { .. } => {
                 need.at(SESSION_PROTOCOL, SESSION);
@@ -1144,6 +1161,7 @@ impl IpcRequest {
             | IpcRequest::TrustRemove { .. }
             | IpcRequest::TaskClaim { .. }
             | IpcRequest::TaskReport { .. }
+            | IpcRequest::BootstrapReport { .. }
             | IpcRequest::LimitClear { .. }
             | IpcRequest::OrchestratorRun { .. }
             | IpcRequest::OrchestratorStart { .. }
@@ -2426,6 +2444,17 @@ mod tests {
                 "flock join",
             ),
             (
+                req(
+                    serde_json::json!({"op": "bootstrap_report", "machine": "m", "result": {
+                        "ok": true, "mode": "root", "isolation": "users", "steps": [],
+                        "machine_key": null, "agent_key": null, "host_key": null,
+                        "herdr_version": null, "pastor_version": null
+                    }}),
+                ),
+                BOOTSTRAP_PROTOCOL,
+                "bootstrap reports",
+            ),
+            (
                 req(serde_json::json!({"op": "orchestrator_list"})),
                 ORCHESTRATOR_PROTOCOL,
                 "orchestrator files",
@@ -2500,6 +2529,7 @@ mod tests {
             KEEP_PANE_PROTOCOL,
             PULL_TRUST_PROTOCOL,
             PULL_VERSIONS_PROTOCOL,
+            BOOTSTRAP_PROTOCOL,
         ] {
             assert!(covered.contains(&p), "no request needs protocol {p}");
         }

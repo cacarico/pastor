@@ -289,6 +289,7 @@ fn user_mode_without_sudo() {
     assert!(o.ok, "{:#?}", o.steps);
     assert_eq!(o.mode, Mode::User);
     assert_eq!(o.isolation, Isolation::None);
+    assert_eq!(o.service_user.as_deref(), Some("me"), "the login user");
     assert!(!r.called_containing("useradd"), "{:#?}", r.calls());
     // Nothing runs through sudo but the probe.
     assert!(
@@ -331,6 +332,7 @@ fn root_mode_creates_both_users() {
     assert!(o.ok, "{:#?}", o.steps);
     assert_eq!(o.mode, Mode::Root);
     assert_eq!(o.isolation, Isolation::Users);
+    assert_eq!(o.service_user.as_deref(), Some("pastor"));
     for user in ["pastor", "pastor-agent"] {
         assert!(
             r.called(&format!(
