@@ -3383,6 +3383,13 @@ pub struct Daemon {
     scheduler: SchedulerHandle,
     events: broadcast::Sender<PastorEvent>,
     orchestrators: Arc<crate::orchestrator::Runner>,
+    /// The head's `~/.ssh/authorized_keys` (or `PASTOR_AUTHORIZED_KEYS`),
+    /// resolved once at start so a removal always edits the file the daemon
+    /// began with, not whatever the environment says at the moment.
+    authorized_keys: PathBuf,
+    /// `ssh-keygen -R` and `ssh -O exit` for a removed machine go through
+    /// this, so tests script the answer instead of touching the host.
+    runner: Arc<dyn crate::setup::Runner + Send + Sync>,
 }
 
 /// The longest IPC request line, newline excluded. The largest real one is a
@@ -3650,6 +3657,8 @@ impl Daemon {
             scheduler,
             events,
             orchestrators,
+            authorized_keys: crate::authkeys::default_file(),
+            runner: Arc::new(crate::setup::SystemRunner),
         })
     }
 
@@ -3910,6 +3919,37 @@ impl Daemon {
             Err(err) => IpcResponse::Text(format!(
                 "{done}{sep}the reload after it failed ({err}); run `pastor job reload`"
             )),
+        }
+    }
+
+    /// What `MachineRemove` does beyond the flock edit: drop the machine's
+    /// (and its agent's) lines from the head's `authorized_keys`, forget its
+    /// host key, end its ssh `ControlMaster` and drop its bootstrap row. The
+    /// machine is already out of the flock by the time this runs, so each
+    /// step is best-effort and logged rather than failing the request.
+    fn cleanup_removed_machine(&self, name: &str, ssh_target: Option<&str>) {
+        if let Err(err) = crate::authkeys::remove_machine(&self.authorized_keys, name) {
+            tracing::warn!(machine = %name, %err, "could not drop authorized_keys lines");
+        }
+        if let Some(target) = ssh_target {
+            // The host alone, as ssh-keygen's known_hosts keys it: `user@host`
+            // with no `@` keeps `target` unchanged.
+            let host = target.rsplit('@').next().unwrap_or(target);
+            let known_hosts = self.paths.known_hosts_file().to_string_lossy().into_owned();
+            let _ = self
+                .runner
+                .run("ssh-keygen", &["-R", host, "-f", known_hosts.as_str()]);
+            if let Some(control_path) = crate::ssh::fitting_control_path(&self.paths, name) {
+                let control_path = control_path.to_string_lossy().into_owned();
+                // Ok to fail: a machine with no live master (already gone,
+                // or never connected) has nothing to exit.
+                let _ = self
+                    .runner
+                    .run("ssh", &["-S", control_path.as_str(), "-O", "exit", target]);
+            }
+        }
+        if let Err(err) = self.store.drop_machine_state(name) {
+            tracing::warn!(machine = %name, %err, "could not drop machine_state");
         }
     }
 
@@ -4213,8 +4253,22 @@ impl Daemon {
                     .await
             }
             IpcRequest::MachineRemove { name } => {
-                self.edit_flock_file("; ", |file| crate::fleet_edit::remove_machine(file, &name))
-                    .await
+                let ssh_target = self
+                    .fleet
+                    .flock()
+                    .machines
+                    .into_iter()
+                    .find(|m| m.name == name)
+                    .and_then(|m| m.ssh);
+                let resp = self
+                    .edit_flock_file("; ", |file| crate::fleet_edit::remove_machine(file, &name))
+                    .await;
+                // Only once the flock edit itself landed: an unknown machine
+                // (or a refused edit) must leave its keys and state alone.
+                if matches!(resp, IpcResponse::Text(_)) {
+                    self.cleanup_removed_machine(&name, ssh_target.as_deref());
+                }
+                resp
             }
             IpcRequest::MachineMove { name, flock } => {
                 self.edit_flock_file("; ", |file| {
@@ -9951,7 +10005,7 @@ mod tests {
     /// `Text`, and its fleet matches the file afterwards.
     #[tokio::test]
     async fn fleet_edits_go_through_the_head() {
-        let (d, tmp) = daemon_with_flock(
+        let (mut d, tmp) = daemon_with_flock(
             home_and_work(),
             &[
                 ("h", 2, FakeHerdr::new()),
@@ -9960,6 +10014,8 @@ mod tests {
             ],
         )
         .await;
+        // A removal below edits authorized_keys; never the real one.
+        d.authorized_keys = tmp.path().join("authorized_keys");
         let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
         let on_disk = || Flock::load(&paths.flock_file()).unwrap();
         let text = |resp: IpcResponse| match resp {
@@ -10118,6 +10174,133 @@ mod tests {
             assert_eq!(error_code(d.handle(req).await), code);
         }
         assert_eq!(std::fs::read_to_string(paths.flock_file()).unwrap(), before);
+    }
+
+    /// Scripts the answer to every `Runner::run` call, so a test can check
+    /// what pastor asked for without running `ssh-keygen` or `ssh` for real.
+    struct RecordingRunner {
+        calls: std::sync::Mutex<Vec<(String, Vec<String>)>>,
+    }
+
+    impl RecordingRunner {
+        fn new() -> Self {
+            RecordingRunner {
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<(String, Vec<String>)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::setup::Runner for RecordingRunner {
+        fn run(&self, program: &str, args: &[&str]) -> std::io::Result<crate::setup::CmdOutput> {
+            self.calls.lock().unwrap().push((
+                program.to_string(),
+                args.iter().map(|a| a.to_string()).collect(),
+            ));
+            Ok(crate::setup::CmdOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    /// `MachineRemove` also drops the machine's (and its agent's)
+    /// `authorized_keys` lines, asks the runner to forget its host key and
+    /// end its ssh master, and clears its bootstrap row - all only once the
+    /// flock edit itself lands.
+    #[tokio::test]
+    async fn remove_cleans_keys_and_state() {
+        let flock = Flock {
+            flocks: vec![],
+            machines: vec![MachineConfig {
+                ssh: Some("pastor-agent@pi-9".into()),
+                command: None,
+                ..machine("pi-9", 1)
+            }],
+        };
+        let (mut d, tmp) = daemon_with_flock(flock, &[("pi-9", 1, FakeHerdr::new())]).await;
+
+        // Never the real `~/.ssh/authorized_keys`.
+        let authorized_keys = tmp.path().join("authorized_keys");
+        std::fs::write(&authorized_keys, "ssh-ed25519 AAAA me@laptop\n").unwrap();
+        d.authorized_keys = authorized_keys.clone();
+        let runner = Arc::new(RecordingRunner::new());
+        d.runner = runner.clone();
+
+        crate::authkeys::upsert(
+            &authorized_keys,
+            &crate::authkeys::Marker::Machine("pi-9".into()),
+            "restrict,command=\"/bin/pastor bridge\" ssh-ed25519 KEY1 pastor:machine:pi-9",
+        )
+        .unwrap();
+        crate::authkeys::upsert(
+            &authorized_keys,
+            &crate::authkeys::Marker::Agent("pi-9".into()),
+            "restrict,command=\"/bin/pastor bridge --agent\" ssh-ed25519 KEY2 pastor:agent:pi-9",
+        )
+        .unwrap();
+
+        d.store
+            .put_machine_state(&crate::store::MachineState {
+                machine: "pi-9".into(),
+                bootstrap: crate::store::BootstrapState::Ok,
+                mode: Some("root".into()),
+                isolation: Some("none".into()),
+                failed_step: None,
+                why: None,
+                host_key: Some("ssh-ed25519 AAAA".into()),
+                herdr_version: Some("0.9.5".into()),
+                pastor_version: None,
+                updated_at: "2026-10-16T10:00:00+00:00".into(),
+            })
+            .unwrap();
+
+        let resp = d
+            .handle(IpcRequest::MachineRemove {
+                name: "pi-9".into(),
+            })
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+
+        // The foreign line survives; both marked lines are gone.
+        assert_eq!(
+            std::fs::read_to_string(&authorized_keys).unwrap(),
+            "ssh-ed25519 AAAA me@laptop\n"
+        );
+
+        let calls = runner.calls();
+        let known_hosts = d.paths.known_hosts_file().to_string_lossy().into_owned();
+        assert!(
+            calls.iter().any(|(p, a)| p == "ssh-keygen"
+                && a == &[
+                    "-R".to_string(),
+                    "pi-9".to_string(),
+                    "-f".to_string(),
+                    known_hosts.clone()
+                ]),
+            "{calls:?}"
+        );
+        let control_path = crate::ssh::fitting_control_path(&d.paths, "pi-9")
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            calls.iter().any(|(p, a)| p == "ssh"
+                && a == &[
+                    "-S".to_string(),
+                    control_path.clone(),
+                    "-O".to_string(),
+                    "exit".to_string(),
+                    "pastor-agent@pi-9".to_string(),
+                ]),
+            "{calls:?}"
+        );
+
+        assert!(d.store.machine_state("pi-9").unwrap().is_none());
     }
 
     /// `flock add --default` on a file with only the implicit flock keeps its
