@@ -348,6 +348,9 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `agy_permissions_missing` | a profiled agy task on a machine whose agy settings do not deny what the profile denies, or that pastor cannot read or write to make them (a `command` machine, a file that is not JSON, a symlink, a failed write); the message lists the rules to add |
 | `agy_profile_mismatch` | a profiled agy task on a machine whose own profile does not deny everything the task's does |
 | `already_seen` | a job's key was queued before and its task row is gone |
+| `bootstrap_missing` | `pastor bootstrap` found something the machine lacks and could not install it: a package in user mode, or herdr with no `--herdr-from` |
+| `bootstrap_needs_sudo` | `pastor bootstrap --sudo` where `sudo -n true` fails: sudo wants a password or is not allowed |
+| `bootstrap_unsupported_platform` | `pastor bootstrap` on a platform it does not set up: not Linux with systemd or macOS, macOS as root, or an arch herdr ships no build for |
 | `branch_gone` | reopening a closed task: its worktree and its branch are both gone |
 | `close_failed` | `task close` could not close one or more of the tasks |
 | `config_error` | a config file (pastor.toml, flock.toml, a job, the head file) does not read |

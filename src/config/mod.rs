@@ -2090,10 +2090,23 @@ impl ShepherdConfig {
     }
 }
 
-/// This machine's hostname, read from the kernel and files rather than a
-/// new dependency for `gethostname`; `-` when none says.
+/// This machine's hostname: the kernel's file, /etc/hostname, `HOSTNAME`,
+/// then `gethostname(3)`; `-` when none says.
 pub fn hostname() -> String {
-    ["/proc/sys/kernel/hostname", "/etc/hostname"]
+    hostname_from(
+        &[
+            Path::new("/proc/sys/kernel/hostname"),
+            Path::new("/etc/hostname"),
+        ],
+        std::env::var("HOSTNAME").ok(),
+    )
+}
+
+/// `hostname` from the given files and `HOSTNAME` value, then the kernel's
+/// own answer: macOS has neither file, and a non-interactive shell there
+/// does not set `HOSTNAME`.
+pub(crate) fn hostname_from(files: &[&Path], env: Option<String>) -> String {
+    files
         .iter()
         .find_map(|p| {
             std::fs::read_to_string(p)
@@ -2101,8 +2114,23 @@ pub fn hostname() -> String {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
         })
-        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
+        .or_else(|| env.filter(|s| !s.is_empty()))
+        .or_else(gethostname)
         .unwrap_or_else(|| "-".into())
+}
+
+fn gethostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: the pointer and length describe `buf`, which outlives the call.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    // POSIX lets a truncated name come back without its 0, so no 0 means
+    // the whole buffer is the name.
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..end]).trim().to_string();
+    (!name.is_empty()).then_some(name)
 }
 
 /// `[watch]` in pastor.toml.
