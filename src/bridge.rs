@@ -218,7 +218,8 @@ pub fn authorized_key_line(pastor: &Path, machine: &str, key: &str) -> anyhow::R
         ));
     }
     Ok(format!(
-        "command=\"{pastor} bridge --agent --machine {machine}\",no-pty,no-user-rc,no-port-forwarding,no-agent-forwarding,no-X11-forwarding {key}"
+        "command=\"{pastor} bridge --agent --machine {machine}\",{} {key}",
+        crate::authkeys::restrict_options()
     ))
 }
 
