@@ -640,7 +640,7 @@ pub fn machine_text(m: &MachineDescription) -> String {
         ("tags", dash(Some(r.tags.join(",")))),
         ("error", dash(r.error.clone().map(|e| one_line(&e)))),
     ];
-    if let Some(line) = bootstrap_line(&r.host, m.bootstrap.as_ref()) {
+    if let Some(line) = bootstrap_line(m.bootstrap.as_ref()) {
         rows.push(("bootstrap", line));
     }
     if let Some(line) = isolation_line(m.bootstrap.as_ref()) {
@@ -658,24 +658,28 @@ pub fn machine_text(m: &MachineDescription) -> String {
 
 /// `machine describe`'s `bootstrap:` line, from `Store::machine_state`:
 /// `None` for a machine with no row, so an existing machine's description
-/// is unchanged. `host` is the flock's `ssh` destination as written (`me@gpu-3`),
-/// which `machine list`'s `host` column already carries; its user before the
-/// `@` is the login user, the service user by default (root mode).
-fn bootstrap_line(host: &str, state: Option<&crate::store::MachineState>) -> Option<String> {
+/// is unchanged. A root-mode line names the shepherd's user only when the
+/// report said who it is.
+fn bootstrap_line(state: Option<&crate::store::MachineState>) -> Option<String> {
     use crate::store::BootstrapState;
     let s = state?;
     Some(match s.bootstrap {
         BootstrapState::Pending => "pending".to_string(),
-        BootstrapState::Failed => format!(
-            "failed at {}: {}",
-            s.failed_step.as_deref().unwrap_or("?"),
-            s.why.as_deref().unwrap_or("?"),
-        ),
+        BootstrapState::Failed => {
+            let step = s.failed_step.as_deref().unwrap_or("unknown");
+            match s.why.as_deref().filter(|w| !w.is_empty()) {
+                Some(why) => format!("failed at {step}: {why}"),
+                None => format!("failed at {step}"),
+            }
+        }
         BootstrapState::Ok => match s.mode.as_deref() {
-            Some("root") => format!(
-                "ok, root mode (agents as pastor-agent, shepherd as {})",
-                ssh_user(host)
-            ),
+            Some("root") => match s.service_user.as_deref().filter(|u| !u.is_empty()) {
+                Some(user) => format!(
+                    "ok, root mode (agents as {}, shepherd as {user})",
+                    crate::bootstrap::AGENT_USER
+                ),
+                None => format!("ok, root mode (agents as {})", crate::bootstrap::AGENT_USER),
+            },
             _ => "ok, user mode".to_string(),
         },
     })
@@ -687,15 +691,6 @@ fn isolation_line(state: Option<&crate::store::MachineState>) -> Option<String> 
     let s = state?;
     (s.mode.as_deref() == Some("user") && s.isolation.as_deref() == Some("none"))
         .then(|| "none (agents can read the machine key)".to_string())
-}
-
-/// The user before the `@` in an ssh destination (`Endpoint::host`), else a
-/// placeholder for a local or command machine, which has none.
-fn ssh_user(host: &str) -> &str {
-    match host.split_once('@') {
-        Some((user, _)) if !user.is_empty() => user,
-        _ => "the login user",
-    }
 }
 
 pub fn flock_text(f: &FlockDescription) -> String {

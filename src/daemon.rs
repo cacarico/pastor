@@ -1798,12 +1798,14 @@ impl Fleet {
     ) -> anyhow::Result<Vec<QueueEntry>> {
         let queued = self.store.queued_tasks()?;
         let wanted = self.flock();
-        // Same model/agent compatibility check `dispatch_queued` applies: a
-        // machine whose agent cannot run the task's model does not take it.
+        // Same checks `dispatch_queued` applies: a machine whose agent
+        // cannot run the task's model, or whose bootstrap is pending or
+        // failed, does not take it.
         let accepts = |task: &Task, machine: &str| {
             let target = task.flock.as_deref().unwrap_or(wanted.default_flock());
             self.settled_on(task, target, machine)
                 .is_none_or(|r| r.is_ok())
+                && self.bootstrap_ready(machine)
         };
         let mut entries = crate::queue::entries(
             queued,
@@ -2426,6 +2428,11 @@ impl Fleet {
         let handle = self.pull_handle(machine)?;
         self.heard(&handle);
         self.count_pull(&handle);
+        // A machine whose bootstrap is pending or failed takes nothing,
+        // pinned or loose, as a dispatch pass places nothing there.
+        if !self.bootstrap_ready(machine) {
+            return Ok(Vec::new());
+        }
         let flock = self.flock();
         let s = handle.snapshot();
         let mut view = MachineView {
@@ -2509,12 +2516,13 @@ impl Fleet {
     /// (`accepts` in `place_queued`) and `machine describe` can show it.
     /// The table has no column for a step's `fix`, so a failure folds it
     /// into `why` as `"<why>; fix: <fix>"`, which `describe::bootstrap_line`
-    /// prints back whole.
+    /// prints back whole. True when the report made a pending or failed
+    /// machine ready, so the caller dispatches what waited for it.
     pub fn report_bootstrap(
         &self,
         machine: &str,
         outcome: crate::bootstrap::Outcome,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         use crate::bootstrap::{Isolation, Mode, StepStatus};
         use crate::store::{BootstrapState, MachineState};
         if self.flock().get(machine).is_none() {
@@ -2531,6 +2539,7 @@ impl Fleet {
             host_key,
             herdr_version,
             pastor_version,
+            service_user,
             ..
         } = outcome;
         let mode = match mode {
@@ -2541,11 +2550,25 @@ impl Fleet {
             Isolation::Users => "users",
             Isolation::None => "none",
         };
-        let failed = steps.iter().find(|s| s.status == StepStatus::Failed);
-        let failed_step = failed.map(|s| s.step.clone());
-        let why = failed.map(|s| match &s.fix {
-            Some(fix) => format!("{}; fix: {fix}", s.why.as_deref().unwrap_or("")),
-            None => s.why.clone().unwrap_or_default(),
+        // A failed report names its failed step, else the last one run,
+        // else none at all.
+        let failed = (!ok).then(|| {
+            steps
+                .iter()
+                .find(|s| s.status == StepStatus::Failed)
+                .or(steps.last())
+        });
+        let failed_step =
+            failed.map(|s| s.map_or_else(|| "unknown".to_string(), |s| s.step.clone()));
+        let why = failed.flatten().and_then(|s| {
+            let parts: Vec<String> = s
+                .why
+                .iter()
+                .filter(|w| !w.is_empty())
+                .cloned()
+                .chain(s.fix.iter().map(|fix| format!("fix: {fix}")))
+                .collect();
+            (!parts.is_empty()).then(|| parts.join("; "))
         });
         let missing: Vec<String> = steps.into_iter().flat_map(|s| s.missing).collect();
         let state = MachineState {
@@ -2562,8 +2585,10 @@ impl Fleet {
             host_key,
             herdr_version,
             pastor_version,
+            service_user,
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
+        let was_held = !self.bootstrap_ready(machine);
         self.store.put_machine_state(&state)?;
         if ok {
             self.emit(
@@ -2585,7 +2610,7 @@ impl Fleet {
                 })),
             );
         }
-        Ok(())
+        Ok(ok && was_held)
     }
 
     /// Whether dispatch may place work on `machine`: a `Pending` or
@@ -3891,6 +3916,23 @@ impl Daemon {
                 );
             }
         }
+        // Only `pastor bootstrap` on the machine itself reports how its
+        // bootstrap ended: never an agent's pane or an orchestrator's
+        // script, `agents_change_fleet` or not, or one could mark a failed
+        // machine ready.
+        if matches!(req, IpcRequest::BootstrapReport { .. }) {
+            let who = match (&caller.task, &caller.orchestrator) {
+                (Some(task), _) => Some(format!("{task} is a task")),
+                (None, Some(o)) => Some(format!("orchestrator {o}'s script is not a person")),
+                (None, None) => None,
+            };
+            if let Some(who) = who {
+                return IpcResponse::error(
+                    "agent_refused",
+                    format!("{who}, and only pastor bootstrap reports a machine's bootstrap"),
+                );
+            }
+        }
         if let Some(task) = caller.task.as_deref() {
             if let Some(why) = self.makes_orchestrator(&req) {
                 return IpcResponse::error("role_refused", format!("{task} is a task, and {why}"));
@@ -4554,7 +4596,13 @@ impl Daemon {
             },
             IpcRequest::BootstrapReport { machine, result } => {
                 match self.fleet.report_bootstrap(&machine, result) {
-                    Ok(()) => IpcResponse::Text(format!("{machine}: bootstrap recorded")),
+                    Ok(ready) => {
+                        // Tasks that waited on it start now, not next tick.
+                        if ready {
+                            self.fleet.dispatch_queued().await;
+                        }
+                        IpcResponse::Text(format!("{machine}: bootstrap recorded"))
+                    }
                     Err(err) => cli_error(err),
                 }
             }
@@ -6659,6 +6707,7 @@ mod tests {
                 host_key: None,
                 herdr_version: None,
                 pastor_version: None,
+                service_user: None,
                 updated_at: chrono::Utc::now().to_rfc3339(),
             })
             .unwrap();
@@ -6669,10 +6718,12 @@ mod tests {
             panic!("{resp:?}")
         };
         let text = crate::describe::machine_text(&m);
+        // The report did not say who runs the shepherd: no guess at it.
         assert!(
-            text.contains("ok, root mode (agents as pastor-agent, shepherd as the login user)"),
+            text.contains("ok, root mode (agents as pastor-agent)\n"),
             "{text}"
         );
+        assert!(!text.contains("shepherd as"), "{text}");
     }
 
     #[tokio::test]
@@ -6740,6 +6791,7 @@ mod tests {
             host_key: None,
             herdr_version: None,
             pastor_version: None,
+            service_user: None,
             updated_at: chrono::Utc::now().to_rfc3339(),
         }
     }
@@ -6803,6 +6855,7 @@ mod tests {
             host_key: None,
             herdr_version: None,
             pastor_version: None,
+            service_user: None,
         }
     }
 
@@ -6837,6 +6890,192 @@ mod tests {
             panic!("{resp:?}")
         };
         assert_eq!(t.state, TaskState::Queued);
+    }
+
+    fn outcome(ok: bool, mode: crate::bootstrap::Mode) -> crate::bootstrap::Outcome {
+        crate::bootstrap::Outcome {
+            ok,
+            mode,
+            isolation: match mode {
+                crate::bootstrap::Mode::Root => crate::bootstrap::Isolation::Users,
+                crate::bootstrap::Mode::User => crate::bootstrap::Isolation::None,
+            },
+            ..failed_outcome()
+        }
+    }
+
+    fn bootstrap_report(machine: &str, result: crate::bootstrap::Outcome) -> IpcRequest {
+        IpcRequest::BootstrapReport {
+            machine: machine.into(),
+            result,
+        }
+    }
+
+    async fn describe(d: &Daemon, name: &str) -> String {
+        let resp = d
+            .handle(IpcRequest::MachineDescribe { name: name.into() })
+            .await;
+        let IpcResponse::MachineDescription(m) = resp else {
+            panic!("{resp:?}")
+        };
+        crate::describe::machine_text(&m)
+    }
+
+    /// A pull machine whose bootstrap is pending (or failed) claims
+    /// nothing, neither the task pinned to it nor loose flock work.
+    #[tokio::test]
+    async fn pending_pull_machine_claims_nothing() {
+        let (d, _tmp) = pull_daemon(3).await;
+        let pinned = queued(&d, "p1", Some("laptop")).await;
+        let _on_a = queued(&d, "u1", None).await;
+        let loose = queued(&d, "u2", None).await;
+        assert_eq!(pinned.state, TaskState::Queued);
+        assert_eq!(loose.state, TaskState::Queued, "a is full");
+        d.store.put_machine_state(&pending_state("laptop")).unwrap();
+        assert!(claim(&d, 5, true).await.is_empty());
+        assert_eq!(state_of(&d, &pinned), TaskState::Queued);
+        assert_eq!(state_of(&d, &loose), TaskState::Queued);
+        // The queue says the same: no "next claim" on a machine that
+        // takes nothing.
+        let entries = d.fleet().queue(None, None).unwrap();
+        let why = &entries
+            .iter()
+            .find(|e| e.task.id == pinned.id)
+            .expect("pinned is queued")
+            .why;
+        assert!(!why.starts_with("next claim"), "{why}");
+    }
+
+    /// Only `pastor bootstrap` reports a machine's bootstrap: an agent's
+    /// pane may not, even with `agents_change_fleet` on.
+    #[tokio::test]
+    async fn agent_may_not_report_bootstrap() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        d.fleet().set_config(&PastorConfig {
+            agents_change_fleet: true,
+            ..test_config()
+        });
+        let resp = d
+            .handle_from(
+                bootstrap_report("a", outcome(true, crate::bootstrap::Mode::Root)),
+                Some("t-1"),
+            )
+            .await;
+        assert_eq!(error_code(resp), "agent_refused");
+        assert!(d.store.machine_state("a").unwrap().is_none());
+    }
+
+    /// A report that ends a failed bootstrap starts the tasks that waited
+    /// for it there and then, not on the next tick.
+    #[tokio::test]
+    async fn ok_report_after_failure_dispatches_queued() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        d.handle(bootstrap_report("a", failed_outcome())).await;
+        let IpcResponse::Task(t) = d.handle(run_req()).await else {
+            panic!()
+        };
+        assert_eq!(t.state, TaskState::Queued);
+        let resp = d
+            .handle(bootstrap_report(
+                "a",
+                outcome(true, crate::bootstrap::Mode::Root),
+            ))
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while d.store.get_task(t.id).unwrap().unwrap().state == TaskState::Queued {
+            assert!(Instant::now() < deadline, "never dispatched");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn describe_shows_failed_step_and_fix() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        d.handle(bootstrap_report("a", failed_outcome())).await;
+        let text = describe(&d, "a").await;
+        assert!(
+            text.contains("failed at install_herdr: no sudo; fix: rerun with --sudo"),
+            "{text}"
+        );
+    }
+
+    /// ok=false with no failed step names the last step run, and a failed
+    /// step with a fix but no why prints the fix alone.
+    #[tokio::test]
+    async fn describe_failure_without_failed_step_or_why() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        let mut o = failed_outcome();
+        o.steps = vec![crate::bootstrap::StepResult {
+            step: "keys".into(),
+            ..crate::bootstrap::StepResult::done()
+        }];
+        d.handle(bootstrap_report("a", o)).await;
+        let text = describe(&d, "a").await;
+        assert!(!text.contains('?'), "{text}");
+        assert!(text.contains("failed at keys"), "{text}");
+
+        let mut o = failed_outcome();
+        o.steps.clear();
+        d.handle(bootstrap_report("a", o)).await;
+        let text = describe(&d, "a").await;
+        assert!(text.contains("failed at unknown"), "{text}");
+
+        let mut o = failed_outcome();
+        o.steps[0].why = None;
+        d.handle(bootstrap_report("a", o)).await;
+        let text = describe(&d, "a").await;
+        assert!(
+            text.contains("failed at install_herdr: fix: rerun with --sudo"),
+            "{text}"
+        );
+        assert!(!text.contains(": ; "), "{text}");
+    }
+
+    #[tokio::test]
+    async fn describe_shows_service_user_and_isolation() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        let mut o = outcome(true, crate::bootstrap::Mode::Root);
+        o.service_user = Some("pastor".into());
+        d.handle(bootstrap_report("a", o)).await;
+        let text = describe(&d, "a").await;
+        assert!(
+            text.contains("ok, root mode (agents as pastor-agent, shepherd as pastor)"),
+            "{text}"
+        );
+        assert!(!text.contains("isolation:"), "{text}");
+
+        let o = outcome(true, crate::bootstrap::Mode::User);
+        d.handle(bootstrap_report("a", o)).await;
+        let text = describe(&d, "a").await;
+        assert!(text.contains("ok, user mode"), "{text}");
+        assert!(
+            text.contains("none (agents can read the machine key)"),
+            "{text}"
+        );
+    }
+
+    /// Nothing connects out to a pull machine, so `machine list` shows
+    /// the versions its last bootstrap report read.
+    #[tokio::test]
+    async fn pull_machine_list_falls_back_to_stored_versions() {
+        let (d, _tmp) = pull_daemon(1).await;
+        d.store
+            .put_machine_state(&crate::store::MachineState {
+                bootstrap: crate::store::BootstrapState::Ok,
+                herdr_version: Some("0.9.6".into()),
+                pastor_version: Some("1.2.3".into()),
+                ..pending_state("laptop")
+            })
+            .unwrap();
+        let laptop = d
+            .fleet()
+            .statuses()
+            .into_iter()
+            .find(|s| s.name == "laptop")
+            .unwrap();
+        assert_eq!(laptop.herdr_version.as_deref(), Some("0.9.6"));
+        assert_eq!(laptop.pastor_version.as_deref(), Some("1.2.3"));
     }
 
     #[tokio::test]

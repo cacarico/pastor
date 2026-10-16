@@ -1440,6 +1440,22 @@ fn migrates_from_18() {
     old_database(&path, 18);
     let store = Store::open(&path).unwrap();
     assert!(store.machine_state("pi-1").unwrap().is_none());
+    // Every column, service_user included, reads back.
+    let state = pastor::store::MachineState {
+        machine: "pi-1".into(),
+        bootstrap: pastor::store::BootstrapState::Ok,
+        mode: Some("root".into()),
+        isolation: Some("users".into()),
+        failed_step: None,
+        why: None,
+        host_key: None,
+        herdr_version: Some("0.9.6".into()),
+        pastor_version: Some("1.2.3".into()),
+        service_user: Some("pastor".into()),
+        updated_at: "2026-10-16T10:00:00+00:00".into(),
+    };
+    store.put_machine_state(&state).unwrap();
+    assert_eq!(store.machine_state("pi-1").unwrap(), Some(state));
     assert!(store.join_token("none").unwrap().is_none());
     assert!(store.get_task(7).unwrap().is_some());
     drop(store);

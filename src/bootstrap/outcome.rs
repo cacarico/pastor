@@ -20,6 +20,11 @@ pub struct Outcome {
     pub host_key: Option<String>,
     pub herdr_version: Option<String>,
     pub pastor_version: Option<String>,
+    /// The user that holds the machine key and runs the shepherd
+    /// (`--service-user`, else the login user). Absent from a report made
+    /// before it was sent.
+    #[serde(default)]
+    pub service_user: Option<String>,
 }
 
 /// Root mode makes users and installs packages; user mode does neither.

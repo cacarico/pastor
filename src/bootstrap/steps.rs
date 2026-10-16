@@ -80,7 +80,7 @@ impl User {
 type StepOutcome = Result<StepResult, StepResult>;
 
 impl Ctx<'_> {
-    fn service_name(&self) -> String {
+    pub(super) fn service_name(&self) -> String {
         self.o
             .service_user
             .clone()
