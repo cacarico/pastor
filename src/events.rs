@@ -153,6 +153,16 @@ impl EventRecord {
         self.task.as_ref().map(|t| t.id)
     }
 
+    /// The machine the record is about: a `machine.*` event's own machine,
+    /// else its task's. A record about neither (a job event with no task)
+    /// is about no machine.
+    pub fn machine_name(&self) -> Option<&str> {
+        self.machine
+            .as_ref()
+            .map(|m| m.name.as_str())
+            .or_else(|| self.task.as_ref().and_then(|t| t.machine.as_deref()))
+    }
+
     /// One human-readable line: time, type, and whatever the event is about.
     pub fn line(&self) -> String {
         let mut cols = vec![
@@ -434,6 +444,20 @@ impl EventsPage {
 /// returned. `gap` is decided on the whole log, whatever `task` is: it is set
 /// when the oldest numbered record left is past `after + 1`.
 pub fn since(path: &Path, after: u64, limit: u32, task: Option<i64>) -> anyhow::Result<EventsPage> {
+    since_for(path, after, limit, task, None)
+}
+
+/// `since`, cut to the records about `machine` too when given
+/// (`EventRecord::machine_name`). The cut comes before `limit`, so a reader
+/// that sees fewer than `limit` records has seen all of the machine's up to
+/// the end of the log, however many of other machines' lay between.
+pub fn since_for(
+    path: &Path,
+    after: u64,
+    limit: u32,
+    task: Option<i64>,
+    machine: Option<&str>,
+) -> anyhow::Result<EventsPage> {
     let all = read(path, None)?;
     let oldest = all.iter().map(|r| r.seq).filter(|&s| s > 0).min();
     let newest = all.iter().map(|r| r.seq).max().filter(|&s| s > 0);
@@ -441,6 +465,7 @@ pub fn since(path: &Path, after: u64, limit: u32, task: Option<i64>) -> anyhow::
     let events = all
         .into_iter()
         .filter(|r| r.seq > after && matches(r, task))
+        .filter(|r| machine.is_none() || r.machine_name() == machine)
         .take(limit as usize)
         .collect();
     Ok(EventsPage {
@@ -637,6 +662,7 @@ pub async fn cli(client: &crate::ipc::Client, args: EventsArgs) -> anyhow::Resul
                 after,
                 limit: REMOTE_PAGE,
                 task,
+                machine: None,
             };
             async move {
                 let resp = crate::ipc::request_head(client, &req)
@@ -1415,6 +1441,42 @@ mod tests {
         // A cursor right before the oldest record lost nothing.
         let page = since(&path, oldest - 1, 100, None).unwrap();
         assert!(!page.gap);
+    }
+
+    /// Cut to one machine, the cut comes before the limit: a page whose
+    /// first `limit` records are all another machine's still holds the
+    /// machine's own that follow, so a reader's cursor moves on.
+    #[test]
+    fn since_for_a_machine_cuts_before_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let (_, t) = store_with_task("j");
+        let on = |m: &str| {
+            let mut t = t.clone();
+            t.machine = Some(m.into());
+            t
+        };
+        let (other, own) = (on("pi-1"), on("pi-2"));
+        let w = LogWriter::new(path.clone(), DEFAULT_MAX_BYTES);
+        for seq in 1..=5 {
+            w.append(&numbered(seq, "task.running", Some(&other)))
+                .unwrap();
+        }
+        w.append(&numbered(6, "task.running", Some(&own))).unwrap();
+        w.append(&numbered(7, "task.running", Some(&other)))
+            .unwrap();
+        w.append(&numbered(8, "task.done", Some(&own))).unwrap();
+        let seqs = |p: &EventsPage| p.events.iter().map(|r| r.seq).collect::<Vec<_>>();
+        let page = since_for(&path, 0, 2, None, Some("pi-2")).unwrap();
+        assert_eq!(seqs(&page), [6, 8]);
+        let page = since_for(&path, 6, 2, None, Some("pi-2")).unwrap();
+        assert_eq!(seqs(&page), [8]);
+        let page = since_for(&path, 8, 2, None, Some("pi-2")).unwrap();
+        assert!(page.events.is_empty());
+        assert_eq!(page.newest, Some(8));
+        // No machine: every record, as `since`.
+        let page = since_for(&path, 0, 2, None, None).unwrap();
+        assert_eq!(seqs(&page), [1, 2]);
     }
 
     /// A scripted head for `page_remote`: answers `EventsSince` from `log`

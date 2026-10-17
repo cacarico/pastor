@@ -681,11 +681,25 @@ fn machine_describe_json_is_the_row_its_tasks_and_errors() {
         agents_by_kind: Default::default(),
         tasks: vec![full_task()],
         recent_errors: vec![],
+        bootstrap: Some(pastor::store::MachineState {
+            machine: "pi-1".into(),
+            bootstrap: pastor::store::BootstrapState::Ok,
+            mode: Some("root".into()),
+            isolation: Some("users".into()),
+            failed_step: None,
+            why: None,
+            host_key: None,
+            herdr_version: None,
+            pastor_version: None,
+            service_user: Some("pastor".into()),
+            updated_at: "2024-01-01T00:00:00Z".into(),
+        }),
     };
     let v = serde_json::to_value(&d).unwrap();
     let mut want: Vec<(&str, &str)> = MACHINE.to_vec();
     want.extend([
         ("agents_by_kind", "object"),
+        ("bootstrap", "object|null"),
         ("fallback", "array|null"),
         ("model", "string|null"),
         ("recent_errors", "array"),
@@ -705,6 +719,7 @@ fn machine_describe_json_is_the_row_its_tasks_and_errors() {
         agents_by_kind: Default::default(),
         tasks: vec![],
         recent_errors: vec![],
+        bootstrap: None,
     };
     let v = serde_json::to_value(&d).unwrap();
     assert_shape("machine describe", &v, &want, MACHINE_MAY_BE_ABSENT);

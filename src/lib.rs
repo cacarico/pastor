@@ -1,3 +1,6 @@
+pub mod artifacts;
+pub mod authkeys;
+pub mod bootstrap;
 pub mod bridge;
 pub mod cli;
 pub mod cli_reference;
@@ -14,6 +17,8 @@ pub mod head;
 pub mod herdr;
 pub mod hooks;
 pub mod ipc;
+pub mod join;
+pub mod leave;
 pub mod limit;
 pub mod limit_cli;
 pub mod machine;

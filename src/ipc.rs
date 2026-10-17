@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -40,8 +40,13 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 /// (`DispatchSpec::keep_pane`, a job's `[dispatch] keep_pane`,
 /// `FlockEntry::keep_pane`). 30: usage limits (`LimitList`, `LimitClear`,
 /// `TaskReport::limit`). 31: saved trust on pull machines (`PullTrust`,
-/// `TaskReport::trusted`).
-pub const IPC_PROTOCOL: u32 = 31;
+/// `TaskReport::trusted`). 32: a pull machine's own versions
+/// (`TaskClaim::herdr_version`, `TaskClaim::pastor_version`), join tokens
+/// (`JoinCreate`, `JoinList`, `JoinRevoke`, `Join`), bootstrap reports
+/// (`BootstrapReport`) and the machine state they record, push bootstrap
+/// (`MachineBootstrap`, with its `repin`), and the artifact cache
+/// (`ArtifactLocate`).
+pub const IPC_PROTOCOL: u32 = 32;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -220,6 +225,38 @@ pub const LIMIT_PROTOCOL: u32 = 30;
 /// one refuses the first as unreadable and drops the second.
 pub const PULL_TRUST_PROTOCOL: u32 = 31;
 
+/// The first protocol whose head keeps a pull machine's own versions
+/// (`TaskClaim::herdr_version`, `TaskClaim::pastor_version`). An older one
+/// would drop them without a word.
+pub const PULL_VERSIONS_PROTOCOL: u32 = 32;
+
+/// The first protocol whose head makes, lists, revokes and redeems join
+/// tokens (`JoinCreate`, `JoinList`, `JoinRevoke`, `Join`). An older one
+/// refuses them as unreadable.
+pub const JOIN_TOKEN_PROTOCOL: u32 = 32;
+
+/// The first protocol whose head answers `BootstrapReport` and keeps
+/// `machine_state`: a `Pending` or `Failed` machine takes no tasks. An
+/// older one refuses the request as unreadable, so the report is lost and
+/// dispatch never learns to skip the machine.
+pub const BOOTSTRAP_PROTOCOL: u32 = 32;
+
+/// The first protocol whose head runs a push bootstrap
+/// (`MachineBootstrap`). An older one refuses the request as unreadable,
+/// so `machine add --bootstrap` would add nothing and say only that.
+pub const MACHINE_BOOTSTRAP_PROTOCOL: u32 = 32;
+
+/// The first protocol whose head answers `ShepherdCheck`, cuts
+/// `EventsSince` to `machine`'s records itself, and keeps a joining
+/// machine's `Join::service_user`. An older one refuses the first as
+/// unreadable and drops the other two fields.
+pub const SHEPHERD_SCOPE_PROTOCOL: u32 = 32;
+
+/// The first protocol whose head answers `ArtifactLocate` from its cache of
+/// the binaries it puts on a machine. An older one refuses the request as
+/// unreadable.
+pub const ARTIFACT_PROTOCOL: u32 = 32;
+
 /// The first protocol whose head honours `Run::priority` and knows
 /// `TaskPriority`. An older one would queue the task at its own level
 /// without a word, or refuse the request as unreadable.
@@ -338,8 +375,21 @@ const SESSION: &str = "predates session orchestrators, and would refuse the requ
 const LIMITS: &str = "predates usage limits, and would refuse the request";
 const REPORT_LIMIT: &str = "predates usage limits, and would drop the limit the report carries";
 const PULL_TRUST: &str = "predates saved trust on pull machines, and would refuse the request";
+const JOIN_TOKENS: &str = "predates join tokens, and would refuse the request";
 const REPORT_TRUSTED: &str =
     "predates saved trust on pull machines, and would drop the trust answer the report carries";
+const PULL_VERSIONS: &str =
+    "predates a pull machine's own versions, and would drop the claim's herdr and pastor versions";
+const BOOTSTRAP: &str = "predates bootstrap reports, and would refuse the request without recording the machine's state";
+const MACHINE_BOOTSTRAP: &str =
+    "predates push bootstrap, and would refuse the request without setting the machine up";
+const ARTIFACT: &str =
+    "predates the artifact cache, and would refuse to say where pastor or herdr is";
+const SHEPHERD_CHECK: &str =
+    "predates the shepherd bridge's generation check, and would refuse the request";
+const EVENTS_MACHINE: &str = "predates events cut to one machine, and would answer every machine's";
+const JOIN_SERVICE_USER: &str =
+    "predates a join's service user, and would record the machine without it";
 
 /// How long a head's `Pong` settles the protocol check before it is asked
 /// again: a long-lived sender (a headless serve) sees a restarted head
@@ -534,6 +584,28 @@ pub enum IpcRequest {
     MachineAdd {
         machine: crate::config::flock::MachineConfig,
     },
+    /// `machine add --bootstrap` (with `machine`, the entry to write) and
+    /// `machine bootstrap` (without): the head sets the machine up over ssh
+    /// as `login`, else the entry's own `ssh`, and records how it ended
+    /// (`bootstrap::push`). Binaries go over the head's own ssh, never
+    /// through this socket. Answers `Text`, or the failed step's error.
+    MachineBootstrap {
+        name: String,
+        #[serde(default)]
+        sudo: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        service_user: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host_key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        machine: Option<crate::config::flock::MachineConfig>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        login: Option<String>,
+        /// `--repin`: replace the host key on record with the one the
+        /// machine offers now (`PushOpts::repin`).
+        #[serde(default)]
+        repin: bool,
+    },
     /// `machine remove`, the flock.toml part, as for `MachineAdd`. Answers
     /// `Text`.
     MachineRemove {
@@ -626,6 +698,12 @@ pub enum IpcRequest {
         limit: u32,
         #[serde(default)]
         task: Option<i64>,
+        /// Only the records about this machine (a `machine.*` event's own
+        /// machine, else its task's), cut before `limit`: what a shepherd's
+        /// bridge sets, so a page never comes back empty while the
+        /// machine's own records wait further on.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        machine: Option<String>,
     },
     /// Delete rows in `states` that finished more than `older_than_secs`
     /// ago. Answers `Pruned`.
@@ -719,6 +797,15 @@ pub enum IpcRequest {
         free_slots: u32,
         #[serde(default)]
         flock_work: bool,
+        /// This pull machine's own herdr, read locally
+        /// (`cli::herdr_version_from`). `Fleet::heard` keeps it on the
+        /// machine's `machine_state` row (`Store::set_versions`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        herdr_version: Option<String>,
+        /// This pull machine's own pastor (`CARGO_PKG_VERSION`), kept the
+        /// same way.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pastor_version: Option<String>,
     },
     /// A pull machine's serve says what became of a task it claimed: its
     /// state, its pane, and `detail`, the note the task carries there (why
@@ -752,6 +839,23 @@ pub enum IpcRequest {
     /// Answers `Trusted`.
     PullTrust {
         machine: String,
+    },
+    /// What `pastor bootstrap` found on `machine`, once it has run the
+    /// setup steps: saved as the machine's `machine_state`, which dispatch
+    /// reads before placing a task there. The head emits `machine.bootstrapped`
+    /// or `machine.bootstrap_failed`. Answers `Text`.
+    BootstrapReport {
+        machine: String,
+        result: crate::bootstrap::Outcome,
+    },
+    /// Where the head's cache keeps `name` (`pastor` or `herdr`) at
+    /// `version` for `target`, fetched and checked first when it is not
+    /// there. Only the path, sum and size cross the socket; `pastor bridge
+    /// --fetch` streams the file itself. Answers `Artifact`.
+    ArtifactLocate {
+        name: String,
+        version: String,
+        target: String,
     },
     /// Every usage limit the head keeps. Answers `Limits`.
     LimitList,
@@ -794,6 +898,55 @@ pub enum IpcRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
         text: String,
+    },
+    /// `join create`: a one-time token for a new pull machine, with the
+    /// flock, tags and `--replace` target fixed now. Answers `JoinCreated`.
+    JoinCreate {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        flock: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replace: Option<String>,
+        ttl_secs: u64,
+    },
+    /// `join list`. Answers `JoinTokens`.
+    JoinList,
+    /// `join revoke`: the token's line and row go. Answers `Text`.
+    JoinRevoke {
+        id: String,
+    },
+    /// A joining machine's one request, through `bridge --join <id>`, which
+    /// sets `id` from its forced command whatever the machine sent. Answers
+    /// `Joined`.
+    Join {
+        id: String,
+        name: String,
+        /// The public key its shepherd reaches the head with.
+        machine_key: String,
+        /// The public key its agents reach the head with.
+        agent_key: String,
+        /// Its sshd host key.
+        host_key: String,
+        /// What it says about itself (os, arch, ...); kept for later use.
+        #[serde(default)]
+        facts: serde_json::Value,
+        /// The user that runs its shepherd, recorded with its pending state.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        service_user: Option<String>,
+    },
+    /// Whether a shepherd bridge's forced command (`bridge --shepherd
+    /// --machine X --gen N`) still speaks for `machine`: `generation` must
+    /// be the machine's enrollment generation, and the machine must have a
+    /// record. A line with no `--gen` (one made by hand) passes only while
+    /// no join has enrolled the machine. The bridge asks before every
+    /// request it passes on, so a connection that authenticated before a
+    /// `--replace` or a `machine remove` is cut off at its next request.
+    /// Answers `Text`, or `machine_revoked`.
+    ShepherdCheck {
+        machine: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<i64>,
     },
 }
 
@@ -902,7 +1055,13 @@ impl IpcRequest {
                 }
             }
             R::TaskSummaries { .. } => need.at(SUMMARY_PROTOCOL, SUMMARY),
-            R::EventsSince { .. } => need.at(EVENTS_PROTOCOL, EVENTS),
+            R::EventsSince { machine, .. } => {
+                need.at(EVENTS_PROTOCOL, EVENTS);
+                if machine.is_some() {
+                    need.at(SHEPHERD_SCOPE_PROTOCOL, EVENTS_MACHINE);
+                }
+            }
+            R::ShepherdCheck { .. } => need.at(SHEPHERD_SCOPE_PROTOCOL, SHEPHERD_CHECK),
             R::FlockAdd {
                 description,
                 machines,
@@ -1000,7 +1159,16 @@ impl IpcRequest {
             | R::TrustRemove { .. }
             | R::FlockDescribe { .. }
             | R::MachineDescribe { .. } => need.at(HEAD_READS_PROTOCOL, HEAD_READS),
-            R::TaskClaim { .. } => need.at(PULL_PROTOCOL, PULL),
+            R::TaskClaim {
+                herdr_version,
+                pastor_version,
+                ..
+            } => {
+                need.at(PULL_PROTOCOL, PULL);
+                if herdr_version.is_some() || pastor_version.is_some() {
+                    need.at(PULL_VERSIONS_PROTOCOL, PULL_VERSIONS);
+                }
+            }
             R::TaskReport { limit, trusted, .. } => {
                 need.at(PULL_PROTOCOL, PULL);
                 if limit.is_some() {
@@ -1011,6 +1179,9 @@ impl IpcRequest {
                 }
             }
             R::PullTrust { .. } => need.at(PULL_TRUST_PROTOCOL, PULL_TRUST),
+            R::BootstrapReport { .. } => need.at(BOOTSTRAP_PROTOCOL, BOOTSTRAP),
+            R::MachineBootstrap { .. } => need.at(MACHINE_BOOTSTRAP_PROTOCOL, MACHINE_BOOTSTRAP),
+            R::ArtifactLocate { .. } => need.at(ARTIFACT_PROTOCOL, ARTIFACT),
             R::LimitList | R::LimitClear { .. } => need.at(LIMIT_PROTOCOL, LIMITS),
             R::OrchestratorStart { .. } | R::OrchestratorStop { .. } => {
                 need.at(SESSION_PROTOCOL, SESSION);
@@ -1020,6 +1191,15 @@ impl IpcRequest {
             | R::OrchestratorRun { .. }
             | R::OrchestratorSetEnabled { .. }
             | R::OrchestratorNote { .. } => need.at(ORCHESTRATOR_PROTOCOL, ORCHESTRATOR),
+            R::JoinCreate { .. } | R::JoinList | R::JoinRevoke { .. } => {
+                need.at(JOIN_TOKEN_PROTOCOL, JOIN_TOKENS);
+            }
+            R::Join { service_user, .. } => {
+                need.at(JOIN_TOKEN_PROTOCOL, JOIN_TOKENS);
+                if service_user.is_some() {
+                    need.at(SHEPHERD_SCOPE_PROTOCOL, JOIN_SERVICE_USER);
+                }
+            }
         }
         need.0
     }
@@ -1045,7 +1225,12 @@ impl IpcRequest {
             | IpcRequest::OrchestratorList
             | IpcRequest::OrchestratorDescribe { .. }
             | IpcRequest::LimitList
+            | IpcRequest::JoinList
+            | IpcRequest::ShepherdCheck { .. }
             | IpcRequest::Queue { .. } => false,
+            // It may download into the cache, but changes no task, job or
+            // machine.
+            IpcRequest::ArtifactLocate { .. } => false,
             IpcRequest::FileGet { .. } | IpcRequest::JobDescribe { .. } => false,
             IpcRequest::Reload
             | IpcRequest::Tick { .. }
@@ -1056,6 +1241,7 @@ impl IpcRequest {
             | IpcRequest::FlockLeave { .. }
             | IpcRequest::FlockSetDefault { .. }
             | IpcRequest::MachineAdd { .. }
+            | IpcRequest::MachineBootstrap { .. }
             | IpcRequest::MachineRemove { .. }
             | IpcRequest::MachineMove { .. }
             | IpcRequest::JobRun { .. }
@@ -1074,12 +1260,16 @@ impl IpcRequest {
             | IpcRequest::TrustRemove { .. }
             | IpcRequest::TaskClaim { .. }
             | IpcRequest::TaskReport { .. }
+            | IpcRequest::BootstrapReport { .. }
             | IpcRequest::LimitClear { .. }
             | IpcRequest::OrchestratorRun { .. }
             | IpcRequest::OrchestratorStart { .. }
             | IpcRequest::OrchestratorStop { .. }
             | IpcRequest::OrchestratorSetEnabled { .. }
-            | IpcRequest::OrchestratorNote { .. } => true,
+            | IpcRequest::OrchestratorNote { .. }
+            | IpcRequest::JoinCreate { .. }
+            | IpcRequest::JoinRevoke { .. }
+            | IpcRequest::Join { .. } => true,
         }
     }
 
@@ -1216,6 +1406,29 @@ pub enum IpcResponse {
     Orchestrators(Vec<crate::orchestrator::OrchestratorStatus>),
     Orchestrator(crate::orchestrator::OrchestratorDescription),
     Limits(Vec<crate::limit::AccountLimit>),
+    /// `JoinCreate`'s token, which only this reply carries.
+    JoinCreated {
+        id: String,
+        token: String,
+        expires_at: String,
+    },
+    JoinTokens(Vec<crate::store::JoinToken>),
+    /// `Join`: the machine is in flock.toml under `name`.
+    Joined {
+        name: String,
+        /// The herdr the head puts on its machines (`[provision] herdr`,
+        /// else the one most of them run, else pastor's default), for the
+        /// machine to fetch next. Absent from a head that leaves it to the
+        /// machine.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        herdr_version: Option<String>,
+    },
+    /// `ArtifactLocate`: the checked file in the head's cache.
+    Artifact {
+        path: PathBuf,
+        sha256: String,
+        size: u64,
+    },
 }
 
 /// One of the head's config files as `FileGet` found it.
@@ -1768,11 +1981,14 @@ mod tests {
                 after: 7,
                 limit: 50,
                 task: Some(3),
+                machine: None,
             },
             IpcRequest::TaskClaim {
                 machine: "laptop".into(),
                 free_slots: 2,
                 flock_work: true,
+                herdr_version: Some("0.9.5".into()),
+                pastor_version: Some("1.2.3".into()),
             },
             IpcRequest::TaskReport {
                 machine: "laptop".into(),
@@ -1828,6 +2044,7 @@ mod tests {
                 after: 0,
                 limit: 10,
                 task: None,
+                machine: None,
             },
             IpcRequest::FileGet {
                 file: "flock".into(),
@@ -1846,6 +2063,7 @@ mod tests {
             IpcRequest::OrchestratorList,
             IpcRequest::OrchestratorDescribe { name: "o".into() },
             IpcRequest::LimitList,
+            IpcRequest::JoinList,
         ];
         for req in reads {
             assert!(!req.changes_fleet(), "{req:?}");
@@ -1935,6 +2153,15 @@ mod tests {
                     unknown_room: None,
                 },
             },
+            IpcRequest::MachineBootstrap {
+                name: "m".into(),
+                sudo: true,
+                service_user: None,
+                host_key: None,
+                machine: None,
+                login: None,
+                repin: false,
+            },
             IpcRequest::MachineRemove { name: "m".into() },
             IpcRequest::MachineMove {
                 name: "m".into(),
@@ -1991,6 +2218,24 @@ mod tests {
             IpcRequest::OrchestratorNote {
                 name: None,
                 text: "n".into(),
+            },
+            IpcRequest::JoinCreate {
+                flock: None,
+                tags: vec![],
+                replace: None,
+                ttl_secs: 60,
+            },
+            IpcRequest::JoinRevoke {
+                id: "0123456789abcdef".into(),
+            },
+            IpcRequest::Join {
+                id: "0123456789abcdef".into(),
+                name: "m".into(),
+                machine_key: "ssh-ed25519 K".into(),
+                agent_key: "ssh-ed25519 A".into(),
+                host_key: "ssh-ed25519 H".into(),
+                facts: serde_json::Value::Null,
+                service_user: None,
             },
         ]
     }
@@ -2307,6 +2552,13 @@ mod tests {
             ),
             (
                 req(
+                    serde_json::json!({"op": "task_claim", "machine": "m", "free_slots": 1, "herdr_version": "0.9.5"}),
+                ),
+                PULL_VERSIONS_PROTOCOL,
+                "own versions",
+            ),
+            (
+                req(
                     serde_json::json!({"op": "task_report", "machine": "m", "id": 1, "state": "running", "trusted": ["Enter"]}),
                 ),
                 PULL_TRUST_PROTOCOL,
@@ -2316,6 +2568,24 @@ mod tests {
                 req(serde_json::json!({"op": "flock_join", "flock": "f", "machine": "m"})),
                 JOIN_PROTOCOL,
                 "flock join",
+            ),
+            (
+                req(
+                    serde_json::json!({"op": "bootstrap_report", "machine": "m", "result": {
+                        "ok": true, "mode": "root", "isolation": "users", "steps": [],
+                        "machine_key": null, "agent_key": null, "host_key": null,
+                        "herdr_version": null, "pastor_version": null
+                    }}),
+                ),
+                BOOTSTRAP_PROTOCOL,
+                "bootstrap reports",
+            ),
+            (
+                req(
+                    serde_json::json!({"op": "artifact_locate", "name": "herdr", "version": "0.9.5", "target": "linux-x86_64"}),
+                ),
+                ARTIFACT_PROTOCOL,
+                "artifact cache",
             ),
             (
                 req(serde_json::json!({"op": "orchestrator_list"})),
@@ -2391,6 +2661,10 @@ mod tests {
             FALLBACK_PROTOCOL,
             KEEP_PANE_PROTOCOL,
             PULL_TRUST_PROTOCOL,
+            PULL_VERSIONS_PROTOCOL,
+            BOOTSTRAP_PROTOCOL,
+            MACHINE_BOOTSTRAP_PROTOCOL,
+            ARTIFACT_PROTOCOL,
         ] {
             assert!(covered.contains(&p), "no request needs protocol {p}");
         }

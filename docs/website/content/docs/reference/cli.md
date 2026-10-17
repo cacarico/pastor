@@ -263,6 +263,23 @@ Add a machine to flock.toml, reached over ssh, locally or by a command
 | `--flock <FLOCK>` | The flock it joins (default: the default flock) |  |
 | `--description <TEXT>` | One line on what the machine is for, for `machine list --wide` |  |
 | `--herdr` | Also save it in herdr's sidebar (runs `herdr machine add`) |  |
+| `--bootstrap` | Set the machine up over ssh first: pastor, herdr and their services (needs a running head) |  |
+| `--sudo` | With --bootstrap: do root work through sudo -n (packages, users, lingering), so agents run as pastor-agent |  |
+| `--service-user <NAME>` | With --bootstrap: the user that holds the machine key; created if missing |  |
+| `--host-key <KEY>` | With --bootstrap: the machine's ed25519 host key must be this (SHA256:... or the key itself) |  |
+
+### pastor machine bootstrap
+
+Run bootstrap again on a machine over ssh: after a failed step, or to upgrade pastor and herdr
+
+| argument | does | default |
+|---|---|---|
+| `<NAME>` | The machine, as flock.toml names it |  |
+| `--sudo` | Do root work through sudo -n (packages, users, lingering), so agents run as pastor-agent |  |
+| `--service-user <NAME>` | The user that holds the machine key; created if missing |  |
+| `--ssh <DEST>` | The login to bootstrap as (default: the login its last bootstrap used, else the machine's ssh) |  |
+| `--host-key <KEY>` | The machine's ed25519 host key must be this (SHA256:... or the key itself) |  |
+| `--repin` | Drop the host key pinned for the machine and pin the one it offers now, after a reinstall |  |
 
 ### pastor machine remove
 
@@ -311,12 +328,13 @@ Open the full herdr UI on a machine
 
 ### pastor machine authorized-key
 
-Print the authorized_keys line that lets a machine's agents reach this head
+Print the authorized_keys line that lets a machine's agents (or, with --shepherd, its shepherd) reach this head
 
 | argument | does | default |
 |---|---|---|
 | `<NAME>` | The machine, as flock.toml names it |  |
 | `--key <FILE>` | The public key of the machine's user: a .pub file, or - for stdin (required) |  |
+| `--shepherd` | Print the shepherd's line (bridge --shepherd --machine NAME) instead of the agent's |  |
 
 ## flock
 
@@ -754,6 +772,47 @@ Forget a saved trust; the repo's next task asks again
 | `<MACHINE>` | The machine, as flock.toml names it |  |
 | `<REPO>` | The repo's path on that machine, as `trust list` shows it |  |
 
+## join
+
+One-time tokens a new machine joins the fleet with, as a pull machine
+
+| argument | does | default |
+|---|---|---|
+| `<TOKEN>` | On the new machine: the token `join create` printed; `ps` shows it, so prefer --token-stdin |  |
+| `--token-stdin` | Read the join token from stdin |  |
+| `--name <NAME>` | The name this machine takes in the head's flock.toml (default: its hostname) |  |
+| `--sudo` | Do root work (packages, users, lingering) through `sudo -n` |  |
+| `--service-user <NAME>` | The user that holds the machine key and runs the shepherd; created if missing (root mode) |  |
+| `--json` | Print as a JSON object: mode, isolation, each step, the public keys and versions |  |
+
+### pastor join create
+
+Make a one-time token a new machine joins the fleet with, as a pull machine; prints the token
+
+| argument | does | default |
+|---|---|---|
+| `--flock <FLOCK>` | The flock the machine joins (default: the default flock) |  |
+| `--tag <TAGS>` | A tag the machine gets; repeat for more |  |
+| `--replace <REPLACE>` | The one machine name already in flock.toml the token may take over |  |
+| `--ttl <TTL>` | How long the token works, like 30m or 1h | `1h` |
+| `--json` | Print as a JSON object: the id, the token and its expiry |  |
+
+### pastor join list
+
+The join tokens the head knows: id, flock, tags, expiry, whether used
+
+| argument | does | default |
+|---|---|---|
+| `--json` | Print as a JSON array |  |
+
+### pastor join revoke
+
+Remove a join token's key from authorized_keys and forget it
+
+| argument | does | default |
+|---|---|---|
+| `<ID>` | The token's id, as `join list` shows it |  |
+
 ## bridge
 
 Pass request lines from stdin to this machine's head; for a remote CLI over ssh
@@ -761,7 +820,11 @@ Pass request lines from stdin to this machine's head; for a remote CLI over ssh
 | argument | does | default |
 |---|---|---|
 | `--agent` | Pass on only what an agent on --machine may ask: its machine's tasks |  |
-| `--machine <MACHINE>` | The machine whose agents this bridge serves, as flock.toml names it |  |
+| `--shepherd` | Pass on only what the shepherd on --machine may ask: claiming and reporting its own tasks, its saved trust, job submits and its events |  |
+| `--machine <MACHINE>` | The machine this bridge serves (needs --agent or --shepherd), as flock.toml names it |  |
+| `--gen <N>` | The enrollment of --machine this shepherd's key belongs to; the head refuses every request once a join or removal moves past it (needs --shepherd) |  |
+| `--join <ID>` | Take one join request for the join token with this id, then exit; what a token's authorized_keys line runs |  |
+| `--fetch <NAME>` | Stream pastor or herdr from the head's artifact cache to stdout, checked against its sha256 (needs --shepherd) |  |
 
 ## head
 
@@ -788,3 +851,13 @@ Print the head this CLI uses
 ### pastor head unset
 
 Use the head on this machine again
+
+## leave
+
+A clean teardown of this machine: disable and remove its pastor and herdr services, and delete its keys
+
+Touches only this machine: the service user's and (in root mode) pastor-agent's pastor and herdr user units, and the machine and agent keys bootstrap left under the state dir. Run `pastor machine remove` on the head too, or a removed pull machine keeps trying to log in with a key that no longer works.
+
+| argument | does | default |
+|---|---|---|
+| `-y, --yes` | Skip the confirmation prompt; needed when stdin is not a terminal |  |

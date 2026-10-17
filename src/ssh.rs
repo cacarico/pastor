@@ -40,6 +40,18 @@ pub struct Ssh<'a> {
     pub keepalive: bool,
     /// `-T`: no pseudo-terminal.
     pub no_tty: bool,
+    /// Pastor's own key: `-i` plus `IdentitiesOnly=yes`, so ssh offers no
+    /// other key and an agent full of keys cannot trip the server's
+    /// `MaxAuthTries`.
+    pub identity: Option<&'a Path>,
+    /// A key offered besides the user's own: `-i` alone, without
+    /// `IdentitiesOnly`, so keys the user already relies on still work.
+    pub extra_identity: Option<&'a Path>,
+    /// Pastor's own `known_hosts` file, instead of the user's.
+    pub known_hosts: Option<&'a Path>,
+    /// With `known_hosts`: trust a host seen for the first time
+    /// (`accept-new`), else only hosts already in the file (`yes`).
+    pub accept_new: bool,
 }
 
 impl Ssh<'_> {
@@ -48,7 +60,15 @@ impl Ssh<'_> {
     /// remote command, which the remote login shell does parse, is quoted, by
     /// `posix_command`.
     pub fn args(&self, remote: &str) -> Vec<String> {
-        let mut opts = vec!["BatchMode=yes".to_string()];
+        // No forwarding, whatever the user's ssh config says: a
+        // `ForwardAgent` there would hand the head's agent to whatever runs
+        // on the far side, a pastor agent's pane among them.
+        let mut opts = vec![
+            "BatchMode=yes".to_string(),
+            "ForwardAgent=no".into(),
+            "ForwardX11=no".into(),
+            "ClearAllForwardings=yes".into(),
+        ];
         if self.keepalive {
             opts.push("ServerAliveInterval=15".into());
             opts.push("ServerAliveCountMax=3".into());
@@ -68,7 +88,19 @@ impl Ssh<'_> {
                 opts.push("ControlPath=none".into());
             }
         }
+        if self.identity.is_some() {
+            opts.push("IdentitiesOnly=yes".into());
+        }
+        if let Some(path) = self.known_hosts {
+            opts.push(format!("UserKnownHostsFile={}", path.display()));
+            let mode = if self.accept_new { "accept-new" } else { "yes" };
+            opts.push(format!("StrictHostKeyChecking={mode}"));
+        }
         let mut args = Vec::new();
+        for key in [self.identity, self.extra_identity].into_iter().flatten() {
+            args.push("-i".to_string());
+            args.push(key.display().to_string());
+        }
         for opt in opts {
             args.push("-o".to_string());
             args.push(opt);
@@ -80,6 +112,37 @@ impl Ssh<'_> {
         args.push(self.target.to_string());
         args.push(posix_command(remote));
         args
+    }
+}
+
+/// The host and port of ssh destination `dest`: `[user@]host`, or the URI
+/// form `ssh://[user@]host[:port]` (a bracketed IPv6 host keeps its
+/// brackets off). No port is `None`, which ssh reads as 22 unless its
+/// config says otherwise.
+pub fn destination_host_port(dest: &str) -> (&str, Option<&str>) {
+    let Some(rest) = dest.strip_prefix("ssh://") else {
+        return (dest.rsplit_once('@').map_or(dest, |(_, h)| h), None);
+    };
+    let rest = rest.split('/').next().unwrap_or(rest);
+    let hostport = rest.rsplit_once('@').map_or(rest, |(_, h)| h);
+    if let Some(inner) = hostport.strip_prefix('[')
+        && let Some((host, after)) = inner.split_once(']')
+    {
+        return (host, after.strip_prefix(':').filter(|p| !p.is_empty()));
+    }
+    match hostport.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() => (host, Some(port)),
+        Some((host, _)) => (host, None),
+        None => (hostport, None),
+    }
+}
+
+/// How known_hosts names `host` reached on `port`: the host alone on 22,
+/// else `[host]:port`, as ssh looks it up and `ssh-keyscan` prints it.
+pub fn known_hosts_name(host: &str, port: Option<&str>) -> String {
+    match port {
+        Some(p) if p != "22" => format!("[{host}]:{p}"),
+        _ => host.to_string(),
     }
 }
 
@@ -178,6 +241,134 @@ mod tests {
             control_persist: "600",
             keepalive: false,
             no_tty: false,
+            identity: None,
+            extra_identity: None,
+            known_hosts: None,
+            accept_new: false,
+        }
+    }
+
+    fn has_seq(args: &[String], seq: &[&str]) -> bool {
+        args.windows(seq.len()).any(|w| w == seq)
+    }
+
+    #[test]
+    fn destinations_name_their_host_and_port() {
+        for (dest, host, port, name) in [
+            ("me@head", "head", None, "head"),
+            ("head", "head", None, "head"),
+            ("ssh://me@head", "head", None, "head"),
+            ("ssh://me@head:22", "head", Some("22"), "head"),
+            ("ssh://me@head:2222", "head", Some("2222"), "[head]:2222"),
+            ("ssh://head:2222/", "head", Some("2222"), "[head]:2222"),
+            (
+                "ssh://me@[fd00::1]:2222",
+                "fd00::1",
+                Some("2222"),
+                "[fd00::1]:2222",
+            ),
+        ] {
+            assert_eq!(destination_host_port(dest), (host, port), "{dest}");
+            assert_eq!(known_hosts_name(host, port), name, "{dest}");
+        }
+    }
+
+    #[test]
+    fn identity_adds_identities_only() {
+        let args = Ssh {
+            identity: Some(Path::new("/k")),
+            ..ssh("fleet@pi-3", None)
+        }
+        .args("true");
+        assert!(has_seq(&args, &["-i", "/k"]), "{args:?}");
+        assert!(opt(&args, "IdentitiesOnly=yes"), "{args:?}");
+    }
+
+    #[test]
+    fn extra_identity_does_not_restrict_keys() {
+        let args = Ssh {
+            extra_identity: Some(Path::new("/k")),
+            ..ssh("fleet@pi-3", None)
+        }
+        .args("true");
+        assert!(has_seq(&args, &["-i", "/k"]), "{args:?}");
+        assert!(!args.iter().any(|a| a.starts_with("IdentitiesOnly")));
+    }
+
+    #[test]
+    fn known_hosts_strict_by_default() {
+        let args = Ssh {
+            known_hosts: Some(Path::new("/kh")),
+            ..ssh("fleet@pi-3", None)
+        }
+        .args("true");
+        assert!(opt(&args, "UserKnownHostsFile=/kh"), "{args:?}");
+        assert!(opt(&args, "StrictHostKeyChecking=yes"), "{args:?}");
+    }
+
+    #[test]
+    fn accept_new_when_asked() {
+        let args = Ssh {
+            known_hosts: Some(Path::new("/kh")),
+            accept_new: true,
+            ..ssh("fleet@pi-3", None)
+        }
+        .args("true");
+        assert!(opt(&args, "StrictHostKeyChecking=accept-new"), "{args:?}");
+        assert!(!opt(&args, "StrictHostKeyChecking=yes"), "{args:?}");
+    }
+
+    /// Existing machines see no change: today's argv, byte for byte.
+    #[test]
+    fn no_options_unchanged() {
+        let args = Ssh {
+            keepalive: true,
+            no_tty: true,
+            ..ssh("fleet@pi-3", Some(Path::new("/tmp/s/ssh/pi-3-%C")))
+        }
+        .args("true");
+        assert_eq!(
+            args,
+            [
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ForwardAgent=no",
+                "-o",
+                "ForwardX11=no",
+                "-o",
+                "ClearAllForwardings=yes",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=3",
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                "ControlPath=/tmp/s/ssh/pi-3-%C",
+                "-o",
+                "ControlPersist=600",
+                "-T",
+                "--",
+                "fleet@pi-3",
+                "sh -c true"
+            ]
+        );
+    }
+
+    /// A `ForwardAgent yes` in the head user's ssh config must never reach a
+    /// machine whose panes run agents.
+    #[test]
+    fn never_forwards_whatever_the_config_says() {
+        for cp in [None, Some(Path::new("/tmp/s/ssh/pi-3-%C"))] {
+            let args = ssh("fleet@pi-3", cp).args("true");
+            for o in [
+                "ForwardAgent=no",
+                "ForwardX11=no",
+                "ClearAllForwardings=yes",
+            ] {
+                assert!(opt(&args, o), "{o}: {args:?}");
+            }
         }
     }
 
