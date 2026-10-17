@@ -277,7 +277,7 @@ Run bootstrap again on a machine over ssh: after a failed step, or to upgrade pa
 | `<NAME>` | The machine, as flock.toml names it |  |
 | `--sudo` | Do root work through sudo -n (packages, users, lingering), so agents run as pastor-agent |  |
 | `--service-user <NAME>` | The user that holds the machine key; created if missing |  |
-| `--ssh <DEST>` | The login to bootstrap as (default: the machine's ssh); needed once agents run as pastor-agent |  |
+| `--ssh <DEST>` | The login to bootstrap as (default: the login its last bootstrap used, else the machine's ssh) |  |
 | `--host-key <KEY>` | The machine's ed25519 host key must be this (SHA256:... or the key itself) |  |
 
 ### pastor machine remove
@@ -821,6 +821,7 @@ Pass request lines from stdin to this machine's head; for a remote CLI over ssh
 | `--agent` | Pass on only what an agent on --machine may ask: its machine's tasks |  |
 | `--shepherd` | Pass on only what the shepherd on --machine may ask: claiming and reporting its own tasks, its saved trust, job submits and its events |  |
 | `--machine <MACHINE>` | The machine this bridge serves (needs --agent or --shepherd), as flock.toml names it |  |
+| `--gen <N>` | The enrollment of --machine this shepherd's key belongs to; the head refuses every request once a join or removal moves past it (needs --shepherd) |  |
 | `--join <ID>` | Take one join request for the join token with this id, then exit; what a token's authorized_keys line runs |  |
 | `--fetch <NAME>` | Stream pastor or herdr from the head's artifact cache to stdout, checked against its sha256 (needs --shepherd) |  |
 

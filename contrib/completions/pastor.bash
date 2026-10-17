@@ -917,7 +917,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__bootstrap)
-            opts="-h --sudo --service-user --head-key --herdr-from --json --write-client --print-state-dir --write-shepherd --write-report --head --help"
+            opts="-h --sudo --service-user --head-key --herdr-from --json --write-client --print-state-dir --write-shepherd --write-report --write-shepherd-herdr --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -947,6 +947,10 @@ _pastor() {
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
+                --write-shepherd-herdr)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 --head)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
@@ -959,13 +963,17 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__bridge)
-            opts="-h --agent --shepherd --machine --join --fetch --head --help"
+            opts="-h --agent --shepherd --machine --gen --join --fetch --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
                 --machine)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --gen)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -3961,7 +3969,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__machine__subcmd__bootstrap)
-            opts="-h --sudo --service-user --ssh --host-key --head --help"
+            opts="-h --sudo --service-user --login --ssh --host-key --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3972,6 +3980,10 @@ _pastor() {
                     return 0
                     ;;
                 --ssh)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --login)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

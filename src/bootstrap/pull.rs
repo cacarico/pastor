@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use super::steps::{self, Ctx, Step, StepOutcome, must, path, succeeded};
-use super::{Options, Outcome, StepResult};
+use super::{AGENT_USER, Mode, Options, Outcome, StepResult};
 use crate::cli::CliError;
 use crate::config::Paths;
 use crate::ipc::{IpcRequest, IpcResponse};
@@ -43,20 +43,24 @@ pub trait HeadLink: Send + Sync {
         remote: &[&str],
         line: &str,
     ) -> anyhow::Result<String>;
-    /// `remote` on `head`, its stdout written to `dest`, and refused once
-    /// it passes `max` bytes.
+    /// `line` to `remote` on `head`, its stdout written to `dest`, and
+    /// refused once it passes `max` bytes.
+    #[allow(clippy::too_many_arguments)]
     fn download(
         &self,
         head: &str,
         key: &Path,
         known_hosts: &Path,
         remote: &[&str],
+        line: &str,
         dest: &Path,
         max: u64,
     ) -> anyhow::Result<()>;
 }
 
-/// Where a pull machine's outcome waits for its shepherd to report it.
+/// Where a pull machine's outcome waits until the head has it: `pastor
+/// join` removes it once its own report is answered, else the shepherd
+/// sends it and removes it then.
 pub fn report_file(state_dir: &Path) -> PathBuf {
     state_dir.join("bootstrap.json")
 }
@@ -127,6 +131,68 @@ pub fn write_shepherd(file: &Path, name: &str) -> anyhow::Result<bool> {
     }
     std::fs::write(file, doc.to_string())?;
     Ok(true)
+}
+
+/// The argv a root-mode shepherd reaches the agent user's herdr with, at
+/// `herdr`: through the one command its sudoers drop-in allows
+/// (`shepherd_herdr`). `-H` gives herdr the agent user's home, where its
+/// socket is.
+pub fn shepherd_herdr_argv(herdr: &str) -> Vec<String> {
+    ["sudo", "-n", "-H", "-u", AGENT_USER, herdr]
+        .into_iter()
+        .chain(["--session", "default", "remote-api-bridge"])
+        .map(String::from)
+        .collect()
+}
+
+/// Set `[shepherd] command` in `file` to `shepherd_herdr_argv(herdr)`,
+/// keeping the rest. Returns whether it wrote.
+pub fn write_shepherd_herdr(file: &Path, herdr: &str) -> anyhow::Result<bool> {
+    if !herdr.starts_with('/') || !plain_path(herdr) {
+        return Err(CliError::err(
+            "invalid_path",
+            format!("{herdr:?} is not an absolute path of letters, digits, '.', '_', '/' and '-'"),
+        ));
+    }
+    let argv = shepherd_herdr_argv(herdr);
+    let text = match std::fs::read_to_string(file) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .map_err(|e| CliError::err("config_error", format!("{}: {e}", file.display())))?;
+    let have: Option<Vec<String>> = doc
+        .get("shepherd")
+        .and_then(|t| t.get("command"))
+        .and_then(|c| c.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        });
+    if have.as_ref() == Some(&argv) {
+        return Ok(false);
+    }
+    if !doc.contains_key("shepherd") {
+        doc["shepherd"] = toml_edit::table();
+    }
+    doc["shepherd"]["command"] = toml_edit::value(argv.iter().collect::<toml_edit::Array>());
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(file, doc.to_string())?;
+    Ok(true)
+}
+
+/// Letters, digits, `.`, `_`, `/` and `-` only, and no leading `-`: safe in
+/// a sudoers rule and on a command line unquoted.
+fn plain_path(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('-')
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'-'))
 }
 
 /// Leave `json`, an [`Outcome`], in `state_dir` for this user's shepherd,
@@ -482,18 +548,26 @@ impl HeadLink for SshLink {
         key: &Path,
         known_hosts: &Path,
         remote: &[&str],
+        line: &str,
         dest: &Path,
         max: u64,
     ) -> anyhow::Result<()> {
+        use std::io::Write;
         use std::process::{Command, Stdio};
         let mut file = std::fs::File::create(dest)?;
         let mut child = Command::new(&self.ssh)
             .args(ssh_argv(head, key, known_hosts, remote))
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| anyhow::anyhow!("run ssh: {e}"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            // The one request line, then end of input; a bridge that gave
+            // up already says why on stderr.
+            let _ = stdin.write_all(line.trim_end().as_bytes());
+            let _ = stdin.write_all(b"\n");
+        }
         let stderr = drain_stderr(&mut child);
         let copied = match child.stdout.take() {
             Some(out) => copy_capped(out, &mut file, max),
@@ -609,14 +683,19 @@ fn identity_steps() -> Vec<(&'static str, Step)> {
 }
 
 /// Every bootstrap step, with pull's own: the head pinned for each user,
-/// then the shepherd's service last, once the rest is there.
+/// the shepherd's way to the agent user's herdr once client.toml is
+/// written, then the shepherd's service last, once the rest is there.
 fn all_steps() -> Vec<(&'static str, Step)> {
     let mut list = steps::STEPS.to_vec();
-    let at = list
-        .iter()
-        .position(|(n, _)| *n == "keys")
-        .map_or(list.len(), |i| i + 1);
+    let after = |list: &[(&str, Step)], name: &str| {
+        list.iter()
+            .position(|(n, _)| *n == name)
+            .map_or(list.len(), |i| i + 1)
+    };
+    let at = after(&list, "keys");
     list.insert(at, ("known_hosts", known_hosts));
+    let at = after(&list, "client");
+    list.insert(at, ("shepherd_herdr", shepherd_herdr));
     list.push(("shepherd", shepherd));
     list
 }
@@ -666,6 +745,24 @@ pub fn join_with(
         .clone()
         .filter(|n| !n.trim().is_empty())
         .unwrap_or_else(crate::config::hostname);
+    // The head refuses it too, but not before this machine made users.
+    crate::join::check_name(&name)?;
+    // The fetch and the report go over the service user's machine key, in
+    // its 0700 state dir: from a login that is neither that user nor root,
+    // ssh could not read it, and the machine would stay pending. Refused
+    // before the token is spent.
+    if let Some(user) = &o.service_user {
+        let uid = super::facts::stdout(r, "id", &["-u"]).unwrap_or_default();
+        let login = super::facts::stdout(r, "id", &["-un"]).unwrap_or_default();
+        if uid.trim() != "0" && login.trim() != user {
+            return Err(CliError::err(
+                "usage_error",
+                format!(
+                    "--service-user {user} needs pastor join to run as root (sudo pastor join ...): it reaches the head with {user}'s machine key, which only {user} and root can read"
+                ),
+            ));
+        }
+    }
     let opts = Options {
         sudo: o.sudo,
         service_user: o.service_user.clone(),
@@ -718,6 +815,7 @@ pub fn join_with(
             "userland_bits": facts.userland_bits,
             "hostname": facts.hostname,
         }),
+        service_user: ids.service_user.clone(),
     };
     let line = crate::ipc::request_line(&req, None)?;
     let answered = {
@@ -789,13 +887,14 @@ pub fn join_with(
         };
     }
 
-    // 6. The report: left for the shepherd when it will run, sent now when
-    // it will not; each the other's fallback.
+    // 6. The report: left in the service user's state dir first, so it
+    // survives whatever happens next, then sent to the head over the
+    // machine key at once, so a failure before the shepherd ever runs still
+    // reaches the head. The file goes once the head has it; otherwise the
+    // shepherd sends it after its first claim.
     let json = serde_json::to_string(&outcome)?;
-    let leave = || {
-        super::with_ctx(r, &opts, Some(&pull), |c| leave_report(r, c, &json))
-            .map_err(|s| anyhow::anyhow!("{}", s.why.unwrap_or_default()))
-    };
+    let left = super::with_ctx(r, &opts, Some(&pull), |c| leave_report(r, c, &json))
+        .map_err(|s| anyhow::anyhow!("{}", s.why.unwrap_or_default()));
     let send = || -> anyhow::Result<()> {
         let req = IpcRequest::BootstrapReport {
             machine: name.clone(),
@@ -805,14 +904,23 @@ pub fn join_with(
         let answer = link.request(&token.head, &machine_key, &known_hosts, &["bridge"], &line)?;
         reply(&answer).map(|_| ())
     };
-    let first = if outcome.ok { leave() } else { send() };
-    if let Err(err) = first {
-        let fallback = if outcome.ok { send() } else { leave() };
-        if let Err(again) = fallback {
+    match (send(), left) {
+        (Ok(()), Ok(())) => {
+            let _ = super::with_ctx(r, &opts, Some(&pull), |c| drop_report(r, c));
+        }
+        (Ok(()), Err(err)) => {
+            tracing::debug!(machine = %name, err = %format!("{err:#}"), "the head has the bootstrap report; none was left for the shepherd");
+        }
+        (Err(err), Ok(())) => {
+            eprintln!(
+                "the head did not take the bootstrap report yet ({err:#}); the shepherd sends it after its first claim"
+            );
+        }
+        (Err(err), Err(again)) => {
             return Err(CliError::err(
                 "runtime_error",
                 format!(
-                    "machine {name} joined, but its bootstrap result reached neither its shepherd ({err:#}) nor the head ({again:#}); the head shows it pending: join again with a token from `pastor join create --replace {name}`"
+                    "machine {name} joined, but its bootstrap result reached neither the head ({err:#}) nor its shepherd ({again:#}); the head shows it pending: join again with a token from `pastor join create --replace {name}`"
                 ),
             ));
         }
@@ -835,8 +943,8 @@ fn fetch_herdr(
     use sha2::{Digest, Sha256};
     use std::os::unix::fs::PermissionsExt;
     let target = super::target_for(facts, "herdr")?;
-    // The words go on ssh's command line: plain names only.
-    crate::artifacts::Artifact::new("herdr", version, &target)
+    // The words go into a request line and a cache path: plain names only.
+    let artifact = crate::artifacts::Artifact::new("herdr", version, &target)
         .map_err(|e| CliError::err(e.code(), e))?;
     let req = IpcRequest::ArtifactLocate {
         name: "herdr".into(),
@@ -861,11 +969,14 @@ fn fetch_herdr(
         ));
     }
     let dest = dir.join("herdr");
+    // sshd hands a forced command none of the client's argv, so the fetch
+    // goes as the bridge's first request line.
     link.download(
         head,
         machine_key,
         known_hosts,
-        &["bridge", "--fetch", "herdr", version, &target],
+        &["bridge"],
+        &crate::bridge::fetch_line(&artifact),
         &dest,
         size,
     )?;
@@ -934,6 +1045,107 @@ fn shepherd_name_inner(r: &dyn Runner, c: &Ctx) -> StepOutcome {
     Ok(StepResult::changed(out.stdout.trim() != "unchanged"))
 }
 
+/// Root mode: the shepherd runs as the service user and herdr as the agent
+/// user, so the local herdr session the shepherd would look for under its
+/// own home is not there. A sudoers drop-in (`/etc/sudoers.d/pastor-<service
+/// user>`, 0440, checked with `visudo -c`) lets the service user run exactly
+/// one command as the agent user, NOPASSWD: that user's herdr as
+/// `remote-api-bridge` on its default session. `[shepherd] command` in the
+/// service user's pastor.toml runs it (`shepherd_herdr_argv`). User mode
+/// needs neither: there both are the login user.
+fn shepherd_herdr(r: &dyn Runner, c: &Ctx) -> StepResult {
+    shepherd_herdr_inner(r, c).unwrap_or_else(|e| e)
+}
+
+fn shepherd_herdr_inner(r: &dyn Runner, c: &Ctx) -> StepOutcome {
+    if c.mode != Mode::Root {
+        return Ok(StepResult::skipped(
+            "user mode: the shepherd reaches its own herdr",
+        ));
+    }
+    let service = c.service(r)?;
+    let agent = c.agent(r)?;
+    if service.name == agent.name {
+        return Ok(StepResult::skipped(
+            "the shepherd and herdr run as one user",
+        ));
+    }
+    let herdr = path(&agent.bin().join("herdr"));
+    // Both go into the rule unquoted; a sudoers drop-in whose name holds a
+    // `.` is skipped by sudo, and a user name never does.
+    if !plain_path(&herdr) || !plain_path(&service.name) || service.name.contains(['.', '/']) {
+        return Err(StepResult::failed(
+            format!("{} or {herdr} cannot go in a sudoers rule", service.name),
+            "pick a --service-user of lowercase letters, digits, _ and -",
+        ));
+    }
+    if !succeeded(r.run("sh", &["-c", "command -v sudo && command -v visudo"])) {
+        return Err(StepResult::failed(
+            "sudo is not installed, and the shepherd reaches the agent user's herdr through it",
+            "install sudo, then rerun",
+        )
+        .with_missing(vec!["sudo".into()]));
+    }
+    let mut changed = false;
+    let file = format!("/etc/sudoers.d/pastor-{}", service.name);
+    let rule = format!(
+        "{} ALL=({AGENT_USER}) NOPASSWD: {herdr} --session default remote-api-bridge\n",
+        service.name
+    );
+    let have = c
+        .as_root(r, "cat", &["--", &file])
+        .ok()
+        .filter(|o| o.success)
+        .map(|o| o.stdout);
+    if have.as_deref().map(str::trim) != Some(rule.trim()) {
+        // Written beside, checked, then renamed: a rule visudo refuses
+        // never reaches the file sudo reads, which would lock sudo out.
+        // `$1` and `$2` keep the rule out of the shell's parsing.
+        let write = [
+            "-c",
+            "set -e; umask 0337; t=\"$2.pastor-new\"; printf '%s' \"$1\" > \"$t\"; chmod 0440 \"$t\"; \
+             if visudo -cqf \"$t\"; then mv -f \"$t\" \"$2\"; else rm -f \"$t\"; exit 3; fi",
+            "sh",
+            rule.as_str(),
+            file.as_str(),
+        ];
+        must(
+            c.as_root(r, "sh", &write),
+            "sh",
+            &["-c", &format!("<write {file}>")],
+            "check that /etc/sudoers.d exists, then rerun",
+        )?;
+        changed = true;
+    }
+    // sudo skips /etc/sudoers.d unless /etc/sudoers includes it.
+    let check = [
+        "-n",
+        "-l",
+        "-U",
+        service.name.as_str(),
+        herdr.as_str(),
+        "--session",
+        "default",
+        "remote-api-bridge",
+    ];
+    must(
+        c.as_root(r, "sudo", &check),
+        "sudo",
+        &check,
+        "add `@includedir /etc/sudoers.d` to /etc/sudoers with visudo, then rerun",
+    )?;
+    let pastor = c.readable(r, &path(&c.o.pastor_from), "pastor")?;
+    let args = ["bootstrap", "--write-shepherd-herdr", herdr.as_str()];
+    let out = must(
+        c.as_user(r, &service, &pastor, &args),
+        &pastor,
+        &args,
+        "rerun",
+    )?;
+    changed |= out.stdout.trim() != "unchanged";
+    Ok(StepResult::changed(changed))
+}
+
 /// The outcome in the service user's state dir, for its shepherd to report
 /// after its first claim.
 fn leave_report(r: &dyn Runner, c: &Ctx, json: &str) -> Result<(), StepResult> {
@@ -946,6 +1158,16 @@ fn leave_report(r: &dyn Runner, c: &Ctx, json: &str) -> Result<(), StepResult> {
         &["bootstrap", "--write-report"],
         "rerun",
     )?;
+    Ok(())
+}
+
+/// The report `leave_report` left, gone once the head has it, so the
+/// shepherd does not send it again. As the service user, whose dir it is.
+fn drop_report(r: &dyn Runner, c: &Ctx) -> Result<(), StepResult> {
+    let u = c.service(r)?;
+    let file = path(&report_file(&u.state));
+    let args = ["-f", "--", file.as_str()];
+    must(c.as_user(r, &u, "rm", &args), "rm", &args, "rerun")?;
     Ok(())
 }
 
@@ -986,7 +1208,7 @@ mod tests {
 
     use super::*;
     use crate::bootstrap::StepStatus;
-    use crate::bootstrap::tests::{FakeRunner, step};
+    use crate::bootstrap::tests::{FakeRunner, runs_as, step};
 
     fn token() -> Token {
         Token {
@@ -1019,6 +1241,8 @@ mod tests {
         key: PathBuf,
         remote: Vec<String>,
         line: String,
+        /// A download's cap.
+        max: Option<u64>,
         /// The key file's mode and its dir's, and its text, while ssh ran.
         key_mode: u32,
         dir_mode: u32,
@@ -1033,6 +1257,8 @@ mod tests {
         sum: Option<String>,
         /// The size the head answers, when not `herdr`'s.
         size: Option<u64>,
+        /// The head does not take the bootstrap report.
+        refuse_report: bool,
         seen: Mutex<Vec<Seen>>,
     }
 
@@ -1043,6 +1269,7 @@ mod tests {
                 herdr: b"HERDR".to_vec(),
                 sum: None,
                 size: None,
+                refuse_report: false,
                 seen: Mutex::new(Vec::new()),
             }
         }
@@ -1059,7 +1286,7 @@ mod tests {
             self.seen.lock().unwrap().clone()
         }
 
-        fn record(&self, key: &Path, remote: &[&str], line: &str) {
+        fn record(&self, key: &Path, remote: &[&str], line: &str, max: Option<u64>) {
             use std::os::unix::fs::PermissionsExt;
             let mode = |p: &Path| {
                 std::fs::metadata(p)
@@ -1070,6 +1297,7 @@ mod tests {
                 key: key.to_path_buf(),
                 remote: remote.iter().map(|s| s.to_string()).collect(),
                 line: line.to_string(),
+                max,
                 key_mode: mode(key),
                 dir_mode: key.parent().map_or(0, mode),
                 key_text: std::fs::read_to_string(key).unwrap_or_default(),
@@ -1086,7 +1314,7 @@ mod tests {
             remote: &[&str],
             line: &str,
         ) -> anyhow::Result<String> {
-            self.record(key, remote, line);
+            self.record(key, remote, line, None);
             let (req, _) = crate::ipc::parse_request_line(line.trim()).unwrap();
             let reply = match req {
                 IpcRequest::Join { .. } => {
@@ -1104,6 +1332,9 @@ mod tests {
                         size: self.size.unwrap_or(self.herdr.len() as u64),
                     }
                 }
+                IpcRequest::BootstrapReport { .. } if self.refuse_report => {
+                    anyhow::bail!("ssh: connect to host head port 22: Connection timed out")
+                }
                 IpcRequest::BootstrapReport { machine, .. } => {
                     IpcResponse::Text(format!("{machine}: bootstrap recorded"))
                 }
@@ -1118,10 +1349,11 @@ mod tests {
             key: &Path,
             _known_hosts: &Path,
             remote: &[&str],
+            line: &str,
             dest: &Path,
             max: u64,
         ) -> anyhow::Result<()> {
-            self.record(key, remote, &max.to_string());
+            self.record(key, remote, line, Some(max));
             std::fs::write(dest, &self.herdr)?;
             Ok(())
         }
@@ -1274,8 +1506,10 @@ mod tests {
                 name,
                 machine_key,
                 host_key,
+                service_user,
                 ..
             } => {
+                assert_eq!(service_user.as_deref(), Some("me"));
                 assert_eq!(name, "gpu-3");
                 assert_eq!(machine_key, "ssh-ed25519 KEY");
                 assert_eq!(host_key, "ssh-ed25519 HOST root@box");
@@ -1283,13 +1517,18 @@ mod tests {
             other => panic!("{other:?}"),
         }
         let machine_key = PathBuf::from("/home/me/.local/state/pastor/machine_key");
-        let fetch = seen
-            .iter()
-            .find(|s| s.remote.get(1).is_some_and(|a| a == "--fetch"))
-            .expect("a fetch");
+        // The fetch is a request line to the forced bridge, never argv,
+        // which sshd would not pass on.
+        let fetch = seen.iter().find(|s| s.max.is_some()).expect("a fetch");
+        assert_eq!(fetch.remote, ["bridge"]);
         assert_eq!(
-            fetch.remote,
-            ["bridge", "--fetch", "herdr", "0.9.6", "linux-x86_64"]
+            crate::bridge::fetch_request(fetch.line.as_bytes()),
+            Some(Ok(crate::artifacts::Artifact::new(
+                "herdr",
+                "0.9.6",
+                "linux-x86_64"
+            )
+            .unwrap()))
         );
         assert_eq!(fetch.key, machine_key);
         let calls = r.calls();
@@ -1305,13 +1544,24 @@ mod tests {
             "the shepherd's unit: {calls:#?}"
         );
         assert_eq!(step(&out, "shepherd").status, StepStatus::Done);
-        let report = calls
-            .iter()
-            .find(|c| c.starts_with("/tmp/cache/pastor bootstrap --write-report "))
+        let at = |part: &str| calls.iter().position(|c| c.starts_with(part));
+        let report = at("/tmp/cache/pastor bootstrap --write-report ")
             .expect("the report is written for the shepherd");
-        let json = report.trim_start_matches("/tmp/cache/pastor bootstrap --write-report ");
+        let json = calls[report].trim_start_matches("/tmp/cache/pastor bootstrap --write-report ");
         let written: Outcome = serde_json::from_str(json).unwrap();
         assert_eq!(written, out);
+        // Sent to the head over the machine key too, then the file goes,
+        // since the head has it.
+        let sent = seen.iter().find(|s| {
+            matches!(
+                crate::ipc::parse_request_line(s.line.trim()),
+                Ok((IpcRequest::BootstrapReport { .. }, _))
+            )
+        });
+        assert_eq!(sent.expect("the report is sent").key, machine_key);
+        let dropped = at("rm -f -- /home/me/.local/state/pastor/bootstrap.json")
+            .expect("the sent report is removed");
+        assert!(report < dropped, "{calls:#?}");
         // The fetched herdr and the token's key are gone with their dirs.
         let left: Vec<_> = std::fs::read_dir(&p.state_dir)
             .unwrap()
@@ -1352,10 +1602,82 @@ mod tests {
             )
         });
         assert!(sent, "{:#?}", link.seen());
+        // Left first, then removed once the head had it.
+        let calls = r.calls();
         assert!(
-            !r.calls().iter().any(|c| c.contains("--write-report")),
-            "sent, so not left for a shepherd"
+            calls.iter().any(|c| c.contains("--write-report")),
+            "{calls:#?}"
         );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.ends_with("rm -f -- /home/me/.local/state/pastor/bootstrap.json")),
+            "{calls:#?}"
+        );
+    }
+
+    /// A report the head does not take stays in bootstrap.json for the
+    /// shepherd, and the join still succeeds.
+    #[test]
+    fn a_report_the_head_does_not_take_is_kept_for_the_shepherd() {
+        let (_tmp, p) = paths();
+        let r = FakeRunner::new(&[]);
+        let mut link = FakeLink::joins("gpu-3", None);
+        link.refuse_report = true;
+        let out = join_with(&p, &token(), &opts(), &r, &link).unwrap();
+        assert!(out.ok, "{out:#?}");
+        let calls = r.calls();
+        assert!(
+            calls.iter().any(|c| c.contains("--write-report")),
+            "{calls:#?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.contains("rm -f -- /home/me/.local/state/pastor/bootstrap.json")),
+            "{calls:#?}"
+        );
+    }
+
+    /// `--service-user` from a login that is neither that user nor root is
+    /// refused before the token is spent: the fetch and the report would go
+    /// over that user's machine key, which such a login cannot read.
+    #[test]
+    fn a_service_user_from_a_non_root_login_is_refused_before_the_join() {
+        let (_tmp, p) = paths();
+        let r = FakeRunner::new(&[]);
+        let link = FakeLink::joins("gpu-3", None);
+        let o = JoinOpts {
+            sudo: true,
+            service_user: Some("pastor".into()),
+            ..opts()
+        };
+        let err = join_with(&p, &token(), &o, &r, &link).unwrap_err();
+        assert_eq!(code(&err), "usage_error", "{err:#}");
+        assert!(format!("{err:#}").contains("as root"), "{err:#}");
+        assert!(link.seen().is_empty(), "{:#?}", link.seen());
+        assert!(
+            !r.calls().iter().any(|c| c.contains("useradd")),
+            "{:#?}",
+            r.calls()
+        );
+    }
+
+    /// A name the head would refuse is refused here first, before any
+    /// user or key is made.
+    #[test]
+    fn a_bad_name_is_refused_before_anything_runs() {
+        let (_tmp, p) = paths();
+        let r = FakeRunner::new(&[]);
+        let link = FakeLink::joins("gpu-3", None);
+        let o = JoinOpts {
+            name: Some("a;id".into()),
+            ..opts()
+        };
+        let err = join_with(&p, &token(), &o, &r, &link).unwrap_err();
+        assert_eq!(code(&err), "machine_name_invalid", "{err:#}");
+        assert!(link.seen().is_empty());
+        assert!(r.calls().is_empty(), "{:#?}", r.calls());
     }
 
     /// `--skip-bootstrap` joins and names the shepherd, and leaves the
@@ -1386,7 +1708,9 @@ mod tests {
     #[test]
     fn the_shepherd_waits_for_its_runtime_dir() {
         let (_tmp, p) = paths();
-        let r = FakeRunner::new(&[("test -d /run/user/991", false, "")]);
+        let mut rules = vec![("test -d /run/user/991", false, "")];
+        rules.extend(as_root());
+        let r = FakeRunner::new(&rules);
         let link = FakeLink::joins("gpu-3", None);
         let o = JoinOpts {
             sudo: true,
@@ -1406,10 +1730,119 @@ mod tests {
         );
         assert!(
             r.calls()
-                .contains(&"sudo -n systemctl start user@991.service".to_string()),
+                .contains(&"systemctl start user@991.service".to_string()),
             "{:#?}",
             r.calls()
         );
+    }
+
+    /// `pastor join` run as root, which `--service-user` needs.
+    fn as_root() -> Vec<(&'static str, bool, &'static str)> {
+        vec![
+            ("id -un", true, "root"),
+            ("id -u pastor-agent", false, ""),
+            ("id -u pastor", false, ""),
+            ("id -u", true, "0"),
+            (
+                "getent passwd root",
+                true,
+                "root:x:0:0:root:/root:/bin/bash",
+            ),
+        ]
+    }
+
+    /// In root mode the shepherd (the service user) reaches herdr (the
+    /// agent user) through one sudoers rule and `[shepherd] command`, both
+    /// in place after client.toml and before either service starts.
+    #[test]
+    fn a_root_join_gives_the_shepherd_a_way_to_the_agents_herdr() {
+        let (_tmp, p) = paths();
+        let r = FakeRunner::new(&as_root());
+        let link = FakeLink::joins("gpu-3", None);
+        let o = JoinOpts {
+            sudo: true,
+            service_user: Some("pastor".into()),
+            ..opts()
+        };
+        let out = join_with(&p, &token(), &o, &r, &link).unwrap();
+        assert!(out.ok, "{out:#?}");
+        assert_eq!(step(&out, "shepherd_herdr").status, StepStatus::Done);
+        let calls = r.calls();
+        let herdr = "/home/pastor-agent/.local/bin/herdr";
+        let rule = format!(
+            "pastor ALL=(pastor-agent) NOPASSWD: {herdr} --session default remote-api-bridge\n"
+        );
+        let at = |what: &dyn Fn(&str) -> bool| {
+            calls
+                .iter()
+                .position(|c| what(c))
+                .unwrap_or_else(|| panic!("{calls:#?}"))
+        };
+        let sudoers = at(&|c| {
+            c.starts_with("sh -c set -e; umask 0337;")
+                && c.ends_with(&format!("sh {rule} /etc/sudoers.d/pastor-pastor"))
+        });
+        let checked = at(&|c| {
+            c == format!("sudo -n -l -U pastor {herdr} --session default remote-api-bridge")
+        });
+        let command = at(&|c| {
+            runs_as(c) == "pastor"
+                && c.ends_with(&format!("bootstrap --write-shepherd-herdr {herdr}"))
+        });
+        let client = at(&|c| c.ends_with("bootstrap --write-client me@head"));
+        let herdr_unit = at(&|c| c.ends_with("setup systemd --herdr --yes --require-linger"));
+        let shepherd_unit = at(&|c| c.ends_with("setup systemd --yes --require-linger"));
+        assert!(
+            client < sudoers && sudoers < checked && checked < command,
+            "{calls:#?}"
+        );
+        assert!(
+            command < herdr_unit && herdr_unit < shepherd_unit,
+            "{calls:#?}"
+        );
+    }
+
+    /// User mode needs no rule: the shepherd and herdr are the login user.
+    #[test]
+    fn a_user_mode_join_writes_no_sudoers_rule() {
+        let (_tmp, p) = paths();
+        let r = FakeRunner::new(&[]);
+        let link = FakeLink::joins("gpu-3", None);
+        let out = join_with(&p, &token(), &opts(), &r, &link).unwrap();
+        assert_eq!(step(&out, "shepherd_herdr").status, StepStatus::Skipped);
+        assert!(!r.calls().iter().any(|c| c.contains("sudoers")));
+    }
+
+    /// `[shepherd] command` is the sudo line, written once, beside what the
+    /// file already holds; a path that is not plain is refused.
+    #[test]
+    fn write_shepherd_herdr_sets_the_command_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("pastor.toml");
+        std::fs::write(&file, "[shepherd]\nmachine = \"gpu-3\"\n").unwrap();
+        let herdr = "/home/pastor-agent/.local/bin/herdr";
+        assert!(write_shepherd_herdr(&file, herdr).unwrap());
+        assert!(!write_shepherd_herdr(&file, herdr).unwrap());
+        let cfg = crate::config::PastorConfig::load(&file).unwrap();
+        assert_eq!(cfg.shepherd.machine.as_deref(), Some("gpu-3"));
+        assert_eq!(cfg.shepherd.command, Some(shepherd_herdr_argv(herdr)));
+        assert_eq!(
+            shepherd_herdr_argv(herdr),
+            [
+                "sudo",
+                "-n",
+                "-H",
+                "-u",
+                "pastor-agent",
+                herdr,
+                "--session",
+                "default",
+                "remote-api-bridge"
+            ]
+        );
+        for bad in ["herdr", "/a b/herdr", "/a;b", "-x"] {
+            assert!(write_shepherd_herdr(&file, bad).is_err(), "{bad}");
+        }
     }
 
     /// The token's host key line is pinned only when it is one plain line
@@ -1525,9 +1958,9 @@ mod tests {
         let fetch = link
             .seen()
             .into_iter()
-            .find(|s| s.remote.get(1).is_some_and(|a| a == "--fetch"))
+            .find(|s| s.max.is_some())
             .expect("a fetch");
-        assert_eq!(fetch.line, "5", "capped at the head's size");
+        assert_eq!(fetch.max, Some(5), "capped at the head's size");
 
         let (_tmp, p) = paths();
         let mut link = FakeLink::joins("gpu-3", None);
@@ -1540,10 +1973,7 @@ mod tests {
             "{failed:?}"
         );
         assert!(
-            !link
-                .seen()
-                .iter()
-                .any(|s| s.remote.get(1).is_some_and(|a| a == "--fetch")),
+            !link.seen().iter().any(|s| s.max.is_some()),
             "nothing fetched: {:#?}",
             link.seen()
         );
@@ -1586,12 +2016,13 @@ mod tests {
         let k = tmp.path().join("k");
         let dest = tmp.path().join("herdr");
         let link = fake_ssh(tmp.path(), "printf 12345");
-        link.download("h", &k, &k, &["bridge"], &dest, 5).unwrap();
+        link.download("h", &k, &k, &["bridge"], "{}", &dest, 5)
+            .unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"12345");
         let link = fake_ssh(tmp.path(), "head -c 10485760 /dev/zero; sleep 30");
         let started = std::time::Instant::now();
         let err = link
-            .download("h", &k, &k, &["bridge"], &dest, 1024)
+            .download("h", &k, &k, &["bridge"], "{}", &dest, 1024)
             .unwrap_err();
         assert_eq!(code(&err), "artifact_checksum_mismatch", "{err:#}");
         assert!(std::fs::metadata(&dest).map_or(0, |m| m.len()) <= 1024);

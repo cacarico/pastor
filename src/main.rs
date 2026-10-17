@@ -175,6 +175,9 @@ struct BridgeArgs {
     /// The machine this bridge serves (needs --agent or --shepherd), as flock.toml names it
     #[arg(long)]
     machine: Option<String>,
+    /// The enrollment of --machine this shepherd's key belongs to; the head refuses every request once a join or removal moves past it (needs --shepherd)
+    #[arg(long = "gen", value_name = "N", requires = "shepherd")]
+    generation: Option<i64>,
     /// Take one join request for the join token with this id, then exit; what a token's authorized_keys line runs
     #[arg(long, value_name = "ID", conflicts_with_all = ["agent", "machine"])]
     join: Option<String>,
@@ -513,8 +516,8 @@ enum MachineCmd {
         /// The user that holds the machine key; created if missing
         #[arg(long, value_name = "NAME")]
         service_user: Option<String>,
-        /// The login to bootstrap as (default: the machine's ssh); needed once agents run as pastor-agent
-        #[arg(long, value_name = "DEST")]
+        /// The login to bootstrap as (default: the login its last bootstrap used, else the machine's ssh)
+        #[arg(long, value_name = "DEST", visible_alias = "login")]
         ssh: Option<String>,
         /// The machine's ed25519 host key must be this (SHA256:... or the key itself)
         #[arg(long, value_name = "KEY")]
@@ -994,34 +997,64 @@ fn completion_tree() -> clap::Command {
 fn bridge(paths: &Paths, args: &BridgeArgs) -> ! {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let socket = paths.socket_file();
+    let mut input = tokio::io::BufReader::new(tokio::io::stdin());
     let mut fetch = args
         .fetch
         .as_deref()
         .and_then(|f| <&[String; 3]>::try_from(f).ok())
         .map(|[n, v, t]| (n.clone(), v.clone(), t.clone()));
-    // A pull machine's key forces `bridge --shepherd --machine X`, so its
-    // `ssh <head> bridge --fetch ...` reaches here as SSH_ORIGINAL_COMMAND:
-    // that one form runs the fetch, anything else is refused, and none at
-    // all is the line bridge.
+    // A pull machine's key forces `bridge --shepherd --machine X --gen N`:
+    // its ssh's own command (SSH_ORIGINAL_COMMAND) may only be the line
+    // bridge, and a fetch comes as the first request line instead.
+    let mut first = None;
     if args.shepherd && fetch.is_none() {
         let original = std::env::var("SSH_ORIGINAL_COMMAND").ok();
-        match pastor::bridge::forced_fetch(original.as_deref()) {
-            Ok(Some(a)) => fetch = Some((a.name, a.version, a.target)),
-            Ok(None) => {}
-            Err(why) => fail(pastor::bridge::NOT_ALLOWED_FOR_SHEPHERD, &why),
+        if let Err(why) = pastor::bridge::forced_command(original.as_deref()) {
+            fail(pastor::bridge::NOT_ALLOWED_FOR_SHEPHERD, &why);
+        }
+        first = match rt.block_on(pastor::bridge::first_line(
+            &mut input,
+            pastor::daemon::MAX_IPC_REQUEST,
+        )) {
+            Ok(line) => line,
+            Err(err) => match err.downcast_ref::<CliError>() {
+                Some(e) => fail(&e.code, &e.message),
+                None => fail("runtime_error", &format!("{err:#}")),
+            },
+        };
+        match first.as_deref().and_then(pastor::bridge::fetch_request) {
+            Some(Ok(a)) => fetch = Some((a.name, a.version, a.target)),
+            Some(Err(why)) => fail("invalid_artifact", &why),
+            None => {}
         }
     }
     if let Some((name, version, target)) = &fetch {
         // stdout carries the binary, so a failure goes to stderr as any
         // other command's does.
-        let fetched = rt.block_on(pastor::bridge::fetch(
-            &socket,
-            &paths.state_dir,
-            name,
-            version,
-            target,
-            tokio::io::stdout(),
-        ));
+        let fetched = rt.block_on(async {
+            if let Some(machine) = args.machine.as_deref().filter(|_| args.shepherd)
+                && let Err(reply) =
+                    pastor::bridge::check_generation(&socket, machine, args.generation).await?
+            {
+                let (code, message) = match serde_json::from_slice(&reply) {
+                    Ok(pastor::ipc::IpcResponse::Error { code, message }) => (code, message),
+                    _ => (
+                        pastor::bridge::MACHINE_REVOKED.to_string(),
+                        "the head refused the generation check".to_string(),
+                    ),
+                };
+                return Err(CliError::err(&code, message));
+            }
+            pastor::bridge::fetch(
+                &socket,
+                &paths.state_dir,
+                name,
+                version,
+                target,
+                tokio::io::stdout(),
+            )
+            .await
+        });
         match fetched {
             Ok(()) => std::process::exit(0),
             Err(err) => match err.downcast_ref::<CliError>() {
@@ -1030,7 +1063,6 @@ fn bridge(paths: &Paths, args: &BridgeArgs) -> ! {
             },
         }
     }
-    let input = tokio::io::BufReader::new(tokio::io::stdin());
     let result = rt.block_on(async {
         match (args.agent, args.shepherd, &args.machine) {
             _ if args.join.is_some() => {
@@ -1041,7 +1073,18 @@ fn bridge(paths: &Paths, args: &BridgeArgs) -> ! {
                 pastor::bridge::run_agent(&socket, machine, input, tokio::io::stdout()).await
             }
             (_, true, Some(machine)) => {
-                pastor::bridge::run_shepherd(&socket, machine, input, tokio::io::stdout()).await
+                // The line read to see whether it was a fetch goes first.
+                use tokio::io::AsyncReadExt;
+                let first = std::io::Cursor::new(first.unwrap_or_default());
+                let input = tokio::io::BufReader::new(AsyncReadExt::chain(first, input));
+                pastor::bridge::run_shepherd(
+                    &socket,
+                    machine,
+                    args.generation,
+                    input,
+                    tokio::io::stdout(),
+                )
+                .await
             }
             _ => pastor::bridge::run(&socket, input, tokio::io::stdout()).await,
         }

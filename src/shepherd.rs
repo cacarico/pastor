@@ -839,6 +839,7 @@ impl Follower {
             after,
             limit: PAGE,
             task: None,
+            machine: None,
         })
         .await?
         {

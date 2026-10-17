@@ -303,9 +303,18 @@ fn user_mode_without_sudo() {
     assert_eq!(
         names,
         [
-            "facts", "platform", "packages", "users", "pastor", "herdr", "services", "keys",
-            "client"
+            "facts", "platform", "packages", "users", "pastor", "herdr", "keys", "client",
+            "services"
         ]
+    );
+    // The unit starts as whatever client.toml says, so client.toml is
+    // there before the unit is.
+    let calls = r.calls();
+    let at = |c: &str| calls.iter().position(|x| x == c).unwrap();
+    assert!(
+        at("/home/me/.local/bin/pastor bootstrap --write-client me@head")
+            < at("/home/me/.local/bin/pastor setup systemd --herdr --yes --require-linger"),
+        "{calls:#?}"
     );
     // Everything as the login user: both keys in one state dir.
     assert!(r.called("ssh-keygen -t ed25519 -N  -f /home/me/.local/state/pastor/machine_key"));
@@ -657,6 +666,7 @@ fn service_user_rejects_option_like_name() {
             print_state_dir: false,
             write_shepherd: None,
             write_report: None,
+            write_shepherd_herdr: None,
         };
         let err = cli(&args, Some("me@head")).unwrap_err();
         assert_eq!(code(&err), "invalid_user", "{name:?}");

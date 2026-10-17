@@ -62,6 +62,12 @@ const V18_TABLES: &str = "CREATE TABLE IF NOT EXISTS answered_dialogs (
 /// Schema 19: how each machine's bootstrap ended (`machine_state`, one row
 /// per machine), and the one-use tokens `pastor join` redeems
 /// (`join_tokens`). Times are RFC 3339 UTC strings, so they compare as text.
+/// `generation` is a pull machine's enrollment, which its shepherd's
+/// forced command carries (`--gen`): 0 until a join sets it, bumped by each
+/// join that takes the name over. `bootstrap_login` is the ssh login a push
+/// bootstrap last got through as, kept apart from flock.toml's `ssh`, which
+/// root mode moves to the agent user. Neither is in `MachineState`: a
+/// report never sets them (`Store::put_machine_state`).
 const V19_TABLES: &str = "CREATE TABLE IF NOT EXISTS machine_state (
         machine TEXT PRIMARY KEY,
         bootstrap TEXT NOT NULL,
@@ -73,7 +79,9 @@ const V19_TABLES: &str = "CREATE TABLE IF NOT EXISTS machine_state (
         herdr_version TEXT,
         pastor_version TEXT,
         service_user TEXT,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        generation INTEGER NOT NULL DEFAULT 0,
+        bootstrap_login TEXT
      );
      CREATE TABLE IF NOT EXISTS join_tokens (
         id TEXT PRIMARY KEY,
@@ -1935,14 +1943,27 @@ impl Store {
         })
     }
 
-    /// Save `s`, replacing the machine's earlier record.
+    /// Save `s`, replacing the machine's earlier record, but for its
+    /// `generation` and `bootstrap_login`, which only their own setters
+    /// change.
     pub fn put_machine_state(&self, s: &MachineState) -> anyhow::Result<()> {
         blocking(|| {
             self.conn.lock().recover().execute(
-                "INSERT OR REPLACE INTO machine_state
+                "INSERT INTO machine_state
                     (machine, bootstrap, mode, isolation, failed_step, why, host_key,
                      herdr_version, pastor_version, updated_at, service_user)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT(machine) DO UPDATE SET
+                    bootstrap = excluded.bootstrap,
+                    mode = excluded.mode,
+                    isolation = excluded.isolation,
+                    failed_step = excluded.failed_step,
+                    why = excluded.why,
+                    host_key = excluded.host_key,
+                    herdr_version = excluded.herdr_version,
+                    pastor_version = excluded.pastor_version,
+                    updated_at = excluded.updated_at,
+                    service_user = excluded.service_user",
                 params![
                     s.machine,
                     s.bootstrap.as_str(),
@@ -1976,6 +1997,63 @@ impl Store {
                      pastor_version = COALESCE(?3, pastor_version)
                  WHERE machine = ?1",
                 params![machine, herdr, pastor],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// `machine`'s enrollment generation; `None` when it has no record.
+    pub fn machine_generation(&self, machine: &str) -> anyhow::Result<Option<i64>> {
+        blocking(|| {
+            Ok(self
+                .conn
+                .lock()
+                .recover()
+                .query_row(
+                    "SELECT generation FROM machine_state WHERE machine = ?1",
+                    params![machine],
+                    |r| r.get(0),
+                )
+                .optional()?)
+        })
+    }
+
+    /// Set `machine`'s enrollment generation; a machine with no record is
+    /// left alone.
+    pub fn set_machine_generation(&self, machine: &str, generation: i64) -> anyhow::Result<()> {
+        blocking(|| {
+            self.conn.lock().recover().execute(
+                "UPDATE machine_state SET generation = ?2 WHERE machine = ?1",
+                params![machine, generation],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// The login `machine`'s last push bootstrap got through as, if any.
+    pub fn bootstrap_login(&self, machine: &str) -> anyhow::Result<Option<String>> {
+        blocking(|| {
+            Ok(self
+                .conn
+                .lock()
+                .recover()
+                .query_row(
+                    "SELECT bootstrap_login FROM machine_state WHERE machine = ?1",
+                    params![machine],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten())
+        })
+    }
+
+    /// Keep `login` as the one `machine bootstrap` reconnects as; a machine
+    /// with no record is left alone.
+    pub fn set_bootstrap_login(&self, machine: &str, login: &str) -> anyhow::Result<()> {
+        blocking(|| {
+            self.conn.lock().recover().execute(
+                "UPDATE machine_state SET bootstrap_login = ?2 WHERE machine = ?1",
+                params![machine, login],
             )?;
             Ok(())
         })
@@ -2648,6 +2726,33 @@ mod tests {
         assert_eq!(got.pastor_version.as_deref(), Some("1.2.4"));
         s.drop_machine_state("pi-1").unwrap();
         assert!(s.machine_state("pi-1").unwrap().is_none());
+    }
+
+    /// A report replaces the record but never its generation or its
+    /// bootstrap login, which only their own setters change.
+    #[test]
+    fn generation_and_bootstrap_login_survive_a_put() {
+        let s = Store::open_in_memory().unwrap();
+        assert_eq!(s.machine_generation("pi-1").unwrap(), None);
+        assert_eq!(s.bootstrap_login("pi-1").unwrap(), None);
+        // No record: nothing to set.
+        s.set_machine_generation("pi-1", 3).unwrap();
+        assert_eq!(s.machine_generation("pi-1").unwrap(), None);
+        let mut m = sample_state();
+        s.put_machine_state(&m).unwrap();
+        assert_eq!(s.machine_generation("pi-1").unwrap(), Some(0));
+        s.set_machine_generation("pi-1", 2).unwrap();
+        s.set_bootstrap_login("pi-1", "me@pi-1").unwrap();
+        m.bootstrap = BootstrapState::Ok;
+        s.put_machine_state(&m).unwrap();
+        assert_eq!(s.machine_state("pi-1").unwrap(), Some(m));
+        assert_eq!(s.machine_generation("pi-1").unwrap(), Some(2));
+        assert_eq!(
+            s.bootstrap_login("pi-1").unwrap().as_deref(),
+            Some("me@pi-1")
+        );
+        s.drop_machine_state("pi-1").unwrap();
+        assert_eq!(s.machine_generation("pi-1").unwrap(), None);
     }
 
     fn token(id: &str, expires_at: &str) -> JoinToken {

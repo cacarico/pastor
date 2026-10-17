@@ -96,10 +96,16 @@ pub struct PushOpts {
 }
 
 /// The ssh login `machine bootstrap NAME` uses: `--ssh` when given, else
-/// the entry's own `ssh`. A root-mode machine's entry names the agent user,
-/// who has no sudo and was never the login, so it needs `--ssh`.
-pub fn login_for(entry: &MachineConfig, given: Option<&str>) -> anyhow::Result<String> {
-    if let Some(login) = given {
+/// `stored`, the login its last good bootstrap went through as
+/// (`machine_state.bootstrap_login`), else the entry's own `ssh`. A
+/// root-mode machine's entry names the agent user, who has no sudo and was
+/// never the login, so with nothing stored it needs `--ssh`.
+pub fn login_for(
+    entry: &MachineConfig,
+    given: Option<&str>,
+    stored: Option<&str>,
+) -> anyhow::Result<String> {
+    if let Some(login) = given.or(stored) {
         return Ok(login.to_string());
     }
     match entry.ssh.as_deref() {
@@ -224,6 +230,16 @@ pub async fn push(
             }
         }
         return Err(err);
+    }
+    // The login that got through, kept apart from the entry's `ssh`, which
+    // root mode just moved to the agent user: a later `machine bootstrap`
+    // (an upgrade, a `--sudo` rerun) connects as it again, not as a user
+    // with no sudo.
+    if outcome.ok
+        && !login.starts_with(&format!("{AGENT_USER}@"))
+        && let Err(err) = store.set_bootstrap_login(name, login)
+    {
+        tracing::warn!(machine = %name, %err, "could not keep the bootstrap login; the next `machine bootstrap` needs --ssh");
     }
     close_master(paths, name, login, &opts.runner).await;
     Ok(outcome)
@@ -511,11 +527,17 @@ fn tail(stderr: &str) -> String {
     }
 }
 
-/// Step 2: `ssh-keyscan` the machine's ed25519 key into pastor's own
-/// known_hosts, under the host and port `ssh -G` resolves the login to.
-/// With `--host-key` the scanned key must be that one. A key that differs
-/// from one already pinned for the host stops the push: that is what a
-/// man in the middle looks like, as much as a reinstalled machine.
+/// Step 2: pin the machine's ed25519 key in pastor's own known_hosts,
+/// under the host and port `ssh -G` resolves the login to, once. A host
+/// already pinned is not scanned again: `ssh-keyscan` neither
+/// authenticates its answer nor goes through ssh's own host key check, so
+/// the pinned key stands, and every ssh after this checks the machine
+/// against it strictly (`ssh_args`): a changed key stops the rerun at its
+/// first connection instead of being trusted. The first time, the key is
+/// scanned, and with `--host-key` it must be that one; a scanned key that
+/// differs from one pinned under another of the host's names stops the
+/// push too: that is what a man in the middle looks like, as much as a
+/// reinstalled machine.
 async fn pin_host_key(paths: &Paths, login: &str, opts: &PushOpts) -> Result<String, Stop> {
     let stop = |why: String, fix: &str| Stop::new("host_key", why, fix);
     let fallback = (host_part(login).to_string(), "22".to_string());
@@ -530,6 +552,29 @@ async fn pin_host_key(paths: &Paths, login: &str, opts: &PushOpts) -> Result<Str
         Ok(out) if out.success => resolved_host(&out.stdout).unwrap_or(fallback),
         _ => fallback,
     };
+    // known_hosts names a host on another port than 22 `[host]:port`.
+    let pinned_as = if port == "22" {
+        host.clone()
+    } else {
+        format!("[{host}]:{port}")
+    };
+    if let Some(pinned) = pinned_key(&paths.known_hosts_file(), &pinned_as) {
+        if let Some(want) = &opts.host_key {
+            let got = fingerprint(paths, &opts.runner, &pinned_as, &pinned).await?;
+            if !host_key_matches(want, &pinned, &got) {
+                return Err(stop(
+                    format!(
+                        "{pinned_as} is pinned with host key {got}, not the --host-key given ({want})"
+                    ),
+                    &format!(
+                        "if the machine was reinstalled, run ssh-keygen -f {} -R {pinned_as} and try again",
+                        paths.known_hosts_file().display()
+                    ),
+                ));
+            }
+        }
+        return Ok(pinned);
+    }
     let args = vec![
         "-p".into(),
         port.clone(),
@@ -605,6 +650,15 @@ async fn pin_host_key(paths: &Paths, login: &str, opts: &PushOpts) -> Result<Str
         )
     })?;
     Ok(key)
+}
+
+/// The ed25519 key pinned in `file` for `name`, as `keytype base64`.
+fn pinned_key(file: &Path, name: &str) -> Option<String> {
+    let text = std::fs::read_to_string(file).ok()?;
+    text.lines().find_map(|line| {
+        let (names, key) = scanned(line)?;
+        (names.split(',').any(|n| n == name) && key.starts_with("ssh-ed25519 ")).then_some(key)
+    })
 }
 
 /// `names keytype base64` from a known_hosts or keyscan line, as

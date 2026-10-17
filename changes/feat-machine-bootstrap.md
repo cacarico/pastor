@@ -7,8 +7,10 @@
   The flock, tags and `--replace` target are fixed at creation; a join
   emits `machine.joined`, an expired token `machine.join_token_expired`.
   A join drops the token's line before it writes anything else, and
-  refuses a name starting with `-`, a key of an unknown type or one
-  already in `authorized_keys`.
+  refuses, before the token is used, a name that is not letters, digits,
+  `.`, `_` and `-` starting with a letter or digit
+  (`machine_name_invalid`), a key of an unknown type or one already in
+  `authorized_keys`.
 - The head answers `BootstrapReport` from `pastor bootstrap`: it saves the
   machine's bootstrap state (ok, pending or failed, its mode, isolation,
   host key and the herdr and pastor versions it read) and emits
@@ -62,3 +64,34 @@
   machine reached over ssh forgets its host key and ends its ssh master.
 - The ssh to a remote head uses pastor's `known_hosts` only beside a
   pastor machine or agent key, so a person's CLI keeps their own.
+- Each join of a name is a new enrollment: its shepherd line carries
+  `--gen <n>`, and `bridge --shepherd` asks the head before every request
+  whether that is still the machine's (`ShepherdCheck`, IPC protocol 32).
+  A shepherd connected before a `--replace` or a `machine remove` is
+  refused `machine_revoked` at its next request and hung up on, though
+  OpenSSH never rereads `authorized_keys` for a live connection.
+- `EventsSince` takes a `machine`, cut by the head before its page limit,
+  and `bridge --shepherd` sets it to its own machine, so a page of other
+  machines' events no longer leaves a shepherd's cursor stuck.
+- Bootstrap writes the keys and each user's `client.toml` before it starts
+  the services, so a unit never starts in the wrong role.
+- A root-mode `pastor join` gives the shepherd a way to the agent user's
+  herdr: a `/etc/sudoers.d/pastor-<service user>` rule, checked with
+  `visudo`, for that one command, and `[shepherd] command` running it.
+- A push keeps the login it got through as (`bootstrap_login`, in the
+  head's bootstrap record), and `pastor machine bootstrap NAME` connects as
+  it, so rerunning or upgrading a root-mode machine needs no `--ssh`
+  (alias `--login`).
+- A push rerun against a host already pinned no longer runs
+  `ssh-keyscan`: it checks the machine against the pinned key, so a
+  changed key stops the rerun instead of being trusted.
+- A pull machine's herdr fetch goes to the head as a request line
+  (`artifact_fetch`) instead of `bridge --fetch` arguments, which sshd
+  never passes to a forced command; `SSH_ORIGINAL_COMMAND` may only be the
+  line bridge.
+- `pastor join` sends the bootstrap report to the head itself first, over
+  the machine key, and keeps `bootstrap.json` for the shepherd to send only
+  when the head did not take it. A join records the service user its
+  request names. `--service-user` from a login that is neither root nor
+  that user is refused (`usage_error`) before the token is used, since its
+  machine key is unreadable there.

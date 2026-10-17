@@ -3660,7 +3660,7 @@ impl Drop for Pushing {
 
 /// The longest IPC request line, newline excluded. The largest real one is a
 /// `task run` prompt, far below this.
-const MAX_IPC_REQUEST: usize = 1024 * 1024;
+pub const MAX_IPC_REQUEST: usize = 1024 * 1024;
 
 /// How long a client gets to send its request line. The CLI sends it at once;
 /// a connection that stays silent is holding a file descriptor for nothing.
@@ -4281,7 +4281,11 @@ impl Daemon {
                 }
             },
             None => match self.fleet.flock().get(&name) {
-                Some(entry) => match push::login_for(entry, login.as_deref()) {
+                Some(entry) => match push::login_for(
+                    entry,
+                    login.as_deref(),
+                    self.store.bootstrap_login(&name).ok().flatten().as_deref(),
+                ) {
                     Ok(login) => login,
                     Err(err) => return cli_error(err),
                 },
@@ -4473,6 +4477,7 @@ impl Daemon {
         machine_key: &str,
         agent_key: &str,
         host_key: &str,
+        service_user: Option<&str>,
     ) -> anyhow::Result<()> {
         let files = crate::join::HeadFiles::for_head(&self.paths)?;
         self.join_with(
@@ -4483,8 +4488,36 @@ impl Daemon {
             machine_key,
             agent_key,
             host_key,
+            service_user,
         )
         .await
+    }
+
+    /// `ShepherdCheck`: whether a shepherd bridge started as `--gen
+    /// generation` still speaks for `machine`. A store that cannot be read
+    /// refuses: the check is the one thing that cuts off a connection a
+    /// replace or a removal moved past.
+    fn shepherd_check(&self, machine: &str, generation: Option<i64>) -> IpcResponse {
+        let have = match self.store.machine_generation(machine) {
+            Ok(have) => have,
+            Err(err) => return IpcResponse::error("store_error", err),
+        };
+        let revoked = |why: String| IpcResponse::error("machine_revoked", why);
+        match (generation, have) {
+            (Some(want), Some(have)) if want == have => IpcResponse::Text("current".into()),
+            (Some(want), Some(have)) => revoked(format!(
+                "this key's line is from enrollment {want} of {machine}, which is now at {have}: the machine was joined again"
+            )),
+            (Some(_), None) => revoked(format!(
+                "{machine} has no bootstrap record on the head: it was removed"
+            )),
+            // A line made by hand carries no generation: it is good until
+            // a join enrolls the machine, whose own line then does.
+            (None, Some(have)) if have > 0 => revoked(format!(
+                "{machine} was joined, so only its join's line (with --gen {have}) speaks for it"
+            )),
+            (None, _) => IpcResponse::Text("current".into()),
+        }
     }
 
     /// The herdr a machine that just joined fetches: `[provision] herdr`,
@@ -4511,24 +4544,28 @@ impl Daemon {
         machine_key: &str,
         agent_key: &str,
         host_key: &str,
+        service_user: Option<&str>,
     ) -> anyhow::Result<()> {
         use crate::authkeys::{Marker, line};
         use crate::cli::CliError;
         let now = chrono::Utc::now();
         crate::join::redeemable(&self.store, id, now)?;
+        // Before anything is spent or written: the name goes into a forced
+        // command, which a shell runs.
+        crate::join::check_name(name)?;
+        if let Some(user) = service_user {
+            crate::bootstrap::check_user(user)?;
+        }
         let as_machine = Marker::Machine(name.into());
         let as_agent = Marker::Agent(name.into());
         as_machine.check()?;
-        // The name goes on command lines (ssh, herdr): never an option.
-        if name.starts_with('-') {
-            return Err(CliError::err(
-                "invalid_machine",
-                format!("{name:?} cannot be a machine name: it must not start with '-'"),
-            ));
-        }
+        // Each join of a name is a new enrollment: its shepherd line
+        // carries the generation, and a bridge started under an older one
+        // is refused at its next request (`ShepherdCheck`).
+        let generation = self.store.machine_generation(name)?.unwrap_or(0) + 1;
         let machine_line = line(
             pastor,
-            &format!("bridge --shepherd --machine {name}"),
+            &format!("bridge --shepherd --machine {name} --gen {generation}"),
             machine_key,
             &as_machine,
         )?;
@@ -4636,10 +4673,8 @@ impl Daemon {
                 tracing::warn!(machine = name, "{why}");
             }
         }
-        keys.upsert(&as_machine, &machine_line)
-            .map_err(|e| after_save("its machine line to authorized_keys", e))?;
-        keys.upsert(&as_agent, &agent_line)
-            .map_err(|e| after_save("its agent line to authorized_keys", e))?;
+        // The record and its new generation before the lines: from here a
+        // bridge under the generation this join replaced is refused.
         self.store
             .put_machine_state(&crate::store::MachineState {
                 machine: name.into(),
@@ -4652,9 +4687,14 @@ impl Daemon {
                 herdr_version: None,
                 pastor_version: None,
                 updated_at: now.to_rfc3339(),
-                service_user: None,
+                service_user: service_user.map(str::to_string),
             })
+            .and_then(|()| self.store.set_machine_generation(name, generation))
             .map_err(|e| after_save("its bootstrap record to the store", e))?;
+        keys.upsert(&as_machine, &machine_line)
+            .map_err(|e| after_save("its machine line to authorized_keys", e))?;
+        keys.upsert(&as_agent, &agent_line)
+            .map_err(|e| after_save("its agent line to authorized_keys", e))?;
         tracing::info!(machine = name, id, "machine joined");
         let _ = self.events.send(PastorEvent {
             kind: "machine.joined".into(),
@@ -5066,11 +5106,16 @@ impl Daemon {
                     Err(err) => IpcResponse::error("store_error", err),
                 }
             }
-            IpcRequest::EventsSince { after, limit, task } => {
+            IpcRequest::EventsSince {
+                after,
+                limit,
+                task,
+                machine,
+            } => {
                 // Up to two log generations of file reading: off the runtime.
                 let path = self.paths.events_file();
                 match tokio::task::spawn_blocking(move || {
-                    crate::events::since(&path, after, limit, task)
+                    crate::events::since_for(&path, after, limit, task, machine.as_deref())
                 })
                 .await
                 {
@@ -5158,6 +5203,10 @@ impl Daemon {
                 replace,
                 ttl_secs,
             } => self.join_create(flock, tags, replace, ttl_secs),
+            IpcRequest::ShepherdCheck {
+                machine,
+                generation,
+            } => self.shepherd_check(&machine, generation),
             IpcRequest::JoinList => match self.store.join_tokens() {
                 Ok(list) => IpcResponse::JoinTokens(list),
                 Err(err) => IpcResponse::error("store_error", err),
@@ -5177,8 +5226,16 @@ impl Daemon {
                 agent_key,
                 host_key,
                 facts: _,
+                service_user,
             } => match self
-                .join(&id, &name, &machine_key, &agent_key, &host_key)
+                .join(
+                    &id,
+                    &name,
+                    &machine_key,
+                    &agent_key,
+                    &host_key,
+                    service_user.as_deref(),
+                )
                 .await
             {
                 Ok(()) => {
@@ -15728,6 +15785,7 @@ mod tests {
             "ssh-ed25519 AAAAMACHINE m",
             "ssh-ed25519 AAAAAGENT a",
             "ssh-ed25519 AAAAHOST",
+            None,
         )
         .await
     }
@@ -15754,6 +15812,81 @@ mod tests {
         assert!(text.contains("me@laptop"), "{text}");
         let row = d.store().join_token(id).unwrap().unwrap();
         assert!(row.used_at.is_some(), "the token is spent");
+    }
+
+    /// A join records the service user its request names with the pending
+    /// state, and enrolls the machine: generation 1, its shepherd line
+    /// carrying it, and `ShepherdCheck` answering for that one only.
+    #[tokio::test]
+    async fn a_join_records_its_service_user_and_enrolls_the_machine() {
+        let id = "00112233445566ee";
+        let (d, _tmp, keys) = join_head(id).await;
+        d.join_with(
+            std::path::Path::new("/usr/local/bin/pastor"),
+            &keys,
+            id,
+            "gpu-3",
+            "ssh-ed25519 AAAAMACHINE m",
+            "ssh-ed25519 AAAAAGENT a",
+            "ssh-ed25519 AAAAHOST",
+            Some("pastor"),
+        )
+        .await
+        .unwrap();
+        let state = d.store().machine_state("gpu-3").unwrap().unwrap();
+        assert_eq!(state.service_user.as_deref(), Some("pastor"));
+        assert_eq!(d.store().machine_generation("gpu-3").unwrap(), Some(1));
+        let text = std::fs::read_to_string(&keys).unwrap();
+        assert!(
+            text.contains("bridge --shepherd --machine gpu-3 --gen 1\""),
+            "{text}"
+        );
+        let check = |generation| d.shepherd_check("gpu-3", generation);
+        assert!(matches!(check(Some(1)), IpcResponse::Text(_)));
+        for stale in [Some(0), Some(2), None] {
+            assert!(
+                matches!(check(stale), IpcResponse::Error { ref code, .. } if code == "machine_revoked"),
+                "{stale:?}"
+            );
+        }
+        // A machine with no record (never joined, or removed) is refused a
+        // generation, and a hand-made gen-less line still works for one
+        // that was never joined.
+        assert!(matches!(
+            d.shepherd_check("pi-9", Some(1)),
+            IpcResponse::Error { ref code, .. } if code == "machine_revoked"
+        ));
+        assert!(matches!(
+            d.shepherd_check("pi-9", None),
+            IpcResponse::Text(_)
+        ));
+        // A user name that is not one is refused before the token is spent.
+        let id = "00112233445566ef";
+        d.store()
+            .put_join_token(&crate::store::JoinToken {
+                id: id.into(),
+                flock: None,
+                tags: vec![],
+                replace: None,
+                expires_at: "2999-01-01T00:00:00.000000+00:00".into(),
+                used_at: None,
+            })
+            .unwrap();
+        let err = d
+            .join_with(
+                std::path::Path::new("/usr/local/bin/pastor"),
+                &keys,
+                id,
+                "gpu-4",
+                "ssh-ed25519 AAAAMACHINE4 m",
+                "ssh-ed25519 AAAAAGENT4 a",
+                "ssh-ed25519 AAAAHOST",
+                Some("a;b"),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("not a user name"), "{err:#}");
+        assert!(d.store().join_token(id).unwrap().unwrap().used_at.is_none());
     }
 
     /// The agent line failing after the save reads the same way.
@@ -15804,6 +15937,7 @@ mod tests {
             "ssh-ed25519 AAAAMACHINE m",
             "ssh-ed25519 AAAAAGENT a",
             "ssh-ed25519 AAAAHOST",
+            None,
         )
         .await
         .unwrap();

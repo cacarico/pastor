@@ -245,6 +245,12 @@ pub const BOOTSTRAP_PROTOCOL: u32 = 32;
 /// so `machine add --bootstrap` would add nothing and say only that.
 pub const MACHINE_BOOTSTRAP_PROTOCOL: u32 = 32;
 
+/// The first protocol whose head answers `ShepherdCheck`, cuts
+/// `EventsSince` to `machine`'s records itself, and keeps a joining
+/// machine's `Join::service_user`. An older one refuses the first as
+/// unreadable and drops the other two fields.
+pub const SHEPHERD_SCOPE_PROTOCOL: u32 = 32;
+
 /// The first protocol whose head answers `ArtifactLocate` from its cache of
 /// the binaries it puts on a machine. An older one refuses the request as
 /// unreadable.
@@ -378,6 +384,11 @@ const MACHINE_BOOTSTRAP: &str =
     "predates push bootstrap, and would refuse the request without setting the machine up";
 const ARTIFACT: &str =
     "predates the artifact cache, and would refuse to say where pastor or herdr is";
+const SHEPHERD_CHECK: &str =
+    "predates the shepherd bridge's generation check, and would refuse the request";
+const EVENTS_MACHINE: &str = "predates events cut to one machine, and would answer every machine's";
+const JOIN_SERVICE_USER: &str =
+    "predates a join's service user, and would record the machine without it";
 
 /// How long a head's `Pong` settles the protocol check before it is asked
 /// again: a long-lived sender (a headless serve) sees a restarted head
@@ -682,6 +693,12 @@ pub enum IpcRequest {
         limit: u32,
         #[serde(default)]
         task: Option<i64>,
+        /// Only the records about this machine (a `machine.*` event's own
+        /// machine, else its task's), cut before `limit`: what a shepherd's
+        /// bridge sets, so a page never comes back empty while the
+        /// machine's own records wait further on.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        machine: Option<String>,
     },
     /// Delete rows in `states` that finished more than `older_than_secs`
     /// ago. Answers `Pruned`.
@@ -909,6 +926,22 @@ pub enum IpcRequest {
         /// What it says about itself (os, arch, ...); kept for later use.
         #[serde(default)]
         facts: serde_json::Value,
+        /// The user that runs its shepherd, recorded with its pending state.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        service_user: Option<String>,
+    },
+    /// Whether a shepherd bridge's forced command (`bridge --shepherd
+    /// --machine X --gen N`) still speaks for `machine`: `generation` must
+    /// be the machine's enrollment generation, and the machine must have a
+    /// record. A line with no `--gen` (one made by hand) passes only while
+    /// no join has enrolled the machine. The bridge asks before every
+    /// request it passes on, so a connection that authenticated before a
+    /// `--replace` or a `machine remove` is cut off at its next request.
+    /// Answers `Text`, or `machine_revoked`.
+    ShepherdCheck {
+        machine: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<i64>,
     },
 }
 
@@ -1017,7 +1050,13 @@ impl IpcRequest {
                 }
             }
             R::TaskSummaries { .. } => need.at(SUMMARY_PROTOCOL, SUMMARY),
-            R::EventsSince { .. } => need.at(EVENTS_PROTOCOL, EVENTS),
+            R::EventsSince { machine, .. } => {
+                need.at(EVENTS_PROTOCOL, EVENTS);
+                if machine.is_some() {
+                    need.at(SHEPHERD_SCOPE_PROTOCOL, EVENTS_MACHINE);
+                }
+            }
+            R::ShepherdCheck { .. } => need.at(SHEPHERD_SCOPE_PROTOCOL, SHEPHERD_CHECK),
             R::FlockAdd {
                 description,
                 machines,
@@ -1147,8 +1186,14 @@ impl IpcRequest {
             | R::OrchestratorRun { .. }
             | R::OrchestratorSetEnabled { .. }
             | R::OrchestratorNote { .. } => need.at(ORCHESTRATOR_PROTOCOL, ORCHESTRATOR),
-            R::JoinCreate { .. } | R::JoinList | R::JoinRevoke { .. } | R::Join { .. } => {
+            R::JoinCreate { .. } | R::JoinList | R::JoinRevoke { .. } => {
                 need.at(JOIN_TOKEN_PROTOCOL, JOIN_TOKENS);
+            }
+            R::Join { service_user, .. } => {
+                need.at(JOIN_TOKEN_PROTOCOL, JOIN_TOKENS);
+                if service_user.is_some() {
+                    need.at(SHEPHERD_SCOPE_PROTOCOL, JOIN_SERVICE_USER);
+                }
             }
         }
         need.0
@@ -1176,6 +1221,7 @@ impl IpcRequest {
             | IpcRequest::OrchestratorDescribe { .. }
             | IpcRequest::LimitList
             | IpcRequest::JoinList
+            | IpcRequest::ShepherdCheck { .. }
             | IpcRequest::Queue { .. } => false,
             // It may download into the cache, but changes no task, job or
             // machine.
@@ -1930,6 +1976,7 @@ mod tests {
                 after: 7,
                 limit: 50,
                 task: Some(3),
+                machine: None,
             },
             IpcRequest::TaskClaim {
                 machine: "laptop".into(),
@@ -1992,6 +2039,7 @@ mod tests {
                 after: 0,
                 limit: 10,
                 task: None,
+                machine: None,
             },
             IpcRequest::FileGet {
                 file: "flock".into(),
@@ -2178,6 +2226,7 @@ mod tests {
                 agent_key: "ssh-ed25519 A".into(),
                 host_key: "ssh-ed25519 H".into(),
                 facts: serde_json::Value::Null,
+                service_user: None,
             },
         ]
     }

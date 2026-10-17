@@ -219,7 +219,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_s
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from add" -l sudo -d 'With --bootstrap: do root work through sudo -n (packages, users, lingering), so agents run as pastor-agent'
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from add" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from bootstrap" -l service-user -d 'The user that holds the machine key; created if missing' -r
-complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from bootstrap" -l ssh -d 'The login to bootstrap as (default: the machine\'s ssh); needed once agents run as pastor-agent' -r
+complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from bootstrap" -l ssh -l login -d 'The login to bootstrap as (default: the login its last bootstrap used, else the machine\'s ssh)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from bootstrap" -l host-key -d 'The machine\'s ed25519 host key must be this (SHA256:... or the key itself)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from bootstrap" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from bootstrap" -l sudo -d 'Do root work through sudo -n (packages, users, lingering), so agents run as pastor-agent'
@@ -540,6 +540,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand join; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand join; and __fish_seen_subcommand_from help" -f -a "revoke" -d 'Remove a join token\'s key from authorized_keys and forget it'
 complete -c pastor -n "__fish_pastor_using_subcommand join; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand bridge" -l machine -d 'The machine this bridge serves (needs --agent or --shepherd), as flock.toml names it' -r
+complete -c pastor -n "__fish_pastor_using_subcommand bridge" -l gen -d 'The enrollment of --machine this shepherd\'s key belongs to; the head refuses every request once a join or removal moves past it (needs --shepherd)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand bridge" -l join -d 'Take one join request for the join token with this id, then exit; what a token\'s authorized_keys line runs' -r
 complete -c pastor -n "__fish_pastor_using_subcommand bridge" -l fetch -d 'Stream pastor or herdr from the head\'s artifact cache to stdout, checked against its sha256 (needs --shepherd)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand bridge" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
@@ -552,6 +553,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand bootstrap" -l herdr-from -
 complete -c pastor -n "__fish_pastor_using_subcommand bootstrap" -l write-client -d 'Write client.toml\'s [head] for this user and print `written` or `unchanged`; the client step runs it as each user' -r
 complete -c pastor -n "__fish_pastor_using_subcommand bootstrap" -l write-shepherd -d 'Write pastor.toml\'s [shepherd] machine for this user and print `written` or `unchanged`; `pastor join` runs it as the service user' -r
 complete -c pastor -n "__fish_pastor_using_subcommand bootstrap" -l write-report -d 'Leave this bootstrap outcome (JSON) in this user\'s state dir for its shepherd to report; `pastor join` runs it as the service user' -r
+complete -c pastor -n "__fish_pastor_using_subcommand bootstrap" -l write-shepherd-herdr -d 'Set pastor.toml\'s [shepherd] command to run the agent user\'s herdr at this path through sudo, and print `written` or `unchanged`; `pastor join` runs it as the service user in root mode' -r
 complete -c pastor -n "__fish_pastor_using_subcommand bootstrap" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand bootstrap" -l sudo -d 'Do root work (packages, users, lingering) through `sudo -n`'
 complete -c pastor -n "__fish_pastor_using_subcommand bootstrap" -l json -d 'Print as a JSON object: mode, isolation, each step, the public keys and versions'
