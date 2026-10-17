@@ -54,14 +54,16 @@ test-ssh: ## the CLI against a head over a real ssh, through a throwaway sshd
 # musl gcc (the tests build a static pastor for the containers), and
 # PASTOR_TEST_HERDR_BIN naming a static linux-x86_64 herdr; each test checks for them and skips cleanly without them, or fails
 # with PASTOR_E2E_REQUIRE=1. The images and containers are removed after,
-# pass or fail.
+# pass or fail. Running that `cargo test` directly, without make, leaves the
+# images (labeled pastor-bootstrap-test) behind; `make test-bootstrap-clean`
+# removes them.
 test-bootstrap: ## end-to-end push and pull bootstrap in debian, fedora and arch containers
 	@status=0; \
 	cargo test --features fake-herdr --test bootstrap_e2e -- --ignored --test-threads 1 || status=$$?; \
 	$(MAKE) --no-print-directory test-bootstrap-clean; \
 	exit $$status
 
-test-bootstrap-clean: ## remove the images and containers test-bootstrap made
+test-bootstrap-clean: ## remove the labeled images and containers the bootstrap tests made (a direct cargo test leaves them)
 	@if command -v docker >/dev/null 2>&1; then \
 		docker ps -aq --filter label=pastor-bootstrap-test | xargs -r docker rm -f -v >/dev/null; \
 		docker images -q --filter label=pastor-bootstrap-test | sort -u | xargs -r docker rmi -f >/dev/null; \

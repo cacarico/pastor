@@ -1098,14 +1098,19 @@ stopped instead of redoing what is already there.
   For a machine behind NAT or otherwise unreachable from the head.
 
 Either way, root (uid 0, or `--sudo` with working passwordless sudo) buys
-isolation: bootstrap makes a service user (the login user, or `pastor` with
-`--service-user pastor`, or when the login user is root, as with `curl … |
-sudo sh -s -- join`: the shepherd never runs as root, so `pastor` is made,
-or reused if it is there, and `--service-user root` is a `usage_error`)
-that holds the machine key and runs herdr and the shepherd, and
-`pastor-agent`, which every agent pane runs as; each gets its
-own `0700` state directory, so `pastor-agent` cannot read the service
-user's machine key. Without root, bootstrap makes neither: herdr and every
+isolation. Bootstrap uses two users:
+
+- The service user holds the machine key and runs the shepherd. A non-root
+  login is its own service user, and `--service-user` may name only that
+  login. A root login, as with `curl … | sudo sh -s -- join`, runs the
+  shepherd as `--service-user`, else as `pastor`, made or reused if it is
+  there. The shepherd never runs as root, so `--service-user root` is a
+  `usage_error`.
+- `pastor-agent` runs herdr and every agent pane, since a pane starts as
+  whoever runs herdr.
+
+Each gets its own `0700` state directory, so `pastor-agent` cannot read the
+service user's machine key. Without root, bootstrap makes neither: herdr and every
 agent run as the login user, so there is no isolation between them, and an
 agent can read the machine key the same as the user it runs as can.
 `machine describe` and `pastor bootstrap`'s own output say so
@@ -1114,17 +1119,22 @@ macOS only bootstraps in user mode; root there is
 `bootstrap_unsupported_platform`, since brew refuses root and launchd
 agents are per user.
 
-Rerun bootstrap (`pastor machine bootstrap <name>`, or `pastor join` again
-with `--skip-bootstrap` left out) at any time to upgrade pastor and herdr to
-what the head's cache, or herdr's own index, now gives; a machine already
-`ok` keeps taking work throughout. Only `pastor bootstrap` itself may send
+Rerun bootstrap at any time to upgrade pastor and herdr to what the head's
+cache, or herdr's own index, now gives. For a push machine, `pastor machine
+bootstrap <name>` does it, and a machine already `ok` keeps taking work
+throughout. A pull machine reruns it by joining again, and that is a new
+enrollment: a token is good once, so the rejoin needs a new one from
+`pastor join create --replace <name>`, and the join records the machine
+pending, so it takes no new task until its bootstrap report comes back
+`ok`. Its old shepherd connection is cut off (`machine_revoked`) once the
+new enrollment is recorded. Only `pastor bootstrap` itself may send
 its report: a task's agent asking for one is a fleet change agents may not
 make (`agent_refused`).
 
 To undo a push or a join, run `pastor leave` on the machine itself first
 (its own teardown: it stops and removes the pastor and herdr services of
-this login and, in root mode, of `pastor-agent`, and deletes the machine
-and agent keys), then `pastor machine remove <name>` on the head, which
+this login, of the service user and, in root mode, of `pastor-agent`, and
+deletes the machine and agent keys), then `pastor machine remove <name>` on the head, which
 revokes the `authorized_keys` lines bootstrap added, forgets the pinned
 host key and drops the machine's bootstrap record. Removing on the head
 first still works, but a machine left un-`leave`d keeps a key that logs in
@@ -1206,9 +1216,16 @@ key still logs in until those two lines are gone.
 
 `pastor leave` is the other half, run on the machine itself. It stops,
 disables and removes the pastor and herdr user services (systemd units, or
-launchd agents on macOS) of this login and, in root mode, of pastor-agent,
-whose own pastor says where its agent key is; then it deletes the machine
-and agent keys and their `.pub` files. It checks every step, prints what it
+launchd agents on macOS) of this login and deletes its machine and agent
+keys and their `.pub` files. Then it does the same for the shepherd's
+service user when that is another user (so `sudo pastor leave` reaches the
+`pastor` user a root join ran the shepherd as) and, in root mode, for
+pastor-agent; each one's own pastor says where its keys are. The service
+user is the one root mode's sudoers drop-in, `/etc/sudoers.d/pastor-<user>`,
+names (leave removes the drop-in too); with no drop-in to read, a `pastor`
+user whose home has pastor or a pastor unit. A service user leave cannot
+run commands as is a failed step, not a silent skip, since its shepherd
+may still be running. It checks every step, prints what it
 did and what failed, and ends in `leave_incomplete` if anything did. It
 refuses on the head (`leave_on_head`), and asks first unless `--yes`.
 
@@ -4060,6 +4077,18 @@ uses it with `IdentitiesOnly=yes` and the pinned `known_hosts` with
 `StrictHostKeyChecking=yes`. Without a pastor key, pastor's `known_hosts`
 is not used for the head, so a person's CLI keeps their own.
 
+The same goes for every CLI call to a remote head, not only the
+shepherd's. A `pastor` run on a machine whose state dir holds a machine key
+or an agent key (the machine key first) sends that key and checks the head
+against pastor's `known_hosts`, for every command that user runs against
+the head. The key is what the head's `authorized_keys` knows that machine
+by, and the pin is the head key that `pastor join` or a push checked, so a
+call that used the person's own keys and `known_hosts` instead could reach
+a head pastor never vouched for. It also means such a user's CLI gets only
+what that key's bridge allows (`not_allowed_for_shepherd` or
+`not_allowed_for_agent` for the rest); run fleet commands from a login with
+no pastor key.
+
 On the head, a failure after flock.toml is saved (the machine's
 `authorized_keys` lines, its bootstrap record) is `join_failed` and says
 the machine is in flock.toml and the token spent, and to join again with a
@@ -4135,9 +4164,9 @@ To set it up for machine `pi-1`:
    restrict,command="/path/to/pastor bridge --agent --machine pi-1",no-pty,no-user-rc,no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAA... pastor:agent:pi-1
    ```
 
-Give each machine its own key: the machine named in the line is the only one
-whose tasks that key reaches. A work flock's machine then cannot even list a
-personal flock's tasks.
+Give each machine its own key. The key lists the tasks of its machine's
+flocks, and reads and ends only the tasks of the machine named in its line.
+A work flock's machine then cannot even list a personal flock's tasks.
 
 A pull machine's shepherd gets a line of its own:
 `pastor machine authorized-key pi-1 --key <file> --shepherd` prints one that

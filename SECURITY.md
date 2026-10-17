@@ -37,14 +37,37 @@ including the machine key that logs the machine into the head. Root mode's
 prompt-injected agent from reading the service user's machine key; pick it
 for any machine that runs work you do not fully trust.
 
+User mode also gives the head a shell on the machine as the login. A push
+puts the head's `head_key` into the login's `authorized_keys` with no
+forced command and no restrictions, because the head runs herdr's
+`remote-api-bridge` and every agent through a shell as that user, and in
+user mode that user is the login itself. Root mode puts the key into
+`pastor-agent`'s file instead, so the head's shell there is the agents'
+user, not the person's. That is the trade of user mode: no root needed, at
+the cost of the head holding the login's account.
+
+**Host keys are pinned once.** A push trusts a machine's ed25519 host key
+the first time (or checks it against `--host-key SHA256:...`) and pins it in
+pastor's own `known_hosts`; after that, every ssh to the machine accepts
+that key only, and a pinned host is never keyscanned again. A changed key
+stops the push, and a pull machine's report naming another key is refused
+(`host_key_mismatch`). If the machine really changed (reinstalled, a new
+disk), check the new key out of band, then run `pastor machine bootstrap
+NAME --repin`, the one way to trust it. A machine on a port other than 22 is
+pinned as `[host]:port`, as ssh itself looks it up, so remove or check that
+form when you edit the file by hand.
+
 **A leaked join token** reaches only `bridge --join <id>`, a forced command
 answering exactly one `pastor join` request before the connection ends.
 Before it is redeemed or its `--ttl` runs out, that one request can add one
 machine, under a name not already in `flock.toml` (or the one name the
-token's own `--replace` targets). Once it is used, revoked or past its
-`--ttl`, the same token's ssh gets `Permission denied`: its line is gone
-from `authorized_keys`, and no later request, successful or not, adds a
-second machine or extends its life.
+token's own `--replace` targets). Once it is used or revoked, the same
+token's ssh gets `Permission denied`: its line is gone from
+`authorized_keys`, and no later request, successful or not, adds a second
+machine or extends its life. Past its `--ttl` it is refused at once, not on
+the next sweep: the line carries `expiry-time`, which sshd (OpenSSH 8.2 or
+later) honours, and the head checks the expiry again itself. The line is
+then removed on the next scheduler pass.
 
 **A hijacked pull machine's shepherd** reaches the head through its own
 `bridge --shepherd --machine NAME` key, which answers for `NAME` and nothing
@@ -55,7 +78,9 @@ job it submits is pinned to `NAME` the same way, and one that sets
 `agent_args`, `allow`, `deny`, `agent_source` or `tags`, or names a flock
 `NAME` is not in, is refused outright (`not_allowed_for_shepherd`): a
 compromised pull machine cannot pick what an agent runs with or widen its
-own reach. It can read its own machine's events and fetch pastor or herdr
+own reach. It may set a job's permission `profile`, but the head never runs
+one past what `NAME`'s own profile allows, so `unrestricted` needs `NAME` to
+be `unrestricted` already. It can read its own machine's events and fetch pastor or herdr
 from the head's artifact cache, and nothing past that.
 
 ## What connectors inherit

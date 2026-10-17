@@ -150,13 +150,20 @@ down here because getting them wrong cost a day.
   command or event hooks is a connector. The Claude Code plugin `pastor` that
   ships the skills is Claude Code's word, not pastor's.
 - `pastor bridge` with no flag is unrestricted: whatever reaches the head's
-  user over ssh reaches the fleet. `--agent --machine NAME`, `--shepherd
-  --machine NAME` (folding in `--fetch`) and `--join ID` are narrower
-  `authorized_keys` forced commands instead, each a key that can only act as
-  its one machine or redeem its one token; a shepherd's `TaskClaim`,
-  `TaskReport`, `PullTrust`, `BootstrapReport` and job submits all get their
-  `machine` field overwritten to the bridge's own, whatever the request
-  said, so a hijacked pull machine can never claim or report as another.
+  user over ssh reaches the fleet. Each mode below is a narrower
+  `authorized_keys` forced command instead, so a stolen key can do no more
+  than its one line allows:
+  - `--agent --machine NAME`, the agent key: ping, list its flock's tasks,
+    and read and end only NAME's own tasks.
+  - `--shepherd --machine NAME`, the machine key: what the agent key may,
+    plus claiming and reporting NAME's tasks, its saved trust, job submits,
+    its own events, its bootstrap report and artifact fetches. `TaskClaim`,
+    `TaskReport`, `PullTrust`, `BootstrapReport` and job submits all get
+    their `machine` field overwritten to the bridge's own, whatever the
+    request said, so a hijacked pull machine can never claim or report as
+    another.
+  - `--join ID`, a join token's key: one `Join` request for its one token,
+    then the connection ends.
   `pastor-agent` is the fixed user bootstrap makes for every agent pane in
   root mode, with its own `0700` state dir, so a prompt-injected agent
   cannot read the service user's machine key; in user mode there is no such
