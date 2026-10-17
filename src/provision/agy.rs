@@ -1,6 +1,6 @@
 //! The agy provisioner: before a profiled agy launch, make agy's global
 //! settings on the machine deny what the machine's own permission profile
-//! denies (`docs/superpowers/specs/2026-10-15-agy-provisioner-design.md`).
+//! denies.
 //!
 //! agy takes no permission rule from a flag or the environment, only from
 //! its settings files, so the rules a profile needs must be on the machine.
