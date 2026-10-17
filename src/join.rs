@@ -811,7 +811,15 @@ mod tests {
         Token {
             head: "me@head.example".into(),
             head_host_key: "head.example ssh-ed25519 AAAAHOST".into(),
-            key: "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA+/=\n-----END OPENSSH PRIVATE KEY-----\n".into(),
+            // Not a key: the header is split so secret scanners do not
+            // read the fixture as one. `+/=` keeps base64url's odd ones in.
+            key: concat!(
+                "-----BEGIN OPENSSH ",
+                "PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA+/=\n",
+                "-----END OPENSSH ",
+                "PRIVATE KEY-----\n"
+            )
+            .into(),
         }
     }
 
