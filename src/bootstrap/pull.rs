@@ -156,7 +156,7 @@ pub fn write_report(state_dir: &Path, json: &str) -> anyhow::Result<()> {
 /// `@revoked`), pattern, negation or list, and a key type sshd logs in
 /// with. Anything more would pin other hosts, or another kind of trust.
 fn pinnable(line: &str, head: &str) -> bool {
-    let host = head.rsplit_once('@').map_or(head, |(_, h)| h);
+    let (host, _) = crate::ssh::destination_host_port(head);
     let words: Vec<&str> = line.split_whitespace().collect();
     let [name, kind, key] = words[..] else {
         return false;
@@ -232,6 +232,62 @@ fn remove_live_dirs() {
     let dirs = LIVE_DIRS.lock().map(|l| l.clone()).unwrap_or_default();
     for dir in dirs {
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// Children by pid, for a signal to stop.
+struct Children(std::sync::Mutex<Vec<u32>>);
+
+/// The ssh children a join is running now: a killed join runs no `Drop`,
+/// and its ssh would live on, orphaned.
+static LIVE_CHILDREN: Children = Children(std::sync::Mutex::new(Vec::new()));
+
+/// A child in a [`Children`] while this lives; dropped once it was waited
+/// for.
+struct LiveChild<'a> {
+    list: &'a Children,
+    pid: u32,
+}
+
+impl Children {
+    fn track(&self, child: &std::process::Child) -> LiveChild<'_> {
+        let pid = child.id();
+        if let Ok(mut live) = self.0.lock() {
+            live.push(pid);
+        }
+        LiveChild { list: self, pid }
+    }
+
+    /// Kill and reap every child there is, on the way out of a signal.
+    fn kill_all(&self) {
+        let Ok(live) = self.0.lock() else {
+            return;
+        };
+        kill_and_reap(&live);
+    }
+}
+
+impl Drop for LiveChild<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut live) = self.list.0.lock() {
+            live.retain(|p| *p != self.pid);
+        }
+    }
+}
+
+/// SIGKILL each of `pids`, then wait for it.
+fn kill_and_reap(pids: &[u32]) {
+    for &pid in pids {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            continue;
+        };
+        // SAFETY: a pid this process spawned and has not reaped yet (the
+        // entry goes once it is waited for); kill and waitpid take plain
+        // integers and a null status pointer.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+        }
     }
 }
 
@@ -453,6 +509,7 @@ impl HeadLink for SshLink {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| anyhow::anyhow!("run ssh: {e}"))?;
+        let _live = LIVE_CHILDREN.track(&child);
         if let Some(mut stdin) = child.stdin.take() {
             // A bridge that already gave up closes the pipe; its reply, or
             // ssh's stderr, says why.
@@ -494,6 +551,7 @@ impl HeadLink for SshLink {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| anyhow::anyhow!("run ssh: {e}"))?;
+        let _live = LIVE_CHILDREN.track(&child);
         let stderr = drain_stderr(&mut child);
         let copied = match child.stdout.take() {
             Some(out) => copy_capped(out, &mut file, max),
@@ -593,6 +651,7 @@ pub async fn join(paths: &Paths, token: Token, o: JoinOpts) -> anyhow::Result<Ou
         _ = term.recv() => 143,
         _ = hup.recv() => 129,
     };
+    LIVE_CHILDREN.kill_all();
     remove_live_dirs();
     std::process::exit(code);
 }
@@ -1435,6 +1494,21 @@ mod tests {
             let text = std::fs::read_to_string(p.known_hosts_file()).unwrap();
             assert_eq!(text, format!("{line}\n"));
         }
+        // A head on port 2222, named in the URI form ssh takes.
+        {
+            let (_tmp, p) = paths();
+            let r = FakeRunner::new(&[]);
+            let link = FakeLink::new(Err("down".into()));
+            let line = "[head]:2222 ssh-ed25519 AAAAHEAD";
+            let t = Token {
+                head: "ssh://me@head:2222".into(),
+                head_host_key: line.into(),
+                ..token()
+            };
+            let _ = join_with(&p, &t, &opts(), &r, &link);
+            let text = std::fs::read_to_string(p.known_hosts_file()).unwrap();
+            assert_eq!(text, format!("{line}\n"));
+        }
         let bad = [
             "@cert-authority head ssh-ed25519 AAAAHEAD",
             "@revoked head ssh-ed25519 AAAAHEAD",
@@ -1464,6 +1538,36 @@ mod tests {
             assert!(!p.known_hosts_file().exists(), "{line:?}");
             assert!(link.seen().is_empty(), "{line:?}");
         }
+    }
+
+    /// A join stopped by a signal takes its ssh down with it: the child is
+    /// killed and reaped, not left running orphaned. One done with drops
+    /// out of the list.
+    #[test]
+    fn a_signal_kills_and_reaps_the_joins_ssh() {
+        // A list of its own: the joins other tests run are not this one's
+        // to kill.
+        let children = Children(std::sync::Mutex::new(Vec::new()));
+        let mut done = std::process::Command::new("true").spawn().unwrap();
+        {
+            let _live = children.track(&done);
+            done.wait().unwrap();
+        }
+        assert!(children.0.lock().unwrap().is_empty());
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let live = children.track(&child);
+        children.kill_all();
+        // Reaped: no process, not even a zombie, has the pid now.
+        // SAFETY: signal 0 sends nothing; it only checks that pid exists.
+        let gone = unsafe { libc::kill(pid as libc::pid_t, 0) } != 0;
+        assert!(gone, "ssh {pid} still there");
+        assert!(child.wait().is_err(), "reaped already, nothing to wait for");
+        drop(live);
+        assert!(children.0.lock().unwrap().is_empty());
     }
 
     /// A pid no process has: one that ran and was reaped.

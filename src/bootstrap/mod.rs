@@ -24,11 +24,16 @@ use crate::setup::Runner;
 /// The user herdr and every agent pane run as, in root mode.
 pub const AGENT_USER: &str = "pastor-agent";
 
+/// The service user when bootstrap runs as root and `--service-user` is
+/// not given: the shepherd never runs as root.
+pub const ROOT_SERVICE_USER: &str = "pastor";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
     /// Use `sudo -n` for root work when not uid 0.
     pub sudo: bool,
-    /// The user that holds the machine key; the login user when unset.
+    /// The user that holds the machine key; the login user when unset,
+    /// or `ROOT_SERVICE_USER` when that is root. Never root.
     pub service_user: Option<String>,
     /// The head's ssh destination, written to each user's client.toml.
     pub head: String,
@@ -285,6 +290,14 @@ fn check_dest(dest: &str) -> anyhow::Result<()> {
 /// A user name as useradd takes it (`^[a-z_][a-z0-9_-]*$`, at most 32
 /// characters), so none reads as an option or splits into two words.
 pub(crate) fn check_user(name: &str) -> anyhow::Result<()> {
+    if name == "root" {
+        return Err(CliError::err(
+            "usage_error",
+            format!(
+                "--service-user root is refused: the shepherd never runs as root; leave it out to use {ROOT_SERVICE_USER}"
+            ),
+        ));
+    }
     let mut chars = name.chars();
     let ok = name.len() <= 32
         && chars
