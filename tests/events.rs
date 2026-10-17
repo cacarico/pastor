@@ -323,6 +323,7 @@ async fn the_daemon_writes_the_events_log() {
             after: queued.seq - 1,
             limit: 1,
             task: Some(t.id),
+            machine: None,
         },
         &pastor::ipc::Caller::default(),
     )

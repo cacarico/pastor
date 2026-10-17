@@ -124,12 +124,32 @@ enum Command {
         #[command(subcommand)]
         cmd: pastor::trust_cli::TrustCmd,
     },
+    /// One-time tokens a new machine joins the fleet with, as a pull machine
+    Join(pastor::join::JoinArgs),
     /// Pass request lines from stdin to this machine's head; for a remote CLI over ssh
     Bridge(BridgeArgs),
+    /// Set this machine up for a head: packages, users, pastor, herdr, services, keys (`--head DEST`)
+    ///
+    /// Run by `machine add --bootstrap` over ssh and by `pastor join`, not by
+    /// hand, so it is left out of the command list.
+    #[command(hide = true)]
+    Bootstrap(pastor::bootstrap::Args),
     /// Which head this CLI uses: this machine's, or one on another machine over ssh
     Head {
         #[command(subcommand)]
         cmd: pastor::head::HeadCmd,
+    },
+    /// A clean teardown of this machine: disable and remove its pastor and herdr services, and delete its keys
+    ///
+    /// Touches only this machine: the service user's and (in root mode)
+    /// pastor-agent's pastor and herdr user units, and the machine and
+    /// agent keys bootstrap left under the state dir. Run `pastor machine
+    /// remove` on the head too, or a removed pull machine keeps trying to
+    /// log in with a key that no longer works.
+    Leave {
+        /// Skip the confirmation prompt; needed when stdin is not a terminal
+        #[arg(short, long)]
+        yes: bool,
     },
 }
 
@@ -143,13 +163,33 @@ struct ServeArgs {
 }
 
 #[derive(Args, Debug)]
+#[command(group(ArgGroup::new("bridge_mode").args(["agent", "shepherd"])))]
 struct BridgeArgs {
     /// Pass on only what an agent on --machine may ask: its machine's tasks
     #[arg(long, requires = "machine")]
     agent: bool,
-    /// The machine whose agents this bridge serves, as flock.toml names it
-    #[arg(long, requires = "agent")]
+    /// Pass on only what the shepherd on --machine may ask: claiming and
+    /// reporting its own tasks, its saved trust, job submits and its events
+    #[arg(long, requires = "machine")]
+    shepherd: bool,
+    /// The machine this bridge serves (needs --agent or --shepherd), as flock.toml names it
+    #[arg(long)]
     machine: Option<String>,
+    /// The enrollment of --machine this shepherd's key belongs to; the head refuses every request once a join or removal moves past it (needs --shepherd)
+    #[arg(long = "gen", value_name = "N", requires = "shepherd")]
+    generation: Option<i64>,
+    /// Take one join request for the join token with this id, then exit; what a token's authorized_keys line runs
+    #[arg(long, value_name = "ID", conflicts_with_all = ["agent", "machine"])]
+    join: Option<String>,
+    /// Stream pastor or herdr from the head's artifact cache to stdout, checked against its sha256 (needs --shepherd)
+    #[arg(
+        long,
+        num_args = 3,
+        value_names = ["NAME", "VERSION", "TARGET"],
+        requires = "shepherd",
+        conflicts_with = "agent"
+    )]
+    fetch: Option<Vec<String>>,
 }
 
 #[derive(Args, Debug)]
@@ -453,6 +493,38 @@ enum MachineCmd {
         /// Also save it in herdr's sidebar (runs `herdr machine add`)
         #[arg(long, conflicts_with_all = ["local", "command"])]
         herdr: bool,
+        /// Set the machine up over ssh first: pastor, herdr and their services (needs a running head)
+        #[arg(long, requires = "ssh", conflicts_with_all = ["local", "command"])]
+        bootstrap: bool,
+        /// With --bootstrap: do root work through sudo -n (packages, users, lingering), so agents run as pastor-agent
+        #[arg(long, requires = "bootstrap")]
+        sudo: bool,
+        /// With --bootstrap: the user that holds the machine key; created if missing
+        #[arg(long, value_name = "NAME", requires = "bootstrap")]
+        service_user: Option<String>,
+        /// With --bootstrap: the machine's ed25519 host key must be this (SHA256:... or the key itself)
+        #[arg(long, value_name = "KEY", requires = "bootstrap")]
+        host_key: Option<String>,
+    },
+    /// Run bootstrap again on a machine over ssh: after a failed step, or to upgrade pastor and herdr
+    Bootstrap {
+        /// The machine, as flock.toml names it
+        name: String,
+        /// Do root work through sudo -n (packages, users, lingering), so agents run as pastor-agent
+        #[arg(long)]
+        sudo: bool,
+        /// The user that holds the machine key; created if missing
+        #[arg(long, value_name = "NAME")]
+        service_user: Option<String>,
+        /// The login to bootstrap as (default: the login its last bootstrap used, else the machine's ssh)
+        #[arg(long, value_name = "DEST", visible_alias = "login")]
+        ssh: Option<String>,
+        /// The machine's ed25519 host key must be this (SHA256:... or the key itself)
+        #[arg(long, value_name = "KEY")]
+        host_key: Option<String>,
+        /// Drop the host key pinned for the machine and pin the one it offers now, after a reinstall
+        #[arg(long)]
+        repin: bool,
     },
     /// Remove a machine from flock.toml; tasks already on it keep their rows
     Remove {
@@ -494,13 +566,16 @@ enum MachineCmd {
         /// The machine, as flock.toml names it
         name: String,
     },
-    /// Print the authorized_keys line that lets a machine's agents reach this head
+    /// Print the authorized_keys line that lets a machine's agents (or, with --shepherd, its shepherd) reach this head
     AuthorizedKey {
         /// The machine, as flock.toml names it
         name: String,
         /// The public key of the machine's user: a .pub file, or - for stdin
         #[arg(long, value_name = "FILE")]
         key: String,
+        /// Print the shepherd's line (bridge --shepherd --machine NAME) instead of the agent's
+        #[arg(long)]
+        shepherd: bool,
     },
 }
 
@@ -628,6 +703,14 @@ fn main() {
     // Plumbing, before the legacy migration and the fleet guard: it reads no
     // config, and the head checks each request it carries.
     if let Command::Bridge(args) = &command {
+        if args.machine.is_some() && !args.agent && !args.shepherd {
+            <Cli as clap::CommandFactory>::command()
+                .error(
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "--machine needs --agent or --shepherd",
+                )
+                .exit();
+        }
         bridge(&paths, args);
     }
     if let Some(legacy) = pastor::config::legacy_macos_dir() {
@@ -699,6 +782,31 @@ fn main() {
         if changes_fleet(&command) && !orchestrator_may(&command) && !agents_change_fleet(&paths) {
             fail("agent_refused", &pastor::daemon::script_refusal(o));
         }
+    }
+    // After the guard, which keeps agents from running it: it makes users
+    // and services. --head names the head this machine is for, not one to
+    // talk to, so no head is asked.
+    // `pastor join <token>` on a new machine: it bootstraps this machine,
+    // and its head is the token's, so none is asked first.
+    if let Command::Join(args) = &command
+        && args.cmd.is_none()
+    {
+        if let Err(err) = pastor::bootstrap::pull::cli(args) {
+            match err.downcast_ref::<CliError>() {
+                Some(e) => fail(&e.code, &e.message),
+                None => fail("runtime_error", &format!("{err:#}")),
+            }
+        }
+        return;
+    }
+    if let Command::Bootstrap(args) = &command {
+        if let Err(err) = pastor::bootstrap::cli(args, head_flag.as_deref()) {
+            match err.downcast_ref::<CliError>() {
+                Some(e) => fail(&e.code, &e.message),
+                None => fail("runtime_error", &format!("{err:#}")),
+            }
+        }
+        return;
     }
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let result = rt.block_on(async {
@@ -772,10 +880,14 @@ fn main() {
             Command::Profile { cmd } => pastor::profile_cli::run(&head_config(&client).await?, cmd),
             Command::Trust { cmd } => pastor::trust_cli::run(&client, cmd, head).await,
             Command::Limit { cmd } => pastor::limit_cli::run(&client, cmd, head).await,
+            Command::Join(args) => pastor::join::run(&client, args).await,
             Command::Queue(args) => pastor::queue_cli::run(&client, args, head).await,
             Command::Status(args) => status(&client, args, head).await,
-            Command::Bridge(_) => unreachable!("handled before the runtime"),
+            Command::Bridge(_) | Command::Bootstrap(_) => {
+                unreachable!("handled before the runtime")
+            }
             Command::Head { cmd } => pastor::head::run(&paths, cmd, remote.as_ref()).await,
+            Command::Leave { yes } => pastor::leave::cli(&paths, yes).await,
         }
     });
     if let Err(err) = result {
@@ -888,11 +1000,94 @@ fn completion_tree() -> clap::Command {
 fn bridge(paths: &Paths, args: &BridgeArgs) -> ! {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let socket = paths.socket_file();
-    let input = tokio::io::BufReader::new(tokio::io::stdin());
+    let mut input = tokio::io::BufReader::new(tokio::io::stdin());
+    let mut fetch = args
+        .fetch
+        .as_deref()
+        .and_then(|f| <&[String; 3]>::try_from(f).ok())
+        .map(|[n, v, t]| (n.clone(), v.clone(), t.clone()));
+    // A pull machine's key forces `bridge --shepherd --machine X --gen N`:
+    // its ssh's own command (SSH_ORIGINAL_COMMAND) may only be the line
+    // bridge, and a fetch comes as the first request line instead.
+    let mut first = None;
+    if args.shepherd && fetch.is_none() {
+        let original = std::env::var("SSH_ORIGINAL_COMMAND").ok();
+        if let Err(why) = pastor::bridge::forced_command(original.as_deref()) {
+            fail(pastor::bridge::NOT_ALLOWED_FOR_SHEPHERD, &why);
+        }
+        first = match rt.block_on(pastor::bridge::first_line(
+            &mut input,
+            pastor::daemon::MAX_IPC_REQUEST,
+        )) {
+            Ok(line) => line,
+            Err(err) => match err.downcast_ref::<CliError>() {
+                Some(e) => fail(&e.code, &e.message),
+                None => fail("runtime_error", &format!("{err:#}")),
+            },
+        };
+        match first.as_deref().and_then(pastor::bridge::fetch_request) {
+            Some(Ok(a)) => fetch = Some((a.name, a.version, a.target)),
+            Some(Err(why)) => fail("invalid_artifact", &why),
+            None => {}
+        }
+    }
+    if let Some((name, version, target)) = &fetch {
+        // stdout carries the binary, so a failure goes to stderr as any
+        // other command's does.
+        let fetched = rt.block_on(async {
+            if let Some(machine) = args.machine.as_deref().filter(|_| args.shepherd)
+                && let Err(reply) =
+                    pastor::bridge::check_generation(&socket, machine, args.generation).await?
+            {
+                let (code, message) = match serde_json::from_slice(&reply) {
+                    Ok(pastor::ipc::IpcResponse::Error { code, message }) => (code, message),
+                    _ => (
+                        pastor::bridge::MACHINE_REVOKED.to_string(),
+                        "the head refused the generation check".to_string(),
+                    ),
+                };
+                return Err(CliError::err(&code, message));
+            }
+            pastor::bridge::fetch(
+                &socket,
+                &paths.state_dir,
+                name,
+                version,
+                target,
+                tokio::io::stdout(),
+            )
+            .await
+        });
+        match fetched {
+            Ok(()) => std::process::exit(0),
+            Err(err) => match err.downcast_ref::<CliError>() {
+                Some(e) => fail(&e.code, &e.message),
+                None => fail("runtime_error", &format!("{err:#}")),
+            },
+        }
+    }
     let result = rt.block_on(async {
-        match (args.agent, &args.machine) {
-            (true, Some(machine)) => {
+        match (args.agent, args.shepherd, &args.machine) {
+            _ if args.join.is_some() => {
+                let id = args.join.as_deref().unwrap_or_default();
+                pastor::join::bridge(&socket, id, input, tokio::io::stdout()).await
+            }
+            (true, _, Some(machine)) => {
                 pastor::bridge::run_agent(&socket, machine, input, tokio::io::stdout()).await
+            }
+            (_, true, Some(machine)) => {
+                // The line read to see whether it was a fetch goes first.
+                use tokio::io::AsyncReadExt;
+                let first = std::io::Cursor::new(first.unwrap_or_default());
+                let input = tokio::io::BufReader::new(AsyncReadExt::chain(first, input));
+                pastor::bridge::run_shepherd(
+                    &socket,
+                    machine,
+                    args.generation,
+                    input,
+                    tokio::io::stdout(),
+                )
+                .await
             }
             _ => pastor::bridge::run(&socket, input, tokio::io::stdout()).await,
         }
@@ -1046,7 +1241,7 @@ fn head_use(command: &Command) -> Option<bool> {
         },
         Command::Tick(_) | Command::Job { .. } | Command::Config { .. } => Some(false),
         Command::Orchestrator { .. } => Some(false),
-        Command::Trust { .. } | Command::Limit { .. } => Some(false),
+        Command::Trust { .. } | Command::Limit { .. } | Command::Join(_) => Some(false),
         Command::Queue(a) => Some(a.flock.is_some()),
         Command::Status(_) => Some(false),
         Command::Connector { cmd } => {
@@ -1102,6 +1297,8 @@ fn remote_route(command: &Command) -> RemoteRoute {
         | Command::Flock { .. }
         | Command::Trust { .. }
         | Command::Limit { .. }
+        // Tokens are made and redeemed against the head's authorized_keys.
+        | Command::Join(_)
         | Command::Profile { .. }
         | Command::Config { .. }
         | Command::Events(_)
@@ -1112,8 +1309,10 @@ fn remote_route(command: &Command) -> RemoteRoute {
         | Command::Orchestrator { .. } => RemoteRoute::Head,
         Command::Completions { .. }
         | Command::Setup { .. }
+        | Command::Leave { .. }
         | Command::Head { .. }
         | Command::Bridge(_)
+        | Command::Bootstrap(_)
         | Command::Connector { .. } => RemoteRoute::Here,
         // Stop and status act on this machine's serve, head or headless.
         Command::Serve(ServeArgs { cmd: Some(_), .. }) => RemoteRoute::Here,
@@ -1229,9 +1428,14 @@ fn changes_fleet(command: &Command) -> bool {
             cmd: Some(pastor::serve_cli::ServeCmd::Status { .. }),
             ..
         }) => false,
-        Command::Serve(_) | Command::Setup { .. } => true,
+        // Bootstrap makes users and services on this machine.
+        Command::Serve(_)
+        | Command::Setup { .. }
+        | Command::Bootstrap(_)
+        | Command::Leave { .. } => true,
         Command::Trust { cmd } => pastor::trust_cli::changes_fleet(cmd),
         Command::Limit { cmd } => pastor::limit_cli::changes_fleet(cmd),
+        Command::Join(args) => pastor::join::changes_fleet(args),
         Command::Queue(a) => pastor::queue_cli::changes_fleet(a),
         _ => false,
     }
@@ -1644,8 +1848,10 @@ async fn probe_machine(
         .collect();
     // Nothing connects to a pull machine, and with no head running nobody
     // has heard its claims: its row says so, with the tasks the store puts
-    // there, rather than probing whatever herdr runs here.
+    // there, rather than probing whatever herdr runs here. Its versions
+    // come from its last `BootstrapReport`, if it has one.
     if m.pull {
+        let saved = store.machine_state(&m.name)?;
         return Ok(pastor::cli::MachineRow {
             now: Vec::new(),
             name: m.name.clone(),
@@ -1654,8 +1860,8 @@ async fn probe_machine(
             flock: flock.to_string(),
             flocks,
             channel: "not probed".into(),
-            herdr_version: None,
-            pastor_version: None,
+            herdr_version: saved.as_ref().and_then(|s| s.herdr_version.clone()),
+            pastor_version: saved.as_ref().and_then(|s| s.pastor_version.clone()),
             pastor_read_at: None,
             protocol: None,
             error: None,
@@ -2127,6 +2333,10 @@ async fn machine(client: &pastor::ipc::Client, cmd: MachineCmd, head: Head) -> a
             flock,
             description,
             herdr,
+            bootstrap,
+            sudo,
+            service_user,
+            host_key,
         } => {
             let m = MachineConfig {
                 pull: false,
@@ -2154,7 +2364,25 @@ async fn machine(client: &pastor::ipc::Client, cmd: MachineCmd, head: Head) -> a
             };
             // With a head the reload line comes with its answer, before the
             // herdr lines; without one it follows them.
-            let reload = if head.is_live() {
+            let reload = if bootstrap {
+                println!(
+                    "{}",
+                    machine_bootstrap(
+                        client,
+                        IpcRequest::MachineBootstrap {
+                            name: name.clone(),
+                            sudo,
+                            service_user,
+                            host_key,
+                            machine: Some(m.clone()),
+                            login: None,
+                            repin: false,
+                        },
+                    )
+                    .await?
+                );
+                None
+            } else if head.is_live() {
                 println!(
                     "{}",
                     ask_text(client, IpcRequest::MachineAdd { machine: m.clone() }).await?
@@ -2167,7 +2395,18 @@ async fn machine(client: &pastor::ipc::Client, cmd: MachineCmd, head: Head) -> a
                 );
                 Some(reload_running_head(paths, head).await)
             };
-            match (herdr, m.ssh.as_deref()) {
+            // A root-mode bootstrap moved the entry to the agent user, whose
+            // herdr the sidebar should open.
+            let reached = if bootstrap {
+                head_flock(client)
+                    .await
+                    .ok()
+                    .and_then(|f| f.get(&name).and_then(|m| m.ssh.clone()))
+                    .or(m.ssh.clone())
+            } else {
+                m.ssh.clone()
+            };
+            match (herdr, reached.as_deref()) {
                 // The flock file is already written: a herdr failure below is
                 // reported, not rolled back, so the two lists never diverge
                 // silently in the other direction either.
@@ -2192,6 +2431,31 @@ async fn machine(client: &pastor::ipc::Client, cmd: MachineCmd, head: Head) -> a
                 println!("{reload}");
             }
         }
+        MachineCmd::Bootstrap {
+            name,
+            sudo,
+            service_user,
+            ssh,
+            host_key,
+            repin,
+        } => {
+            println!(
+                "{}",
+                machine_bootstrap(
+                    client,
+                    IpcRequest::MachineBootstrap {
+                        name,
+                        sudo,
+                        service_user,
+                        host_key,
+                        machine: None,
+                        login: ssh,
+                        repin,
+                    },
+                )
+                .await?
+            );
+        }
         MachineCmd::Remove { name, herdr } => {
             // Only for the herdr hint below, read before the machine goes,
             // from the head's file; a file that does not load gives no hint.
@@ -2211,7 +2475,13 @@ async fn machine(client: &pastor::ipc::Client, cmd: MachineCmd, head: Head) -> a
             } else {
                 let _lock = offline_fleet_lock(paths)?;
                 let done = fleet_edit::remove_machine(&path, &name).map_err(edit_error)?;
-                println!("{done}; {}", reload_running_head(paths, head).await);
+                let mut done = vec![done];
+                done.extend(forget_removed_machine(paths, &name));
+                println!(
+                    "{}; {}",
+                    done.join("; "),
+                    reload_running_head(paths, head).await
+                );
             }
             if herdr {
                 // herdr removes by profile id; the label is all pastor knows.
@@ -2259,7 +2529,11 @@ async fn machine(client: &pastor::ipc::Client, cmd: MachineCmd, head: Head) -> a
         }
         MachineCmd::Describe { name, json } => machine_describe(client, &name, json, head).await?,
         MachineCmd::Open { name } => open(client, &name).await?,
-        MachineCmd::AuthorizedKey { name, key } => authorized_key(&path, &name, &key)?,
+        MachineCmd::AuthorizedKey {
+            name,
+            key,
+            shepherd,
+        } => authorized_key(&path, &name, &key, shepherd)?,
     }
     Ok(())
 }
@@ -2291,6 +2565,23 @@ fn offline_fleet_lock(paths: &Paths) -> anyhow::Result<std::fs::File> {
 }
 
 /// `ask`, for a request the head answers with `Text`.
+/// A push bootstrap through the head. It downloads, copies and installs on
+/// the machine before it answers, so it gets far longer than a request's
+/// usual bound.
+async fn machine_bootstrap(
+    client: &pastor::ipc::Client,
+    req: IpcRequest,
+) -> anyhow::Result<String> {
+    const PUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
+    let resp = pastor::cli::reply(
+        pastor::ipc::request_head_with_timeout(client, &req, PUSH_TIMEOUT).await,
+    )?;
+    let IpcResponse::Text(text) = resp else {
+        return Err(unexpected(resp));
+    };
+    Ok(text)
+}
+
 async fn ask_text(client: &pastor::ipc::Client, req: IpcRequest) -> anyhow::Result<String> {
     let resp = ask(client, req).await?;
     let IpcResponse::Text(text) = resp else {
@@ -2755,9 +3046,43 @@ async fn attach(client: &pastor::ipc::Client, task: &str) -> anyhow::Result<()> 
     Err(anyhow::anyhow!("exec failed: {err}"))
 }
 
+/// `machine remove` with no head running: what the head's own remove does
+/// besides the flock edit (`Daemon::cleanup_removed_machine`) that needs no
+/// ssh, so a pull machine's shepherd key stops logging in and its
+/// bootstrap row goes. Returns what failed, with what to do about it.
+fn forget_removed_machine(paths: &Paths, name: &str) -> Vec<String> {
+    let mut failed = Vec::new();
+    let keys = pastor::authkeys::default_file();
+    if keys.exists()
+        && let Err(err) = pastor::authkeys::remove_machine(&keys, name)
+    {
+        failed.push(format!(
+            "could not drop its authorized_keys lines: {err:#}; delete the lines ending in \
+             `pastor:machine:{name}` and `pastor:agent:{name}` from {} by hand",
+            keys.display()
+        ));
+    }
+    let db = paths.db_file();
+    if db.exists()
+        && let Err(err) = pastor::store::Store::open(&db).and_then(|s| s.drop_machine_state(name))
+    {
+        failed.push(format!(
+            "could not drop its bootstrap record: {err:#}; a later `machine add` of {name} starts from it"
+        ));
+    }
+    failed
+}
+
 /// `pastor machine authorized-key`: prints the line, and never edits
-/// `authorized_keys` or any other file.
-fn authorized_key(flock: &std::path::Path, machine: &str, key: &str) -> anyhow::Result<()> {
+/// `authorized_keys` or any other file. `--shepherd` prints the line for
+/// that machine's shepherd (`bridge --shepherd --machine NAME`, marker
+/// `pastor:machine:NAME`) instead of its agents'.
+fn authorized_key(
+    flock: &std::path::Path,
+    machine: &str,
+    key: &str,
+    shepherd: bool,
+) -> anyhow::Result<()> {
     if Flock::load(flock)?.get(machine).is_none() {
         fail("unknown_machine", machine);
     }
@@ -2769,10 +3094,17 @@ fn authorized_key(flock: &std::path::Path, machine: &str, key: &str) -> anyhow::
         })?
     };
     let pastor = std::env::current_exe()?;
-    println!(
-        "{}",
+    let line = if shepherd {
+        pastor::authkeys::line(
+            &pastor,
+            &format!("bridge --shepherd --machine {machine}"),
+            &key,
+            &pastor::authkeys::Marker::Machine(machine.to_string()),
+        )?
+    } else {
         pastor::bridge::authorized_key_line(&pastor, machine, &key)?
-    );
+    };
+    println!("{line}");
     Ok(())
 }
 
@@ -3298,6 +3630,7 @@ async fn machine_describe(
     let config = PastorConfig::load(&paths.config_file())?;
     let row = probe_machine(m, &f, &config, paths, &store).await?;
     let tasks = store.list_tasks(&pastor::describe::machine_tasks(name))?;
+    let bootstrap = store.machine_state(name)?;
     let d = pastor::describe::MachineDescription {
         row,
         session: m.session.clone(),
@@ -3306,6 +3639,7 @@ async fn machine_describe(
         agents_by_kind: m.agents.clone(),
         tasks,
         recent_errors: pastor::describe::machine_errors(events_log(paths), name),
+        bootstrap,
     };
     print_description(&d, json, pastor::describe::machine_text)
 }

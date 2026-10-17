@@ -2,6 +2,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
+use std::sync::Arc;
 
 use super::Connection;
 use crate::config::Paths;
@@ -12,6 +13,65 @@ use crate::ssh::{SHORTER_STATE_DIR, check_socket_path, fitting_control_path};
 /// request opens a connection, so the master is what makes them cheap: the same
 /// value herdr's own remote transport uses (`src/remote/attach.rs`).
 const CONTROL_PERSIST: &str = "600";
+
+/// Whether a machine's host key is on record (`machine_state.host_key`),
+/// asked on every ssh so a push that finishes while the machine's actor
+/// runs takes effect at once. `Err` when the record could not be read: the
+/// ssh is then not run at all, since a pinned machine must never fall back
+/// to plain trust.
+pub type Pinned = Arc<dyn Fn() -> Result<bool, String> + Send + Sync>;
+
+/// What the head adds to a machine's ssh once it has set the machine up:
+/// its own key, offered once the file exists, and pastor's known_hosts,
+/// used once the machine's host key was pinned there.
+#[derive(Clone)]
+pub struct SshTrust {
+    head_key: PathBuf,
+    known_hosts: PathBuf,
+    pinned: Pinned,
+}
+
+impl SshTrust {
+    pub fn new(paths: &Paths, pinned: Pinned) -> SshTrust {
+        SshTrust {
+            head_key: paths.head_key(),
+            known_hosts: paths.known_hosts_file(),
+            pinned,
+        }
+    }
+
+    fn head_key(&self) -> Option<&Path> {
+        self.head_key.exists().then_some(self.head_key.as_path())
+    }
+
+    fn known_hosts(&self) -> Result<Option<&Path>, ConnectError> {
+        match (self.pinned)() {
+            Ok(pinned) => Ok(pinned.then_some(self.known_hosts.as_path())),
+            Err(why) => Err(ConnectError {
+                message: format!("cannot tell whether the host key is pinned: {why}"),
+            }),
+        }
+    }
+}
+
+impl std::fmt::Debug for SshTrust {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SshTrust")
+            .field("head_key", &self.head_key)
+            .field("known_hosts", &self.known_hosts)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Two endpoints with the same files are the same; the check is not
+/// comparable, and it reads the same store for the same machine.
+impl PartialEq for SshTrust {
+    fn eq(&self, other: &Self) -> bool {
+        self.head_key == other.head_key && self.known_hosts == other.known_hosts
+    }
+}
+
+impl Eq for SshTrust {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Endpoint {
@@ -25,6 +85,7 @@ pub enum Endpoint {
         /// `None` when that path would not fit in a unix socket name: the
         /// connection then works without multiplexing rather than not at all.
         control_path: Option<PathBuf>,
+        trust: SshTrust,
     },
     Command {
         argv: Vec<String>,
@@ -32,7 +93,34 @@ pub enum Endpoint {
 }
 
 impl Endpoint {
+    /// `from_machine_with` for a CLI command with no store at hand: the
+    /// host key is read once, from the store under `paths` when there is
+    /// one, on the first ssh.
     pub fn from_machine(m: &MachineConfig, paths: &Paths) -> Endpoint {
+        let db = paths.db_file();
+        let name = m.name.clone();
+        let once = std::sync::OnceLock::new();
+        Self::from_machine_with(
+            m,
+            paths,
+            Arc::new(move || {
+                once.get_or_init(|| {
+                    if !db.exists() {
+                        return Ok(false);
+                    }
+                    crate::store::Store::open(&db)
+                        .and_then(|s| s.machine_state(&name))
+                        .map(|s| s.is_some_and(|s| s.host_key.is_some()))
+                        .map_err(|e| format!("{e:#}"))
+                })
+                .clone()
+            }),
+        )
+    }
+
+    /// The endpoint for `m`; `pinned` says whether its host key is on
+    /// record, so its ssh checks it against pastor's known_hosts.
+    pub fn from_machine_with(m: &MachineConfig, paths: &Paths, pinned: Pinned) -> Endpoint {
         if let Some(argv) = &m.command {
             Endpoint::Command { argv: argv.clone() }
         } else if let Some(target) = &m.ssh {
@@ -50,6 +138,7 @@ impl Endpoint {
                 target: target.clone(),
                 session: m.session.clone(),
                 control_path,
+                trust: SshTrust::new(paths, pinned),
             }
         } else {
             Endpoint::Local {
@@ -141,8 +230,42 @@ pub fn shell_quote(s: &str) -> String {
 }
 
 /// ssh argv for a bridge, over the shared master when there is one.
+#[cfg(test)]
 fn ssh_argv(target: &str, session: &str, control_path: Option<&Path>) -> Vec<String> {
     ssh_argv_running(target, control_path, bridge_command(session))
+}
+
+impl Endpoint {
+    /// The ssh argv that runs `remote` on this machine, with the head's
+    /// key and pinned host when it has them (`SshTrust`). `None` for a
+    /// machine not reached over ssh, and an error, so nothing runs, when
+    /// whether its host key is pinned cannot be told.
+    fn ssh_argv_running(&self, remote: String) -> Result<Option<Vec<String>>, ConnectError> {
+        let Endpoint::Ssh {
+            target,
+            control_path,
+            trust,
+            ..
+        } = self
+        else {
+            return Ok(None);
+        };
+        Ok(Some(ssh_argv_running_as(
+            target,
+            control_path.as_deref(),
+            trust.head_key(),
+            trust.known_hosts()?,
+            remote,
+        )))
+    }
+
+    /// The ssh argv of this machine's bridge.
+    fn bridge_argv(&self) -> Result<Option<Vec<String>>, ConnectError> {
+        match self {
+            Endpoint::Ssh { session, .. } => self.ssh_argv_running(bridge_command(session)),
+            _ => Ok(None),
+        }
+    }
 }
 
 /// `command` as a remote login shell should see it: `sh -c '<command>'`.
@@ -158,13 +281,31 @@ pub fn posix_command(command: &str) -> String {
 
 /// ssh argv that runs `remote` (a POSIX shell command, run through
 /// `posix_command`) over the shared master when there is one.
+#[cfg(test)]
 fn ssh_argv_running(target: &str, control_path: Option<&Path>, remote: String) -> Vec<String> {
+    ssh_argv_running_as(target, control_path, None, None, remote)
+}
+
+/// `ssh_argv_running` with the head's own key (`-i`, without `IdentitiesOnly`
+/// so the user's keys still work) and pastor's `known_hosts`, each when
+/// given (`Endpoint::ssh_argv_running` decides).
+fn ssh_argv_running_as(
+    target: &str,
+    control_path: Option<&Path>,
+    head_key: Option<&Path>,
+    known_hosts: Option<&Path>,
+    remote: String,
+) -> Vec<String> {
     let ssh = crate::ssh::Ssh {
         target,
         control_path,
         control_persist: CONTROL_PERSIST,
         keepalive: true,
         no_tty: true,
+        identity: None,
+        extra_identity: head_key,
+        known_hosts,
+        accept_new: false,
     };
     let mut argv = vec!["ssh".to_string()];
     argv.extend(ssh.args(&remote));
@@ -294,7 +435,7 @@ async fn probe(ep: &Endpoint, command: String) -> Result<Option<Probed>, Connect
             // Any probe may be the first ssh to this machine, and so start
             // the master.
             ensure_control_dir(control_path.as_deref())?;
-            let argv = ssh_argv_running(target, control_path.as_deref(), command);
+            let argv = ep.ssh_argv_running(command)?.unwrap_or_default();
             (target.clone(), argv)
         }
         Endpoint::Command { .. } => return Ok(None),
@@ -584,7 +725,9 @@ async fn file_exists(ep: &Endpoint, path: &str) -> Result<Option<bool>, ConnectE
             ..
         } => {
             ensure_control_dir(control_path.as_deref())?;
-            let argv = ssh_argv_running(target, control_path.as_deref(), remote_file_command(path));
+            let argv = ep
+                .ssh_argv_running(remote_file_command(path))?
+                .unwrap_or_default();
             let out = probe_output(&argv).await?;
             remote_dir_answer(target, &out)
         }
@@ -932,13 +1075,9 @@ pub async fn connect(ep: &Endpoint) -> Result<Connection, ConnectError> {
             let (r, w) = stream.into_split();
             Ok(Connection::new(Box::new(r), Box::new(w)))
         }
-        Endpoint::Ssh {
-            target,
-            session,
-            control_path,
-        } => {
+        Endpoint::Ssh { control_path, .. } => {
             ensure_control_dir(control_path.as_deref())?;
-            spawn(&ssh_argv(target, session, control_path.as_deref())).await
+            spawn(&ep.bridge_argv()?.unwrap_or_default()).await
         }
         Endpoint::Command { argv } => spawn(argv).await,
     }
@@ -1216,6 +1355,7 @@ mod tests {
             target,
             session,
             control_path,
+            ..
         } = &ep
         else {
             panic!("expected an ssh endpoint, got {ep:?}");
@@ -1252,6 +1392,107 @@ mod tests {
     /// `~` in a repo path is the home on the machine: ssh asks the remote
     /// shell, over the same master as every request; a local machine is the
     /// head's own home; a bridge command cannot know.
+    #[test]
+    fn head_key_is_offered_without_identities_only() {
+        let argv = ssh_argv_running_as(
+            "fleet@pi-3",
+            None,
+            Some(Path::new("/k")),
+            Some(Path::new("/kh")),
+            "true".into(),
+        );
+        assert!(argv.windows(2).any(|w| w == ["-i", "/k"]), "{argv:?}");
+        assert!(!argv.iter().any(|a| a.starts_with("IdentitiesOnly")));
+        assert!(argv.contains(&"UserKnownHostsFile=/kh".to_string()));
+    }
+
+    /// A pushed machine is reached with the head's own key (offered beside
+    /// the user's, never instead of them) once that key exists, and checked
+    /// against pastor's known_hosts once its host key is on record. A
+    /// machine with neither keeps the argv it always had.
+    #[test]
+    fn ssh_argv_offers_the_head_key_and_pinned_host_when_there_are_some() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().join("c"), dir.path().join("s"));
+        let m = ssh_machine("pi-3");
+        let pinned = |yes: bool| -> Pinned { Arc::new(move || Ok(yes)) };
+        let plain = Endpoint::from_machine_with(&m, &paths, pinned(false));
+        let before = plain.ssh_argv_running("true".into()).unwrap().unwrap();
+        assert_eq!(
+            before,
+            ssh_argv_running_as(
+                "fleet@host",
+                fitting_control_path(&paths, "pi-3").as_deref(),
+                None,
+                None,
+                "true".into()
+            ),
+            "no head key and no pinned host: today's argv"
+        );
+        assert_eq!(
+            plain.bridge_argv().unwrap().unwrap(),
+            ssh_argv_running_as(
+                "fleet@host",
+                fitting_control_path(&paths, "pi-3").as_deref(),
+                None,
+                None,
+                bridge_command("default")
+            )
+        );
+
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        std::fs::write(paths.head_key(), "key").unwrap();
+        let key = paths.head_key().display().to_string();
+        let kh = format!("UserKnownHostsFile={}", paths.known_hosts_file().display());
+        let keyed = plain.ssh_argv_running("true".into()).unwrap().unwrap();
+        assert!(
+            keyed.windows(2).any(|w| w == ["-i", key.as_str()]),
+            "{keyed:?}"
+        );
+        assert!(!keyed.iter().any(|a| a.starts_with("IdentitiesOnly")));
+        assert!(!keyed.contains(&kh), "not pinned yet: {keyed:?}");
+        let bridge = plain.bridge_argv().unwrap().unwrap();
+        assert!(
+            bridge.windows(2).any(|w| w == ["-i", key.as_str()]),
+            "{bridge:?}"
+        );
+
+        let pinned_ep = Endpoint::from_machine_with(&m, &paths, pinned(true));
+        let both = pinned_ep.ssh_argv_running("true".into()).unwrap().unwrap();
+        assert!(
+            both.windows(2).any(|w| w == ["-i", key.as_str()]),
+            "{both:?}"
+        );
+        assert!(
+            both.windows(2).any(|w| w == ["-o", kh.as_str()]),
+            "{both:?}"
+        );
+        assert!(
+            both.windows(2)
+                .any(|w| w == ["-o", "StrictHostKeyChecking=yes"]),
+            "{both:?}"
+        );
+        std::fs::remove_file(paths.head_key()).unwrap();
+        let only_pin = pinned_ep.ssh_argv_running("true".into()).unwrap().unwrap();
+        assert!(!only_pin.iter().any(|a| a == "-i"), "{only_pin:?}");
+        assert!(only_pin.contains(&kh), "{only_pin:?}");
+    }
+
+    /// A store that cannot say whether the host key is pinned stops the
+    /// ssh outright: a pinned machine never falls back to plain trust.
+    #[tokio::test]
+    async fn an_unreadable_pin_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().join("c"), dir.path().join("s"));
+        let m = ssh_machine("pi-3");
+        let broken: Pinned = Arc::new(|| Err("database is locked".into()));
+        let ep = Endpoint::from_machine_with(&m, &paths, broken);
+        let e = ep.ssh_argv_running("true".into()).unwrap_err();
+        assert!(e.message.contains("database is locked"), "{}", e.message);
+        assert!(ep.bridge_argv().is_err());
+        assert!(probe(&ep, "true".into()).await.is_err());
+    }
+
     #[tokio::test]
     async fn home_dir_per_endpoint() {
         let argv = ssh_argv_running(
@@ -2214,6 +2455,7 @@ mod tests {
             target,
             session,
             control_path,
+            ..
         } = Endpoint::from_machine(&m, &paths)
         else {
             panic!("expected an ssh endpoint");

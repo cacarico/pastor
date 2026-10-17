@@ -17,6 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,7 +29,7 @@ use crate::config::{PastorConfig, Paths};
 use crate::daemon::{Answer, Daemon, Fleet, answer_on, jobs_answer};
 use crate::events::{EventRecord, EventsPage};
 use crate::head::RemoteHead;
-use crate::herdr::{Connector, Endpoint};
+use crate::herdr::{Connector, ConnectorExt, Endpoint};
 use crate::ipc::{
     IPC_PROTOCOL, IpcRequest, IpcResponse, ProtocolGate, SHEPHERD_ROLE, request_line,
 };
@@ -47,6 +48,10 @@ const PAGE: u32 = 200;
 /// machine is what bounds how many run here at once.
 const CLAIM_AT_ONCE: u32 = 4;
 
+/// How long the shepherd's herdr may take to answer the ping that reads its
+/// version (`Puller::read_herdr_version`).
+const VERSION_PING_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// How long a request to the head may take. A `JobSubmit` waits for the
 /// head's dispatch pass, agent readiness included.
 const HEAD_TIMEOUT: Duration = Duration::from_secs(60);
@@ -59,20 +64,109 @@ pub type Ask = Arc<
         + Sync,
 >;
 
-/// `Ask` over ssh to `head`, through `pastor bridge` there, `gated`.
+/// How many `machine_revoked` answers in a row the shepherd takes before
+/// it exits, for its service manager to start it afresh.
+const REVOKED_EXIT_AFTER: u32 = 5;
+
+/// The wait before the first request after a `machine_revoked`, doubled on
+/// each one after, up to `REVOKED_MAX_BACKOFF`.
+const REVOKED_BACKOFF: Duration = Duration::from_secs(5);
+const REVOKED_MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// `Ask` over ssh to `head`, through `pastor bridge` there, `gated`, and
+/// `on_revoked`: a `machine_revoked` ends the ssh master, and five in a row
+/// end the process.
 pub fn ask_remote(head: RemoteHead) -> Ask {
     let head = Arc::new(head);
-    gated(Arc::new(move |req| {
-        let head = head.clone();
+    let master = head.clone();
+    let revoked = Arc::new(Revoked {
+        strikes: Default::default(),
+        backoff: REVOKED_BACKOFF,
+        limit: REVOKED_EXIT_AFTER,
+        close: Arc::new(move || {
+            let master = master.clone();
+            Box::pin(async move { master.close_master().await })
+        }),
+        give_up: Arc::new(|| {
+            tracing::error!(
+                "the head revoked this machine's key {REVOKED_EXIT_AFTER} times in a row; exiting, for the service manager to start the shepherd again"
+            );
+            std::process::exit(1)
+        }),
+    });
+    gated(on_revoked(
+        Arc::new(move |req| {
+            let head = head.clone();
+            Box::pin(async move {
+                let line = request_line(&req, None)?;
+                match head.request(&line, HEAD_TIMEOUT).await {
+                    Ok(IpcResponse::Error { code, message }) => Err(CliError::err(&code, message)),
+                    Ok(resp) => Ok(resp),
+                    Err(err) => Err(crate::head::failure(&err)),
+                }
+            })
+        }),
+        revoked,
+    ))
+}
+
+/// What the shepherd does about `machine_revoked`. A rejoin of this box
+/// gives it a new line on the head and revokes the old one, but the ssh
+/// master keeps the old line's forced command for as long as it lives, and
+/// the ticks keep it alive: so the master is ended (`close`), the next
+/// request waits a while (`backoff`, doubled each time), and after `limit`
+/// in a row `give_up` runs (the process exits and systemd starts it again).
+pub struct Revoked {
+    strikes: std::sync::atomic::AtomicU32,
+    backoff: Duration,
+    limit: u32,
+    close: Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>,
+    give_up: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl Revoked {
+    /// The wait before a request after `strikes` revocations in a row.
+    fn wait(&self, strikes: u32) -> Duration {
+        if strikes == 0 {
+            return Duration::ZERO;
+        }
+        let doubled = self.backoff.saturating_mul(1 << (strikes - 1).min(16));
+        doubled.min(REVOKED_MAX_BACKOFF.max(self.backoff))
+    }
+}
+
+/// `ask` with `revoked`'s handling of a `machine_revoked` answer.
+pub fn on_revoked(ask: Ask, revoked: Arc<Revoked>) -> Ask {
+    use std::sync::atomic::Ordering;
+    Arc::new(move |req| {
+        let (ask, revoked) = (ask.clone(), revoked.clone());
         Box::pin(async move {
-            let line = request_line(&req, None)?;
-            match head.request(&line, HEAD_TIMEOUT).await {
-                Ok(IpcResponse::Error { code, message }) => Err(CliError::err(&code, message)),
-                Ok(resp) => Ok(resp),
-                Err(err) => Err(crate::head::failure(&err)),
+            let wait = revoked.wait(revoked.strikes.load(Ordering::SeqCst));
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
             }
+            let got = ask(req).await;
+            let code = got
+                .as_ref()
+                .err()
+                .and_then(|e| e.downcast_ref::<CliError>())
+                .map(|e| e.code.as_str());
+            if code == Some(crate::bridge::MACHINE_REVOKED) {
+                let strikes = revoked.strikes.fetch_add(1, Ordering::SeqCst) + 1;
+                tracing::warn!(
+                    strikes,
+                    "the head revoked this machine's key; ending the ssh master to reconnect with the current one"
+                );
+                (revoked.close)().await;
+                if strikes >= revoked.limit {
+                    (revoked.give_up)();
+                }
+            } else if got.is_ok() {
+                revoked.strikes.store(0, Ordering::SeqCst);
+            }
+            got
         })
-    }))
+    })
 }
 
 /// `ask` that refuses a request the head is too old for, `head_too_old`,
@@ -180,6 +274,7 @@ pub async fn run(paths: Paths, head: String, ask: Ask) -> anyhow::Result<()> {
         store.clone(),
         ask.clone(),
     );
+    puller.report_file = Some(crate::bootstrap::pull::report_file(&paths.state_dir));
     let every = config.tick_duration();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(every);
@@ -241,6 +336,11 @@ struct Puller {
     settings: MachineSettings,
     store: Arc<Store>,
     ask: Ask,
+    /// This machine's own versions, sent with every claim: herdr's as its
+    /// connector answers ping (`read_herdr_version`), `None` until then;
+    /// pastor's own always.
+    herdr_version: Option<String>,
+    pastor_version: Option<String>,
     /// The actor's events; any of them means a row may have changed.
     events: broadcast::Sender<PastorEvent>,
     heard: broadcast::Receiver<PastorEvent>,
@@ -254,6 +354,25 @@ struct Puller {
     refused: Option<String>,
     /// The code of the last `PullTrust` the head refused, likewise.
     trust_refused: Option<String>,
+    /// `<state>/bootstrap.json`: what `pastor join` left to report.
+    report_file: Option<PathBuf>,
+}
+
+/// Whether a `BootstrapReport` that failed with `code` failed on the way
+/// (no head, an unreachable or restarting one, a timeout, a dropped
+/// connection, a head not yet upgraded to take it), so the next claim
+/// sends it again; any other code is the head refusing it.
+fn report_failed_on_the_way(code: &str) -> bool {
+    matches!(
+        code,
+        "head_unreachable"
+            | "no_head"
+            | "timeout"
+            | "runtime_error"
+            | "daemon_not_running"
+            // A head older than the report: it takes it once upgraded.
+            | "head_too_old"
+    )
 }
 
 impl Puller {
@@ -273,6 +392,8 @@ impl Puller {
             settings,
             store,
             ask,
+            herdr_version: None,
+            pastor_version: Some(env!("CARGO_PKG_VERSION").into()),
             events,
             heard,
             actor: None,
@@ -280,6 +401,7 @@ impl Puller {
             dispatching: Default::default(),
             refused: None,
             trust_refused: None,
+            report_file: None,
         }
     }
 
@@ -329,7 +451,11 @@ impl Puller {
             self.actor();
         }
         self.report(true).await;
-        self.claim().await;
+        // A machine join left pending gets nothing until its report lands:
+        // once it does, claim again, so its tasks start this pass.
+        if self.claim().await && self.send_bootstrap_report().await {
+            self.claim().await;
+        }
         self.fetch_trust().await;
         self.start_queued();
     }
@@ -425,14 +551,93 @@ impl Puller {
         }
     }
 
-    /// Ask the head for tasks and keep each as a queued row here.
-    async fn claim(&mut self) {
-        let req = IpcRequest::TaskClaim {
+    /// Send what `pastor join` left in `<state>/bootstrap.json` and delete
+    /// it once the head took it; one that does not parse is logged and
+    /// deleted, since no later pass could parse it either. One that fails on
+    /// the way is sent again next claim; one the head refuses is logged and
+    /// renamed to bootstrap.json.refused, for a person. Returns whether a
+    /// report went.
+    async fn send_bootstrap_report(&mut self) -> bool {
+        let Some(file) = self.report_file.clone() else {
+            return false;
+        };
+        let text = match std::fs::read_to_string(&file) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(err) => {
+                tracing::warn!(file = %file.display(), %err, "read the bootstrap report");
+                return false;
+            }
+        };
+        let result: crate::bootstrap::Outcome = match serde_json::from_str(&text) {
+            Ok(r) => r,
+            Err(err) => {
+                tracing::warn!(file = %file.display(), %err, "the bootstrap report is not one pastor reads; dropped");
+                let _ = std::fs::remove_file(&file);
+                return false;
+            }
+        };
+        let req = IpcRequest::BootstrapReport {
+            machine: self.machine.clone(),
+            result,
+        };
+        match (self.ask)(req).await {
+            Ok(_) => {
+                tracing::info!(machine = %self.machine, "bootstrap reported to the head");
+                if let Err(err) = std::fs::remove_file(&file) {
+                    tracing::warn!(file = %file.display(), %err, "remove the sent bootstrap report");
+                }
+                true
+            }
+            Err(err) => {
+                let refused = err
+                    .downcast_ref::<CliError>()
+                    .filter(|e| !report_failed_on_the_way(&e.code));
+                let Some(e) = refused else {
+                    tracing::warn!(machine = %self.machine, err = %format!("{err:#}"), "report this machine's bootstrap; trying again next claim");
+                    return false;
+                };
+                // The head would refuse it again every claim: it is kept
+                // for a person, out of the next pass's way.
+                let aside = file.with_extension("json.refused");
+                tracing::warn!(
+                    machine = %self.machine,
+                    code = %e.code,
+                    file = %aside.display(),
+                    "the head refused this machine's bootstrap report, so it is not sent again: {}",
+                    e.message
+                );
+                if let Err(err) = std::fs::rename(&file, &aside) {
+                    tracing::warn!(file = %file.display(), %err, "keep the refused bootstrap report aside; removed instead");
+                    let _ = std::fs::remove_file(&file);
+                }
+                false
+            }
+        }
+    }
+
+    /// Ask the head for tasks and keep each as a queued row here. Returns
+    /// whether the head answered.
+    async fn claim(&mut self) -> bool {
+        let req = |versions: bool| IpcRequest::TaskClaim {
             machine: self.machine.clone(),
             free_slots: CLAIM_AT_ONCE,
             flock_work: self.flock_work,
+            herdr_version: self.herdr_version.clone().filter(|_| versions),
+            pastor_version: self.pastor_version.clone().filter(|_| versions),
         };
-        let tasks = match (self.ask)(req).await {
+        let mut answer = (self.ask)(req(true)).await;
+        // A head from before `PULL_VERSIONS_PROTOCOL` refuses the versions
+        // (`head_too_old` before the send); it still hands out tasks to a
+        // claim without them, which matters more than its machine_state row.
+        if let Err(err) = &answer
+            && err
+                .downcast_ref::<CliError>()
+                .is_some_and(|e| e.code == "head_too_old")
+        {
+            answer = (self.ask)(req(false)).await;
+        }
+        let tasks = match answer {
             Ok(IpcResponse::Tasks(tasks)) => {
                 if self.refused.take().is_some() {
                     tracing::info!(machine = %self.machine, "the head gives this machine tasks again");
@@ -441,7 +646,7 @@ impl Puller {
             }
             Ok(other) => {
                 tracing::warn!(?other, "the head answered TaskClaim with something else");
-                return;
+                return false;
             }
             Err(err) => {
                 // An unreachable head is `Follower`'s to report.
@@ -457,15 +662,32 @@ impl Puller {
                     );
                     self.refused = Some(e.code.clone());
                 }
-                return;
+                return false;
             }
         };
         self.actor();
+        self.read_herdr_version().await;
         for t in tasks {
             match self.store.adopt_claimed(&t) {
                 Ok(_) => tracing::info!(task = %t.display_id(), "claimed from the head"),
                 Err(err) => tracing::error!(task = %t.display_id(), %err, "keep a claimed task"),
             }
+        }
+        true
+    }
+
+    /// Ask this machine's herdr, through the connector its tasks run on, for
+    /// its version, until it answers once; the next claim reports it. Only
+    /// after the head answered a claim, so a machine the head does not pull
+    /// never talks to its herdr.
+    async fn read_herdr_version(&mut self) {
+        if self.herdr_version.is_some() {
+            return;
+        }
+        match tokio::time::timeout(VERSION_PING_TIMEOUT, self.connector.ping()).await {
+            Ok(Ok(pong)) => self.herdr_version = Some(pong.version),
+            Ok(Err(err)) => tracing::debug!(%err, "read this machine's herdr version"),
+            Err(_) => tracing::debug!("read this machine's herdr version: timed out"),
         }
     }
 
@@ -712,6 +934,7 @@ impl Follower {
             after,
             limit: PAGE,
             task: None,
+            machine: None,
         })
         .await?
         {
@@ -723,6 +946,15 @@ impl Follower {
 
 #[cfg(all(test, feature = "fake-herdr"))]
 mod tests {
+    /// A head too old for the report takes it once upgraded: the report
+    /// waits for it, it is not put aside as refused. A real refusal is.
+    #[test]
+    fn a_head_too_old_for_the_report_is_tried_again() {
+        assert!(report_failed_on_the_way("head_too_old"));
+        assert!(report_failed_on_the_way("head_unreachable"));
+        assert!(!report_failed_on_the_way("host_key_mismatch"));
+        assert!(!report_failed_on_the_way("unknown_machine"));
+    }
     use super::*;
     use std::sync::Mutex;
 
@@ -1088,6 +1320,225 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "{state} not {want}");
             let _ = tokio::time::timeout(Duration::from_millis(100), p.changed()).await;
             p.pass().await;
+        }
+    }
+
+    /// The herdr version a claim reports is the one the shepherd's own
+    /// connector answers ping with, not whatever `herdr` is on the PATH. It
+    /// is asked only once the head has answered a claim (a machine the head
+    /// does not pull never talks to its herdr).
+    #[tokio::test]
+    async fn claim_reports_the_connectors_herdr_version() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = sent.clone();
+        let ask: Ask = Arc::new(move |req| {
+            log.lock().unwrap().push(req);
+            Box::pin(async { Ok(IpcResponse::Tasks(vec![])) })
+        });
+        let fake = crate::herdr::fake::FakeHerdr::new();
+        let mut p = Puller::new(
+            "laptop".into(),
+            false,
+            Arc::new(fake.clone()),
+            fast(),
+            Arc::new(Store::open_in_memory().unwrap()),
+            ask,
+        );
+        p.claim().await;
+        p.claim().await;
+        p.claim().await;
+        let versions: Vec<(Option<String>, Option<String>)> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| match r {
+                IpcRequest::TaskClaim {
+                    herdr_version,
+                    pastor_version,
+                    ..
+                } => (herdr_version.clone(), pastor_version.clone()),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        let pastor = Some(env!("CARGO_PKG_VERSION").to_string());
+        assert_eq!(
+            versions,
+            [
+                (None, pastor.clone()),
+                (Some("fake".into()), pastor.clone()),
+                (Some("fake".into()), pastor),
+            ]
+        );
+    }
+
+    /// A bootstrap outcome as `pastor join` leaves it.
+    fn joined_outcome() -> crate::bootstrap::Outcome {
+        crate::bootstrap::Outcome {
+            ok: true,
+            mode: crate::bootstrap::Mode::User,
+            isolation: crate::bootstrap::Isolation::None,
+            steps: vec![],
+            machine_key: None,
+            agent_key: None,
+            host_key: Some("ssh-ed25519 HOST".into()),
+            herdr_version: Some("0.9.5".into()),
+            pastor_version: None,
+            service_user: None,
+        }
+    }
+
+    /// A machine `pastor join` left pending claims nothing, sends the
+    /// outcome join left in bootstrap.json once the head has answered a
+    /// claim, and then gets its task in the same pass. The file is gone
+    /// once the head took it.
+    #[tokio::test]
+    async fn the_first_claim_sends_the_bootstrap_report_then_gets_tasks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (head, ask) = pull_head(tmp.path()).await;
+        head.store()
+            .put_machine_state(&crate::store::MachineState {
+                machine: "laptop".into(),
+                bootstrap: crate::store::BootstrapState::Pending,
+                mode: None,
+                isolation: None,
+                failed_step: None,
+                why: None,
+                host_key: None,
+                herdr_version: None,
+                pastor_version: None,
+                updated_at: chrono::Utc::now().to_rfc3339(),
+                service_user: None,
+            })
+            .unwrap();
+        let t = run_pinned(&head, Some("laptop")).await;
+        let state = tmp.path().join("laptop/s");
+        std::fs::create_dir_all(&state).unwrap();
+        let file = crate::bootstrap::pull::report_file(&state);
+        std::fs::write(&file, serde_json::to_string(&joined_outcome()).unwrap()).unwrap();
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = sent.clone();
+        let logged: Ask = Arc::new(move |req| {
+            log.lock().unwrap().push(
+                serde_json::to_value(&req).unwrap()["op"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            ask(req)
+        });
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut p = Puller::new(
+            "laptop".into(),
+            false,
+            Arc::new(crate::herdr::fake::FakeHerdr::new()),
+            fast(),
+            store.clone(),
+            logged,
+        );
+        p.report_file = Some(file.clone());
+        p.pass().await;
+        let ops = sent.lock().unwrap().clone();
+        let claims: Vec<usize> = (0..ops.len()).filter(|&i| ops[i] == "task_claim").collect();
+        let report = ops
+            .iter()
+            .position(|o| o == "bootstrap_report")
+            .unwrap_or_else(|| panic!("no report in {ops:?}"));
+        assert!(claims[0] < report && report < claims[1], "{ops:?}");
+        assert!(!file.exists(), "sent, so gone");
+        let row = head.store().machine_state("laptop").unwrap().unwrap();
+        assert_eq!(row.bootstrap, crate::store::BootstrapState::Ok);
+        assert!(
+            store.get_task(t.id).unwrap().is_some(),
+            "claimed in the same pass"
+        );
+        // Sent once: the next pass sends no report.
+        p.pass().await;
+        let reports = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|o| *o == "bootstrap_report")
+            .count();
+        assert_eq!(reports, 1);
+    }
+
+    /// A puller whose head answers every `BootstrapReport` with `code`,
+    /// counting them, and a report in `dir`.
+    fn reporting_to(
+        dir: &std::path::Path,
+        code: &'static str,
+    ) -> (Puller, PathBuf, Arc<std::sync::atomic::AtomicUsize>) {
+        let file = crate::bootstrap::pull::report_file(dir);
+        std::fs::write(&file, serde_json::to_string(&joined_outcome()).unwrap()).unwrap();
+        let reports = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = reports.clone();
+        let ask: Ask = Arc::new(move |req| {
+            let n = n.clone();
+            Box::pin(async move {
+                match req {
+                    IpcRequest::BootstrapReport { .. } => {
+                        n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Err(CliError::err(code, "no"))
+                    }
+                    _ => Ok(IpcResponse::Tasks(vec![])),
+                }
+            })
+        });
+        let mut p = Puller::new(
+            "laptop".into(),
+            false,
+            Arc::new(crate::herdr::fake::FakeHerdr::new()),
+            fast(),
+            Arc::new(Store::open_in_memory().unwrap()),
+            ask,
+        );
+        p.report_file = Some(file.clone());
+        (p, file, reports)
+    }
+
+    /// A head that cannot take the report now (unreachable, a timeout, a
+    /// dropped connection) leaves the file for the next claim; one that is
+    /// not there yet is no report at all.
+    #[tokio::test]
+    async fn a_report_that_fails_on_the_way_is_kept_for_the_next_claim() {
+        for code in ["head_unreachable", "no_head", "timeout", "runtime_error"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut p, file, reports) = reporting_to(tmp.path(), code);
+            p.pass().await;
+            p.pass().await;
+            assert_eq!(
+                reports.load(std::sync::atomic::Ordering::SeqCst),
+                2,
+                "{code}"
+            );
+            assert!(file.exists(), "{code}: kept until the head takes it");
+            std::fs::remove_file(&file).unwrap();
+            p.pass().await;
+            assert_eq!(reports.load(std::sync::atomic::Ordering::SeqCst), 2);
+        }
+    }
+
+    /// A head that refuses the report (it does not know this machine, or
+    /// the report itself) would refuse it every claim: it is sent once,
+    /// then kept as bootstrap.json.refused for a person, and not sent again.
+    #[tokio::test]
+    async fn a_refused_bootstrap_report_is_kept_aside_not_resent() {
+        for code in ["unknown_machine", "not_pull_machine", "invalid_args"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut p, file, reports) = reporting_to(tmp.path(), code);
+            p.pass().await;
+            p.pass().await;
+            p.pass().await;
+            assert_eq!(
+                reports.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{code}"
+            );
+            assert!(!file.exists(), "{code}");
+            let refused = tmp.path().join("bootstrap.json.refused");
+            let kept: crate::bootstrap::Outcome =
+                serde_json::from_str(&std::fs::read_to_string(&refused).unwrap()).unwrap();
+            assert_eq!(kept, joined_outcome());
         }
     }
 
@@ -1640,6 +2091,8 @@ mod tests {
                 machine: "laptop".into(),
                 free_slots: 1,
                 flock_work: false,
+                herdr_version: None,
+                pastor_version: None,
             })
             .await
         else {
@@ -1692,6 +2145,79 @@ mod tests {
 
     /// A machine the head does not have as a pull machine never starts an
     /// actor, so its herdr is never asked anything.
+    /// A revoked line is the ssh master's, not the machine's: after a
+    /// rejoin the shepherd ends it, waits, and the next request, on a new
+    /// master, gets through; revoked every time, it gives up.
+    #[tokio::test(start_paused = true)]
+    async fn machine_revoked_ends_the_master_backs_off_then_reconnects() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = Arc::new(AtomicU32::new(0));
+        let closed = Arc::new(AtomicU32::new(0));
+        let gave_up = Arc::new(AtomicU32::new(0));
+        // The master is the old line's until it is closed.
+        let head: Ask = {
+            let (calls, closed) = (calls.clone(), closed.clone());
+            Arc::new(move |_req| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let revoked = closed.load(Ordering::SeqCst) < 2;
+                Box::pin(async move {
+                    if revoked {
+                        Err(CliError::err(crate::bridge::MACHINE_REVOKED, "old line"))
+                    } else {
+                        Ok(IpcResponse::Text("ok".into()))
+                    }
+                })
+            })
+        };
+        let revoked = Arc::new(Revoked {
+            strikes: Default::default(),
+            backoff: Duration::from_secs(5),
+            limit: 3,
+            close: {
+                let closed = closed.clone();
+                Arc::new(move || {
+                    closed.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async {})
+                })
+            },
+            give_up: {
+                let gave_up = gave_up.clone();
+                Arc::new(move || {
+                    gave_up.fetch_add(1, Ordering::SeqCst);
+                })
+            },
+        });
+        let ask = on_revoked(head, revoked.clone());
+        let start = tokio::time::Instant::now();
+        assert!(ask(IpcRequest::Ping).await.is_err());
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "the first try does not wait"
+        );
+        assert!(ask(IpcRequest::Ping).await.is_err());
+        assert_eq!(start.elapsed(), Duration::from_secs(5));
+        assert_eq!(closed.load(Ordering::SeqCst), 2);
+        // A new master: the request gets through, after a longer wait.
+        assert!(matches!(
+            ask(IpcRequest::Ping).await,
+            Ok(IpcResponse::Text(_))
+        ));
+        assert_eq!(start.elapsed(), Duration::from_secs(15));
+        assert_eq!(revoked.strikes.load(Ordering::SeqCst), 0);
+        assert_eq!(gave_up.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        // Revoked for good: the third in a row gives up.
+        let always: Ask = Arc::new(|_req| {
+            Box::pin(async { Err(CliError::err(crate::bridge::MACHINE_REVOKED, "gone")) })
+        });
+        let ask = on_revoked(always, revoked);
+        for _ in 0..3 {
+            assert!(ask(IpcRequest::Ping).await.is_err());
+        }
+        assert_eq!(gave_up.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn a_machine_the_head_refuses_starts_no_actor() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1911,6 +2437,8 @@ mod tests {
             machine: "m".into(),
             free_slots: 1,
             flock_work: false,
+            herdr_version: None,
+            pastor_version: None,
         })
         .await
         .unwrap_err();

@@ -81,7 +81,7 @@ fn authorized_key_prints_the_locked_line() {
     };
     let exe = std::fs::canonicalize(env!("CARGO_BIN_EXE_pastor")).unwrap();
     let want = format!(
-        "command=\"{} bridge --agent --machine pi-1\",no-pty,no-user-rc,no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAAC3Nza user@pi-1\n",
+        "restrict,command=\"{} bridge --agent --machine pi-1\",no-pty,no-user-rc,no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAAC3Nza pastor:agent:pi-1\n",
         exe.display()
     );
     let out = run(
@@ -117,6 +117,48 @@ fn authorized_key_prints_the_locked_line() {
     );
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("unknown_machine"));
+}
+
+/// `--shepherd` prints the locked shepherd line instead: `bridge --shepherd
+/// --machine NAME`, marked `pastor:machine:NAME` (`authkeys::line`), not the
+/// agent line `authorized_key_prints_the_locked_line` pins.
+#[test]
+fn authorized_key_shepherd_prints_the_shepherd_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("flock.toml"),
+        "[[machine]]\nname = \"pi-1\"\nssh = \"user@pi-1\"\n",
+    )
+    .unwrap();
+    let key = tmp.path().join("id.pub");
+    std::fs::write(&key, "ssh-ed25519 AAAAC3Nza user@pi-1\n").unwrap();
+    let out = pastor()
+        .args([
+            "machine",
+            "authorized-key",
+            "pi-1",
+            "--key",
+            key.to_str().unwrap(),
+            "--shepherd",
+        ])
+        .env("PASTOR_CONFIG_DIR", &config)
+        .env("PASTOR_STATE_DIR", &state)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let exe = std::fs::canonicalize(env!("CARGO_BIN_EXE_pastor")).unwrap();
+    let want = format!(
+        "restrict,command=\"{} bridge --shepherd --machine pi-1\",no-pty,no-user-rc,no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAAC3Nza pastor:machine:pi-1\n",
+        exe.display()
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), want);
 }
 
 /// Copilot 4102376166: a socket that accepts but never answers `Ping` is

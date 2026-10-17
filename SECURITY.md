@@ -21,6 +21,83 @@ fed by issues or chat messages from outside your team; run herdr for that
 work as a separate user and add it as an ssh machine instead. Connectors also
 run as that user, so installing one grants it control of the fleet.
 
+## Bootstrapping and joining a machine
+
+The head's own user is the trust root for every machine it bootstraps or
+takes a join from, not just the ones it already had: its `head_key` reaches
+every pushed machine's agent user, and the ed25519 key a join token hands
+out reaches the head itself, scoped to one `pastor join` request. Treat the
+head's account with the same care on day one as on the hundredth machine.
+
+**User mode has no isolation.** Without root (no `--sudo`, not already
+root), bootstrap makes no separate user: herdr, the shepherd and every agent
+pane run as the login user, so an agent can read that user's ssh keys,
+including the machine key that logs the machine into the head. Root mode's
+`pastor-agent`, with its own `0700` state directory, is what keeps a
+prompt-injected agent from reading the service user's machine key; pick it
+for any machine that runs work you do not fully trust.
+
+User mode also gives the head a shell on the machine as the login. A push
+puts the head's `head_key` into the login's `authorized_keys` with no
+forced command and no restrictions, because the head runs herdr's
+`remote-api-bridge` and every agent through a shell as that user, and in
+user mode that user is the login itself. Root mode puts the key into
+`pastor-agent`'s file instead, so the head's shell there is the agents'
+user, not the person's. That is the trade of user mode: no root needed, at
+the cost of the head holding the login's account.
+
+**Host keys are pinned once.** A push trusts a machine's ed25519 host key
+the first time (or checks it against `--host-key SHA256:...`) and pins it in
+pastor's own `known_hosts`; after that, every ssh to the machine accepts
+that key only, and a pinned host is never keyscanned again. A changed key
+stops the push. A pull machine's host key is the one its join brought, and
+only a join sets it: its shepherd's bootstrap report never sets or changes
+it. If the machine really changed (reinstalled, a new disk), check the new
+key out of band, then run `pastor machine bootstrap NAME --repin`, the one
+way to trust it (for a pull machine, it drops the key, and the next join
+with a `--replace` token sets the new one). A machine on a port other than 22 is
+pinned as `[host]:port`, as ssh itself looks it up, so remove or check that
+form when you edit the file by hand.
+
+**A leaked join token** reaches only `bridge --join <id>`, a forced command
+answering exactly one `pastor join` request before the connection ends.
+Before it is redeemed or its `--ttl` runs out, that one request can add one
+machine, under a name not already in `flock.toml` (or the one name the
+token's own `--replace` targets). Once it is used or revoked, the same
+token's ssh gets `Permission denied`: its line is gone from
+`authorized_keys`, and no later request, successful or not, adds a second
+machine or extends its life. Past its `--ttl` it is refused at once, not on
+the next sweep: the line carries `expiry-time`, which sshd honours, and the
+head checks the expiry again itself. The line is then removed on the next
+scheduler pass. OpenSSH 8.2 is therefore the head's minimum for joins: an
+older sshd rejects the whole line, so no join gets through at all
+(`join_token_invalid`).
+
+**A root-mode pull machine's shepherd keeps the right to gain privileges.**
+Its shepherd reaches `pastor-agent`'s herdr through sudo (`sudo -n -H -u
+pastor-agent herdr --session default remote-api-bridge`, the one command its
+sudoers drop-in allows), and sudo needs its setuid bit, which
+`NoNewPrivileges=yes` would make the kernel ignore. So `pastor setup
+systemd` writes that shepherd's `pastor.service` without `NoNewPrivileges`
+(only when pastor.toml's `[shepherd] command` starts with `sudo`; every
+other unit keeps it). A process in that unit that is compromised can run
+any setuid program the machine has, bounded by sudoers for sudo itself: the
+cost of keeping agents in a user apart from the machine key.
+
+**A hijacked pull machine's shepherd** reaches the head through its own
+`bridge --shepherd --machine NAME` key, which answers for `NAME` and nothing
+else: `TaskClaim`, `TaskReport`, `PullTrust` and `BootstrapReport` all get
+their `machine` field forced to `NAME` whatever the request said, so it can
+claim, report or mark bootstrapped only itself, never another machine. A
+job it submits is pinned to `NAME` the same way, and one that sets
+`agent_args`, `allow`, `deny`, `agent_source` or `tags`, or names a flock
+`NAME` is not in, is refused outright (`not_allowed_for_shepherd`): a
+compromised pull machine cannot pick what an agent runs with or widen its
+own reach. It may set a job's permission `profile`, but the head never runs
+one past what `NAME`'s own profile allows, so `unrestricted` needs `NAME` to
+be `unrestricted` already. It can read its own machine's events and fetch pastor or herdr
+from the head's artifact cache, and nothing past that.
+
 ## What connectors inherit
 
 A connector command (a connector's run or one of its hooks) runs on the head,

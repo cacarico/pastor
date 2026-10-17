@@ -153,6 +153,27 @@ impl Paths {
         PathBuf::from(format!("{dir}/{safe}-%C"))
     }
 
+    /// Pastor's own `known_hosts`, apart from the user's, so bootstrap never
+    /// touches `~/.ssh/known_hosts`.
+    pub fn known_hosts_file(&self) -> PathBuf {
+        self.state_dir.join("known_hosts")
+    }
+
+    /// The key the head offers to machines it provisions.
+    pub fn head_key(&self) -> PathBuf {
+        self.state_dir.join("head_key")
+    }
+
+    /// The key a machine uses to reach the head.
+    pub fn machine_key(&self) -> PathBuf {
+        self.state_dir.join("machine_key")
+    }
+
+    /// The key an agent user uses to reach the head.
+    pub fn agent_key(&self) -> PathBuf {
+        self.state_dir.join("agent_key")
+    }
+
     pub fn data_dir(&self) -> PathBuf {
         self.data_dir.clone()
     }
@@ -2072,6 +2093,29 @@ pub struct PastorConfig {
     /// `[limits]`: how the head treats an agent that ran out of usage.
     #[serde(skip_serializing_if = "LimitsConfig::is_default")]
     pub limits: LimitsConfig,
+    /// `[provision]`: where the head fetches the binaries it puts on a machine.
+    #[serde(skip_serializing_if = "ProvisionConfig::is_empty")]
+    pub provision: ProvisionConfig,
+}
+
+/// `[provision]` in pastor.toml: what the head installs on a machine it
+/// bootstraps. Unset keys take the built-in defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProvisionConfig {
+    /// The herdr version to install; unset, the version most of the fleet
+    /// already runs, else `artifacts::DEFAULT_HERDR_VERSION`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub herdr: Option<String>,
+    /// The URL of herdr's release index; unset, `https://herdr.dev/latest.json`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub herdr_index: Option<String>,
+}
+
+impl ProvisionConfig {
+    pub fn is_empty(&self) -> bool {
+        self == &ProvisionConfig::default()
+    }
 }
 
 /// `[limits]` in pastor.toml: what the head does about usage limits. Every
@@ -2191,10 +2235,23 @@ impl ShepherdConfig {
     }
 }
 
-/// This machine's hostname, read from the kernel and files rather than a
-/// new dependency for `gethostname`; `-` when none says.
+/// This machine's hostname: the kernel's file, /etc/hostname, `HOSTNAME`,
+/// then `gethostname(3)`; `-` when none says.
 pub fn hostname() -> String {
-    ["/proc/sys/kernel/hostname", "/etc/hostname"]
+    hostname_from(
+        &[
+            Path::new("/proc/sys/kernel/hostname"),
+            Path::new("/etc/hostname"),
+        ],
+        std::env::var("HOSTNAME").ok(),
+    )
+}
+
+/// `hostname` from the given files and `HOSTNAME` value, then the kernel's
+/// own answer: macOS has neither file, and a non-interactive shell there
+/// does not set `HOSTNAME`.
+pub(crate) fn hostname_from(files: &[&Path], env: Option<String>) -> String {
+    files
         .iter()
         .find_map(|p| {
             std::fs::read_to_string(p)
@@ -2202,8 +2259,23 @@ pub fn hostname() -> String {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
         })
-        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
+        .or_else(|| env.filter(|s| !s.is_empty()))
+        .or_else(gethostname)
         .unwrap_or_else(|| "-".into())
+}
+
+fn gethostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: the pointer and length describe `buf`, which outlives the call.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    // POSIX lets a truncated name come back without its 0, so no 0 means
+    // the whole buffer is the name.
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..end]).trim().to_string();
+    (!name.is_empty()).then_some(name)
 }
 
 /// `[watch]` in pastor.toml.
@@ -2254,6 +2326,7 @@ impl Default for PastorConfig {
             watch: WatchConfig::default(),
             shepherd: ShepherdConfig::default(),
             limits: LimitsConfig::default(),
+            provision: ProvisionConfig::default(),
         }
     }
 }
@@ -2661,6 +2734,21 @@ mod tests {
         assert!(!PastorConfig::default().agents_change_fleet);
         let cfg: PastorConfig = toml::from_str("agents_change_fleet = true").unwrap();
         assert!(cfg.agents_change_fleet);
+    }
+
+    /// `[provision]` reads both keys, round-trips, and refuses a stray one.
+    #[test]
+    fn provision_parses_and_refuses_unknown_keys() {
+        let cfg: PastorConfig =
+            toml::from_str("[provision]\nherdr = \"0.9.5\"\nherdr_index = \"https://x/y.json\"\n")
+                .unwrap();
+        assert_eq!(cfg.provision.herdr.as_deref(), Some("0.9.5"));
+        assert_eq!(
+            cfg.provision.herdr_index.as_deref(),
+            Some("https://x/y.json")
+        );
+        assert!(PastorConfig::default().provision.is_empty());
+        assert!(toml::from_str::<PastorConfig>("[provision]\nnope = 1\n").is_err());
     }
 
     /// `[limits]` takes every key, each checked as it loads; unset keys keep
@@ -5607,7 +5695,10 @@ mod tests {
             );
         }
         assert!(text.contains("\npull = true"), "no pull machine example");
-        let flag = ["--", "shepherd"].concat();
+        // A pull machine is set up in pastor.toml, never with a serve flag;
+        // `--shepherd` itself is real, on `bridge` and `machine
+        // authorized-key`.
+        let flag = ["serve --", "shepherd"].concat();
         assert!(!text.contains(&flag), "the manual names {flag}");
     }
 

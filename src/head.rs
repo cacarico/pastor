@@ -68,6 +68,11 @@ pub struct RemoteHead {
     /// than `sun_path` (104 bytes on macOS) fails every request. `None` when
     /// even a bare `-%C` does not fit; ssh then runs without multiplexing.
     control_path: Option<PathBuf>,
+    /// Pastor's own key for the head, when bootstrap made one: the machine
+    /// key, else the agent key.
+    identity: Option<PathBuf>,
+    /// Pastor's `known_hosts`, when it exists.
+    known_hosts: Option<PathBuf>,
 }
 
 pub fn client_file(paths: &Paths) -> PathBuf {
@@ -158,11 +163,22 @@ pub fn resolve(
 
 impl RemoteHead {
     pub fn new(paths: &Paths, ssh: &str, pastor: Option<String>, source: HeadSource) -> Self {
+        let identity = [paths.machine_key(), paths.agent_key()]
+            .into_iter()
+            .find(|k| k.exists());
+        // Only beside a pastor key: that is a machine bootstrap or `pastor
+        // join` set up, which pinned the head there. A person's CLI keeps
+        // their own known_hosts, even on a head whose file pins the
+        // machines it reaches.
+        let known_hosts =
+            Some(paths.known_hosts_file()).filter(|k| identity.is_some() && k.exists());
         RemoteHead {
             ssh: ssh.to_string(),
             pastor: pastor.unwrap_or_else(|| DEFAULT_PASTOR.to_string()),
             source,
             control_path: crate::ssh::fitting_control_path(paths, "head"),
+            identity,
+            known_hosts,
         }
     }
 
@@ -176,8 +192,41 @@ impl RemoteHead {
             control_persist: "60s",
             keepalive: false,
             no_tty: false,
+            identity: self.identity.as_deref(),
+            extra_identity: None,
+            known_hosts: self.known_hosts.as_deref(),
+            accept_new: false,
         }
         .args(&format!("{} bridge", self.pastor))
+    }
+
+    /// End the ssh master to the head (`ssh -O exit`), so the next request
+    /// authenticates afresh and runs whatever forced command the head's
+    /// authorized_keys holds now. A master keeps the forced command it
+    /// authenticated with, so after a rejoin it would go on speaking with
+    /// the old, revoked line. No master is nothing to end.
+    pub async fn close_master(&self) {
+        let Some(control_path) = &self.control_path else {
+            return;
+        };
+        let out = tokio::process::Command::new("ssh")
+            .arg("-S")
+            .arg(control_path)
+            .args(["-O", "exit", "--", self.ssh.as_str()])
+            .stdin(Stdio::null())
+            .output()
+            .await;
+        match out {
+            Ok(out) if out.status.success() => {
+                tracing::info!(head = %self.ssh, "ended the ssh master to the head");
+            }
+            Ok(out) => tracing::debug!(
+                head = %self.ssh,
+                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                "no ssh master to the head to end"
+            ),
+            Err(e) => tracing::warn!(head = %self.ssh, "could not run ssh -O exit: {e}"),
+        }
     }
 
     /// One request, one reply, over ssh to `pastor bridge` on the head.
@@ -417,6 +466,64 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
         (tmp, p)
+    }
+
+    /// Pastor's own keys and known_hosts join the argv only once they exist,
+    /// the machine key before the agent key.
+    #[test]
+    fn ssh_args_use_pastors_own_key_and_known_hosts_when_present() {
+        let (_t, p) = paths();
+        let plain = RemoteHead::new(&p, "user@pi-1", None, HeadSource::File).ssh_args();
+        assert!(!plain.iter().any(|a| a == "-i" || a.contains("KnownHosts")));
+        // A known_hosts alone (a head that pinned machines it reaches) is
+        // not one for reaching a head: the person's own file decides.
+        std::fs::create_dir_all(p.known_hosts_file().parent().unwrap()).unwrap();
+        std::fs::write(p.known_hosts_file(), "").unwrap();
+        let args = RemoteHead::new(&p, "user@pi-1", None, HeadSource::File).ssh_args();
+        assert!(
+            !args.iter().any(|a| a == "-i" || a.contains("KnownHosts")),
+            "{args:?}"
+        );
+        std::fs::write(p.agent_key(), "k").unwrap();
+        let args = RemoteHead::new(&p, "user@pi-1", None, HeadSource::File).ssh_args();
+        let agent = p.agent_key().display().to_string();
+        assert!(
+            args.windows(2).any(|w| w == ["-i", agent.as_str()]),
+            "{args:?}"
+        );
+        assert!(args.contains(&"IdentitiesOnly=yes".to_string()));
+        assert!(args.contains(&"StrictHostKeyChecking=yes".to_string()));
+        std::fs::write(p.machine_key(), "k").unwrap();
+        let args = RemoteHead::new(&p, "user@pi-1", None, HeadSource::File).ssh_args();
+        let machine = p.machine_key().display().to_string();
+        assert!(
+            args.windows(2).any(|w| w == ["-i", machine.as_str()]),
+            "{args:?}"
+        );
+    }
+
+    /// A machine `pastor join` set up holds its machine key and the head's
+    /// pinned host key: its shepherd's ssh uses both, and checks the host
+    /// strictly.
+    #[test]
+    fn a_joined_machine_uses_its_key_and_the_pinned_head() {
+        let (_t, p) = paths();
+        std::fs::create_dir_all(&p.state_dir).unwrap();
+        std::fs::write(p.machine_key(), "k").unwrap();
+        std::fs::write(p.agent_key(), "k").unwrap();
+        std::fs::write(p.known_hosts_file(), "head ssh-ed25519 AAAAHEAD\n").unwrap();
+        let args = RemoteHead::new(&p, "me@head", None, HeadSource::File).ssh_args();
+        let machine = p.machine_key().display().to_string();
+        let known = format!("UserKnownHostsFile={}", p.known_hosts_file().display());
+        assert!(
+            args.windows(2).any(|w| w == ["-i", machine.as_str()]),
+            "{args:?}"
+        );
+        assert!(args.contains(&known), "{args:?}");
+        assert!(
+            args.contains(&"StrictHostKeyChecking=yes".to_string()),
+            "{args:?}"
+        );
     }
 
     /// A misspelt key under `[head]` fails the load, naming the file and

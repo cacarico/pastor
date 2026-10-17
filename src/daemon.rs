@@ -40,9 +40,23 @@ pub type HeadForward = crate::shepherd::Ask;
 pub type ConnectorFactory = Arc<dyn Fn(&MachineConfig) -> Arc<dyn Connector> + Send + Sync>;
 
 /// The transports `pastor serve` uses: ssh, the local socket or a command.
-pub fn endpoint_factory(paths: Paths) -> ConnectorFactory {
+/// An ssh machine's host key is looked up in `store` on each connection, so
+/// one pinned by a push is checked from the push's end on.
+pub fn endpoint_factory(paths: Paths, store: Arc<Store>) -> ConnectorFactory {
     Arc::new(move |m: &MachineConfig| {
-        Arc::new(Endpoint::from_machine(m, &paths)) as Arc<dyn Connector>
+        let (store, name) = (store.clone(), m.name.clone());
+        // A read that fails is no answer: the ssh is refused rather than
+        // run without the pin, which would trust whatever answers.
+        let pinned: crate::herdr::transport::Pinned = Arc::new(move || {
+            store
+                .machine_state(&name)
+                .map(|s| s.is_some_and(|s| s.host_key.is_some()))
+                .map_err(|e| {
+                    tracing::warn!(machine = %name, error = %format!("{e:#}"), "cannot read the pinned host key; not connecting");
+                    format!("{e:#}")
+                })
+        });
+        Arc::new(Endpoint::from_machine_with(m, &paths, pinned)) as Arc<dyn Connector>
     })
 }
 
@@ -63,6 +77,34 @@ pub fn machine_settings(config: &PastorConfig) -> MachineSettings {
         limits: Some(config.limits.clone()),
         ..Default::default()
     }
+}
+
+/// A failed report's step and reason: its failed step, else the last one
+/// run, else `unknown`. The table has no column for a step's `fix`, so it
+/// folds into the reason as `"<why>; fix: <fix>"`. `(None, None)` when ok.
+fn bootstrap_failure(
+    ok: bool,
+    steps: &[crate::bootstrap::StepResult],
+) -> (Option<String>, Option<String>) {
+    use crate::bootstrap::StepStatus;
+    let failed = (!ok).then(|| {
+        steps
+            .iter()
+            .find(|s| s.status == StepStatus::Failed)
+            .or(steps.last())
+    });
+    let failed_step = failed.map(|s| s.map_or_else(|| "unknown".to_string(), |s| s.step.clone()));
+    let why = failed.flatten().and_then(|s| {
+        let parts: Vec<String> = s
+            .why
+            .iter()
+            .filter(|w| !w.is_empty())
+            .cloned()
+            .chain(s.fix.iter().map(|fix| format!("fix: {fix}")))
+            .collect();
+        (!parts.is_empty()).then(|| parts.join("; "))
+    });
+    (failed_step, why)
 }
 
 /// "text and 1 key", "2 keys": what `task send` reports it sent.
@@ -587,6 +629,28 @@ impl Fleet {
                             .collect()
                     })
                     .unwrap_or_default();
+                // A pull machine's versions come from its own `TaskClaim`
+                // and `TaskReport`, so a plain `connect` never learns them;
+                // `machine_state` (its `BootstrapReport`, if any) fills in
+                // what the connection itself has not.
+                let saved = (m.pull && (s.herdr_version.is_none() || s.pastor_version.is_none()))
+                    .then(|| {
+                        self.store
+                            .machine_state(&m.handle.name)
+                            .unwrap_or_else(|err| {
+                                tracing::error!(machine = %m.handle.name, %err, "read machine_state");
+                                None
+                            })
+                    })
+                    .flatten();
+                let herdr_version = s
+                    .herdr_version
+                    .clone()
+                    .or_else(|| saved.as_ref().and_then(|st| st.herdr_version.clone()));
+                let pastor_version = s
+                    .pastor_version
+                    .clone()
+                    .or_else(|| saved.as_ref().and_then(|st| st.pastor_version.clone()));
                 crate::machine::MachineStatus {
                     now,
                     profile: self.own_profile(&flock, Some(&m.handle.name)),
@@ -596,6 +660,8 @@ impl Fleet {
                     description: wanted
                         .get(&m.handle.name)
                         .and_then(|c| crate::config::clean_description(c.description.as_deref())),
+                    herdr_version,
+                    pastor_version,
                     ..s
                 }
             })
@@ -1777,12 +1843,14 @@ impl Fleet {
     ) -> anyhow::Result<Vec<QueueEntry>> {
         let queued = self.store.queued_tasks()?;
         let wanted = self.flock();
-        // Same model/agent compatibility check `dispatch_queued` applies: a
-        // machine whose agent cannot run the task's model does not take it.
+        // Same checks `dispatch_queued` applies: a machine whose agent
+        // cannot run the task's model, or whose bootstrap is pending or
+        // failed, does not take it.
         let accepts = |task: &Task, machine: &str| {
             let target = task.flock.as_deref().unwrap_or(wanted.default_flock());
             self.settled_on(task, target, machine)
                 .is_none_or(|r| r.is_ok())
+                && self.bootstrap_ready(machine)
         };
         let mut entries = crate::queue::entries(
             queued,
@@ -2367,9 +2435,17 @@ impl Fleet {
         });
     }
 
-    /// Pull machine `handle` was heard from now: it is connected, and one
-    /// counted lost is announced back.
-    fn heard(&self, handle: &MachineHandle) {
+    /// Pull machine `handle` was heard from now: it is connected, one
+    /// counted lost is announced back, and its reported versions (a
+    /// `TaskClaim`'s own, if any) are kept on its `machine_state` row. A
+    /// machine with no row yet (nothing has bootstrapped it) is left alone
+    /// (`Store::set_versions`).
+    fn heard(
+        &self,
+        handle: &MachineHandle,
+        herdr_version: Option<&str>,
+        pastor_version: Option<&str>,
+    ) {
         let was_lost = {
             let mut seen = self.pull_seen.lock().recover();
             let e = seen.entry(handle.name.clone()).or_insert(PullSeen {
@@ -2383,6 +2459,15 @@ impl Fleet {
             let mut s = handle.status.write().recover();
             s.channel = crate::machine::ChannelState::Connected;
             s.error = None;
+        }
+        let herdr_version = safe_version(herdr_version);
+        let pastor_version = safe_version(pastor_version);
+        if (herdr_version.is_some() || pastor_version.is_some())
+            && let Err(err) = self
+                .store
+                .set_versions(&handle.name, herdr_version, pastor_version)
+        {
+            tracing::warn!(%err, machine = %handle.name, "record a pull machine's versions");
         }
         if was_lost {
             self.emit("machine.connected", &handle.name, None, None);
@@ -2400,11 +2485,18 @@ impl Fleet {
         machine: &str,
         free_slots: u32,
         flock_work: bool,
+        herdr_version: Option<&str>,
+        pastor_version: Option<&str>,
     ) -> anyhow::Result<Vec<Task>> {
         let _pass = self.dispatch_lock.lock().await;
         let handle = self.pull_handle(machine)?;
-        self.heard(&handle);
+        self.heard(&handle, herdr_version, pastor_version);
         self.count_pull(&handle);
+        // A machine whose bootstrap is pending or failed takes nothing,
+        // pinned or loose, as a dispatch pass places nothing there.
+        if !self.bootstrap_ready(machine) {
+            return Ok(Vec::new());
+        }
         let flock = self.flock();
         let s = handle.snapshot();
         let mut view = MachineView {
@@ -2433,6 +2525,7 @@ impl Fleet {
             let theirs = task.flock.as_deref().unwrap_or(default);
             self.settled_on(task, theirs, machine)
                 .is_none_or(|r| r.is_ok())
+                && self.bootstrap_ready(machine)
         };
         let mut claimed = Vec::new();
         for (i, task) in order.iter().enumerate() {
@@ -2482,6 +2575,165 @@ impl Fleet {
         Ok(claimed)
     }
 
+    /// `BootstrapReport`: what `pastor bootstrap` found on `machine`, saved
+    /// as its `machine_state` so dispatch skips it while pending or failed
+    /// (`accepts` in `place_queued`) and `machine describe` can show it.
+    /// The table has no column for a step's `fix`, so a failure folds it
+    /// into `why` as `"<why>; fix: <fix>"`, which `describe::bootstrap_line`
+    /// prints back whole. True when the report made a pending or failed
+    /// machine ready, so the caller dispatches what waited for it.
+    ///
+    /// A shepherd sends this through its bridge, which pins `machine` to
+    /// its own; so a shepherd may mark its own machine bootstrapped, and
+    /// only that one, which is accepted. What it reports is untrusted text
+    /// that `machine describe` and the events print, so it is cut to size
+    /// and stripped of control characters first (`sanitise_outcome`).
+    pub fn report_bootstrap(
+        &self,
+        machine: &str,
+        outcome: crate::bootstrap::Outcome,
+    ) -> anyhow::Result<bool> {
+        use crate::bootstrap::{Isolation, Mode};
+        use crate::store::{BootstrapState, MachineState};
+        let Some(pull) = self.flock().get(machine).map(|m| m.pull) else {
+            return Err(crate::cli::CliError::err(
+                "unknown_machine",
+                format!("no machine {machine} in the flock"),
+            ));
+        };
+        let outcome = sanitise_outcome(outcome);
+        let crate::bootstrap::Outcome {
+            ok,
+            mode,
+            isolation,
+            steps,
+            host_key,
+            herdr_version,
+            pastor_version,
+            service_user,
+            ..
+        } = outcome;
+        // A host key on record is changed only by `--repin`, never by a
+        // report: one that names another key is refused whole, and one
+        // that names none (a push stopped before its pin) keeps it. A pull
+        // machine's key is its join's (`join_with`): its report, the
+        // shepherd's own word, never sets or changes it.
+        let on_record = self.store.machine_state(machine)?.and_then(|s| s.host_key);
+        let host_key = match (on_record, host_key) {
+            (on_record, _) if pull => on_record,
+            (Some(old), Some(new)) if !same_host_key(&old, &new) => {
+                return Err(crate::cli::CliError::err(
+                    "host_key_mismatch",
+                    format!(
+                        "{machine} reports host key {new}, not the {old} on record; if the machine was reinstalled, run `pastor machine bootstrap {machine} --repin`"
+                    ),
+                ));
+            }
+            (Some(old), _) => Some(old),
+            (None, new) => new,
+        };
+        let mode = match mode {
+            Mode::Root => "root",
+            Mode::User => "user",
+        };
+        let isolation = match isolation {
+            Isolation::Users => "users",
+            Isolation::None => "none",
+        };
+        let (failed_step, why) = bootstrap_failure(ok, &steps);
+        let missing: Vec<String> = steps
+            .into_iter()
+            .flat_map(|s| s.missing)
+            .take(MAX_REPORT_ITEMS)
+            .collect();
+        let state = MachineState {
+            machine: machine.to_string(),
+            bootstrap: if ok {
+                BootstrapState::Ok
+            } else {
+                BootstrapState::Failed
+            },
+            mode: Some(mode.to_string()),
+            isolation: Some(isolation.to_string()),
+            failed_step: failed_step.clone(),
+            why: why.clone(),
+            host_key,
+            herdr_version,
+            pastor_version,
+            service_user,
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let was_held = !self.bootstrap_ready(machine);
+        self.store.put_machine_state(&state)?;
+        if ok {
+            self.emit(
+                "machine.bootstrapped",
+                machine,
+                None,
+                Some(
+                    serde_json::json!({ "mode": mode, "isolation": isolation, "missing": missing }),
+                ),
+            );
+        } else {
+            self.emit(
+                "machine.bootstrap_failed",
+                machine,
+                None,
+                Some(serde_json::json!({
+                    "step": failed_step.unwrap_or_default(),
+                    "why": why.unwrap_or_default(),
+                })),
+            );
+        }
+        Ok(ok && was_held)
+    }
+
+    /// A push that failed before the machine's own steps ran, on a machine
+    /// already `Ok`: nothing there changed, so its state stays as it is and
+    /// only `machine.bootstrap_failed` says what happened.
+    pub fn report_bootstrap_kept(
+        &self,
+        machine: &str,
+        outcome: &crate::bootstrap::Outcome,
+    ) -> anyhow::Result<()> {
+        if self.flock().get(machine).is_none() {
+            return Err(crate::cli::CliError::err(
+                "unknown_machine",
+                format!("no machine {machine} in the flock"),
+            ));
+        }
+        let (failed_step, why) = bootstrap_failure(outcome.ok, &outcome.steps);
+        self.emit(
+            "machine.bootstrap_failed",
+            machine,
+            None,
+            Some(serde_json::json!({
+                "step": failed_step.unwrap_or_default(),
+                "why": why.unwrap_or_default(),
+            })),
+        );
+        Ok(())
+    }
+
+    /// Whether dispatch may place work on `machine`: a `Pending` or
+    /// `Failed` `machine_state` row holds it back until a `BootstrapReport`
+    /// says `Ok`; no row at all reads as ready, so a machine from before
+    /// bootstrap tracking is unaffected. A store error is logged and
+    /// treated as ready, so a read glitch never wedges the whole fleet.
+    fn bootstrap_ready(&self, machine: &str) -> bool {
+        match self.store.machine_state(machine) {
+            Ok(None) => true,
+            Ok(Some(s)) => !matches!(
+                s.bootstrap,
+                crate::store::BootstrapState::Pending | crate::store::BootstrapState::Failed
+            ),
+            Err(err) => {
+                tracing::error!(machine, %err, "read machine_state");
+                true
+            }
+        }
+    }
+
     /// `PullTrust`: the folder trust saved for pull machine `machine`, and
     /// only its own, so its actor answers its tasks' trust prompts as the
     /// head's actor answers another machine's (`Actor::auto_answer`).
@@ -2516,7 +2768,7 @@ impl Fleet {
             trusted,
         } = report;
         let handle = self.pull_handle(machine)?;
-        self.heard(&handle);
+        self.heard(&handle, None, None);
         // Once per task, as `Actor::auto_answer` claims it, so a report sent
         // again (after a restart of the serve, say) is not a second event.
         let trust = |task: &Task| -> anyhow::Result<()> {
@@ -2862,6 +3114,7 @@ impl Fleet {
             let theirs = task.flock.as_deref().unwrap_or(flock.default_flock());
             self.settled_on(task, theirs, machine)
                 .is_none_or(|r| r.is_ok())
+                && self.bootstrap_ready(machine)
         };
         // A waiting task goes on once its `waiting_until` has passed and no
         // live limit holds its agent and model on its machine: at its
@@ -2925,7 +3178,8 @@ impl Fleet {
             // longer resolve it refuses instead of quietly dropping it.
             let settled_on = |machine: &str| self.settled_on(task, target, machine);
             let claim = Claim::of(task);
-            let accepts = |m: &str| settled_on(m).is_none_or(|r| r.is_ok());
+            let accepts =
+                |m: &str| settled_on(m).is_none_or(|r| r.is_ok()) && self.bootstrap_ready(m);
             // A `--now` task takes its pinned machine past its limits, or
             // nothing: it neither waits for a slot nor pauses another task.
             if task.spec.now {
@@ -3386,11 +3640,63 @@ pub struct Daemon {
     scheduler: SchedulerHandle,
     events: broadcast::Sender<PastorEvent>,
     orchestrators: Arc<crate::orchestrator::Runner>,
+    /// The head's `~/.ssh/authorized_keys` (or `PASTOR_AUTHORIZED_KEYS`),
+    /// resolved once at start so a removal always edits the file the daemon
+    /// began with, not whatever the environment says at the moment.
+    authorized_keys: PathBuf,
+    /// `ssh-keygen -R` and `ssh -O exit` for a removed machine go through
+    /// this, so tests script the answer instead of touching the host.
+    runner: Arc<dyn crate::setup::Runner + Send + Sync>,
+    /// What a push bootstrap runs on the head (ssh, ssh-keyscan,
+    /// ssh-keygen); tests put fakes here.
+    push_runner: Arc<dyn crate::bootstrap::push::PushRunner>,
+    /// Downloads into the artifact cache (`ArtifactLocate`, and a push
+    /// bootstrap's own binaries) go through this, so tests serve local
+    /// files instead of the network.
+    fetch: Arc<dyn crate::artifacts::Fetch + Send + Sync>,
+    /// The machines a push bootstrap is running for: a second push of one
+    /// of them is refused (`machine_busy`) rather than racing the first.
+    pushing: Arc<std::sync::Mutex<HashSet<String>>>,
+}
+
+/// What `MachineBootstrap` asks for, besides the machine's name.
+struct Push {
+    sudo: bool,
+    service_user: Option<String>,
+    host_key: Option<String>,
+    machine: Option<MachineConfig>,
+    login: Option<String>,
+    repin: bool,
+}
+
+/// A machine's place in `Daemon::pushing`, given back when its push ends,
+/// however it ends.
+struct Pushing {
+    set: Arc<std::sync::Mutex<HashSet<String>>>,
+    name: String,
+}
+
+impl Pushing {
+    fn take(set: &Arc<std::sync::Mutex<HashSet<String>>>, name: &str) -> Option<Pushing> {
+        set.lock()
+            .recover()
+            .insert(name.to_string())
+            .then(|| Pushing {
+                set: set.clone(),
+                name: name.to_string(),
+            })
+    }
+}
+
+impl Drop for Pushing {
+    fn drop(&mut self) {
+        self.set.lock().recover().remove(&self.name);
+    }
 }
 
 /// The longest IPC request line, newline excluded. The largest real one is a
 /// `task run` prompt, far below this.
-const MAX_IPC_REQUEST: usize = 1024 * 1024;
+pub const MAX_IPC_REQUEST: usize = 1024 * 1024;
 
 /// How long a client gets to send its request line. The CLI sends it at once;
 /// a connection that stays silent is holding a file descriptor for nothing.
@@ -3607,7 +3913,7 @@ impl Daemon {
         // sees a task from before flocks without one.
         store.adopt_default_flock(flock.default_flock())?;
         let (events, log_rx) = broadcast::channel(1024);
-        let connect = connect.unwrap_or_else(|| endpoint_factory(paths.clone()));
+        let connect = connect.unwrap_or_else(|| endpoint_factory(paths.clone(), store.clone()));
         let fleet = Arc::new(Fleet::managed(store.clone(), events.clone(), connect));
         fleet.apply_flock(&flock, &machine_settings(&config)).await;
         // Fresh set: nothing has been warned about yet, so every task on a
@@ -3653,6 +3959,11 @@ impl Daemon {
             scheduler,
             events,
             orchestrators,
+            authorized_keys: crate::authkeys::default_file(),
+            runner: Arc::new(crate::setup::SystemRunner),
+            push_runner: Arc::new(crate::bootstrap::push::SystemPushRunner),
+            fetch: Arc::new(crate::artifacts::CurlFetch),
+            pushing: Arc::default(),
         })
     }
 
@@ -3761,6 +4072,23 @@ impl Daemon {
                 return IpcResponse::error(
                     "now_refused",
                     format!("{who}, and only a person may run a task with --now"),
+                );
+            }
+        }
+        // Only `pastor bootstrap` on the machine itself reports how its
+        // bootstrap ended: never an agent's pane or an orchestrator's
+        // script, `agents_change_fleet` or not, or one could mark a failed
+        // machine ready.
+        if matches!(req, IpcRequest::BootstrapReport { .. }) {
+            let who = match (&caller.task, &caller.orchestrator) {
+                (Some(task), _) => Some(format!("{task} is a task")),
+                (None, Some(o)) => Some(format!("orchestrator {o}'s script is not a person")),
+                (None, None) => None,
+            };
+            if let Some(who) = who {
+                return IpcResponse::error(
+                    "agent_refused",
+                    format!("{who}, and only pastor bootstrap reports a machine's bootstrap"),
                 );
             }
         }
@@ -3914,6 +4242,582 @@ impl Daemon {
                 "{done}{sep}the reload after it failed ({err}); run `pastor job reload`"
             )),
         }
+    }
+
+    /// What `MachineRemove` does beyond the flock edit: drop the machine's
+    /// (and its agent's) lines from the head's `authorized_keys`, forget its
+    /// host key, end its ssh `ControlMaster` and drop its bootstrap row. The
+    /// machine is already out of the flock by the time this runs, so a step
+    /// that fails does not fail the request; it comes back, with what to do
+    /// about it, for the reply.
+    fn cleanup_removed_machine(&self, name: &str, ssh_target: Option<&str>) -> Vec<String> {
+        let mut failed = Vec::new();
+        if let Err(err) = crate::authkeys::remove_machine(&self.authorized_keys, name) {
+            tracing::warn!(machine = %name, %err, "could not drop authorized_keys lines");
+            failed.push(format!(
+                "could not drop its authorized_keys lines: {err:#}; its key still logs in \
+                 until you delete the lines ending in `pastor:machine:{name}` and \
+                 `pastor:agent:{name}` from {} by hand",
+                self.authorized_keys.display()
+            ));
+        }
+        if let Some(target) = ssh_target {
+            failed.extend(self.forget_ssh(name, target));
+        }
+        if let Err(err) = self.store.drop_machine_state(name) {
+            tracing::warn!(machine = %name, %err, "could not drop machine_state");
+            failed.push(format!(
+                "could not drop its bootstrap record: {err:#}; a later `machine add` of \
+                 {name} starts from it"
+            ));
+        }
+        for why in &failed {
+            tracing::warn!(machine = %name, "{why}");
+        }
+        failed
+    }
+
+    /// `MachineBootstrap`: a push bootstrap of `name`, run in this request's
+    /// own task. Only its flock edits take the dispatch lock, and each for a
+    /// moment, so a bootstrap that takes minutes never holds up dispatch.
+    async fn machine_bootstrap(&self, name: String, push: Push) -> IpcResponse {
+        use crate::bootstrap::push;
+        let Push {
+            sudo,
+            service_user,
+            host_key,
+            machine,
+            login,
+            repin,
+        } = push;
+        if repin && machine.is_some() {
+            return IpcResponse::error(
+                "usage_error",
+                "--repin is for a machine already in the flock: use machine bootstrap",
+            );
+        }
+        // A pull machine is never reached from here: its key on record is
+        // dropped, and the next join with a `--replace` token sets the one
+        // that join brings; a report never does.
+        if repin
+            && let Some(entry) = self.fleet.flock().get(&name)
+            && entry.pull
+            && entry.ssh.is_none()
+        {
+            let Some(_busy) = Pushing::take(&self.pushing, &name) else {
+                return IpcResponse::error(
+                    "machine_busy",
+                    format!("{name} is being bootstrapped already; wait for that run to end"),
+                );
+            };
+            return match self.store.machine_state(&name) {
+                Ok(Some(mut state)) => {
+                    state.host_key = None;
+                    state.updated_at = chrono::Utc::now().to_rfc3339();
+                    match self.store.put_machine_state(&state) {
+                        Ok(()) => IpcResponse::Text(format!(
+                            "dropped the host key on record for {name}; the next join with a token from `pastor join create --replace {name}` pins the one it brings"
+                        )),
+                        Err(err) => IpcResponse::error("store_error", err),
+                    }
+                }
+                Ok(None) => IpcResponse::Text(format!("{name} has no host key on record")),
+                Err(err) => IpcResponse::error("store_error", err),
+            };
+        }
+        let config = match PastorConfig::load(&self.paths.config_file()) {
+            Ok(c) => c,
+            Err(err) => return IpcResponse::error("config_error", format!("{err:#}")),
+        };
+        let Some(head) = config.head_address.clone() else {
+            return IpcResponse::error(
+                "config_error",
+                "bootstrap needs head_address in pastor.toml: the ssh destination the machine reaches this head at, like me@head",
+            );
+        };
+        let login = match &machine {
+            Some(m) if m.name != name => {
+                return IpcResponse::error(
+                    "invalid_request",
+                    format!("the entry is named {}, not {name}", m.name),
+                );
+            }
+            Some(m) => match &m.ssh {
+                Some(ssh) => ssh.clone(),
+                None => {
+                    return IpcResponse::error(
+                        "usage_error",
+                        "machine add --bootstrap needs the machine's ssh destination",
+                    );
+                }
+            },
+            None => match self.fleet.flock().get(&name) {
+                Some(entry) => match push::login_for(
+                    entry,
+                    login.as_deref(),
+                    self.store.bootstrap_login(&name).ok().flatten().as_deref(),
+                ) {
+                    Ok(login) => login,
+                    Err(err) => return cli_error(err),
+                },
+                None => {
+                    return IpcResponse::error(
+                        "unknown_machine",
+                        format!("no machine {name} in the flock"),
+                    );
+                }
+            },
+        };
+        let Some(_busy) = Pushing::take(&self.pushing, &name) else {
+            return IpcResponse::error(
+                "machine_busy",
+                format!("{name} is being bootstrapped already; wait for that run to end"),
+            );
+        };
+        let fleet_versions = self
+            .fleet
+            .statuses()
+            .into_iter()
+            .filter_map(|s| s.herdr_version)
+            .collect();
+        let opts = push::PushOpts {
+            sudo,
+            service_user,
+            host_key,
+            repin,
+            machine,
+            head,
+            provision: config.provision.clone(),
+            fleet_versions,
+            authorized_keys: self.authorized_keys.clone(),
+            runner: self.push_runner.clone(),
+            fetch: self.fetch.clone(),
+        };
+        let outcome =
+            match push::push(&self.paths, &self.store, &self.fleet, &name, &login, opts).await {
+                Ok(outcome) => outcome,
+                Err(err) => return cli_error(err),
+            };
+        // The entry was added, or its ssh moved to the agent user: the
+        // scheduler starts or reconnects its actor from the file.
+        let reload = match self.scheduler.reload().await {
+            Ok(_) => "the running pastor serve picked it up".to_string(),
+            Err(err) => format!("the reload after it failed ({err}); run `pastor job reload`"),
+        };
+        if let Some(err) = crate::bootstrap::error(&outcome) {
+            return cli_error(err);
+        }
+        // Tasks that waited for it start now, not next tick.
+        self.fleet.dispatch_queued().await;
+        let reached = self
+            .fleet
+            .flock()
+            .get(&name)
+            .and_then(|m| m.ssh.clone())
+            .unwrap_or(login);
+        let how = match outcome.mode {
+            crate::bootstrap::Mode::Root => {
+                format!("root mode, agents as {}", crate::bootstrap::AGENT_USER)
+            }
+            crate::bootstrap::Mode::User => {
+                "user mode, isolation: none (agents run as the login user and can read its keys)"
+                    .to_string()
+            }
+        };
+        IpcResponse::Text(format!(
+            "bootstrapped {name} ({how}), reached as {reached}; {reload}"
+        ))
+    }
+
+    /// Forget machine `name`'s host key at `target` and end its ssh
+    /// master, for a machine removed or taken over by a join. Returns what
+    /// failed.
+    fn forget_ssh(&self, name: &str, target: &str) -> Vec<String> {
+        let mut failed = self.forget_host_key(target);
+        if let Some(control_path) = crate::ssh::fitting_control_path(&self.paths, name) {
+            let control_path = control_path.to_string_lossy().into_owned();
+            let args = ["-S", control_path.as_str(), "-O", "exit", "--", target];
+            match self.runner.run("ssh", &args) {
+                Ok(out) if out.success => {}
+                // No socket: no master to end (never connected, or gone).
+                Ok(out) if out.stderr.contains("No such file or directory") => {}
+                out => failed.push(format!(
+                    "could not end its ssh master: {}; run `ssh {}`",
+                    run_failure(out),
+                    args.join(" ")
+                )),
+            }
+        }
+        failed
+    }
+
+    /// `ssh-keygen -R` of `target`'s host key from pastor's known_hosts,
+    /// under the host and port `ssh -G` resolves it to (an alias, a `Port`
+    /// in the ssh config): known_hosts keys a host on another port than 22
+    /// as `[host]:port`. Returns what failed.
+    fn forget_host_key(&self, target: &str) -> Vec<String> {
+        let mut failed = Vec::new();
+        let known_hosts = self.paths.known_hosts_file();
+        if !known_hosts.exists() {
+            return failed;
+        }
+        // The host alone: `user@host` with no `@` keeps `target` unchanged.
+        let fallback = target.rsplit('@').next().unwrap_or(target);
+        let (host, port, alias) = match self.runner.run("ssh", &["-G", "--", target]) {
+            Ok(out) if out.success => resolved_host(&out.stdout)
+                .map(|(h, p)| (h, p, crate::bootstrap::push::host_key_alias(&out.stdout)))
+                .unwrap_or_else(|| (fallback.to_string(), "22".to_string(), None)),
+            out => {
+                failed.push(format!(
+                    "could not resolve its host with `ssh -G {target}`: {}; forgot {fallback} only",
+                    run_failure(out)
+                ));
+                (fallback.to_string(), "22".to_string(), None)
+            }
+        };
+        let mut names = vec![host.clone()];
+        if port != "22" {
+            names.push(format!("[{host}]:{port}"));
+        }
+        // The name a push pinned it under, when the ssh config gives one.
+        names.extend(alias);
+        // A push pinning a key at the same moment edits the file in turn.
+        let _lock = match crate::authkeys::lock(&known_hosts) {
+            Ok(lock) => lock,
+            Err(err) => {
+                failed.push(format!(
+                    "could not lock {}: {err:#}; run `ssh-keygen -f {} -R {host}`",
+                    known_hosts.display(),
+                    known_hosts.display()
+                ));
+                return failed;
+            }
+        };
+        let known_hosts = known_hosts.to_string_lossy().into_owned();
+        for host in names {
+            let args = ["-f", known_hosts.as_str(), "-R", host.as_str()];
+            match self.runner.run("ssh-keygen", &args) {
+                Ok(out) if out.success => {}
+                out => failed.push(format!(
+                    "could not forget its host key {host}: {}; run `ssh-keygen {}`",
+                    run_failure(out),
+                    args.join(" ")
+                )),
+            }
+        }
+        failed
+    }
+
+    /// `JoinCreate`: a token whose flock exists, for the head at
+    /// `head_address` (else `user@hostname`).
+    fn join_create(
+        &self,
+        flock: Option<String>,
+        tags: Vec<String>,
+        replace: Option<String>,
+        ttl_secs: u64,
+    ) -> IpcResponse {
+        if let Some(f) = &flock
+            && !self.fleet.flock().has_flock(f)
+        {
+            return IpcResponse::error("unknown_flock", format!("flock {f} does not exist"));
+        }
+        let made = (|| {
+            let config = PastorConfig::load(&self.paths.config_file())?;
+            let files = crate::join::HeadFiles::for_head(&self.paths)?;
+            let ask = crate::join::Ask {
+                flock,
+                tags,
+                replace,
+                ttl: Duration::from_secs(ttl_secs),
+            };
+            crate::join::create(
+                &files,
+                &self.store,
+                &crate::join::head_destination(&config),
+                &ask,
+            )
+        })();
+        match made {
+            Ok(made) => {
+                tracing::info!(id = made.id, "join token made");
+                IpcResponse::JoinCreated {
+                    id: made.id,
+                    token: made.token.encode(),
+                    expires_at: made.row.expires_at,
+                }
+            }
+            Err(err) => cli_error(err),
+        }
+    }
+
+    /// `Join`: redeem token `id` for machine `name`. Everything that can
+    /// refuse the join (the name, the keys, the token, a name already in
+    /// flock.toml) is checked before the token is marked used, so a refused
+    /// try leaves it good for the next. The token is checked, taken and the
+    /// machine added under the dispatch lock, so two machines racing one
+    /// token add one machine.
+    async fn join(
+        &self,
+        id: &str,
+        name: &str,
+        machine_key: &str,
+        agent_key: &str,
+        host_key: &str,
+        service_user: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let files = crate::join::HeadFiles::for_head(&self.paths)?;
+        self.join_with(
+            &files.pastor,
+            &files.authorized_keys,
+            id,
+            name,
+            machine_key,
+            agent_key,
+            host_key,
+            service_user,
+        )
+        .await
+    }
+
+    /// `ShepherdCheck`: whether a shepherd bridge started as `--gen
+    /// generation` still speaks for `machine`. A store that cannot be read
+    /// refuses: the check is the one thing that cuts off a connection a
+    /// replace or a removal moved past.
+    ///
+    /// A machine not in the flock is refused whatever its line says: a
+    /// `machine remove` ends every line of it. A line with no `--gen`
+    /// (`machine authorized-key --shepherd`, or one written by hand) passes
+    /// only for a pull machine that no join has enrolled.
+    fn shepherd_check(&self, machine: &str, generation: Option<i64>) -> IpcResponse {
+        let revoked = |why: String| IpcResponse::error("machine_revoked", why);
+        let Some(pull) = self.fleet.flock().get(machine).map(|m| m.pull) else {
+            return revoked(format!(
+                "{machine} is not in the head's flock.toml: it was removed"
+            ));
+        };
+        let have = match self.store.machine_generation(machine) {
+            Ok(have) => have,
+            Err(err) => return IpcResponse::error("store_error", err),
+        };
+        match (generation, have) {
+            (Some(want), Some(have)) if want == have => IpcResponse::Text("current".into()),
+            (Some(want), Some(have)) => revoked(format!(
+                "this key's line is from enrollment {want} of {machine}, which is now at {have}: the machine was joined again"
+            )),
+            (Some(_), None) => revoked(format!(
+                "{machine} has no bootstrap record on the head: it was removed"
+            )),
+            // A line made by hand carries no generation: it is good until
+            // a join enrolls the machine, whose own line then does.
+            (None, Some(have)) if have > 0 => revoked(format!(
+                "{machine} was joined, so only its join's line (with --gen {have}) speaks for it"
+            )),
+            (None, _) if pull => IpcResponse::Text("current".into()),
+            (None, _) => revoked(format!(
+                "{machine} is not a pull machine in the head's flock.toml"
+            )),
+        }
+    }
+
+    /// The herdr a machine that just joined fetches: `[provision] herdr`,
+    /// else the one most machines run, else pastor's default.
+    fn join_herdr_version(&self, config: &PastorConfig) -> String {
+        let fleet: Vec<String> = self
+            .fleet
+            .statuses()
+            .into_iter()
+            .filter_map(|s| s.herdr_version)
+            .collect();
+        crate::artifacts::herdr_version(&config.provision, &fleet)
+    }
+
+    /// `join` with the pastor its lines run and the authorized_keys it
+    /// edits as seams.
+    #[allow(clippy::too_many_arguments)]
+    async fn join_with(
+        &self,
+        pastor: &std::path::Path,
+        keys: &dyn crate::join::Keys,
+        id: &str,
+        name: &str,
+        machine_key: &str,
+        agent_key: &str,
+        host_key: &str,
+        service_user: Option<&str>,
+    ) -> anyhow::Result<()> {
+        use crate::authkeys::{Marker, line};
+        use crate::cli::CliError;
+        let now = chrono::Utc::now();
+        crate::join::redeemable(&self.store, id, now)?;
+        // Before anything is spent or written: the name goes into a forced
+        // command, which a shell runs.
+        crate::join::check_name(name)?;
+        if let Some(user) = service_user {
+            crate::bootstrap::check_user(user)?;
+        }
+        let as_machine = Marker::Machine(name.into());
+        let as_agent = Marker::Agent(name.into());
+        as_machine.check()?;
+        // Each join of a name is a new enrollment: its shepherd line
+        // carries the generation, and a bridge started under an older one
+        // is refused at its next request (`ShepherdCheck`). The number is
+        // store-wide and never given twice: a per-name count would start
+        // over after `machine remove` drops the record, and let a
+        // connection from before the removal (sshd never rereads
+        // authorized_keys for it) speak for the name again. A join that
+        // fails from here only burns one.
+        let generation = self.store.next_generation()?;
+        let machine_line = line(
+            pastor,
+            &format!("bridge --shepherd --machine {name} --gen {generation}"),
+            machine_key,
+            &as_machine,
+        )?;
+        let agent_line = line(
+            pastor,
+            &format!("bridge --agent --machine {name}"),
+            agent_key,
+            &as_agent,
+        )?;
+        let machine_blob = crate::join::key_blob("the machine key", machine_key)?;
+        let agent_blob = crate::join::key_blob("the agent key", agent_key)?;
+        if machine_blob == agent_blob {
+            return Err(CliError::err(
+                "invalid_key",
+                "the machine key and the agent key must differ: sshd only ever matches the first line a key is on",
+            ));
+        }
+        let host_key = host_key.trim();
+        if host_key.is_empty() || host_key.contains('\n') {
+            return Err(CliError::err(
+                "invalid_key",
+                "the host key must be one public key line",
+            ));
+        }
+        let store = &self.store;
+        let (row, replaced_ssh) = self
+            .fleet
+            .edit_flock_file(&self.paths.flock_file(), |file| {
+                let edit = |e: EditError| CliError::err(e.code(), &e);
+                let row = crate::join::redeemable(store, id, now)?;
+                // A key already let in, other than by this name's own lines
+                // (which this join replaces), would log in as two things.
+                let own = [as_machine.clone(), as_agent.clone()];
+                for (what, blob) in [("machine", machine_blob), ("agent", agent_blob)] {
+                    if keys.holds(blob, &own)? {
+                        return Err(CliError::err(
+                            "key_in_use",
+                            format!("the {what} key is already in the head's authorized_keys; each machine brings keys of its own"),
+                        ));
+                    }
+                }
+                let mut doc = crate::config::flock::FlockDoc::open(file)?;
+                let old = doc
+                    .flock()
+                    .map_err(anyhow::Error::msg)?
+                    .get(name)
+                    .map(|m| m.ssh.clone());
+                let exists = old.is_some();
+                if exists && row.replace.as_deref() != Some(name) {
+                    return Err(CliError::err(
+                        "machine_name_taken",
+                        format!(
+                            "machine {name} is already in flock.toml; only a token made with --replace {name} may take it over"
+                        ),
+                    ));
+                }
+                let mut m: MachineConfig =
+                    serde_json::from_value(serde_json::json!({ "name": name, "pull": true }))?;
+                m.flock = row.flock.clone();
+                m.tags = row.tags.clone();
+                if exists {
+                    doc.remove_machine(name).map_err(edit)?;
+                }
+                doc.add_machine(&m).map_err(edit)?;
+                crate::join::take(store, id, now)?;
+                // The token is spent, so its line goes before anything else
+                // is written: whatever fails after this, a used token gets
+                // no ssh session.
+                if let Err(err) = keys.remove(&Marker::Join(id.into())) {
+                    // Nothing was added and the line is still there, so the
+                    // token stays good.
+                    if let Err(restore) = store.put_join_token(&row) {
+                        tracing::warn!(id, err = %format!("{restore:#}"), "could not mark the join token unused again; its line is still in authorized_keys, so `pastor join revoke {id}` removes it");
+                    }
+                    return Err(CliError::err(
+                        "join_failed",
+                        format!(
+                            "could not remove join token {id}'s line from the head's authorized_keys ({err:#}); nothing was added and the token is still good"
+                        ),
+                    ));
+                }
+                if let Err(err) = doc.save(file) {
+                    // Its line is gone, so the token stays spent.
+                    return Err(err.context(format!(
+                        "save flock.toml; nothing was added and join token {id} is spent: make a new one"
+                    )));
+                }
+                Ok((row, old.flatten()))
+            })
+            .await?;
+        // The machine is in flock.toml and the token is spent: from here on
+        // a failure is reported, not undone, with what to run.
+        let after_save = |what: &str, err: anyhow::Error| {
+            CliError::err(
+                "join_failed",
+                format!(
+                    "machine {name} is in flock.toml and join token {id} is spent, but writing {what} failed ({err:#}); make a new token with `pastor join create --replace {name}` and join the machine again with it"
+                ),
+            )
+        };
+        // The machine this join took over was reached over ssh: its host
+        // key and master must not vouch for whoever has its name now.
+        if let Some(target) = &replaced_ssh {
+            for why in self.forget_ssh(name, target) {
+                tracing::warn!(machine = name, "{why}");
+            }
+        }
+        // The record and its new generation before the lines: from here a
+        // bridge under the generation this join replaced is refused.
+        self.store
+            .put_machine_state(&crate::store::MachineState {
+                machine: name.into(),
+                bootstrap: crate::store::BootstrapState::Pending,
+                mode: None,
+                isolation: None,
+                failed_step: None,
+                why: None,
+                host_key: Some(host_key.into()),
+                herdr_version: None,
+                pastor_version: None,
+                updated_at: now.to_rfc3339(),
+                service_user: service_user.map(str::to_string),
+            })
+            .and_then(|()| self.store.set_machine_generation(name, generation))
+            .map_err(|e| after_save("its bootstrap record to the store", e))?;
+        keys.upsert(&as_machine, &machine_line)
+            .map_err(|e| after_save("its machine line to authorized_keys", e))?;
+        keys.upsert(&as_agent, &agent_line)
+            .map_err(|e| after_save("its agent line to authorized_keys", e))?;
+        tracing::info!(machine = name, id, "machine joined");
+        let _ = self.events.send(PastorEvent {
+            kind: "machine.joined".into(),
+            task_id: None,
+            machine: Some(name.into()),
+            job: None,
+            detail: Some(serde_json::json!({
+                "id": id,
+                "flock": row.flock,
+                "tags": row.tags,
+                "replaced": row.replace.as_deref() == Some(name),
+            })),
+            summary: None,
+        });
+        if let Err(err) = self.scheduler.reload().await {
+            tracing::warn!(machine = name, %err, "reload after a join; the next pass picks it up");
+        }
+        Ok(())
     }
 
     pub async fn handle(&self, req: IpcRequest) -> IpcResponse {
@@ -4215,9 +5119,60 @@ impl Daemon {
                 self.edit_flock_file("\n", |file| crate::fleet_edit::add_machine(file, &machine))
                     .await
             }
+            IpcRequest::MachineBootstrap {
+                name,
+                sudo,
+                service_user,
+                host_key,
+                machine,
+                login,
+                repin,
+            } => {
+                let push = Push {
+                    sudo,
+                    service_user,
+                    host_key,
+                    machine,
+                    login,
+                    repin,
+                };
+                self.machine_bootstrap(name, push).await
+            }
             IpcRequest::MachineRemove { name } => {
-                self.edit_flock_file("; ", |file| crate::fleet_edit::remove_machine(file, &name))
-                    .await
+                // Held for the whole remove, so a push of the machine cannot
+                // start under it either.
+                let Some(_busy) = Pushing::take(&self.pushing, &name) else {
+                    return IpcResponse::error(
+                        "machine_busy",
+                        format!(
+                            "{name} is being bootstrapped; wait for that run to end, then remove it"
+                        ),
+                    );
+                };
+                let ssh_target = self
+                    .fleet
+                    .flock()
+                    .machines
+                    .into_iter()
+                    .find(|m| m.name == name)
+                    .and_then(|m| m.ssh);
+                let resp = self
+                    .edit_flock_file("; ", |file| crate::fleet_edit::remove_machine(file, &name))
+                    .await;
+                // Only once the flock edit itself landed: an unknown machine
+                // (or a refused edit) must leave its keys and state alone.
+                match resp {
+                    IpcResponse::Text(text) => {
+                        let failed = self.cleanup_removed_machine(&name, ssh_target.as_deref());
+                        IpcResponse::Text(
+                            std::iter::once(text)
+                                .chain(failed)
+                                .collect::<Vec<_>>()
+                                .join("; "),
+                        )
+                    }
+                    other => other,
+                }
             }
             IpcRequest::MachineMove { name, flock } => {
                 self.edit_flock_file("; ", |file| {
@@ -4264,11 +5219,16 @@ impl Daemon {
                     Err(err) => IpcResponse::error("store_error", err),
                 }
             }
-            IpcRequest::EventsSince { after, limit, task } => {
+            IpcRequest::EventsSince {
+                after,
+                limit,
+                task,
+                machine,
+            } => {
                 // Up to two log generations of file reading: off the runtime.
                 let path = self.paths.events_file();
                 match tokio::task::spawn_blocking(move || {
-                    crate::events::since(&path, after, limit, task)
+                    crate::events::since_for(&path, after, limit, task, machine.as_deref())
                 })
                 .await
                 {
@@ -4350,6 +5310,56 @@ impl Daemon {
                     )),
                 }
             }
+            IpcRequest::JoinCreate {
+                flock,
+                tags,
+                replace,
+                ttl_secs,
+            } => self.join_create(flock, tags, replace, ttl_secs),
+            IpcRequest::ShepherdCheck {
+                machine,
+                generation,
+            } => self.shepherd_check(&machine, generation),
+            IpcRequest::JoinList => match self.store.join_tokens() {
+                Ok(list) => IpcResponse::JoinTokens(list),
+                Err(err) => IpcResponse::error("store_error", err),
+            },
+            IpcRequest::JoinRevoke { id } => {
+                let revoked = crate::join::HeadFiles::for_head(&self.paths)
+                    .and_then(|files| crate::join::revoke(&files, &self.store, &id));
+                match revoked {
+                    Ok(()) => IpcResponse::Text(format!("revoked join token {id}")),
+                    Err(err) => cli_error(err),
+                }
+            }
+            IpcRequest::Join {
+                id,
+                name,
+                machine_key,
+                agent_key,
+                host_key,
+                facts: _,
+                service_user,
+            } => match self
+                .join(
+                    &id,
+                    &name,
+                    &machine_key,
+                    &agent_key,
+                    &host_key,
+                    service_user.as_deref(),
+                )
+                .await
+            {
+                Ok(()) => {
+                    let config = PastorConfig::load(&self.paths.config_file()).unwrap_or_default();
+                    IpcResponse::Joined {
+                        name,
+                        herdr_version: Some(self.join_herdr_version(&config)),
+                    }
+                }
+                Err(err) => cli_error(err),
+            },
             IpcRequest::LimitList => match self.store.limits() {
                 Ok(list) => IpcResponse::Limits(list),
                 Err(err) => IpcResponse::error("store_error", err),
@@ -4395,7 +5405,19 @@ impl Daemon {
                 machine,
                 free_slots,
                 flock_work,
-            } => match self.fleet.claim(&machine, free_slots, flock_work).await {
+                herdr_version,
+                pastor_version,
+            } => match self
+                .fleet
+                .claim(
+                    &machine,
+                    free_slots,
+                    flock_work,
+                    herdr_version.as_deref(),
+                    pastor_version.as_deref(),
+                )
+                .await
+            {
                 Ok(tasks) => IpcResponse::Tasks(tasks),
                 Err(err) => cli_error(err),
             },
@@ -4425,6 +5447,23 @@ impl Daemon {
                 Ok(task) => IpcResponse::Task(task),
                 Err(err) => cli_error(err),
             },
+            IpcRequest::ArtifactLocate {
+                name,
+                version,
+                target,
+            } => self.locate_artifact(&name, &version, &target).await,
+            IpcRequest::BootstrapReport { machine, result } => {
+                match self.fleet.report_bootstrap(&machine, result) {
+                    Ok(ready) => {
+                        // Tasks that waited on it start now, not next tick.
+                        if ready {
+                            self.fleet.dispatch_queued().await;
+                        }
+                        IpcResponse::Text(format!("{machine}: bootstrap recorded"))
+                    }
+                    Err(err) => cli_error(err),
+                }
+            }
             IpcRequest::PullTrust { machine } => match self.fleet.pull_trust(&machine) {
                 Ok(list) => IpcResponse::Trusted(list),
                 Err(err) => cli_error(err),
@@ -4545,6 +5584,36 @@ impl Daemon {
         }
     }
 
+    /// `ArtifactLocate`: the artifact in the cache, fetched and checked
+    /// first when it is not there. A download and the hashing block, so the
+    /// whole of it runs off the runtime's workers. pastor.toml is read here,
+    /// not at start, so an edited `[provision] herdr_index` counts at once.
+    async fn locate_artifact(&self, name: &str, version: &str, target: &str) -> IpcResponse {
+        let a = match crate::artifacts::Artifact::new(name, version, target) {
+            Ok(a) => a,
+            Err(err) => return IpcResponse::error(err.code(), err),
+        };
+        let paths = self.paths.clone();
+        let fetch = self.fetch.clone();
+        let rt = tokio::runtime::Handle::current();
+        let found = tokio::task::spawn_blocking(move || {
+            let cfg = PastorConfig::load(&paths.config_file())?.provision;
+            let (path, sha256) =
+                rt.block_on(crate::artifacts::ensure(&paths, &cfg, &a, fetch.as_ref()))?;
+            let size = std::fs::metadata(&path)?.len();
+            anyhow::Ok((path, sha256, size))
+        })
+        .await;
+        match found {
+            Ok(Ok((path, sha256, size))) => IpcResponse::Artifact { path, sha256, size },
+            Ok(Err(err)) => match crate::artifacts::error_code(&err) {
+                Some(code) => IpcResponse::error(code, format!("{err:#}")),
+                None => cli_error(err),
+            },
+            Err(err) => IpcResponse::error("runtime_error", err),
+        }
+    }
+
     /// `FlockDescribe`: from the flock last applied and the live agents,
     /// not from flock.toml as it reads now.
     fn describe_flock(&self, name: &str) -> IpcResponse {
@@ -4580,6 +5649,10 @@ impl Daemon {
         };
         // A description is still worth sending without the log.
         let events = crate::events::read(&self.paths.events_file(), None).unwrap_or_default();
+        let bootstrap = self.store.machine_state(name).unwrap_or_else(|err| {
+            tracing::error!(machine = name, %err, "read machine_state");
+            None
+        });
         IpcResponse::MachineDescription(crate::describe::MachineDescription {
             row: crate::cli::MachineRow::from(&status),
             session: m.session.clone(),
@@ -4588,6 +5661,7 @@ impl Daemon {
             agents_by_kind: m.agents.clone(),
             tasks,
             recent_errors: crate::describe::machine_errors(events, name),
+            bootstrap,
         })
     }
 
@@ -5073,6 +6147,116 @@ pub async fn serve(paths: Paths) -> anyhow::Result<()> {
     drop(fleet_lock);
     tracing::info!(socket = %daemon.socket_path().display(), machines = daemon.fleet.machines().len(), "pastor serve");
     daemon.run_with_listener(listener).await
+}
+
+/// Two `keytype base64 [comment]` keys are the same key.
+fn same_host_key(a: &str, b: &str) -> bool {
+    let mut a = a.split_whitespace();
+    let mut b = b.split_whitespace();
+    (a.next(), a.next()) == (b.next(), b.next())
+}
+
+/// The `hostname` and `port` lines of `ssh -G`'s output.
+fn resolved_host(out: &str) -> Option<(String, String)> {
+    let field = |key: &str| {
+        out.lines()
+            .find_map(|l| l.strip_prefix(key))
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    Some((
+        field("hostname ")?,
+        field("port ").unwrap_or_else(|| "22".into()),
+    ))
+}
+
+/// Why a command run through a `setup::Runner` failed, for a reply.
+fn run_failure(out: std::io::Result<crate::setup::CmdOutput>) -> String {
+    match out {
+        Ok(o) if o.stderr.trim().is_empty() => "it exited non-zero".to_string(),
+        Ok(o) => o.stderr.trim().to_string(),
+        Err(err) => err.to_string(),
+    }
+}
+
+/// The longest version string a pull machine may report.
+const MAX_VERSION_LEN: usize = 64;
+
+/// The most characters kept of each text a bootstrap report carries: a
+/// step's name, why and fix, and each missing entry.
+const MAX_REPORT_TEXT: usize = 256;
+
+/// The most steps, and missing entries, kept of a bootstrap report.
+const MAX_REPORT_ITEMS: usize = 64;
+
+/// `s` with its control characters dropped (printable text and plain
+/// spaces stay, so a tab or a newline goes too), and the invisible ones
+/// that reorder or hide text (`invisible`), and cut to `MAX_REPORT_TEXT`
+/// characters.
+fn report_text(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() && !invisible(*c))
+        .take(MAX_REPORT_TEXT)
+        .collect()
+}
+
+/// Zero-width characters (U+200B-U+200F, U+2060-U+2064, U+FEFF) and bidi
+/// embeddings, overrides and isolates (U+202A-U+202E, U+2066-U+2069): a
+/// report that carries them can print as something it is not.
+fn invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
+/// A bootstrap report as the head keeps it: at most `MAX_REPORT_ITEMS`
+/// steps (the first failed one kept, as the last, when it lies past them),
+/// at most `MAX_REPORT_ITEMS` missing entries per step, each text through
+/// `report_text`, and versions through `safe_version`.
+fn sanitise_outcome(mut o: crate::bootstrap::Outcome) -> crate::bootstrap::Outcome {
+    use crate::bootstrap::StepStatus;
+    let failed = o.steps.iter().position(|s| s.status == StepStatus::Failed);
+    if o.steps.len() > MAX_REPORT_ITEMS {
+        if let Some(i) = failed.filter(|i| *i >= MAX_REPORT_ITEMS) {
+            o.steps.swap(i, MAX_REPORT_ITEMS - 1);
+        }
+        o.steps.truncate(MAX_REPORT_ITEMS);
+    }
+    for step in &mut o.steps {
+        step.step = report_text(&step.step);
+        step.why = step.why.as_deref().map(report_text);
+        step.fix = step.fix.as_deref().map(report_text);
+        step.missing.truncate(MAX_REPORT_ITEMS);
+        for m in &mut step.missing {
+            *m = report_text(m);
+        }
+    }
+    o.herdr_version = safe_version(o.herdr_version.as_deref()).map(str::to_string);
+    o.pastor_version = safe_version(o.pastor_version.as_deref()).map(str::to_string);
+    o.service_user = o.service_user.as_deref().map(report_text);
+    o.host_key = o.host_key.as_deref().map(report_text);
+    o
+}
+
+/// A version a pull machine reported, if it is safe to keep and print later:
+/// at most `MAX_VERSION_LEN` characters of `[0-9A-Za-z.+-]`. Anything else
+/// (an escape sequence, a newline) is dropped with a warning, as if the
+/// machine had reported none.
+fn safe_version(v: Option<&str>) -> Option<&str> {
+    let v = v?;
+    let ok = !v.is_empty()
+        && v.len() <= MAX_VERSION_LEN
+        && v.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-'));
+    if !ok {
+        tracing::warn!(version = ?v, "drop a pull machine's reported version");
+    }
+    ok.then_some(v)
 }
 
 #[cfg(all(test, feature = "fake-herdr"))]
@@ -5687,6 +6871,8 @@ mod tests {
             machine: "laptop".into(),
             free_slots,
             flock_work,
+            herdr_version: None,
+            pastor_version: None,
         };
         match d.handle(req).await {
             IpcResponse::Tasks(ts) => ts
@@ -5818,10 +7004,100 @@ mod tests {
                     machine: "nope".into(),
                     free_slots: 1,
                     flock_work: false,
+                    herdr_version: None,
+                    pastor_version: None,
                 })
                 .await
             ),
             "unknown_machine"
+        );
+    }
+
+    /// A `TaskClaim` that carries its machine's own herdr and pastor
+    /// versions keeps them on its `machine_state` row
+    /// (`Store::set_versions`), and a later claim with one version missing
+    /// keeps the other rather than clearing it. A machine with no row yet
+    /// is left alone: nothing has bootstrapped it, so there is nowhere to
+    /// put the versions.
+    #[tokio::test]
+    async fn claim_versions_stored() {
+        let (d, _tmp) = pull_daemon(1).await;
+        let claim_with = |herdr: Option<&str>, pastor: Option<&str>| {
+            d.handle(IpcRequest::TaskClaim {
+                machine: "laptop".into(),
+                free_slots: 1,
+                flock_work: false,
+                herdr_version: herdr.map(str::to_string),
+                pastor_version: pastor.map(str::to_string),
+            })
+        };
+        claim_with(Some("0.9.5"), Some("1.2.3")).await;
+        assert!(
+            d.store().machine_state("laptop").unwrap().is_none(),
+            "nothing to bootstrap yet, so no row to update"
+        );
+        d.store()
+            .put_machine_state(&crate::store::MachineState {
+                machine: "laptop".into(),
+                bootstrap: crate::store::BootstrapState::Ok,
+                mode: None,
+                isolation: None,
+                failed_step: None,
+                why: None,
+                host_key: None,
+                herdr_version: None,
+                pastor_version: None,
+                service_user: None,
+                updated_at: "2026-10-16T10:00:00+00:00".into(),
+            })
+            .unwrap();
+        claim_with(Some("0.9.5"), Some("1.2.3")).await;
+        let state = d.store().machine_state("laptop").unwrap().unwrap();
+        assert_eq!(state.herdr_version.as_deref(), Some("0.9.5"));
+        assert_eq!(state.pastor_version.as_deref(), Some("1.2.3"));
+        claim_with(None, Some("1.2.4")).await;
+        let state = d.store().machine_state("laptop").unwrap().unwrap();
+        assert_eq!(state.herdr_version.as_deref(), Some("0.9.5"), "kept");
+        assert_eq!(state.pastor_version.as_deref(), Some("1.2.4"), "updated");
+    }
+
+    /// A reported version that is too long or holds anything past
+    /// `[0-9A-Za-z.+-]` (an escape sequence a later `machine show` would
+    /// print) is dropped, not stored; the other version still is.
+    #[tokio::test]
+    async fn claim_versions_unsafe_dropped() {
+        let (d, _tmp) = pull_daemon(1).await;
+        d.store()
+            .put_machine_state(&crate::store::MachineState {
+                machine: "laptop".into(),
+                bootstrap: crate::store::BootstrapState::Ok,
+                mode: None,
+                isolation: None,
+                failed_step: None,
+                why: None,
+                host_key: None,
+                herdr_version: None,
+                pastor_version: None,
+                service_user: None,
+                updated_at: "2026-10-16T10:00:00+00:00".into(),
+            })
+            .unwrap();
+        for bad in ["0.9.5\u{1b}[2J", &"1".repeat(65), "", "1 2"] {
+            d.handle(IpcRequest::TaskClaim {
+                machine: "laptop".into(),
+                free_slots: 1,
+                flock_work: false,
+                herdr_version: Some(bad.to_string()),
+                pastor_version: Some("1.2.3+g4f5-dirty".into()),
+            })
+            .await;
+            let state = d.store().machine_state("laptop").unwrap().unwrap();
+            assert_eq!(state.herdr_version, None, "{bad:?}");
+            assert_eq!(state.pastor_version.as_deref(), Some("1.2.3+g4f5-dirty"));
+        }
+        assert_eq!(
+            safe_version(Some(&"1".repeat(64))),
+            Some("1".repeat(64).as_str())
         );
     }
 
@@ -6511,6 +7787,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn describe_shows_bootstrap_line() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        d.store
+            .put_machine_state(&crate::store::MachineState {
+                machine: "a".into(),
+                bootstrap: crate::store::BootstrapState::Ok,
+                mode: Some("root".into()),
+                isolation: Some("users".into()),
+                failed_step: None,
+                why: None,
+                host_key: None,
+                herdr_version: None,
+                pastor_version: None,
+                service_user: None,
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+        let resp = d
+            .handle(IpcRequest::MachineDescribe { name: "a".into() })
+            .await;
+        let IpcResponse::MachineDescription(m) = resp else {
+            panic!("{resp:?}")
+        };
+        let text = crate::describe::machine_text(&m);
+        // The report did not say who runs the shepherd: no guess at it.
+        assert!(
+            text.contains("ok, root mode (agents as pastor-agent)\n"),
+            "{text}"
+        );
+        assert!(!text.contains("shepherd as"), "{text}");
+    }
+
+    #[tokio::test]
     async fn run_dispatches_immediately() {
         let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
         let mut events = d.subscribe();
@@ -6562,6 +7871,721 @@ mod tests {
             Some("fake"),
             "the flock list carries what the machine answered on connect"
         );
+    }
+
+    fn pending_state(machine: &str) -> crate::store::MachineState {
+        crate::store::MachineState {
+            machine: machine.into(),
+            bootstrap: crate::store::BootstrapState::Pending,
+            mode: None,
+            isolation: None,
+            failed_step: None,
+            why: None,
+            host_key: None,
+            herdr_version: None,
+            pastor_version: None,
+            service_user: None,
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    fn run_req() -> IpcRequest {
+        IpcRequest::Run {
+            now: false,
+            preempt: false,
+            summary: None,
+            role: Default::default(),
+            description: None,
+            prompt: "hi".into(),
+            spec: spec(),
+            flock: None,
+            agent: None,
+            priority: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_machine_gets_no_task() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        d.store.put_machine_state(&pending_state("a")).unwrap();
+        let resp = d.handle(run_req()).await;
+        let IpcResponse::Task(t) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(
+            t.state,
+            TaskState::Queued,
+            "a pending machine never takes a task"
+        );
+    }
+
+    #[tokio::test]
+    async fn machine_without_state_still_dispatches() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        assert!(d.store.machine_state("a").unwrap().is_none());
+        let resp = d.handle(run_req()).await;
+        let IpcResponse::Task(t) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(
+            t.state,
+            TaskState::Running,
+            "a machine with no machine_state row reads as bootstrapped ok"
+        );
+    }
+
+    fn failed_outcome() -> crate::bootstrap::Outcome {
+        crate::bootstrap::Outcome {
+            ok: false,
+            mode: crate::bootstrap::Mode::Root,
+            isolation: crate::bootstrap::Isolation::Users,
+            steps: vec![crate::bootstrap::StepResult {
+                step: "install_herdr".into(),
+                ..crate::bootstrap::StepResult::failed("no sudo", "rerun with --sudo")
+            }],
+            machine_key: None,
+            agent_key: None,
+            host_key: None,
+            herdr_version: None,
+            pastor_version: None,
+            service_user: None,
+        }
+    }
+
+    /// `ArtifactLocate` fills the cache from the `[provision]` index and
+    /// answers where the checked file is, its sum and its size; a bad part
+    /// or a sum that does not match keeps its own code.
+    #[tokio::test]
+    async fn artifact_locate_returns_path_and_sum() {
+        let (mut d, tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("herdr-bin"), b"herdr-binary").unwrap();
+        let sum = |b: &[u8]| -> String {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(b)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        let index = |want: &str| {
+            serde_json::json!({"releases": {"0.9.5": {
+                "assets": {"linux-aarch64": format!("https://herdr.example/{}", src.join("herdr-bin").display())},
+                "sha256": {"linux-aarch64": want},
+            }}})
+        };
+        // The index is a `file://` fixture, as in `artifacts`' own tests;
+        // the asset URL must be https, so the fetch maps it back to a file.
+        struct HttpsToFile;
+        impl crate::artifacts::Fetch for HttpsToFile {
+            fn get(&self, url: &str, to: &std::path::Path) -> anyhow::Result<()> {
+                let path = url
+                    .strip_prefix("https://herdr.example")
+                    .or_else(|| url.strip_prefix("file://"))
+                    .unwrap_or(url);
+                std::fs::copy(path, to)?;
+                Ok(())
+            }
+        }
+        d.fetch = Arc::new(HttpsToFile);
+        let index_path = src.join("latest.json");
+        let mut config = test_config();
+        config.provision.herdr_index = Some(format!("file://{}", index_path.display()));
+        std::fs::write(d.paths.config_file(), toml::to_string(&config).unwrap()).unwrap();
+        let locate = |target: &str| IpcRequest::ArtifactLocate {
+            name: "herdr".into(),
+            version: "0.9.5".into(),
+            target: target.into(),
+        };
+
+        std::fs::write(&index_path, index(&sum(b"something else")).to_string()).unwrap();
+        let resp = d.handle(locate("linux-aarch64")).await;
+        assert!(
+            matches!(&resp, IpcResponse::Error { code, .. } if code == "artifact_checksum_mismatch"),
+            "{resp:?}"
+        );
+
+        std::fs::write(&index_path, index(&sum(b"herdr-binary")).to_string()).unwrap();
+        let resp = d.handle(locate("linux-aarch64")).await;
+        let IpcResponse::Artifact { path, sha256, size } = resp else {
+            panic!("{resp:?}")
+        };
+        let a = crate::artifacts::Artifact::new("herdr", "0.9.5", "linux-aarch64").unwrap();
+        assert_eq!(path, crate::artifacts::cache_path(&d.paths, &a));
+        assert_eq!(sha256, sum(b"herdr-binary"));
+        assert_eq!(size, 12);
+        assert_eq!(std::fs::read(&path).unwrap(), b"herdr-binary");
+
+        let resp = d.handle(locate("..")).await;
+        assert!(
+            matches!(&resp, IpcResponse::Error { code, .. } if code == "invalid_artifact"),
+            "{resp:?}"
+        );
+    }
+
+    /// A shepherd's report is cut to size and stripped of control
+    /// characters before it is stored or emitted; versions that are not
+    /// safe are dropped.
+    #[tokio::test]
+    async fn a_bootstrap_report_is_sanitised() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        let mut events = d.subscribe();
+        let long = "x".repeat(1000);
+        let mut steps: Vec<crate::bootstrap::StepResult> = (0..100)
+            .map(|i| crate::bootstrap::StepResult {
+                step: format!("s{i}"),
+                ..crate::bootstrap::StepResult::done()
+                    .with_missing((0..100).map(|j| format!("p{j}\u{1b}[31m")).collect())
+            })
+            .collect();
+        steps.insert(
+            0,
+            crate::bootstrap::StepResult {
+                step: format!("bad\u{1b}]0;title\u{7}\n{long}"),
+                ..crate::bootstrap::StepResult::failed(
+                    format!("why\u{202E}hid\u{200B}den\u{2066}\u{FEFF}\r\n{long}"),
+                    format!("fix\t{long}"),
+                )
+            },
+        );
+        let mut outcome = failed_outcome();
+        outcome.steps = steps;
+        outcome.herdr_version = Some("0.9.5\u{1b}[2J".into());
+        outcome.pastor_version = Some("1".repeat(65));
+        let resp = d
+            .handle(IpcRequest::BootstrapReport {
+                machine: "a".into(),
+                result: outcome,
+            })
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        let state = d.store.machine_state("a").unwrap().unwrap();
+        let step = state.failed_step.unwrap();
+        assert!(step.chars().count() <= 256, "{}", step.len());
+        assert!(!step.chars().any(char::is_control), "{step:?}");
+        assert!(step.starts_with("bad]0;title"), "{step:?}");
+        let why = state.why.unwrap();
+        assert!(!why.chars().any(char::is_control), "{why:?}");
+        // `why` and `fix` are each capped before they are joined.
+        assert!(why.chars().count() <= 256 * 2 + 16, "{}", why.len());
+        assert_eq!(state.herdr_version, None);
+        assert_eq!(state.pastor_version, None);
+        let ev = events.try_recv().expect("machine.bootstrap_failed emitted");
+        let detail = ev.detail.expect("detail");
+        assert_eq!(detail["step"].as_str(), Some(step.as_str()));
+        assert_eq!(detail["why"].as_str(), Some(why.as_str()));
+        assert!(
+            !why.contains('\u{202E}') && !why.contains('\u{200B}'),
+            "{why:?}"
+        );
+        assert!(why.starts_with("whyhidden"), "{why:?}");
+    }
+
+    /// A report with more steps and missing entries than the caps keeps
+    /// only the first of each.
+    #[tokio::test]
+    async fn a_bootstrap_report_keeps_at_most_64_steps_and_missing() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        let mut events = d.subscribe();
+        let mut outcome = failed_outcome();
+        outcome.ok = true;
+        outcome.steps = (0..100)
+            .map(|i| crate::bootstrap::StepResult {
+                step: format!("s{i}"),
+                ..crate::bootstrap::StepResult::done()
+                    .with_missing((0..100).map(|j| format!("p{i}-{j}\u{7}")).collect())
+            })
+            .collect();
+        let resp = d
+            .handle(IpcRequest::BootstrapReport {
+                machine: "a".into(),
+                result: outcome,
+            })
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        let ev = events.try_recv().expect("machine.bootstrapped emitted");
+        assert_eq!(ev.kind, "machine.bootstrapped");
+        let missing = ev.detail.unwrap()["missing"].as_array().unwrap().clone();
+        assert_eq!(missing.len(), 64, "{missing:?}");
+        assert_eq!(missing[0], "p0-0");
+    }
+
+    #[tokio::test]
+    async fn failed_report_emits_event() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        let mut events = d.subscribe();
+        let resp = d
+            .handle(IpcRequest::BootstrapReport {
+                machine: "a".into(),
+                result: failed_outcome(),
+            })
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        let ev = events.try_recv().expect("machine.bootstrap_failed emitted");
+        assert_eq!(ev.kind, "machine.bootstrap_failed");
+        let detail = ev.detail.expect("detail");
+        assert_eq!(detail["step"], "install_herdr");
+        assert!(
+            detail["why"]
+                .as_str()
+                .unwrap()
+                .contains("rerun with --sudo"),
+            "{detail:?}"
+        );
+        let state = d.store.machine_state("a").unwrap().unwrap();
+        assert_eq!(state.bootstrap, crate::store::BootstrapState::Failed);
+        assert_eq!(state.failed_step.as_deref(), Some("install_herdr"));
+        // A second queued task never lands on the now-failed machine.
+        let resp = d.handle(run_req()).await;
+        let IpcResponse::Task(t) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(t.state, TaskState::Queued);
+    }
+
+    fn bootstrap_req(name: &str) -> IpcRequest {
+        IpcRequest::MachineBootstrap {
+            name: name.into(),
+            sudo: true,
+            service_user: None,
+            host_key: None,
+            machine: None,
+            login: Some("me@a".into()),
+            repin: false,
+        }
+    }
+
+    /// pastor.toml as `serve` found it, plus `head_address`.
+    fn set_head_address(d: &Daemon) {
+        let mut config = test_config();
+        config.head_address = Some("me@head".into());
+        std::fs::write(d.paths.config_file(), toml::to_string(&config).unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_second_push_of_a_machine_is_busy() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        set_head_address(&d);
+        let first = Pushing::take(&d.pushing, "a").expect("free");
+        let resp = d.handle(bootstrap_req("a")).await;
+        let IpcResponse::Error { code, .. } = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(code, "machine_busy");
+        assert!(
+            d.store.machine_state("a").unwrap().is_none(),
+            "nothing recorded"
+        );
+        // Free again once the first push ends.
+        drop(first);
+        assert!(Pushing::take(&d.pushing, "a").is_some());
+    }
+
+    /// A remove while the push runs would leave the push to write its agent
+    /// line for a machine no longer there.
+    #[tokio::test]
+    async fn remove_during_a_push_is_busy() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        let first = Pushing::take(&d.pushing, "a").expect("free");
+        let resp = d
+            .handle(IpcRequest::MachineRemove { name: "a".into() })
+            .await;
+        let IpcResponse::Error { code, .. } = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(code, "machine_busy");
+        assert!(d.fleet.flock().get("a").is_some(), "still in the flock");
+        drop(first);
+        assert!(
+            Pushing::take(&d.pushing, "a").is_some(),
+            "the remove let go"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_needs_head_address() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        let resp = d.handle(bootstrap_req("a")).await;
+        let IpcResponse::Error { code, message } = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(code, "config_error");
+        assert!(message.contains("head_address"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn push_of_an_unknown_machine_is_refused() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        set_head_address(&d);
+        let resp = d.handle(bootstrap_req("nope")).await;
+        let IpcResponse::Error { code, .. } = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(code, "unknown_machine");
+    }
+
+    fn outcome(ok: bool, mode: crate::bootstrap::Mode) -> crate::bootstrap::Outcome {
+        crate::bootstrap::Outcome {
+            ok,
+            mode,
+            isolation: match mode {
+                crate::bootstrap::Mode::Root => crate::bootstrap::Isolation::Users,
+                crate::bootstrap::Mode::User => crate::bootstrap::Isolation::None,
+            },
+            ..failed_outcome()
+        }
+    }
+
+    fn bootstrap_report(machine: &str, result: crate::bootstrap::Outcome) -> IpcRequest {
+        IpcRequest::BootstrapReport {
+            machine: machine.into(),
+            result,
+        }
+    }
+
+    async fn describe(d: &Daemon, name: &str) -> String {
+        let resp = d
+            .handle(IpcRequest::MachineDescribe { name: name.into() })
+            .await;
+        let IpcResponse::MachineDescription(m) = resp else {
+            panic!("{resp:?}")
+        };
+        crate::describe::machine_text(&m)
+    }
+
+    /// A pull machine whose bootstrap is pending (or failed) claims
+    /// nothing, neither the task pinned to it nor loose flock work.
+    #[tokio::test]
+    async fn pending_pull_machine_claims_nothing() {
+        let (d, _tmp) = pull_daemon(3).await;
+        let pinned = queued(&d, "p1", Some("laptop")).await;
+        let _on_a = queued(&d, "u1", None).await;
+        let loose = queued(&d, "u2", None).await;
+        assert_eq!(pinned.state, TaskState::Queued);
+        assert_eq!(loose.state, TaskState::Queued, "a is full");
+        d.store.put_machine_state(&pending_state("laptop")).unwrap();
+        assert!(claim(&d, 5, true).await.is_empty());
+        assert_eq!(state_of(&d, &pinned), TaskState::Queued);
+        assert_eq!(state_of(&d, &loose), TaskState::Queued);
+        // The queue says the same: no "next claim" on a machine that
+        // takes nothing.
+        let entries = d.fleet().queue(None, None).unwrap();
+        let why = &entries
+            .iter()
+            .find(|e| e.task.id == pinned.id)
+            .expect("pinned is queued")
+            .why;
+        assert!(!why.starts_with("next claim"), "{why}");
+    }
+
+    /// Every zero-width and bidi control a report might hide behind goes;
+    /// the characters around those ranges stay.
+    #[test]
+    fn report_text_drops_bidi_and_zero_width() {
+        for c in ('\u{200B}'..='\u{200F}')
+            .chain('\u{202A}'..='\u{202E}')
+            .chain('\u{2060}'..='\u{2064}')
+            .chain('\u{2066}'..='\u{2069}')
+            .chain(['\u{FEFF}'])
+        {
+            assert_eq!(report_text(&format!("a{c}b")), "ab", "U+{:04X}", c as u32);
+        }
+        for c in ['\u{200A}', '\u{2010}', '\u{2065}', '\u{206A}', 'é', '→'] {
+            assert_eq!(
+                report_text(&format!("a{c}b")),
+                format!("a{c}b"),
+                "U+{:04X}",
+                c as u32
+            );
+        }
+    }
+
+    fn with_host_key(key: Option<&str>) -> crate::bootstrap::Outcome {
+        crate::bootstrap::Outcome {
+            host_key: key.map(str::to_string),
+            ..outcome(true, crate::bootstrap::Mode::Root)
+        }
+    }
+
+    /// A host key on record is never replaced by a report: one naming
+    /// another key is `host_key_mismatch` and changes nothing; one naming
+    /// none keeps it.
+    #[tokio::test]
+    async fn a_report_never_replaces_the_host_key_on_record() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        let resp = d
+            .handle(bootstrap_report(
+                "a",
+                with_host_key(Some("ssh-ed25519 AAAAOLD")),
+            ))
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        let before = d.store.machine_state("a").unwrap().unwrap();
+        assert_eq!(before.host_key.as_deref(), Some("ssh-ed25519 AAAAOLD"));
+
+        let resp = d
+            .handle(bootstrap_report(
+                "a",
+                with_host_key(Some("ssh-ed25519 AAAANEW")),
+            ))
+            .await;
+        let IpcResponse::Error { code, message } = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(code, "host_key_mismatch");
+        assert!(
+            message.contains("pastor machine bootstrap a --repin"),
+            "{message}"
+        );
+        assert_eq!(d.store.machine_state("a").unwrap().unwrap(), before);
+
+        // The same key with a comment is the same key.
+        let resp = d
+            .handle(bootstrap_report(
+                "a",
+                with_host_key(Some("ssh-ed25519 AAAAOLD root@a")),
+            ))
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        let resp = d.handle(bootstrap_report("a", with_host_key(None))).await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        assert_eq!(
+            d.store
+                .machine_state("a")
+                .unwrap()
+                .unwrap()
+                .host_key
+                .as_deref(),
+            Some("ssh-ed25519 AAAAOLD")
+        );
+    }
+
+    /// A pull machine's host key is its join's: a report never sets it,
+    /// nor changes it, and `machine bootstrap --repin` drops it for the
+    /// next join, not the next report.
+    #[tokio::test]
+    async fn only_a_join_sets_a_pull_machines_host_key() {
+        let (d, _tmp) = pull_daemon(1).await;
+        set_head_address(&d);
+        let resp = d
+            .handle(bootstrap_report(
+                "laptop",
+                with_host_key(Some("ssh-ed25519 AAAAOLD")),
+            ))
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        assert_eq!(
+            d.store.machine_state("laptop").unwrap().unwrap().host_key,
+            None,
+            "a report sets no key"
+        );
+        // What a join recorded.
+        let mut state = d.store.machine_state("laptop").unwrap().unwrap();
+        state.host_key = Some("ssh-ed25519 AAAAOLD".into());
+        d.store.put_machine_state(&state).unwrap();
+        let resp = d
+            .handle(bootstrap_report(
+                "laptop",
+                with_host_key(Some("ssh-ed25519 AAAAOTHER")),
+            ))
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        assert_eq!(
+            d.store
+                .machine_state("laptop")
+                .unwrap()
+                .unwrap()
+                .host_key
+                .as_deref(),
+            Some("ssh-ed25519 AAAAOLD"),
+            "nor changes it"
+        );
+        let resp = d
+            .handle(IpcRequest::MachineBootstrap {
+                name: "laptop".into(),
+                sudo: false,
+                service_user: None,
+                host_key: None,
+                machine: None,
+                login: None,
+                repin: true,
+            })
+            .await;
+        let IpcResponse::Text(text) = resp else {
+            panic!("{resp:?}")
+        };
+        assert!(text.contains("join create --replace laptop"), "{text}");
+        assert_eq!(
+            d.store.machine_state("laptop").unwrap().unwrap().host_key,
+            None
+        );
+        let resp = d
+            .handle(bootstrap_report(
+                "laptop",
+                with_host_key(Some("ssh-ed25519 AAAANEW")),
+            ))
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        assert_eq!(
+            d.store.machine_state("laptop").unwrap().unwrap().host_key,
+            None,
+            "the next report pins nothing"
+        );
+    }
+
+    /// `--repin` is for a machine already in the flock.
+    #[tokio::test]
+    async fn repin_with_a_new_entry_is_a_usage_error() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        set_head_address(&d);
+        let resp = d
+            .handle(IpcRequest::MachineBootstrap {
+                name: "b".into(),
+                sudo: false,
+                service_user: None,
+                host_key: None,
+                machine: Some(MachineConfig {
+                    ssh: Some("me@b".into()),
+                    command: None,
+                    ..machine("b", 1)
+                }),
+                login: None,
+                repin: true,
+            })
+            .await;
+        assert_eq!(error_code(resp), "usage_error");
+    }
+
+    /// Only `pastor bootstrap` reports a machine's bootstrap: an agent's
+    /// pane may not, even with `agents_change_fleet` on.
+    #[tokio::test]
+    async fn agent_may_not_report_bootstrap() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        d.fleet().set_config(&PastorConfig {
+            agents_change_fleet: true,
+            ..test_config()
+        });
+        let resp = d
+            .handle_from(
+                bootstrap_report("a", outcome(true, crate::bootstrap::Mode::Root)),
+                Some("t-1"),
+            )
+            .await;
+        assert_eq!(error_code(resp), "agent_refused");
+        assert!(d.store.machine_state("a").unwrap().is_none());
+    }
+
+    /// A report that ends a failed bootstrap starts the tasks that waited
+    /// for it there and then, not on the next tick.
+    #[tokio::test]
+    async fn ok_report_after_failure_dispatches_queued() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        d.handle(bootstrap_report("a", failed_outcome())).await;
+        let IpcResponse::Task(t) = d.handle(run_req()).await else {
+            panic!()
+        };
+        assert_eq!(t.state, TaskState::Queued);
+        let resp = d
+            .handle(bootstrap_report(
+                "a",
+                outcome(true, crate::bootstrap::Mode::Root),
+            ))
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while d.store.get_task(t.id).unwrap().unwrap().state == TaskState::Queued {
+            assert!(Instant::now() < deadline, "never dispatched");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn describe_shows_failed_step_and_fix() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        d.handle(bootstrap_report("a", failed_outcome())).await;
+        let text = describe(&d, "a").await;
+        assert!(
+            text.contains("failed at install_herdr: no sudo; fix: rerun with --sudo"),
+            "{text}"
+        );
+    }
+
+    /// ok=false with no failed step names the last step run, and a failed
+    /// step with a fix but no why prints the fix alone.
+    #[tokio::test]
+    async fn describe_failure_without_failed_step_or_why() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        let mut o = failed_outcome();
+        o.steps = vec![crate::bootstrap::StepResult {
+            step: "keys".into(),
+            ..crate::bootstrap::StepResult::done()
+        }];
+        d.handle(bootstrap_report("a", o)).await;
+        let text = describe(&d, "a").await;
+        assert!(!text.contains('?'), "{text}");
+        assert!(text.contains("failed at keys"), "{text}");
+
+        let mut o = failed_outcome();
+        o.steps.clear();
+        d.handle(bootstrap_report("a", o)).await;
+        let text = describe(&d, "a").await;
+        assert!(text.contains("failed at unknown"), "{text}");
+
+        let mut o = failed_outcome();
+        o.steps[0].why = None;
+        d.handle(bootstrap_report("a", o)).await;
+        let text = describe(&d, "a").await;
+        assert!(
+            text.contains("failed at install_herdr: fix: rerun with --sudo"),
+            "{text}"
+        );
+        assert!(!text.contains(": ; "), "{text}");
+    }
+
+    #[tokio::test]
+    async fn describe_shows_service_user_and_isolation() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        let mut o = outcome(true, crate::bootstrap::Mode::Root);
+        o.service_user = Some("pastor".into());
+        d.handle(bootstrap_report("a", o)).await;
+        let text = describe(&d, "a").await;
+        assert!(
+            text.contains("ok, root mode (agents as pastor-agent, shepherd as pastor)"),
+            "{text}"
+        );
+        assert!(!text.contains("isolation:"), "{text}");
+
+        let o = outcome(true, crate::bootstrap::Mode::User);
+        d.handle(bootstrap_report("a", o)).await;
+        let text = describe(&d, "a").await;
+        assert!(text.contains("ok, user mode"), "{text}");
+        assert!(
+            text.contains("none (agents can read the machine key)"),
+            "{text}"
+        );
+    }
+
+    /// Nothing connects out to a pull machine, so `machine list` shows
+    /// the versions its last bootstrap report read.
+    #[tokio::test]
+    async fn pull_machine_list_falls_back_to_stored_versions() {
+        let (d, _tmp) = pull_daemon(1).await;
+        d.store
+            .put_machine_state(&crate::store::MachineState {
+                bootstrap: crate::store::BootstrapState::Ok,
+                herdr_version: Some("0.9.6".into()),
+                pastor_version: Some("1.2.3".into()),
+                ..pending_state("laptop")
+            })
+            .unwrap();
+        let laptop = d
+            .fleet()
+            .statuses()
+            .into_iter()
+            .find(|s| s.name == "laptop")
+            .unwrap();
+        assert_eq!(laptop.herdr_version.as_deref(), Some("0.9.6"));
+        assert_eq!(laptop.pastor_version.as_deref(), Some("1.2.3"));
     }
 
     #[tokio::test]
@@ -9957,7 +11981,7 @@ mod tests {
     /// `Text`, and its fleet matches the file afterwards.
     #[tokio::test]
     async fn fleet_edits_go_through_the_head() {
-        let (d, tmp) = daemon_with_flock(
+        let (mut d, tmp) = daemon_with_flock(
             home_and_work(),
             &[
                 ("h", 2, FakeHerdr::new()),
@@ -9966,6 +11990,8 @@ mod tests {
             ],
         )
         .await;
+        // A removal below edits authorized_keys; never the real one.
+        d.authorized_keys = tmp.path().join("authorized_keys");
         let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
         let on_disk = || Flock::load(&paths.flock_file()).unwrap();
         let text = |resp: IpcResponse| match resp {
@@ -10124,6 +12150,333 @@ mod tests {
             assert_eq!(error_code(d.handle(req).await), code);
         }
         assert_eq!(std::fs::read_to_string(paths.flock_file()).unwrap(), before);
+    }
+
+    /// One scripted answer: `(success, stdout, stderr)`.
+    type Answer = (bool, &'static str, &'static str);
+
+    /// What a `RecordingRunner` answers a program and its args with.
+    type AnswerFn = Box<dyn Fn(&str, &[&str]) -> Option<Answer> + Send + Sync>;
+
+    /// Scripts the answer to every `Runner::run` call, so a test can check
+    /// what pastor asked for without running `ssh-keygen` or `ssh` for real.
+    /// `answer` sees the program and its args; a command it has no answer
+    /// for succeeds with no output.
+    struct RecordingRunner {
+        calls: std::sync::Mutex<Vec<(String, Vec<String>)>>,
+        answer: AnswerFn,
+    }
+
+    impl RecordingRunner {
+        fn new() -> Self {
+            Self::answering(|_, _| None)
+        }
+
+        fn answering(
+            answer: impl Fn(&str, &[&str]) -> Option<Answer> + Send + Sync + 'static,
+        ) -> Self {
+            RecordingRunner {
+                calls: std::sync::Mutex::new(Vec::new()),
+                answer: Box::new(answer),
+            }
+        }
+
+        fn calls(&self) -> Vec<(String, Vec<String>)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::setup::Runner for RecordingRunner {
+        fn run(&self, program: &str, args: &[&str]) -> std::io::Result<crate::setup::CmdOutput> {
+            self.calls.lock().unwrap().push((
+                program.to_string(),
+                args.iter().map(|a| a.to_string()).collect(),
+            ));
+            let (success, stdout, stderr) = (self.answer)(program, args).unwrap_or((true, "", ""));
+            Ok(crate::setup::CmdOutput {
+                success,
+                stdout: stdout.into(),
+                stderr: stderr.into(),
+            })
+        }
+    }
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
+    /// A daemon whose flock has `pi-9`, reached as `pastor-agent@pi-9`, with
+    /// its machine and agent lines in a test `authorized_keys` (beside a
+    /// foreign line), a known_hosts file and a bootstrap row.
+    async fn daemon_with_removable_machine(
+        runner: Arc<RecordingRunner>,
+    ) -> (Daemon, tempfile::TempDir) {
+        daemon_with_removable(
+            runner,
+            MachineConfig {
+                ssh: Some("pastor-agent@pi-9".into()),
+                command: None,
+                ..machine("pi-9", 1)
+            },
+        )
+        .await
+    }
+
+    /// `daemon_with_removable_machine` with `pi-9` as `entry` says.
+    async fn daemon_with_removable(
+        runner: Arc<RecordingRunner>,
+        entry: MachineConfig,
+    ) -> (Daemon, tempfile::TempDir) {
+        let flock = Flock {
+            flocks: vec![],
+            machines: vec![entry],
+        };
+        let (mut d, tmp) = daemon_with_flock(flock, &[("pi-9", 1, FakeHerdr::new())]).await;
+
+        // Never the real `~/.ssh/authorized_keys`.
+        let authorized_keys = tmp.path().join("authorized_keys");
+        std::fs::write(&authorized_keys, "ssh-ed25519 AAAA me@laptop\n").unwrap();
+        d.authorized_keys = authorized_keys.clone();
+        d.runner = runner;
+
+        crate::authkeys::upsert(
+            &authorized_keys,
+            &crate::authkeys::Marker::Machine("pi-9".into()),
+            "restrict,command=\"/bin/pastor bridge\" ssh-ed25519 KEY1 pastor:machine:pi-9",
+        )
+        .unwrap();
+        crate::authkeys::upsert(
+            &authorized_keys,
+            &crate::authkeys::Marker::Agent("pi-9".into()),
+            "restrict,command=\"/bin/pastor bridge --agent\" ssh-ed25519 KEY2 pastor:agent:pi-9",
+        )
+        .unwrap();
+        std::fs::create_dir_all(d.paths.known_hosts_file().parent().unwrap()).unwrap();
+        std::fs::write(d.paths.known_hosts_file(), "pi-9.lan ssh-ed25519 AAAA\n").unwrap();
+
+        d.store
+            .put_machine_state(&crate::store::MachineState {
+                machine: "pi-9".into(),
+                bootstrap: crate::store::BootstrapState::Ok,
+                mode: Some("root".into()),
+                isolation: Some("none".into()),
+                failed_step: None,
+                why: None,
+                host_key: Some("ssh-ed25519 AAAA".into()),
+                herdr_version: Some("0.9.5".into()),
+                pastor_version: None,
+                service_user: None,
+                updated_at: "2026-10-16T10:00:00+00:00".into(),
+            })
+            .unwrap();
+        (d, tmp)
+    }
+
+    /// What `ssh -G pi-9` prints for a host on port 2222 under another name.
+    fn resolves_to_port_2222(program: &str, args: &[&str]) -> Option<Answer> {
+        (program == "ssh" && args.first() == Some(&"-G")).then_some((
+            true,
+            "user pastor-agent\nhostname pi-9.lan\nport 2222\n",
+            "",
+        ))
+    }
+
+    /// `MachineRemove` also drops the machine's (and its agent's)
+    /// `authorized_keys` lines, forgets its host key under the name and port
+    /// `ssh -G` resolves it to, ends its ssh master and clears its bootstrap
+    /// row - all only once the flock edit itself lands.
+    #[tokio::test]
+    async fn remove_cleans_keys_and_state() {
+        let runner = Arc::new(RecordingRunner::answering(resolves_to_port_2222));
+        let (d, _tmp) = daemon_with_removable_machine(runner.clone()).await;
+
+        let resp = d
+            .handle(IpcRequest::MachineRemove {
+                name: "pi-9".into(),
+            })
+            .await;
+        let IpcResponse::Text(text) = resp else {
+            panic!("{resp:?}")
+        };
+        assert!(!text.contains("could not"), "{text}");
+
+        // The foreign line survives; both marked lines are gone.
+        assert_eq!(
+            std::fs::read_to_string(&d.authorized_keys).unwrap(),
+            "ssh-ed25519 AAAA me@laptop\n"
+        );
+
+        let calls = runner.calls();
+        let known_hosts = d.paths.known_hosts_file().to_string_lossy().into_owned();
+        assert!(
+            calls.contains(&("ssh".into(), strings(&["-G", "--", "pastor-agent@pi-9"]))),
+            "{calls:?}"
+        );
+        for host in ["pi-9.lan", "[pi-9.lan]:2222"] {
+            assert!(
+                calls.contains(&(
+                    "ssh-keygen".into(),
+                    strings(&["-f", &known_hosts, "-R", host])
+                )),
+                "no ssh-keygen -R {host} in {calls:?}"
+            );
+        }
+        let control_path = crate::ssh::fitting_control_path(&d.paths, "pi-9")
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            calls.contains(&(
+                "ssh".into(),
+                strings(&["-S", &control_path, "-O", "exit", "--", "pastor-agent@pi-9"])
+            )),
+            "{calls:?}"
+        );
+
+        assert!(d.store.machine_state("pi-9").unwrap().is_none());
+    }
+
+    /// A pull machine goes the same way as a pushed one: its lines and its
+    /// bootstrap row. The head never reached it over ssh, so there is no
+    /// host key or master to forget, and nothing is run.
+    #[tokio::test]
+    async fn remove_of_a_pull_machine_drops_its_state_and_lines() {
+        let runner = Arc::new(RecordingRunner::answering(resolves_to_port_2222));
+        let (d, _tmp) = daemon_with_removable(
+            runner.clone(),
+            MachineConfig {
+                pull: true,
+                ssh: None,
+                command: None,
+                ..machine("pi-9", 1)
+            },
+        )
+        .await;
+        let resp = d
+            .handle(IpcRequest::MachineRemove {
+                name: "pi-9".into(),
+            })
+            .await;
+        let IpcResponse::Text(text) = resp else {
+            panic!("{resp:?}")
+        };
+        assert!(!text.contains("could not"), "{text}");
+        assert!(d.store.machine_state("pi-9").unwrap().is_none());
+        assert_eq!(
+            std::fs::read_to_string(&d.authorized_keys).unwrap(),
+            "ssh-ed25519 AAAA me@laptop\n"
+        );
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+    }
+
+    /// A host on port 22 is keyed by its bare name only, and ssh-keygen's
+    /// "not found" is no failure.
+    #[tokio::test]
+    async fn remove_on_port_22_forgets_the_bare_host() {
+        let runner = Arc::new(RecordingRunner::answering(|program, args| {
+            match (program, args.first()) {
+                ("ssh", Some(&"-G")) => Some((true, "hostname 10.0.0.9\nport 22\n", "")),
+                ("ssh-keygen", _) => {
+                    Some((true, "", "Host 10.0.0.9 not found in /x/known_hosts\n"))
+                }
+                _ => None,
+            }
+        }));
+        let (d, _tmp) = daemon_with_removable_machine(runner.clone()).await;
+        let resp = d
+            .handle(IpcRequest::MachineRemove {
+                name: "pi-9".into(),
+            })
+            .await;
+        let IpcResponse::Text(text) = resp else {
+            panic!("{resp:?}")
+        };
+        assert!(!text.contains("could not"), "{text}");
+        let keygen: Vec<_> = runner
+            .calls()
+            .into_iter()
+            .filter(|(p, _)| p == "ssh-keygen")
+            .collect();
+        assert_eq!(keygen.len(), 1, "{keygen:?}");
+        assert_eq!(keygen[0].1.last().unwrap(), "10.0.0.9");
+    }
+
+    /// Every cleanup step that fails is named in the reply with what to do
+    /// about it; none is only logged. The machine is still out of the flock.
+    #[tokio::test]
+    async fn remove_reports_each_failed_cleanup() {
+        let runner = Arc::new(RecordingRunner::answering(|program, args| {
+            match (program, args.first()) {
+                ("ssh", Some(&"-G")) => Some((true, "hostname pi-9.lan\nport 2222\n", "")),
+                ("ssh-keygen", _) => Some((false, "", "mkstemp: Permission denied\n")),
+                ("ssh", Some(&"-S")) => {
+                    Some((false, "", "Control socket connect: Connection refused\n"))
+                }
+                _ => None,
+            }
+        }));
+        let (mut d, tmp) = daemon_with_removable_machine(runner).await;
+        // A path whose parent is a file: no edit of it can work.
+        let not_a_dir = tmp.path().join("not-a-dir");
+        std::fs::write(&not_a_dir, "").unwrap();
+        d.authorized_keys = not_a_dir.join("authorized_keys");
+        d.store.execute_raw("DROP TABLE machine_state");
+
+        let resp = d
+            .handle(IpcRequest::MachineRemove {
+                name: "pi-9".into(),
+            })
+            .await;
+        let IpcResponse::Text(text) = resp else {
+            panic!("{resp:?}")
+        };
+        assert!(text.starts_with("removed pi-9"), "{text}");
+        assert!(
+            text.contains("could not drop its authorized_keys lines")
+                && text.contains("pastor:machine:pi-9")
+                && text.contains("pastor:agent:pi-9")
+                && text.contains("still logs in"),
+            "{text}"
+        );
+        assert!(
+            text.contains("could not forget its host key")
+                && text.contains("Permission denied")
+                && text.contains("ssh-keygen -f"),
+            "{text}"
+        );
+        assert!(
+            text.contains("could not end its ssh master") && text.contains("refused"),
+            "{text}"
+        );
+        assert!(
+            text.contains("could not drop its bootstrap record"),
+            "{text}"
+        );
+        let on_disk = Flock::load(&d.paths.flock_file()).unwrap();
+        assert!(on_disk.machines.iter().all(|m| m.name != "pi-9"));
+    }
+
+    /// A removal the flock edit refuses (an unknown machine) leaves every
+    /// machine's keys, host keys and bootstrap rows alone, and runs nothing.
+    #[tokio::test]
+    async fn remove_of_unknown_machine_touches_nothing() {
+        let runner = Arc::new(RecordingRunner::new());
+        let (d, _tmp) = daemon_with_removable_machine(runner.clone()).await;
+        let keys_before = std::fs::read_to_string(&d.authorized_keys).unwrap();
+
+        let resp = d
+            .handle(IpcRequest::MachineRemove {
+                name: "nope".into(),
+            })
+            .await;
+        assert!(matches!(resp, IpcResponse::Error { .. }), "{resp:?}");
+
+        assert_eq!(
+            std::fs::read_to_string(&d.authorized_keys).unwrap(),
+            keys_before
+        );
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+        assert!(d.store.machine_state("pi-9").unwrap().is_some());
     }
 
     /// `flock add --default` on a file with only the implicit flock keeps its
@@ -13740,5 +16093,456 @@ mod tests {
             matches!(err, PriorityError::InFlight(id) if id == t.id),
             "{err:?}"
         );
+    }
+
+    /// authorized_keys where the edits `fail` picks fail, as a full disk or
+    /// a lock error would.
+    struct FaultyKeys {
+        file: std::path::PathBuf,
+        fail: fn(&crate::authkeys::Marker) -> bool,
+    }
+
+    impl crate::join::Keys for FaultyKeys {
+        fn upsert(&self, m: &crate::authkeys::Marker, line: &str) -> anyhow::Result<()> {
+            if (self.fail)(m) {
+                anyhow::bail!("write {}: No space left on device", self.file.display());
+            }
+            crate::authkeys::upsert(&self.file, m, line)
+        }
+        fn remove(&self, m: &crate::authkeys::Marker) -> anyhow::Result<bool> {
+            if (self.fail)(m) {
+                anyhow::bail!("write {}: No space left on device", self.file.display());
+            }
+            crate::authkeys::remove(&self.file, m)
+        }
+        fn holds(&self, blob: &str, except: &[crate::authkeys::Marker]) -> anyhow::Result<bool> {
+            crate::authkeys::holds_key(&self.file, blob, except)
+        }
+    }
+
+    /// A daemon, an authorized_keys with the user's key and token `id`'s
+    /// line, and the token's row.
+    async fn join_head(id: &str) -> (Daemon, tempfile::TempDir, std::path::PathBuf) {
+        use crate::authkeys::Marker;
+        let (d, tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        let keys = tmp.path().join("authorized_keys");
+        std::fs::write(&keys, "ssh-ed25519 AAAA me@laptop\n").unwrap();
+        crate::authkeys::upsert(
+            &keys,
+            &Marker::Join(id.into()),
+            &format!(
+                "restrict,command=\"/usr/local/bin/pastor bridge --join {id}\" ssh-ed25519 AAAAJOIN pastor:join:{id}"
+            ),
+        )
+        .unwrap();
+        d.store()
+            .put_join_token(&crate::store::JoinToken {
+                id: id.into(),
+                flock: None,
+                tags: vec![],
+                replace: None,
+                expires_at: "2999-01-01T00:00:00.000000+00:00".into(),
+                used_at: None,
+            })
+            .unwrap();
+        (d, tmp, keys)
+    }
+
+    async fn join_through(d: &Daemon, keys: FaultyKeys, id: &str) -> anyhow::Result<()> {
+        d.join_with(
+            std::path::Path::new("/usr/local/bin/pastor"),
+            &keys,
+            id,
+            "gpu-3",
+            "ssh-ed25519 AAAAMACHINE m",
+            "ssh-ed25519 AAAAAGENT a",
+            "ssh-ed25519 AAAAHOST",
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_join_that_fails_after_the_token_is_spent_still_drops_its_line() {
+        use crate::authkeys::Marker;
+        let id = "00112233445566aa";
+        let (d, _tmp, keys) = join_head(id).await;
+        let faulty = FaultyKeys {
+            file: keys.clone(),
+            fail: |m| matches!(m, Marker::Machine(_)),
+        };
+        let err = join_through(&d, faulty, id).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("No space left"), "{msg}");
+        // Past the save nothing is undone, so the message says where that
+        // leaves things and what to run.
+        assert!(msg.contains("gpu-3 is in flock.toml"), "{msg}");
+        assert!(msg.contains(&format!("join token {id} is spent")), "{msg}");
+        assert!(msg.contains("pastor join create --replace gpu-3"), "{msg}");
+        let text = std::fs::read_to_string(&keys).unwrap();
+        assert!(!text.contains("pastor:join:"), "{text}");
+        assert!(text.contains("me@laptop"), "{text}");
+        let row = d.store().join_token(id).unwrap().unwrap();
+        assert!(row.used_at.is_some(), "the token is spent");
+    }
+
+    /// `d` on a socket in `dir`, one request per connection, as `serve`
+    /// answers: what a bridge on the head talks to.
+    fn serve_for_bridge(d: Arc<Daemon>, dir: &std::path::Path) -> std::path::PathBuf {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let socket = dir.join("bridge-head.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let d = d.clone();
+                tokio::spawn(async move {
+                    let (r, mut w) = stream.into_split();
+                    let mut line = String::new();
+                    tokio::io::BufReader::new(r)
+                        .read_line(&mut line)
+                        .await
+                        .unwrap();
+                    let (req, _) = crate::ipc::parse_request_line(line.trim()).unwrap();
+                    let mut out = serde_json::to_vec(&d.handle(req).await).unwrap();
+                    out.push(b'\n');
+                    let _ = w.write_all(&out).await;
+                });
+            }
+        });
+        socket
+    }
+
+    /// The replies `bridge --shepherd --machine laptop [--gen gen]` writes
+    /// for two pings.
+    async fn shepherd_bridge(
+        socket: &std::path::Path,
+        generation: Option<i64>,
+    ) -> Vec<IpcResponse> {
+        let ping = crate::ipc::request_line(&IpcRequest::Ping, None).unwrap();
+        let input = format!("{ping}{ping}");
+        let mut out = Vec::new();
+        crate::bridge::run_shepherd(socket, "laptop", generation, input.as_bytes(), &mut out)
+            .await
+            .unwrap();
+        out.split(|b| *b == b'\n')
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_slice(l).unwrap())
+            .collect()
+    }
+
+    /// Through the shepherd bridge itself: a pull machine set up by hand
+    /// (no record, a gen-less line) works; once joined, a replay of an
+    /// older `--gen` is refused, and so is a gen-less line; once removed,
+    /// every line is, and the bridge answers nothing after the refusal.
+    #[tokio::test]
+    async fn the_shepherd_bridge_refuses_stale_and_removed_lines() {
+        let (d, tmp) = pull_daemon(1).await;
+        let d = Arc::new(d);
+        let socket = serve_for_bridge(d.clone(), tmp.path());
+        let revoked = |replies: &[IpcResponse]| {
+            replies.len() == 1
+                && matches!(&replies[0], IpcResponse::Error { code, .. } if code == "machine_revoked")
+        };
+        let replies = shepherd_bridge(&socket, None).await;
+        assert_eq!(replies.len(), 2, "{replies:?}");
+        assert!(
+            replies
+                .iter()
+                .all(|r| matches!(r, IpcResponse::Pong { .. })),
+            "{replies:?}"
+        );
+
+        // A join enrolled it at 2: generation 1's line, replayed, is stale.
+        d.store()
+            .put_machine_state(&crate::store::MachineState {
+                machine: "laptop".into(),
+                bootstrap: crate::store::BootstrapState::Ok,
+                mode: None,
+                isolation: None,
+                failed_step: None,
+                why: None,
+                host_key: None,
+                herdr_version: None,
+                pastor_version: None,
+                service_user: None,
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+        d.store().set_machine_generation("laptop", 2).unwrap();
+        assert!(matches!(
+            shepherd_bridge(&socket, Some(2)).await[..],
+            [IpcResponse::Pong { .. }, IpcResponse::Pong { .. }]
+        ));
+        for generation in [Some(1), None] {
+            let replies = shepherd_bridge(&socket, generation).await;
+            assert!(revoked(&replies), "{generation:?}: {replies:?}");
+        }
+
+        let resp = d
+            .handle(IpcRequest::MachineRemove {
+                name: "laptop".into(),
+            })
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        for generation in [Some(2), None] {
+            let replies = shepherd_bridge(&socket, generation).await;
+            assert!(revoked(&replies), "{generation:?}: {replies:?}");
+        }
+    }
+
+    /// A join records the service user its request names with the pending
+    /// state, and enrolls the machine: generation 1, its shepherd line
+    /// carrying it, and `ShepherdCheck` answering for that one only.
+    #[tokio::test]
+    async fn a_join_records_its_service_user_and_enrolls_the_machine() {
+        let id = "00112233445566ee";
+        let (d, _tmp, keys) = join_head(id).await;
+        d.join_with(
+            std::path::Path::new("/usr/local/bin/pastor"),
+            &keys,
+            id,
+            "gpu-3",
+            "ssh-ed25519 AAAAMACHINE m",
+            "ssh-ed25519 AAAAAGENT a",
+            "ssh-ed25519 AAAAHOST",
+            Some("pastor"),
+        )
+        .await
+        .unwrap();
+        let state = d.store().machine_state("gpu-3").unwrap().unwrap();
+        assert_eq!(state.service_user.as_deref(), Some("pastor"));
+        assert_eq!(d.store().machine_generation("gpu-3").unwrap(), Some(1));
+        let text = std::fs::read_to_string(&keys).unwrap();
+        assert!(
+            text.contains("bridge --shepherd --machine gpu-3 --gen 1\""),
+            "{text}"
+        );
+        let check = |generation| d.shepherd_check("gpu-3", generation);
+        assert!(matches!(check(Some(1)), IpcResponse::Text(_)));
+        for stale in [Some(0), Some(2), None] {
+            assert!(
+                matches!(check(stale), IpcResponse::Error { ref code, .. } if code == "machine_revoked"),
+                "{stale:?}"
+            );
+        }
+        // A machine not in the flock (never added, or removed) is refused
+        // whatever its line says.
+        for generation in [Some(1), None] {
+            assert!(matches!(
+                d.shepherd_check("pi-9", generation),
+                IpcResponse::Error { ref code, .. } if code == "machine_revoked"
+            ));
+        }
+        // A user name that is not one is refused before the token is spent.
+        let id = "00112233445566ef";
+        d.store()
+            .put_join_token(&crate::store::JoinToken {
+                id: id.into(),
+                flock: None,
+                tags: vec![],
+                replace: None,
+                expires_at: "2999-01-01T00:00:00.000000+00:00".into(),
+                used_at: None,
+            })
+            .unwrap();
+        let err = d
+            .join_with(
+                std::path::Path::new("/usr/local/bin/pastor"),
+                &keys,
+                id,
+                "gpu-4",
+                "ssh-ed25519 AAAAMACHINE4 m",
+                "ssh-ed25519 AAAAAGENT4 a",
+                "ssh-ed25519 AAAAHOST",
+                Some("a;b"),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("not a user name"), "{err:#}");
+        assert!(d.store().join_token(id).unwrap().unwrap().used_at.is_none());
+    }
+
+    /// The agent line failing after the save reads the same way.
+    #[tokio::test]
+    async fn a_join_whose_agent_line_fails_after_the_save_says_what_to_run() {
+        use crate::authkeys::Marker;
+        let id = "00112233445566cc";
+        let (d, _tmp, keys) = join_head(id).await;
+        let faulty = FaultyKeys {
+            file: keys.clone(),
+            fail: |m| matches!(m, Marker::Agent(_)),
+        };
+        let err = join_through(&d, faulty, id).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("its agent line"), "{msg}");
+        assert!(msg.contains("pastor join create --replace gpu-3"), "{msg}");
+        assert_eq!(
+            err.downcast_ref::<crate::cli::CliError>()
+                .map(|e| e.code.as_str()),
+            Some("join_failed"),
+            "{msg}"
+        );
+    }
+
+    /// A token made with `--replace` for a machine the head reached over
+    /// ssh forgets that machine's host key and ends its ssh master, as a
+    /// removal does, so the old host is never trusted through them again.
+    #[tokio::test]
+    async fn a_replacing_join_forgets_the_old_host_key_and_master() {
+        let runner = Arc::new(RecordingRunner::answering(resolves_to_port_2222));
+        let (d, _tmp) = daemon_with_removable_machine(runner.clone()).await;
+        let id = "00112233445566dd";
+        d.store()
+            .put_join_token(&crate::store::JoinToken {
+                id: id.into(),
+                flock: None,
+                tags: vec![],
+                replace: Some("pi-9".into()),
+                expires_at: "2999-01-01T00:00:00.000000+00:00".into(),
+                used_at: None,
+            })
+            .unwrap();
+        d.join_with(
+            std::path::Path::new("/usr/local/bin/pastor"),
+            &d.authorized_keys.clone(),
+            id,
+            "pi-9",
+            "ssh-ed25519 AAAAMACHINE m",
+            "ssh-ed25519 AAAAAGENT a",
+            "ssh-ed25519 AAAAHOST",
+            None,
+        )
+        .await
+        .unwrap();
+        let calls = runner.calls();
+        let known_hosts = d.paths.known_hosts_file().to_string_lossy().into_owned();
+        assert!(
+            calls.contains(&(
+                "ssh-keygen".into(),
+                strings(&["-f", &known_hosts, "-R", "pi-9.lan"])
+            )),
+            "{calls:?}"
+        );
+        let control_path = crate::ssh::fitting_control_path(&d.paths, "pi-9")
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            calls.contains(&(
+                "ssh".into(),
+                strings(&["-S", &control_path, "-O", "exit", "--", "pastor-agent@pi-9"])
+            )),
+            "{calls:?}"
+        );
+        let flock = std::fs::read_to_string(d.paths.flock_file()).unwrap();
+        assert!(flock.contains("pull = true"), "{flock}");
+    }
+
+    /// No generation is given twice for a name: a `--replace` join gets a
+    /// new one, and so does a join after `machine remove`, which drops the
+    /// record. A bridge whose connection authenticated under an older line
+    /// (sshd never rereads authorized_keys for it) is refused from then on.
+    #[tokio::test]
+    async fn a_generation_is_never_reused_for_a_name() {
+        let runner = Arc::new(RecordingRunner::answering(resolves_to_port_2222));
+        let (d, _tmp) = daemon_with_removable_machine(runner).await;
+        let join = |id: &'static str, replace: Option<&str>| {
+            d.store()
+                .put_join_token(&crate::store::JoinToken {
+                    id: id.into(),
+                    flock: None,
+                    tags: vec![],
+                    replace: replace.map(str::to_string),
+                    expires_at: "2999-01-01T00:00:00.000000+00:00".into(),
+                    used_at: None,
+                })
+                .unwrap();
+            let keys = d.authorized_keys.clone();
+            let d = &d;
+            async move {
+                d.join_with(
+                    std::path::Path::new("/usr/local/bin/pastor"),
+                    &keys,
+                    id,
+                    "pi-9",
+                    &format!("ssh-ed25519 AAAAMACHINE{id} m"),
+                    &format!("ssh-ed25519 AAAAAGENT{id} a"),
+                    "ssh-ed25519 AAAAHOST",
+                    None,
+                )
+                .await
+                .unwrap();
+                d.store().machine_generation("pi-9").unwrap().unwrap()
+            }
+        };
+        let revoked = |generation: i64| {
+            matches!(
+                d.shepherd_check("pi-9", Some(generation)),
+                IpcResponse::Error { ref code, .. } if code == "machine_revoked"
+            )
+        };
+        let first = join("00112233445566a1", Some("pi-9")).await;
+        let replaced = join("00112233445566a2", Some("pi-9")).await;
+        assert!(replaced > first, "{replaced} after {first}");
+        assert!(revoked(first));
+        let removed = d
+            .handle(IpcRequest::MachineRemove {
+                name: "pi-9".into(),
+            })
+            .await;
+        assert!(!matches!(removed, IpcResponse::Error { .. }), "{removed:?}");
+        assert_eq!(d.store().machine_generation("pi-9").unwrap(), None);
+        assert!(revoked(first) && revoked(replaced), "no record: removed");
+        let again = join("00112233445566a3", None).await;
+        assert!(again > replaced, "{again} after {replaced}");
+        let text = std::fs::read_to_string(&d.authorized_keys).unwrap();
+        assert!(
+            text.contains(&format!("--machine pi-9 --gen {again}\"")),
+            "{text}"
+        );
+        for old in [first, replaced] {
+            assert!(revoked(old), "generation {old} speaks for pi-9 again");
+        }
+        assert!(matches!(
+            d.shepherd_check("pi-9", Some(again)),
+            IpcResponse::Text(_)
+        ));
+    }
+
+    /// The herdr a joined machine fetches is the head's choice: `[provision]
+    /// herdr`, else the one its machines run, else pastor's default.
+    #[tokio::test]
+    async fn a_join_names_the_herdr_to_fetch() {
+        let (d, _tmp) = daemon(&[]).await;
+        let mut config = test_config();
+        assert_eq!(
+            d.join_herdr_version(&config),
+            crate::artifacts::DEFAULT_HERDR_VERSION,
+            "no machine reports one"
+        );
+        config.provision.herdr = Some("1.2.3".into());
+        assert_eq!(d.join_herdr_version(&config), "1.2.3");
+    }
+
+    #[tokio::test]
+    async fn a_join_whose_token_line_cannot_go_fails_and_adds_nothing() {
+        use crate::authkeys::Marker;
+        let id = "00112233445566bb";
+        let (d, tmp, keys) = join_head(id).await;
+        let faulty = FaultyKeys {
+            file: keys.clone(),
+            fail: |m| matches!(m, Marker::Join(_)),
+        };
+        let err = join_through(&d, faulty, id).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("authorized_keys"), "{msg}");
+        let text = std::fs::read_to_string(&keys).unwrap();
+        assert!(text.contains(&format!("pastor:join:{id}")), "{text}");
+        assert!(!text.contains("pastor:machine:gpu-3"), "{text}");
+        let flock = std::fs::read_to_string(tmp.path().join("c").join("flock.toml")).unwrap();
+        assert!(!flock.contains("gpu-3"), "{flock}");
+        // Its line is still there, so it is still good for a retry.
+        let row = d.store().join_token(id).unwrap().unwrap();
+        assert_eq!(row.used_at, None);
     }
 }
