@@ -416,6 +416,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand setup; and __fish_seen_sub
 complete -c pastor -n "__fish_pastor_using_subcommand setup; and __fish_seen_subcommand_from systemd" -l stop -d 'Stop the unit now'
 complete -c pastor -n "__fish_pastor_using_subcommand setup; and __fish_seen_subcommand_from systemd" -s y -l yes -d 'Skip the confirmation prompt; needed when stdin is not a terminal (a script, a task, `ssh host pastor setup systemd`)'
 complete -c pastor -n "__fish_pastor_using_subcommand setup; and __fish_seen_subcommand_from systemd" -l require-linger -d 'Fail, before writing anything, when lingering is off: bootstrap must not report a machine whose herdr dies at logout'
+complete -c pastor -n "__fish_pastor_using_subcommand setup; and __fish_seen_subcommand_from systemd" -l restart -d 'Restart the unit after the action, so a running one picks up a new config: a join that replaces this machine\'s line needs its shepherd to reconnect with the new one'
 complete -c pastor -n "__fish_pastor_using_subcommand setup; and __fish_seen_subcommand_from systemd" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pastor -n "__fish_pastor_using_subcommand setup; and __fish_seen_subcommand_from launchd" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand setup; and __fish_seen_subcommand_from launchd" -l herdr -d 'Install pastor.herdr (the herdr server) instead, for a flock machine'

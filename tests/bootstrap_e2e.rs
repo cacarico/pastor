@@ -1278,6 +1278,40 @@ fn pull_join_debian() {
         "/home/pastor/.local/state/pastor/machine_key",
         "pastor-agent",
     );
+
+    // A task actually runs there: the shepherd claims it and reaches
+    // pastor-agent's herdr through its `[shepherd] command`, `sudo -n -u
+    // pastor-agent herdr ...`, which a unit with NoNewPrivileges would
+    // stop (sudo's setuid bit ignored), leaving the task without a pane.
+    let t: serde_json::Value = serde_json::from_str(&ok(run(&mut head.cmd(&[
+        "task",
+        "run",
+        "say hello",
+        "--machine",
+        "pull-debian-1",
+        "--repo",
+        "/tmp",
+        "--json",
+    ]))))
+    .unwrap();
+    let id = format!("t-{}", t["id"]);
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let v: serde_json::Value = serde_json::from_str(&ok(run(
+            &mut head.cmd(&["task", "describe", &id, "--json"])
+        )))
+        .unwrap();
+        assert_eq!(v["machine"], "pull-debian-1", "{v}");
+        if v["pane_id"].is_string() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{id} never started on pull-debian-1: {v}\n--- serve ---\n{}",
+            head.log("serve.log")
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
 }
 
 /// The same token a second time, with the pastor the first join already

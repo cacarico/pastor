@@ -57,8 +57,12 @@
   the herdr download at the size the head answered and 512 MiB.
 - `pastor machine bootstrap NAME --repin`: drops the host key pinned for
   the machine and pins the one it offers now, the only way a changed host
-  key is trusted again (for a pull machine it drops the key on record, and
-  its next report pins the one it sends). Gated at IPC protocol 32.
+  key is trusted again; the new key goes to `known_hosts` and the
+  bootstrap record together, so a step failing after the pin leaves them
+  agreeing. For a pull machine it drops the key on record, and the next
+  join with a `--replace` token sets the one it brings: only a join sets a
+  pull machine's host key, never its bootstrap report. Gated at IPC
+  protocol 32.
 
 ### Changed
 
@@ -106,6 +110,24 @@
   `usage_error`.
 - A head whose sshd is not on port 22 sets `head_address` as
   `ssh://user@host:port`; a join token then pins its key as `[host]:port`.
+- `pastor setup systemd` writes `pastor.service` without
+  `NoNewPrivileges` when pastor.toml's `[shepherd] command` starts with
+  `sudo`, as a root-mode pull machine's does: sudo's setuid bit is ignored
+  under it, so that shepherd could never reach herdr. Every other unit
+  keeps it.
+- A join restarts the shepherd's unit, and a shepherd answered
+  `machine_revoked` ends its ssh master to the head and backs off before
+  reconnecting, exiting after five in a row for systemd to restart it, so
+  a rejoined machine's shepherd takes its new line instead of staying
+  revoked on the old master's session.
+- `pastor machine bootstrap NAME` keeps the mode on record: a root-mode
+  machine reruns in root mode without `--sudo`, and `--sudo` on a
+  user-mode machine is a `usage_error` (remove and add it to change mode).
+- `bridge --shepherd` refuses every line, `--gen` or not, for a machine
+  no longer in flock.toml, and a gen-less line passes only for a pull
+  machine no join has enrolled.
+- A refused join token's message asks whether the head's sshd is older
+  than OpenSSH 8.2, the head's minimum for joins (`expiry-time`).
 
 ### Fixed
 
@@ -115,6 +137,13 @@
 - Two pushes, or a push and a `machine remove`, no longer race on pastor's
   `known_hosts`: they take turns on a lock.
 - A failed rerun keeps the host key on record until a new pin succeeds.
+- A root-mode `pastor join` checks its sudoers rule as `pastor-agent`
+  (`sudo -n -l -U <svc> -u pastor-agent …`); checked as root it always
+  failed, so every root-mode pull join stopped at `shepherd_herdr`.
+- `pastor leave` from a non-root login that bootstrapped with `--sudo`
+  removes the service user's `/etc/sudoers.d/pastor-<user>` through
+  `sudo -n`, and reports `leave_incomplete` naming the file when sudo
+  refuses, where before it left the file and reported success.
 - A root-mode push moves the entry to `pastor-agent@<host>` last, and puts
   it back, with the agent line taken away, if the report after it fails.
 - `machine add --bootstrap` of a machine that exists names the rerun to
@@ -144,8 +173,8 @@
   config never hands its agent to a pastor-agent pane.
 - `pastor machine authorized-key` prints a `restrict` line marked
   `pastor:agent:<name>`, which `machine remove` takes away again.
-- A bootstrap report naming another host key than the one on record is
-  refused (`host_key_mismatch`) and changes nothing.
+- A push machine's bootstrap report naming another host key than the one
+  on record is refused (`host_key_mismatch`) and changes nothing.
 - A push refuses an agent key already in the head's `authorized_keys`
   under another line, as a join does.
 - A join token's `authorized_keys` line carries `expiry-time`, so sshd

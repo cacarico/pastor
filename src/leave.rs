@@ -352,7 +352,10 @@ fn leave_service_user(
                  remove its pastor and herdr units and its keys by hand"
             ));
         }
-        remove_drop_in(here, root, name, report);
+        // Only root saw a drop-in to name it; a non-root leave knows of none.
+        if root {
+            remove_drop_in(r, here, root, name, report);
+        }
         return;
     };
     if !recorded {
@@ -382,7 +385,7 @@ fn leave_service_user(
     };
     remove_units(r, here.os, &who, report);
     remove_keys(r, &who, &state, &["machine_key", "agent_key"], report);
-    remove_drop_in(here, root, name, report);
+    remove_drop_in(r, here, root, name, report);
 }
 
 /// `name` as another user leave acts as, or `None` when the user database
@@ -451,12 +454,31 @@ fn remove_keys(r: &dyn Runner, who: &Who, state: &Path, keys: &[&str], report: &
 
 /// Root mode's sudoers drop-in for `name`, which only root can see or
 /// remove: it lets `name` run pastor-agent's herdr, and means nothing once
-/// the shepherd is gone.
-fn remove_drop_in(here: &Here, root: bool, name: &str, report: &mut Report) {
+/// the shepherd is gone. A non-root leave (a login that bootstrapped with
+/// `--sudo`) goes through `sudo -n`; one sudo refuses is a failure that
+/// names the file, never a silent success.
+fn remove_drop_in(r: &dyn Runner, here: &Here, root: bool, name: &str, report: &mut Report) {
+    let path = here.sudoers_dir.join(format!("pastor-{name}"));
     if !root {
+        let shown = path.to_string_lossy().into_owned();
+        let left =
+            |why: String| format!("{name}: could not remove {shown} ({why}); remove it as root");
+        match r.run("sudo", &["-n", "test", "-e", &shown]) {
+            Ok(o) if o.success => {}
+            // test's own "no": not there. sudo saying no writes why.
+            Ok(o) if o.stderr.trim().is_empty() => return,
+            out => {
+                report.failed.push(left(why(out)));
+                return;
+            }
+        }
+        let out = r.run("sudo", &["-n", "rm", "-f", "--", &shown]);
+        match out {
+            Ok(o) if o.success => report.done.push(format!("{name}: removed {shown}")),
+            out => report.failed.push(left(why(out))),
+        }
         return;
     }
-    let path = here.sudoers_dir.join(format!("pastor-{name}"));
     match std::fs::remove_file(&path) {
         Ok(()) => report
             .done

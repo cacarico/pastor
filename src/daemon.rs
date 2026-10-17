@@ -2592,12 +2592,12 @@ impl Fleet {
     ) -> anyhow::Result<bool> {
         use crate::bootstrap::{Isolation, Mode};
         use crate::store::{BootstrapState, MachineState};
-        if self.flock().get(machine).is_none() {
+        let Some(pull) = self.flock().get(machine).map(|m| m.pull) else {
             return Err(crate::cli::CliError::err(
                 "unknown_machine",
                 format!("no machine {machine} in the flock"),
             ));
-        }
+        };
         let outcome = sanitise_outcome(outcome);
         let crate::bootstrap::Outcome {
             ok,
@@ -2612,9 +2612,12 @@ impl Fleet {
         } = outcome;
         // A host key on record is changed only by `--repin`, never by a
         // report: one that names another key is refused whole, and one
-        // that names none (a push stopped before its pin) keeps it.
+        // that names none (a push stopped before its pin) keeps it. A pull
+        // machine's key is its join's (`join_with`): its report, the
+        // shepherd's own word, never sets or changes it.
         let on_record = self.store.machine_state(machine)?.and_then(|s| s.host_key);
         let host_key = match (on_record, host_key) {
+            (on_record, _) if pull => on_record,
             (Some(old), Some(new)) if !same_host_key(&old, &new) => {
                 return Err(crate::cli::CliError::err(
                     "host_key_mismatch",
@@ -4291,8 +4294,8 @@ impl Daemon {
             );
         }
         // A pull machine is never reached from here: its key on record is
-        // dropped, and the next report of its own `pastor bootstrap` pins
-        // the one it sends.
+        // dropped, and the next join with a `--replace` token sets the one
+        // that join brings; a report never does.
         if repin
             && let Some(entry) = self.fleet.flock().get(&name)
             && entry.pull
@@ -4310,7 +4313,7 @@ impl Daemon {
                     state.updated_at = chrono::Utc::now().to_rfc3339();
                     match self.store.put_machine_state(&state) {
                         Ok(()) => IpcResponse::Text(format!(
-                            "dropped the host key on record for {name}; the next report of `pastor bootstrap` there pins the one it sends"
+                            "dropped the host key on record for {name}; the next join with a token from `pastor join create --replace {name}` pins the one it brings"
                         )),
                         Err(err) => IpcResponse::error("store_error", err),
                     }
@@ -4578,12 +4581,22 @@ impl Daemon {
     /// generation` still speaks for `machine`. A store that cannot be read
     /// refuses: the check is the one thing that cuts off a connection a
     /// replace or a removal moved past.
+    ///
+    /// A machine not in the flock is refused whatever its line says: a
+    /// `machine remove` ends every line of it. A line with no `--gen`
+    /// (`machine authorized-key --shepherd`, or one written by hand) passes
+    /// only for a pull machine that no join has enrolled.
     fn shepherd_check(&self, machine: &str, generation: Option<i64>) -> IpcResponse {
+        let revoked = |why: String| IpcResponse::error("machine_revoked", why);
+        let Some(pull) = self.fleet.flock().get(machine).map(|m| m.pull) else {
+            return revoked(format!(
+                "{machine} is not in the head's flock.toml: it was removed"
+            ));
+        };
         let have = match self.store.machine_generation(machine) {
             Ok(have) => have,
             Err(err) => return IpcResponse::error("store_error", err),
         };
-        let revoked = |why: String| IpcResponse::error("machine_revoked", why);
         match (generation, have) {
             (Some(want), Some(have)) if want == have => IpcResponse::Text("current".into()),
             (Some(want), Some(have)) => revoked(format!(
@@ -4597,7 +4610,10 @@ impl Daemon {
             (None, Some(have)) if have > 0 => revoked(format!(
                 "{machine} was joined, so only its join's line (with --gen {have}) speaks for it"
             )),
-            (None, _) => IpcResponse::Text("current".into()),
+            (None, _) if pull => IpcResponse::Text("current".into()),
+            (None, _) => revoked(format!(
+                "{machine} is not a pull machine in the head's flock.toml"
+            )),
         }
     }
 
@@ -8338,10 +8354,11 @@ mod tests {
         );
     }
 
-    /// `machine bootstrap --repin` of a pull machine drops the key on
-    /// record, so its next report pins the one it sends.
+    /// A pull machine's host key is its join's: a report never sets it,
+    /// nor changes it, and `machine bootstrap --repin` drops it for the
+    /// next join, not the next report.
     #[tokio::test]
-    async fn repin_of_a_pull_machine_drops_its_key_for_the_next_report() {
+    async fn only_a_join_sets_a_pull_machines_host_key() {
         let (d, _tmp) = pull_daemon(1).await;
         set_head_address(&d);
         let resp = d
@@ -8351,6 +8368,32 @@ mod tests {
             ))
             .await;
         assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        assert_eq!(
+            d.store.machine_state("laptop").unwrap().unwrap().host_key,
+            None,
+            "a report sets no key"
+        );
+        // What a join recorded.
+        let mut state = d.store.machine_state("laptop").unwrap().unwrap();
+        state.host_key = Some("ssh-ed25519 AAAAOLD".into());
+        d.store.put_machine_state(&state).unwrap();
+        let resp = d
+            .handle(bootstrap_report(
+                "laptop",
+                with_host_key(Some("ssh-ed25519 AAAAOTHER")),
+            ))
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        assert_eq!(
+            d.store
+                .machine_state("laptop")
+                .unwrap()
+                .unwrap()
+                .host_key
+                .as_deref(),
+            Some("ssh-ed25519 AAAAOLD"),
+            "nor changes it"
+        );
         let resp = d
             .handle(IpcRequest::MachineBootstrap {
                 name: "laptop".into(),
@@ -8362,7 +8405,10 @@ mod tests {
                 repin: true,
             })
             .await;
-        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        let IpcResponse::Text(text) = resp else {
+            panic!("{resp:?}")
+        };
+        assert!(text.contains("join create --replace laptop"), "{text}");
         assert_eq!(
             d.store.machine_state("laptop").unwrap().unwrap().host_key,
             None
@@ -8375,13 +8421,9 @@ mod tests {
             .await;
         assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
         assert_eq!(
-            d.store
-                .machine_state("laptop")
-                .unwrap()
-                .unwrap()
-                .host_key
-                .as_deref(),
-            Some("ssh-ed25519 AAAANEW")
+            d.store.machine_state("laptop").unwrap().unwrap().host_key,
+            None,
+            "the next report pins nothing"
         );
     }
 
@@ -16135,6 +16177,110 @@ mod tests {
         assert!(row.used_at.is_some(), "the token is spent");
     }
 
+    /// `d` on a socket in `dir`, one request per connection, as `serve`
+    /// answers: what a bridge on the head talks to.
+    fn serve_for_bridge(d: Arc<Daemon>, dir: &std::path::Path) -> std::path::PathBuf {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let socket = dir.join("bridge-head.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let d = d.clone();
+                tokio::spawn(async move {
+                    let (r, mut w) = stream.into_split();
+                    let mut line = String::new();
+                    tokio::io::BufReader::new(r)
+                        .read_line(&mut line)
+                        .await
+                        .unwrap();
+                    let (req, _) = crate::ipc::parse_request_line(line.trim()).unwrap();
+                    let mut out = serde_json::to_vec(&d.handle(req).await).unwrap();
+                    out.push(b'\n');
+                    let _ = w.write_all(&out).await;
+                });
+            }
+        });
+        socket
+    }
+
+    /// The replies `bridge --shepherd --machine laptop [--gen gen]` writes
+    /// for two pings.
+    async fn shepherd_bridge(
+        socket: &std::path::Path,
+        generation: Option<i64>,
+    ) -> Vec<IpcResponse> {
+        let ping = crate::ipc::request_line(&IpcRequest::Ping, None).unwrap();
+        let input = format!("{ping}{ping}");
+        let mut out = Vec::new();
+        crate::bridge::run_shepherd(socket, "laptop", generation, input.as_bytes(), &mut out)
+            .await
+            .unwrap();
+        out.split(|b| *b == b'\n')
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_slice(l).unwrap())
+            .collect()
+    }
+
+    /// Through the shepherd bridge itself: a pull machine set up by hand
+    /// (no record, a gen-less line) works; once joined, a replay of an
+    /// older `--gen` is refused, and so is a gen-less line; once removed,
+    /// every line is, and the bridge answers nothing after the refusal.
+    #[tokio::test]
+    async fn the_shepherd_bridge_refuses_stale_and_removed_lines() {
+        let (d, tmp) = pull_daemon(1).await;
+        let d = Arc::new(d);
+        let socket = serve_for_bridge(d.clone(), tmp.path());
+        let revoked = |replies: &[IpcResponse]| {
+            replies.len() == 1
+                && matches!(&replies[0], IpcResponse::Error { code, .. } if code == "machine_revoked")
+        };
+        let replies = shepherd_bridge(&socket, None).await;
+        assert_eq!(replies.len(), 2, "{replies:?}");
+        assert!(
+            replies
+                .iter()
+                .all(|r| matches!(r, IpcResponse::Pong { .. })),
+            "{replies:?}"
+        );
+
+        // A join enrolled it at 2: generation 1's line, replayed, is stale.
+        d.store()
+            .put_machine_state(&crate::store::MachineState {
+                machine: "laptop".into(),
+                bootstrap: crate::store::BootstrapState::Ok,
+                mode: None,
+                isolation: None,
+                failed_step: None,
+                why: None,
+                host_key: None,
+                herdr_version: None,
+                pastor_version: None,
+                service_user: None,
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+        d.store().set_machine_generation("laptop", 2).unwrap();
+        assert!(matches!(
+            shepherd_bridge(&socket, Some(2)).await[..],
+            [IpcResponse::Pong { .. }, IpcResponse::Pong { .. }]
+        ));
+        for generation in [Some(1), None] {
+            let replies = shepherd_bridge(&socket, generation).await;
+            assert!(revoked(&replies), "{generation:?}: {replies:?}");
+        }
+
+        let resp = d
+            .handle(IpcRequest::MachineRemove {
+                name: "laptop".into(),
+            })
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        for generation in [Some(2), None] {
+            let replies = shepherd_bridge(&socket, generation).await;
+            assert!(revoked(&replies), "{generation:?}: {replies:?}");
+        }
+    }
+
     /// A join records the service user its request names with the pending
     /// state, and enrolls the machine: generation 1, its shepherd line
     /// carrying it, and `ShepherdCheck` answering for that one only.
@@ -16170,17 +16316,14 @@ mod tests {
                 "{stale:?}"
             );
         }
-        // A machine with no record (never joined, or removed) is refused a
-        // generation, and a hand-made gen-less line still works for one
-        // that was never joined.
-        assert!(matches!(
-            d.shepherd_check("pi-9", Some(1)),
-            IpcResponse::Error { ref code, .. } if code == "machine_revoked"
-        ));
-        assert!(matches!(
-            d.shepherd_check("pi-9", None),
-            IpcResponse::Text(_)
-        ));
+        // A machine not in the flock (never added, or removed) is refused
+        // whatever its line says.
+        for generation in [Some(1), None] {
+            assert!(matches!(
+                d.shepherd_check("pi-9", generation),
+                IpcResponse::Error { ref code, .. } if code == "machine_revoked"
+            ));
+        }
         // A user name that is not one is refused before the token is spent.
         let id = "00112233445566ef";
         d.store()

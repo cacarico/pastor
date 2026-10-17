@@ -166,15 +166,41 @@ pub async fn push(
     fleet: &Fleet,
     name: &str,
     login: &str,
-    opts: PushOpts,
+    mut opts: PushOpts,
 ) -> anyhow::Result<Outcome> {
     if let Some(user) = &opts.service_user {
         super::check_user(user)?;
     }
+    if opts.machine.is_none() {
+        opts.sudo = rerun_sudo(store, name, login, opts.sudo)?;
+    }
     let head_key = head_key(paths, &opts.runner).await?;
     let before = record(paths, store, fleet, name, login, &opts).await?;
     let stored = before.as_ref().and_then(|s| s.host_key.clone());
-    let pinned = match prepare(paths, name, login, stored.as_deref(), &opts).await {
+    // A `--repin` writes the new key to known_hosts; the row on record
+    // takes it at the same moment, so a step that fails after the pin
+    // (platform, copy) leaves the two agreeing, not the file with the new
+    // key and the record with the old.
+    let on_pin = |pinned: &str| -> Result<(), Stop> {
+        if !opts.repin {
+            return Ok(());
+        }
+        let failed = |e: anyhow::Error| {
+            Stop::new(
+                "host_key",
+                format!("pinned the new host key but could not record it: {e:#}"),
+                format!("rerun `pastor machine bootstrap {name} --repin`"),
+            )
+        };
+        if let Some(mut s) = store.machine_state(name).map_err(failed)?
+            && !s.host_key.as_deref().is_some_and(|k| same_key(k, pinned))
+        {
+            s.host_key = Some(pinned.to_string());
+            store.put_machine_state(&s).map_err(failed)?;
+        }
+        Ok(())
+    };
+    let pinned = match prepare(paths, name, login, stored.as_deref(), &opts, on_pin).await {
         Ok(pinned) => pinned,
         Err(stop) => {
             let outcome = stopped(stop, &opts, None);
@@ -259,6 +285,26 @@ pub async fn push(
     }
     close_master(paths, name, login, &opts.runner).await;
     Ok(outcome)
+}
+
+/// Whether a `machine bootstrap` rerun of `name` runs with `--sudo`: the
+/// mode on record decides, whatever `sudo` (the flag) says, so a rerun
+/// without `--sudo` never turns a root-mode machine into a user-mode one
+/// (whose agent line would be the login's key). `--sudo` on a user-mode
+/// machine asks for the other mode, which is refused: that takes a remove
+/// and an add. With no mode on record the flag decides.
+fn rerun_sudo(store: &Store, name: &str, login: &str, sudo: bool) -> anyhow::Result<bool> {
+    let mode = store.machine_state(name)?.and_then(|s| s.mode);
+    match mode.as_deref() {
+        Some("root") => Ok(true),
+        Some("user") if sudo => Err(CliError::err(
+            "usage_error",
+            format!(
+                "machine {name} is set up in user mode, and a rerun keeps the mode it has; to set it up in root mode, remove it with `pastor machine remove {name}` and add it again with `pastor machine add {name} {login} --bootstrap --sudo`"
+            ),
+        )),
+        _ => Ok(sudo),
+    }
 }
 
 /// Ok, and no step says otherwise.
@@ -446,8 +492,10 @@ async fn prepare(
     login: &str,
     stored: Option<&str>,
     opts: &PushOpts,
+    on_pin: impl FnOnce(&str) -> Result<(), Stop>,
 ) -> Result<String, Stop> {
     let pinned = pin_host_key(paths, name, login, stored, opts).await?;
+    on_pin(&pinned)?;
     let ssh = |remote: &str| ssh_args(paths, login, remote);
     let (pastor_target, herdr_target) =
         platform(opts, name, ssh("uname -sm; getconf LONG_BIT")).await?;

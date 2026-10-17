@@ -50,6 +50,11 @@ pub enum SetupCmd {
         /// must not report a machine whose herdr dies at logout
         #[arg(long, hide = true)]
         require_linger: bool,
+        /// Restart the unit after the action, so a running one picks up a
+        /// new config: a join that replaces this machine's line needs its
+        /// shepherd to reconnect with the new one
+        #[arg(long, hide = true, conflicts_with = "stop")]
+        restart: bool,
     },
     /// Install and manage a launchd user agent on macOS: pastor.serve, or pastor.herdr with --herdr
     ///
@@ -95,12 +100,14 @@ pub fn cli(paths: &Paths, cmd: SetupCmd) -> anyhow::Result<()> {
             stop,
             yes,
             require_linger,
+            restart,
         } => {
             if cfg!(target_os = "macos") {
                 anyhow::bail!("macOS has no systemd; use `pastor setup launchd`");
             }
             let unit = if herdr { Unit::Herdr } else { Unit::Pastor };
             let (exec, env) = exec_and_env(unit, paths)?;
+            let sudo_shepherd = unit == Unit::Pastor && shepherd_runs_sudo(paths)?;
             let unit_dir = crate::config::config_home()
                 .context("no config dir")?
                 .join("systemd/user");
@@ -111,6 +118,8 @@ pub fn cli(paths: &Paths, cmd: SetupCmd) -> anyhow::Result<()> {
                 env,
                 action: Action::from_flags(enable, start, now, stop),
                 require_linger,
+                restart,
+                sudo_shepherd,
             };
             ask(&install.plan(), yes)?;
             let report = install.run(&SystemRunner, paths)?;
@@ -144,6 +153,18 @@ pub fn cli(paths: &Paths, cmd: SetupCmd) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether pastor.toml's `[shepherd] command` starts with sudo, as a
+/// root-mode pull machine's does (`bootstrap::pull::shepherd_herdr_argv`).
+fn shepherd_runs_sudo(paths: &Paths) -> anyhow::Result<bool> {
+    let cfg = crate::config::PastorConfig::load(&paths.config_file())?;
+    Ok(cfg
+        .shepherd
+        .command
+        .as_ref()
+        .and_then(|argv| argv.first())
+        .is_some_and(|program| program == "sudo" || program.ends_with("/sudo")))
 }
 
 /// The binary a unit runs and the environment it gets: the PATH of this shell
@@ -431,6 +452,11 @@ pub struct Install {
     pub action: Action,
     /// Fail before writing when lingering is off (`--require-linger`).
     pub require_linger: bool,
+    /// `systemctl --user restart` after the action (`--restart`).
+    pub restart: bool,
+    /// The shepherd reaches herdr through sudo, which `NoNewPrivileges`
+    /// would stop: pastor.service is written without it.
+    pub sudo_shepherd: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -522,6 +548,9 @@ impl Install {
         for args in self.action.systemctl_args(self.unit.file_name()) {
             systemctl(runner, &args)?;
         }
+        if self.restart {
+            systemctl(runner, &["restart", self.unit.file_name()])?;
+        }
         Ok(Report {
             unit: self.unit,
             unit_path,
@@ -533,7 +562,10 @@ impl Install {
     }
 
     fn write(&self, unit_path: &Path) -> anyhow::Result<Written> {
-        let text = render(self.unit.template(), &self.exec, &self.env)?;
+        let mut text = render(self.unit.template(), &self.exec, &self.env)?;
+        if self.sudo_shepherd && self.unit == Unit::Pastor {
+            text = allow_new_privileges(&text);
+        }
         write_file(&self.unit_dir, unit_path, &text)
     }
 
@@ -617,6 +649,23 @@ pub fn render(template: &str, exec: &Path, env: &[(String, String)]) -> anyhow::
         }
     }
     Ok(out)
+}
+
+/// `text` without `NoNewPrivileges=yes`, for a shepherd whose `[shepherd]
+/// command` is sudo: with it the kernel ignores sudo's setuid bit and the
+/// shepherd never reaches the agent user's herdr. The cost of a root-mode
+/// pull machine; every other unit keeps it.
+fn allow_new_privileges(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            if line == "NoNewPrivileges=yes" {
+                "# NoNewPrivileges=yes left out: [shepherd] command runs sudo"
+            } else {
+                line
+            }
+        })
+        .flat_map(|line| [line, "\n"])
+        .collect()
 }
 
 /// A unit-file word: `%` doubled so systemd does not expand it as a
@@ -818,6 +867,8 @@ mod tests {
                 env: vec![("PATH".into(), "/usr/bin:/opt/bin".into())],
                 action: Action::EnableNow,
                 require_linger: false,
+                restart: false,
+                sudo_shepherd: false,
             }
         }
     }
@@ -1124,6 +1175,85 @@ mod tests {
             ..e.install(Unit::Herdr)
         };
         assert_eq!(install.run(&runner, &e.paths).unwrap().linger, Linger::On);
+    }
+
+    /// A root-mode pull machine's shepherd runs sudo, which
+    /// `NoNewPrivileges` would stop; every other pastor.service keeps it,
+    /// and herdr.service never had it.
+    #[test]
+    fn a_sudo_shepherd_gets_a_unit_without_no_new_privileges() {
+        let e = env();
+        let unit = e.tmp.path().join("systemd/user/pastor.service");
+        e.install(Unit::Pastor)
+            .run(&FakeRunner::ok("yes"), &e.paths)
+            .unwrap();
+        let plain = std::fs::read_to_string(&unit).unwrap();
+        assert!(plain.lines().any(|l| l == "NoNewPrivileges=yes"), "{plain}");
+        let install = Install {
+            sudo_shepherd: true,
+            ..e.install(Unit::Pastor)
+        };
+        install.run(&FakeRunner::ok("yes"), &e.paths).unwrap();
+        let sudo = std::fs::read_to_string(&unit).unwrap();
+        assert!(!sudo.lines().any(|l| l == "NoNewPrivileges=yes"), "{sudo}");
+        for line in ["UMask=0077", "LockPersonality=yes", "RestrictRealtime=yes"] {
+            assert!(sudo.lines().any(|l| l == line), "{sudo}");
+        }
+        assert_eq!(
+            plain.replace(
+                "NoNewPrivileges=yes",
+                "# NoNewPrivileges=yes left out: [shepherd] command runs sudo"
+            ),
+            sudo
+        );
+    }
+
+    #[test]
+    fn shepherd_runs_sudo_reads_the_first_word_of_the_command() {
+        let e = env();
+        assert!(!shepherd_runs_sudo(&e.paths).unwrap());
+        std::fs::create_dir_all(&e.paths.config_dir).unwrap();
+        for (command, sudo) in [
+            (
+                r#"["sudo", "-n", "-H", "-u", "pastor-agent", "/h/herdr"]"#,
+                true,
+            ),
+            (r#"["/usr/bin/sudo", "-n", "/h/herdr"]"#, true),
+            (
+                r#"["/h/herdr", "--session", "default", "remote-api-bridge"]"#,
+                false,
+            ),
+            (r#"["sudoku"]"#, false),
+        ] {
+            std::fs::write(
+                e.paths.config_file(),
+                format!("[shepherd]\ncommand = {command}\n"),
+            )
+            .unwrap();
+            assert_eq!(shepherd_runs_sudo(&e.paths).unwrap(), sudo, "{command}");
+        }
+    }
+
+    #[test]
+    fn restart_follows_the_action() {
+        let e = env();
+        let runner = FakeRunner::ok("yes");
+        let install = Install {
+            restart: true,
+            ..e.install(Unit::Pastor)
+        };
+        install.run(&runner, &e.paths).unwrap();
+        let calls = runner.calls();
+        let at = |c: &str| {
+            calls
+                .iter()
+                .position(|x| x == c)
+                .unwrap_or_else(|| panic!("{calls:#?}"))
+        };
+        assert!(
+            at("systemctl --user enable --now pastor.service")
+                < at("systemctl --user restart pastor.service")
+        );
     }
 
     #[test]

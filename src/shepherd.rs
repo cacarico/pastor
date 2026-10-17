@@ -64,20 +64,109 @@ pub type Ask = Arc<
         + Sync,
 >;
 
-/// `Ask` over ssh to `head`, through `pastor bridge` there, `gated`.
+/// How many `machine_revoked` answers in a row the shepherd takes before
+/// it exits, for its service manager to start it afresh.
+const REVOKED_EXIT_AFTER: u32 = 5;
+
+/// The wait before the first request after a `machine_revoked`, doubled on
+/// each one after, up to `REVOKED_MAX_BACKOFF`.
+const REVOKED_BACKOFF: Duration = Duration::from_secs(5);
+const REVOKED_MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// `Ask` over ssh to `head`, through `pastor bridge` there, `gated`, and
+/// `on_revoked`: a `machine_revoked` ends the ssh master, and five in a row
+/// end the process.
 pub fn ask_remote(head: RemoteHead) -> Ask {
     let head = Arc::new(head);
-    gated(Arc::new(move |req| {
-        let head = head.clone();
+    let master = head.clone();
+    let revoked = Arc::new(Revoked {
+        strikes: Default::default(),
+        backoff: REVOKED_BACKOFF,
+        limit: REVOKED_EXIT_AFTER,
+        close: Arc::new(move || {
+            let master = master.clone();
+            Box::pin(async move { master.close_master().await })
+        }),
+        give_up: Arc::new(|| {
+            tracing::error!(
+                "the head revoked this machine's key {REVOKED_EXIT_AFTER} times in a row; exiting, for the service manager to start the shepherd again"
+            );
+            std::process::exit(1)
+        }),
+    });
+    gated(on_revoked(
+        Arc::new(move |req| {
+            let head = head.clone();
+            Box::pin(async move {
+                let line = request_line(&req, None)?;
+                match head.request(&line, HEAD_TIMEOUT).await {
+                    Ok(IpcResponse::Error { code, message }) => Err(CliError::err(&code, message)),
+                    Ok(resp) => Ok(resp),
+                    Err(err) => Err(crate::head::failure(&err)),
+                }
+            })
+        }),
+        revoked,
+    ))
+}
+
+/// What the shepherd does about `machine_revoked`. A rejoin of this box
+/// gives it a new line on the head and revokes the old one, but the ssh
+/// master keeps the old line's forced command for as long as it lives, and
+/// the ticks keep it alive: so the master is ended (`close`), the next
+/// request waits a while (`backoff`, doubled each time), and after `limit`
+/// in a row `give_up` runs (the process exits and systemd starts it again).
+pub struct Revoked {
+    strikes: std::sync::atomic::AtomicU32,
+    backoff: Duration,
+    limit: u32,
+    close: Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>,
+    give_up: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl Revoked {
+    /// The wait before a request after `strikes` revocations in a row.
+    fn wait(&self, strikes: u32) -> Duration {
+        if strikes == 0 {
+            return Duration::ZERO;
+        }
+        let doubled = self.backoff.saturating_mul(1 << (strikes - 1).min(16));
+        doubled.min(REVOKED_MAX_BACKOFF.max(self.backoff))
+    }
+}
+
+/// `ask` with `revoked`'s handling of a `machine_revoked` answer.
+pub fn on_revoked(ask: Ask, revoked: Arc<Revoked>) -> Ask {
+    use std::sync::atomic::Ordering;
+    Arc::new(move |req| {
+        let (ask, revoked) = (ask.clone(), revoked.clone());
         Box::pin(async move {
-            let line = request_line(&req, None)?;
-            match head.request(&line, HEAD_TIMEOUT).await {
-                Ok(IpcResponse::Error { code, message }) => Err(CliError::err(&code, message)),
-                Ok(resp) => Ok(resp),
-                Err(err) => Err(crate::head::failure(&err)),
+            let wait = revoked.wait(revoked.strikes.load(Ordering::SeqCst));
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
             }
+            let got = ask(req).await;
+            let code = got
+                .as_ref()
+                .err()
+                .and_then(|e| e.downcast_ref::<CliError>())
+                .map(|e| e.code.as_str());
+            if code == Some(crate::bridge::MACHINE_REVOKED) {
+                let strikes = revoked.strikes.fetch_add(1, Ordering::SeqCst) + 1;
+                tracing::warn!(
+                    strikes,
+                    "the head revoked this machine's key; ending the ssh master to reconnect with the current one"
+                );
+                (revoked.close)().await;
+                if strikes >= revoked.limit {
+                    (revoked.give_up)();
+                }
+            } else if got.is_ok() {
+                revoked.strikes.store(0, Ordering::SeqCst);
+            }
+            got
         })
-    }))
+    })
 }
 
 /// `ask` that refuses a request the head is too old for, `head_too_old`,
@@ -2056,6 +2145,79 @@ mod tests {
 
     /// A machine the head does not have as a pull machine never starts an
     /// actor, so its herdr is never asked anything.
+    /// A revoked line is the ssh master's, not the machine's: after a
+    /// rejoin the shepherd ends it, waits, and the next request, on a new
+    /// master, gets through; revoked every time, it gives up.
+    #[tokio::test(start_paused = true)]
+    async fn machine_revoked_ends_the_master_backs_off_then_reconnects() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = Arc::new(AtomicU32::new(0));
+        let closed = Arc::new(AtomicU32::new(0));
+        let gave_up = Arc::new(AtomicU32::new(0));
+        // The master is the old line's until it is closed.
+        let head: Ask = {
+            let (calls, closed) = (calls.clone(), closed.clone());
+            Arc::new(move |_req| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let revoked = closed.load(Ordering::SeqCst) < 2;
+                Box::pin(async move {
+                    if revoked {
+                        Err(CliError::err(crate::bridge::MACHINE_REVOKED, "old line"))
+                    } else {
+                        Ok(IpcResponse::Text("ok".into()))
+                    }
+                })
+            })
+        };
+        let revoked = Arc::new(Revoked {
+            strikes: Default::default(),
+            backoff: Duration::from_secs(5),
+            limit: 3,
+            close: {
+                let closed = closed.clone();
+                Arc::new(move || {
+                    closed.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async {})
+                })
+            },
+            give_up: {
+                let gave_up = gave_up.clone();
+                Arc::new(move || {
+                    gave_up.fetch_add(1, Ordering::SeqCst);
+                })
+            },
+        });
+        let ask = on_revoked(head, revoked.clone());
+        let start = tokio::time::Instant::now();
+        assert!(ask(IpcRequest::Ping).await.is_err());
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "the first try does not wait"
+        );
+        assert!(ask(IpcRequest::Ping).await.is_err());
+        assert_eq!(start.elapsed(), Duration::from_secs(5));
+        assert_eq!(closed.load(Ordering::SeqCst), 2);
+        // A new master: the request gets through, after a longer wait.
+        assert!(matches!(
+            ask(IpcRequest::Ping).await,
+            Ok(IpcResponse::Text(_))
+        ));
+        assert_eq!(start.elapsed(), Duration::from_secs(15));
+        assert_eq!(revoked.strikes.load(Ordering::SeqCst), 0);
+        assert_eq!(gave_up.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        // Revoked for good: the third in a row gives up.
+        let always: Ask = Arc::new(|_req| {
+            Box::pin(async { Err(CliError::err(crate::bridge::MACHINE_REVOKED, "gone")) })
+        });
+        let ask = on_revoked(always, revoked);
+        for _ in 0..3 {
+            assert!(ask(IpcRequest::Ping).await.is_err());
+        }
+        assert_eq!(gave_up.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn a_machine_the_head_refuses_starts_no_actor() {
         let tmp = tempfile::tempdir().unwrap();
