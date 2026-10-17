@@ -1051,14 +1051,24 @@ fn concurrent_pins_keep_every_line() {
     assert_eq!(text.lines().count(), 16, "{text}");
 }
 
-/// A machine whose host key changed stops at the pin, naming `--repin`,
-/// and keeps the key on record; `--repin` is the one way to trust the new
-/// key, which then replaces the old one everywhere.
+/// A machine whose host key changed stops at its first connection (the
+/// pinned host is not scanned again), naming `--repin`, and keeps the key
+/// on record; `--repin` is the one way to trust the new key: it scans the
+/// pinned host again, and the new key then replaces the old one
+/// everywhere.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_changed_host_key_needs_repin() {
     let h = head().await;
     let runner = FakePush::new(ok_outcome(Mode::User));
     assert!(h.push(h.opts(&runner, false)).await.unwrap().ok);
+    let scans = || {
+        runner
+            .calls()
+            .iter()
+            .filter(|c| c.starts_with("ssh-keyscan"))
+            .count()
+    };
+    assert_eq!(scans(), 1);
     *runner.host_key.lock().unwrap() = "ssh-ed25519 AAAANEWKEY".into();
     let mut o = ok_outcome(Mode::User);
     o.host_key = Some("ssh-ed25519 AAAANEWKEY".into());
@@ -1066,8 +1076,9 @@ async fn a_changed_host_key_needs_repin() {
 
     let out = h.push(rerun_opts(&h, &runner)).await.unwrap();
     assert!(!out.ok);
+    assert_eq!(scans(), 1);
     let step = out.steps.last().unwrap();
-    assert_eq!(step.step, "host_key");
+    assert_eq!(step.step, "connect", "{out:?}");
     let fix = step.fix.as_deref().unwrap();
     assert!(
         fix.contains("pastor machine bootstrap gpu-3 --repin"),
@@ -1087,6 +1098,7 @@ async fn a_changed_host_key_needs_repin() {
         .await
         .unwrap();
     assert!(out.ok, "{out:?}");
+    assert_eq!(scans(), 2, "--repin scans the pinned host again");
     assert_eq!(
         h.state().host_key.as_deref(),
         Some("ssh-ed25519 AAAANEWKEY")
@@ -1113,7 +1125,8 @@ async fn the_key_on_record_is_checked_even_off_known_hosts() {
 }
 
 /// A failed machine whose rerun stops before its pin keeps the key it had
-/// on record: only a new pin replaces it.
+/// on record: only a new pin replaces it. (known_hosts goes first, or the
+/// pinned host would not be scanned at all.)
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_rerun_keeps_the_host_key() {
     let h = head().await;
@@ -1123,6 +1136,7 @@ async fn a_failed_rerun_keeps_the_host_key() {
         h.state().host_key.as_deref(),
         Some("ssh-ed25519 AAAAHOSTKEY")
     );
+    std::fs::remove_file(h.paths.known_hosts_file()).unwrap();
     runner.host_key.lock().unwrap().clear();
     let out = h.push(h.opts(&runner, false)).await.unwrap();
     assert!(!out.ok);

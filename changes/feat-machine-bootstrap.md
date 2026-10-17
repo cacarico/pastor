@@ -88,8 +88,8 @@
   (alias `--login`).
 - A push rerun against a host already pinned no longer runs
   `ssh-keyscan` unless given `--repin`: it checks the machine against
-  the pinned key, so a changed key stops the rerun instead of being
-  trusted.
+  the pinned key, so a changed key stops the rerun, naming `--repin`,
+  instead of being trusted.
 - A pull machine's herdr fetch goes to the head as a request line
   (`artifact_fetch`) instead of `bridge --fetch` arguments, which sshd
   never passes to a forced command; `SSH_ORIGINAL_COMMAND` may only be the

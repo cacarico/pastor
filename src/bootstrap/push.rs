@@ -449,7 +449,8 @@ async fn prepare(
 ) -> Result<String, Stop> {
     let pinned = pin_host_key(paths, name, login, stored, opts).await?;
     let ssh = |remote: &str| ssh_args(paths, login, remote);
-    let (pastor_target, herdr_target) = platform(opts, ssh("uname -sm; getconf LONG_BIT")).await?;
+    let (pastor_target, herdr_target) =
+        platform(opts, name, ssh("uname -sm; getconf LONG_BIT")).await?;
     let herdr_version = crate::artifacts::herdr_version(&opts.provision, &opts.fleet_versions);
     for (name, version, target) in [
         (
@@ -836,7 +837,11 @@ pub(crate) fn resolved_host(out: &str) -> Option<(String, String)> {
 
 /// Step 3: the machine's OS, arch and userland bits, and the release of
 /// each binary that runs there.
-async fn platform(opts: &PushOpts, argv: Vec<String>) -> Result<(String, String), Stop> {
+async fn platform(
+    opts: &PushOpts,
+    machine: &str,
+    argv: Vec<String>,
+) -> Result<(String, String), Stop> {
     let out = run(&opts.runner, "ssh", argv, None).await.map_err(|e| {
         Stop::new(
             "connect",
@@ -845,10 +850,19 @@ async fn platform(opts: &PushOpts, argv: Vec<String>) -> Result<(String, String)
         )
     })?;
     if !out.success {
+        // A pinned host is not scanned again (`pin_host_key`), so a key
+        // that changed since shows up here, at ssh's own check.
+        let fix = if out.stderr.contains("Host key verification failed") {
+            format!(
+                "the machine's host key is not the one pastor pinned; if it was reinstalled, run `pastor machine bootstrap {machine} --repin`"
+            )
+        } else {
+            "check that ssh with this login works without a password (BatchMode)".to_string()
+        };
         return Err(Stop::new(
             "connect",
             format!("ssh could not reach the machine: {}", tail(&out.stderr)),
-            "check that ssh with this login works without a password (BatchMode)",
+            fix,
         ));
     }
     let mut lines = out.stdout.lines().map(str::trim).filter(|l| !l.is_empty());

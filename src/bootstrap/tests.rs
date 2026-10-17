@@ -656,6 +656,7 @@ fn service_user_root_is_refused() {
         write_client: None,
         print_state_dir: false,
         write_shepherd: None,
+        write_shepherd_herdr: None,
         write_report: None,
     };
     let err = cli(&args, Some("me@head")).unwrap_err();

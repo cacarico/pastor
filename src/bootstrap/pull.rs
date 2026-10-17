@@ -1722,6 +1722,50 @@ mod tests {
         );
     }
 
+    /// A root join with no `--service-user` gets the `pastor` service
+    /// user, and the join names it; from root, any other non-root service
+    /// user passes the login check too, and `root` itself is refused.
+    #[test]
+    fn a_root_join_defaults_its_service_user_to_pastor() {
+        let joined_as = |service_user: Option<&str>| {
+            let (_tmp, p) = paths();
+            let r = FakeRunner::new(&as_root());
+            let link = FakeLink::joins("gpu-3", None);
+            let o = JoinOpts {
+                sudo: true,
+                service_user: service_user.map(str::to_string),
+                ..opts()
+            };
+            let out = join_with(&p, &token(), &o, &r, &link).unwrap();
+            assert!(out.ok, "{out:#?}");
+            let seen = link.seen();
+            match crate::ipc::parse_request_line(seen[0].line.trim())
+                .unwrap()
+                .0
+            {
+                IpcRequest::Join { service_user, .. } => service_user,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(
+            joined_as(None).as_deref(),
+            Some(crate::bootstrap::ROOT_SERVICE_USER)
+        );
+        assert_eq!(joined_as(Some("pastor")).as_deref(), Some("pastor"));
+
+        let (_tmp, p) = paths();
+        let r = FakeRunner::new(&as_root());
+        let link = FakeLink::joins("gpu-3", None);
+        let o = JoinOpts {
+            sudo: true,
+            service_user: Some("root".into()),
+            ..opts()
+        };
+        let err = join_with(&p, &token(), &o, &r, &link).unwrap_err();
+        assert_eq!(code(&err), "usage_error", "{err:#}");
+        assert!(link.seen().is_empty());
+    }
+
     /// A name the head would refuse is refused here first, before any
     /// user or key is made.
     #[test]
