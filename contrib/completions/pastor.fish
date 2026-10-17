@@ -223,6 +223,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_s
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from bootstrap" -l host-key -d 'The machine\'s ed25519 host key must be this (SHA256:... or the key itself)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from bootstrap" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from bootstrap" -l sudo -d 'Do root work through sudo -n (packages, users, lingering), so agents run as pastor-agent'
+complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from bootstrap" -l repin -d 'Drop the host key pinned for the machine and pin the one it offers now, after a reinstall'
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from bootstrap" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from remove" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from remove" -l herdr -d 'Also remove herdr\'s saved machine with this label'
