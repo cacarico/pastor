@@ -219,7 +219,8 @@ fn create_writes_a_locked_join_line_and_a_pjt_token() {
         .lines()
         .find(|l| l.ends_with(&format!(" pastor:join:{id}")))
         .unwrap_or_else(|| panic!("no join line in {keys}"));
-    assert!(line.starts_with("restrict,command=\""), "{line}");
+    assert!(line.starts_with("restrict,expiry-time=\""), "{line}");
+    assert!(line.contains("Z\",command=\""), "{line}");
     assert!(line.contains(&format!(" bridge --join {id}\",")), "{line}");
     assert!(keys.contains(FOREIGN));
     // The head keeps no copy of the private half.

@@ -60,7 +60,15 @@ impl Ssh<'_> {
     /// remote command, which the remote login shell does parse, is quoted, by
     /// `posix_command`.
     pub fn args(&self, remote: &str) -> Vec<String> {
-        let mut opts = vec!["BatchMode=yes".to_string()];
+        // No forwarding, whatever the user's ssh config says: a
+        // `ForwardAgent` there would hand the head's agent to whatever runs
+        // on the far side, a pastor agent's pane among them.
+        let mut opts = vec![
+            "BatchMode=yes".to_string(),
+            "ForwardAgent=no".into(),
+            "ForwardX11=no".into(),
+            "ClearAllForwardings=yes".into(),
+        ];
         if self.keepalive {
             opts.push("ServerAliveInterval=15".into());
             opts.push("ServerAliveCountMax=3".into());
@@ -104,6 +112,37 @@ impl Ssh<'_> {
         args.push(self.target.to_string());
         args.push(posix_command(remote));
         args
+    }
+}
+
+/// The host and port of ssh destination `dest`: `[user@]host`, or the URI
+/// form `ssh://[user@]host[:port]` (a bracketed IPv6 host keeps its
+/// brackets off). No port is `None`, which ssh reads as 22 unless its
+/// config says otherwise.
+pub fn destination_host_port(dest: &str) -> (&str, Option<&str>) {
+    let Some(rest) = dest.strip_prefix("ssh://") else {
+        return (dest.rsplit_once('@').map_or(dest, |(_, h)| h), None);
+    };
+    let rest = rest.split('/').next().unwrap_or(rest);
+    let hostport = rest.rsplit_once('@').map_or(rest, |(_, h)| h);
+    if let Some(inner) = hostport.strip_prefix('[')
+        && let Some((host, after)) = inner.split_once(']')
+    {
+        return (host, after.strip_prefix(':').filter(|p| !p.is_empty()));
+    }
+    match hostport.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() => (host, Some(port)),
+        Some((host, _)) => (host, None),
+        None => (hostport, None),
+    }
+}
+
+/// How known_hosts names `host` reached on `port`: the host alone on 22,
+/// else `[host]:port`, as ssh looks it up and `ssh-keyscan` prints it.
+pub fn known_hosts_name(host: &str, port: Option<&str>) -> String {
+    match port {
+        Some(p) if p != "22" => format!("[{host}]:{p}"),
+        _ => host.to_string(),
     }
 }
 
@@ -214,6 +253,27 @@ mod tests {
     }
 
     #[test]
+    fn destinations_name_their_host_and_port() {
+        for (dest, host, port, name) in [
+            ("me@head", "head", None, "head"),
+            ("head", "head", None, "head"),
+            ("ssh://me@head", "head", None, "head"),
+            ("ssh://me@head:22", "head", Some("22"), "head"),
+            ("ssh://me@head:2222", "head", Some("2222"), "[head]:2222"),
+            ("ssh://head:2222/", "head", Some("2222"), "[head]:2222"),
+            (
+                "ssh://me@[fd00::1]:2222",
+                "fd00::1",
+                Some("2222"),
+                "[fd00::1]:2222",
+            ),
+        ] {
+            assert_eq!(destination_host_port(dest), (host, port), "{dest}");
+            assert_eq!(known_hosts_name(host, port), name, "{dest}");
+        }
+    }
+
+    #[test]
     fn identity_adds_identities_only() {
         let args = Ssh {
             identity: Some(Path::new("/k")),
@@ -273,6 +333,12 @@ mod tests {
                 "-o",
                 "BatchMode=yes",
                 "-o",
+                "ForwardAgent=no",
+                "-o",
+                "ForwardX11=no",
+                "-o",
+                "ClearAllForwardings=yes",
+                "-o",
                 "ServerAliveInterval=15",
                 "-o",
                 "ServerAliveCountMax=3",
@@ -288,6 +354,22 @@ mod tests {
                 "sh -c true"
             ]
         );
+    }
+
+    /// A `ForwardAgent yes` in the head user's ssh config must never reach a
+    /// machine whose panes run agents.
+    #[test]
+    fn never_forwards_whatever_the_config_says() {
+        for cp in [None, Some(Path::new("/tmp/s/ssh/pi-3-%C"))] {
+            let args = ssh("fleet@pi-3", cp).args("true");
+            for o in [
+                "ForwardAgent=no",
+                "ForwardX11=no",
+                "ClearAllForwardings=yes",
+            ] {
+                assert!(opt(&args, o), "{o}: {args:?}");
+            }
+        }
     }
 
     #[test]

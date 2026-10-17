@@ -644,32 +644,22 @@ async fn machine_flocks(socket: &Path, machine: &str) -> anyhow::Result<Option<V
 
 /// The `authorized_keys` line that lets `key` in only to run
 /// `<pastor> bridge --agent --machine <machine>`, with no terminal and no
-/// forwarding. `key` is one public key line (`ssh-ed25519 AAAA... comment`).
-/// `machine` is checked the same way a marker is
+/// forwarding: `authkeys::line` with the machine's agent marker, so it
+/// carries `restrict` and `machine remove` finds it again. `key` is one
+/// public key line (`ssh-ed25519 AAAA... comment`); its comment gives way
+/// to the marker. `machine` is checked the same way a marker is
 /// (`authkeys::Marker::check`, code `invalid_machine`): `[A-Za-z0-9._-]+`
 /// only, so nothing that goes unquoted into `command="..."` can break out
 /// of it or run a second command (`$(id)`, `a;b`).
 pub fn authorized_key_line(pastor: &Path, machine: &str, key: &str) -> anyhow::Result<String> {
-    let lines: Vec<&str> = key.lines().filter(|l| !l.trim().is_empty()).collect();
-    let [key] = lines.as_slice() else {
-        return Err(CliError::err(
-            "invalid_key",
-            "the key must be exactly one public key line",
-        ));
-    };
-    let key = key.trim();
-    if key.split_whitespace().count() < 2 {
-        return Err(CliError::err(
-            "invalid_key",
-            "a public key line is its type and its key, like ssh-ed25519 AAAA...",
-        ));
-    }
-    let pastor = crate::authkeys::check_pastor_path(pastor)?;
-    crate::authkeys::Marker::Agent(machine.to_string()).check()?;
-    Ok(format!(
-        "command=\"{pastor} bridge --agent --machine {machine}\",{} {key}",
-        crate::authkeys::restrict_options()
-    ))
+    let marker = crate::authkeys::Marker::Agent(machine.to_string());
+    marker.check()?;
+    crate::authkeys::line(
+        pastor,
+        &format!("bridge --agent --machine {machine}"),
+        key,
+        &marker,
+    )
 }
 
 #[cfg(test)]
@@ -1119,7 +1109,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             line,
-            "command=\"/opt/pastor/bin/pastor bridge --agent --machine pi-1\",no-pty,no-user-rc,no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAAC3Nza key@pi-1"
+            "restrict,command=\"/opt/pastor/bin/pastor bridge --agent --machine pi-1\",no-pty,no-user-rc,no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAAC3Nza pastor:agent:pi-1"
         );
         for bad in ["", "ssh-ed25519", "ssh-ed25519 A\nssh-rsa B"] {
             assert!(
@@ -1136,7 +1126,28 @@ mod tests {
         // check must let through, not just anything above it.
         let line =
             authorized_key_line(Path::new("/opt/pastor"), "pi-1", "ssh-ed25519 AAAA").unwrap();
-        assert!(line.ends_with("ssh-ed25519 AAAA"), "{line}");
+        assert!(
+            line.ends_with("ssh-ed25519 AAAA pastor:agent:pi-1"),
+            "{line}"
+        );
+    }
+
+    /// The line printed by `pastor machine authorized-key` is one
+    /// `machine remove` takes away again: it carries the agent marker.
+    #[test]
+    fn the_authorized_key_line_is_restricted_and_removed_with_its_machine() {
+        let line =
+            authorized_key_line(Path::new("/opt/pastor"), "pi-1", "ssh-ed25519 AAAA c").unwrap();
+        assert!(line.starts_with("restrict,"), "{line}");
+        assert!(line.contains("pastor:agent:pi-1"), "{line}");
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("authorized_keys");
+        std::fs::write(&file, format!("ssh-ed25519 MINE me@laptop\n{line}\n")).unwrap();
+        crate::authkeys::remove_machine(&file, "pi-1").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "ssh-ed25519 MINE me@laptop\n"
+        );
     }
 
     #[test]
