@@ -95,6 +95,13 @@
 - Two artifacts of one version fetched at once no longer trip over each
   other's cleanup of the cache dir, and a cache dir made part way is
   removed.
+- `pastor leave` also tears down the shepherd's service user when that is
+  not the login, as after a root join, where it is `pastor`: its units,
+  its machine and agent keys and root mode's `/etc/sudoers.d/pastor-<user>`
+  drop-in go, before pastor-agent's. It finds the user by that drop-in,
+  else a `pastor` user whose home has pastor or a pastor unit; one it
+  cannot reach is a failed step (`leave_incomplete`), where before the
+  shepherd kept running and leave reported success.
 
 ### Security
 
