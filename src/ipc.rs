@@ -44,7 +44,8 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 /// (`TaskClaim::herdr_version`, `TaskClaim::pastor_version`), join tokens
 /// (`JoinCreate`, `JoinList`, `JoinRevoke`, `Join`), bootstrap reports
 /// (`BootstrapReport`) and the machine state they record, push bootstrap
-/// (`MachineBootstrap`), and the artifact cache (`ArtifactLocate`).
+/// (`MachineBootstrap`, with its `repin`), and the artifact cache
+/// (`ArtifactLocate`).
 pub const IPC_PROTOCOL: u32 = 32;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
@@ -589,6 +590,10 @@ pub enum IpcRequest {
         machine: Option<crate::config::flock::MachineConfig>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         login: Option<String>,
+        /// `--repin`: replace the host key on record with the one the
+        /// machine offers now (`PushOpts::repin`).
+        #[serde(default)]
+        repin: bool,
     },
     /// `machine remove`, the flock.toml part, as for `MachineAdd`. Answers
     /// `Text`.
@@ -2104,6 +2109,7 @@ mod tests {
                 host_key: None,
                 machine: None,
                 login: None,
+                repin: false,
             },
             IpcRequest::MachineRemove { name: "m".into() },
             IpcRequest::MachineMove {

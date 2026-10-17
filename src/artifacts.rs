@@ -250,25 +250,52 @@ async fn ensure_locked(
         return Ok((dest.to_path_buf(), sum));
     }
     let dir = dest.parent().context("cache path has no parent")?;
-    // The dirs this call makes, deepest first, so a failure removes them
-    // again: a made-up version leaves no `<version>/<target>` behind.
+    let made = create_cache_dir(dir)?;
+    let res = fill(cfg, a, fetch, dir, dest).await;
+    if res.is_err() {
+        remove_made(&made);
+    }
+    Ok((dest.to_path_buf(), res?))
+}
+
+/// Make `dir` and the parents it lacks. Returns the dirs this call made,
+/// deepest first, so a failure removes them again: a made-up version leaves
+/// no `<version>/<target>` behind. A `create_dir_all` that fails part way
+/// removes what it made before it returns.
+///
+/// Another artifact of the same version shares `<name>/<version>`, and its
+/// failed fill may remove that dir between this call making it and making
+/// what goes under it, which `create_dir_all` reads as `NotFound`: it is
+/// tried again.
+fn create_cache_dir(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let made: Vec<PathBuf> = dir
         .ancestors()
         .take_while(|d| !d.exists())
         .map(Path::to_path_buf)
         .collect();
-    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    let res = fill(cfg, a, fetch, dir, dest).await;
-    if res.is_err() {
-        // `remove_dir` only removes an empty dir, so one another artifact
-        // has since put a file under stays.
-        for d in &made {
-            if std::fs::remove_dir(d).is_err() {
-                break;
+    let mut tries = 0;
+    loop {
+        match std::fs::create_dir_all(dir) {
+            Ok(()) => return Ok(made),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && tries < 3 => tries += 1,
+            Err(e) => {
+                remove_made(&made);
+                return Err(anyhow::Error::from(e).context(format!("create {}", dir.display())));
             }
         }
     }
-    Ok((dest.to_path_buf(), res?))
+}
+
+/// Remove the dirs `create_cache_dir` made, deepest first. `remove_dir`
+/// only removes an empty dir, so one another artifact has since put a
+/// file under stays (`DirectoryNotEmpty`), and the ones above it with it.
+/// One already gone (that other artifact's own cleanup got there first, or
+/// one `create_dir_all` never got to) is passed over, so each failure is
+/// passed over and the next one up is tried.
+fn remove_made(made: &[PathBuf]) {
+    for d in made {
+        let _ = std::fs::remove_dir(d);
+    }
 }
 
 /// Downloads `a` beside `dest` in `dir`, checks it and places it.
@@ -283,7 +310,15 @@ async fn fill(
     // filesystem; a failed run leaves nothing but this dir, removed below.
     // Each call gets its own, so two fetches of one artifact never share it.
     let work = dir.join(work_dir_name());
-    std::fs::create_dir(&work).with_context(|| format!("create {}", work.display()))?;
+    // Another artifact's failed fill may have removed `dir` while it was
+    // still empty: make it again.
+    let made = std::fs::create_dir(&work).or_else(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(dir).and_then(|()| std::fs::create_dir(&work))
+        }
+        _ => Err(e),
+    });
+    made.with_context(|| format!("create {}", work.display()))?;
     let res = download(cfg, a, fetch, &work).await;
     let res = res.and_then(|(file, sum)| {
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755))?;
@@ -625,6 +660,41 @@ mod tests {
             .unwrap_err();
         assert!(!cache.join("herdr/7.7.7").exists());
         assert!(cache_path(&rig.paths, &ok).exists());
+    }
+
+    /// A `create_dir_all` that fails part way (a name too long for the
+    /// filesystem, here) leaves none of the dirs it made.
+    #[test]
+    fn a_cache_dir_made_part_way_is_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let long = "x".repeat(300);
+        let dir = tmp.path().join("herdr").join(&long).join("linux-x86_64");
+        assert!(create_cache_dir(&dir).is_err());
+        assert!(!tmp.path().join("herdr").exists());
+    }
+
+    /// Two artifacts of one version clean up after each other: a dir the
+    /// other already removed is passed over, and one it still uses stays,
+    /// with everything above it.
+    #[test]
+    fn cleanup_tolerates_another_artifact_of_the_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let version = tmp.path().join("herdr/0.9.5");
+        let mine = version.join("linux-aarch64");
+        let made = create_cache_dir(&mine).unwrap();
+        assert_eq!(made.len(), 3, "{made:?}");
+        // The other's cleanup removed the shared dirs first.
+        std::fs::remove_dir(&mine).unwrap();
+        std::fs::remove_dir(&version).unwrap();
+        remove_made(&made);
+        assert!(!tmp.path().join("herdr").exists());
+
+        // The other's target is still there: the version dir stays.
+        let made = create_cache_dir(&mine).unwrap();
+        std::fs::create_dir(version.join("linux-x86_64")).unwrap();
+        remove_made(&made);
+        assert!(!mine.exists());
+        assert!(version.join("linux-x86_64").exists());
     }
 
     #[test]

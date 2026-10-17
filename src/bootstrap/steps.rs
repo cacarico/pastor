@@ -92,11 +92,17 @@ impl User {
 pub(super) type StepOutcome = Result<StepResult, StepResult>;
 
 impl Ctx<'_> {
+    /// `--service-user`, else the login user, except root: the shepherd
+    /// never runs as root, so bootstrap run as root (`curl … | sudo sh -s
+    /// -- join`) makes, or reuses, `ROOT_SERVICE_USER` instead.
     pub(super) fn service_name(&self) -> String {
-        self.o
-            .service_user
-            .clone()
-            .unwrap_or_else(|| self.login.clone())
+        self.o.service_user.clone().unwrap_or_else(|| {
+            if self.facts.uid == 0 || self.login == "root" {
+                super::ROOT_SERVICE_USER.to_string()
+            } else {
+                self.login.clone()
+            }
+        })
     }
 
     fn agent_name(&self) -> String {

@@ -45,12 +45,16 @@ pub type ConnectorFactory = Arc<dyn Fn(&MachineConfig) -> Arc<dyn Connector> + S
 pub fn endpoint_factory(paths: Paths, store: Arc<Store>) -> ConnectorFactory {
     Arc::new(move |m: &MachineConfig| {
         let (store, name) = (store.clone(), m.name.clone());
+        // A read that fails is no answer: the ssh is refused rather than
+        // run without the pin, which would trust whatever answers.
         let pinned: crate::herdr::transport::Pinned = Arc::new(move || {
             store
                 .machine_state(&name)
-                .ok()
-                .flatten()
-                .is_some_and(|s| s.host_key.is_some())
+                .map(|s| s.is_some_and(|s| s.host_key.is_some()))
+                .map_err(|e| {
+                    tracing::warn!(machine = %name, error = %format!("{e:#}"), "cannot read the pinned host key; not connecting");
+                    format!("{e:#}")
+                })
         });
         Arc::new(Endpoint::from_machine_with(m, &paths, pinned)) as Arc<dyn Connector>
     })
@@ -2606,6 +2610,22 @@ impl Fleet {
             service_user,
             ..
         } = outcome;
+        // A host key on record is changed only by `--repin`, never by a
+        // report: one that names another key is refused whole, and one
+        // that names none (a push stopped before its pin) keeps it.
+        let on_record = self.store.machine_state(machine)?.and_then(|s| s.host_key);
+        let host_key = match (on_record, host_key) {
+            (Some(old), Some(new)) if !same_host_key(&old, &new) => {
+                return Err(crate::cli::CliError::err(
+                    "host_key_mismatch",
+                    format!(
+                        "{machine} reports host key {new}, not the {old} on record; if the machine was reinstalled, run `pastor machine bootstrap {machine} --repin`"
+                    ),
+                ));
+            }
+            (Some(old), _) => Some(old),
+            (None, new) => new,
+        };
         let mode = match mode {
             Mode::Root => "root",
             Mode::User => "user",
@@ -3633,6 +3653,16 @@ pub struct Daemon {
     pushing: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
+/// What `MachineBootstrap` asks for, besides the machine's name.
+struct Push {
+    sudo: bool,
+    service_user: Option<String>,
+    host_key: Option<String>,
+    machine: Option<MachineConfig>,
+    login: Option<String>,
+    repin: bool,
+}
+
 /// A machine's place in `Daemon::pushing`, given back when its push ends,
 /// however it ends.
 struct Pushing {
@@ -4244,16 +4274,51 @@ impl Daemon {
     /// `MachineBootstrap`: a push bootstrap of `name`, run in this request's
     /// own task. Only its flock edits take the dispatch lock, and each for a
     /// moment, so a bootstrap that takes minutes never holds up dispatch.
-    async fn machine_bootstrap(
-        &self,
-        name: String,
-        sudo: bool,
-        service_user: Option<String>,
-        host_key: Option<String>,
-        machine: Option<MachineConfig>,
-        login: Option<String>,
-    ) -> IpcResponse {
+    async fn machine_bootstrap(&self, name: String, push: Push) -> IpcResponse {
         use crate::bootstrap::push;
+        let Push {
+            sudo,
+            service_user,
+            host_key,
+            machine,
+            login,
+            repin,
+        } = push;
+        if repin && machine.is_some() {
+            return IpcResponse::error(
+                "usage_error",
+                "--repin is for a machine already in the flock: use machine bootstrap",
+            );
+        }
+        // A pull machine is never reached from here: its key on record is
+        // dropped, and the next report of its own `pastor bootstrap` pins
+        // the one it sends.
+        if repin
+            && let Some(entry) = self.fleet.flock().get(&name)
+            && entry.pull
+            && entry.ssh.is_none()
+        {
+            let Some(_busy) = Pushing::take(&self.pushing, &name) else {
+                return IpcResponse::error(
+                    "machine_busy",
+                    format!("{name} is being bootstrapped already; wait for that run to end"),
+                );
+            };
+            return match self.store.machine_state(&name) {
+                Ok(Some(mut state)) => {
+                    state.host_key = None;
+                    state.updated_at = chrono::Utc::now().to_rfc3339();
+                    match self.store.put_machine_state(&state) {
+                        Ok(()) => IpcResponse::Text(format!(
+                            "dropped the host key on record for {name}; the next report of `pastor bootstrap` there pins the one it sends"
+                        )),
+                        Err(err) => IpcResponse::error("store_error", err),
+                    }
+                }
+                Ok(None) => IpcResponse::Text(format!("{name} has no host key on record")),
+                Err(err) => IpcResponse::error("store_error", err),
+            };
+        }
         let config = match PastorConfig::load(&self.paths.config_file()) {
             Ok(c) => c,
             Err(err) => return IpcResponse::error("config_error", format!("{err:#}")),
@@ -4309,6 +4374,7 @@ impl Daemon {
             sudo,
             service_user,
             host_key,
+            repin,
             machine,
             head,
             provision: config.provision.clone(),
@@ -4387,21 +4453,36 @@ impl Daemon {
         }
         // The host alone: `user@host` with no `@` keeps `target` unchanged.
         let fallback = target.rsplit('@').next().unwrap_or(target);
-        let (host, port) = match self.runner.run("ssh", &["-G", "--", target]) {
+        let (host, port, alias) = match self.runner.run("ssh", &["-G", "--", target]) {
             Ok(out) if out.success => resolved_host(&out.stdout)
-                .unwrap_or_else(|| (fallback.to_string(), "22".to_string())),
+                .map(|(h, p)| (h, p, crate::bootstrap::push::host_key_alias(&out.stdout)))
+                .unwrap_or_else(|| (fallback.to_string(), "22".to_string(), None)),
             out => {
                 failed.push(format!(
                     "could not resolve its host with `ssh -G {target}`: {}; forgot {fallback} only",
                     run_failure(out)
                 ));
-                (fallback.to_string(), "22".to_string())
+                (fallback.to_string(), "22".to_string(), None)
             }
         };
         let mut names = vec![host.clone()];
         if port != "22" {
             names.push(format!("[{host}]:{port}"));
         }
+        // The name a push pinned it under, when the ssh config gives one.
+        names.extend(alias);
+        // A push pinning a key at the same moment edits the file in turn.
+        let _lock = match crate::authkeys::lock(&known_hosts) {
+            Ok(lock) => lock,
+            Err(err) => {
+                failed.push(format!(
+                    "could not lock {}: {err:#}; run `ssh-keygen -f {} -R {host}`",
+                    known_hosts.display(),
+                    known_hosts.display()
+                ));
+                return failed;
+            }
+        };
         let known_hosts = known_hosts.to_string_lossy().into_owned();
         for host in names {
             let args = ["-f", known_hosts.as_str(), "-R", host.as_str()];
@@ -4981,9 +5062,17 @@ impl Daemon {
                 host_key,
                 machine,
                 login,
+                repin,
             } => {
-                self.machine_bootstrap(name, sudo, service_user, host_key, machine, login)
-                    .await
+                let push = Push {
+                    sudo,
+                    service_user,
+                    host_key,
+                    machine,
+                    login,
+                    repin,
+                };
+                self.machine_bootstrap(name, push).await
             }
             IpcRequest::MachineRemove { name } => {
                 // Held for the whole remove, so a push of the machine cannot
@@ -5979,6 +6068,13 @@ pub async fn serve(paths: Paths) -> anyhow::Result<()> {
     daemon.run_with_listener(listener).await
 }
 
+/// Two `keytype base64 [comment]` keys are the same key.
+fn same_host_key(a: &str, b: &str) -> bool {
+    let mut a = a.split_whitespace();
+    let mut b = b.split_whitespace();
+    (a.next(), a.next()) == (b.next(), b.next())
+}
+
 /// The `hostname` and `port` lines of `ssh -G`'s output.
 fn resolved_host(out: &str) -> Option<(String, String)> {
     let field = |key: &str| {
@@ -6013,13 +6109,28 @@ const MAX_REPORT_TEXT: usize = 256;
 const MAX_REPORT_ITEMS: usize = 64;
 
 /// `s` with its control characters dropped (printable text and plain
-/// spaces stay, so a tab or a newline goes too) and cut to
-/// `MAX_REPORT_TEXT` characters.
+/// spaces stay, so a tab or a newline goes too), and the invisible ones
+/// that reorder or hide text (`invisible`), and cut to `MAX_REPORT_TEXT`
+/// characters.
 fn report_text(s: &str) -> String {
     s.chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !invisible(*c))
         .take(MAX_REPORT_TEXT)
         .collect()
+}
+
+/// Zero-width characters (U+200B-U+200F, U+2060-U+2064, U+FEFF) and bidi
+/// embeddings, overrides and isolates (U+202A-U+202E, U+2066-U+2069): a
+/// report that carries them can print as something it is not.
+fn invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
 }
 
 /// A bootstrap report as the head keeps it: at most `MAX_REPORT_ITEMS`
@@ -6046,6 +6157,8 @@ fn sanitise_outcome(mut o: crate::bootstrap::Outcome) -> crate::bootstrap::Outco
     }
     o.herdr_version = safe_version(o.herdr_version.as_deref()).map(str::to_string);
     o.pastor_version = safe_version(o.pastor_version.as_deref()).map(str::to_string);
+    o.service_user = o.service_user.as_deref().map(report_text);
+    o.host_key = o.host_key.as_deref().map(report_text);
     o
 }
 
@@ -7846,7 +7959,7 @@ mod tests {
             crate::bootstrap::StepResult {
                 step: format!("bad\u{1b}]0;title\u{7}\n{long}"),
                 ..crate::bootstrap::StepResult::failed(
-                    format!("why\r\n{long}"),
+                    format!("why\u{202E}hid\u{200B}den\u{2066}\u{FEFF}\r\n{long}"),
                     format!("fix\t{long}"),
                 )
             },
@@ -7877,6 +7990,11 @@ mod tests {
         let detail = ev.detail.expect("detail");
         assert_eq!(detail["step"].as_str(), Some(step.as_str()));
         assert_eq!(detail["why"].as_str(), Some(why.as_str()));
+        assert!(
+            !why.contains('\u{202E}') && !why.contains('\u{200B}'),
+            "{why:?}"
+        );
+        assert!(why.starts_with("whyhidden"), "{why:?}");
     }
 
     /// A report with more steps and missing entries than the caps keeps
@@ -7949,6 +8067,7 @@ mod tests {
             host_key: None,
             machine: None,
             login: Some("me@a".into()),
+            repin: false,
         }
     }
 
@@ -8073,6 +8192,158 @@ mod tests {
             .expect("pinned is queued")
             .why;
         assert!(!why.starts_with("next claim"), "{why}");
+    }
+
+    /// Every zero-width and bidi control a report might hide behind goes;
+    /// the characters around those ranges stay.
+    #[test]
+    fn report_text_drops_bidi_and_zero_width() {
+        for c in ('\u{200B}'..='\u{200F}')
+            .chain('\u{202A}'..='\u{202E}')
+            .chain('\u{2060}'..='\u{2064}')
+            .chain('\u{2066}'..='\u{2069}')
+            .chain(['\u{FEFF}'])
+        {
+            assert_eq!(report_text(&format!("a{c}b")), "ab", "U+{:04X}", c as u32);
+        }
+        for c in ['\u{200A}', '\u{2010}', '\u{2065}', '\u{206A}', 'é', '→'] {
+            assert_eq!(
+                report_text(&format!("a{c}b")),
+                format!("a{c}b"),
+                "U+{:04X}",
+                c as u32
+            );
+        }
+    }
+
+    fn with_host_key(key: Option<&str>) -> crate::bootstrap::Outcome {
+        crate::bootstrap::Outcome {
+            host_key: key.map(str::to_string),
+            ..outcome(true, crate::bootstrap::Mode::Root)
+        }
+    }
+
+    /// A host key on record is never replaced by a report: one naming
+    /// another key is `host_key_mismatch` and changes nothing; one naming
+    /// none keeps it.
+    #[tokio::test]
+    async fn a_report_never_replaces_the_host_key_on_record() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        let resp = d
+            .handle(bootstrap_report(
+                "a",
+                with_host_key(Some("ssh-ed25519 AAAAOLD")),
+            ))
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        let before = d.store.machine_state("a").unwrap().unwrap();
+        assert_eq!(before.host_key.as_deref(), Some("ssh-ed25519 AAAAOLD"));
+
+        let resp = d
+            .handle(bootstrap_report(
+                "a",
+                with_host_key(Some("ssh-ed25519 AAAANEW")),
+            ))
+            .await;
+        let IpcResponse::Error { code, message } = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(code, "host_key_mismatch");
+        assert!(
+            message.contains("pastor machine bootstrap a --repin"),
+            "{message}"
+        );
+        assert_eq!(d.store.machine_state("a").unwrap().unwrap(), before);
+
+        // The same key with a comment is the same key.
+        let resp = d
+            .handle(bootstrap_report(
+                "a",
+                with_host_key(Some("ssh-ed25519 AAAAOLD root@a")),
+            ))
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        let resp = d.handle(bootstrap_report("a", with_host_key(None))).await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        assert_eq!(
+            d.store
+                .machine_state("a")
+                .unwrap()
+                .unwrap()
+                .host_key
+                .as_deref(),
+            Some("ssh-ed25519 AAAAOLD")
+        );
+    }
+
+    /// `machine bootstrap --repin` of a pull machine drops the key on
+    /// record, so its next report pins the one it sends.
+    #[tokio::test]
+    async fn repin_of_a_pull_machine_drops_its_key_for_the_next_report() {
+        let (d, _tmp) = pull_daemon(1).await;
+        set_head_address(&d);
+        let resp = d
+            .handle(bootstrap_report(
+                "laptop",
+                with_host_key(Some("ssh-ed25519 AAAAOLD")),
+            ))
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        let resp = d
+            .handle(IpcRequest::MachineBootstrap {
+                name: "laptop".into(),
+                sudo: false,
+                service_user: None,
+                host_key: None,
+                machine: None,
+                login: None,
+                repin: true,
+            })
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        assert_eq!(
+            d.store.machine_state("laptop").unwrap().unwrap().host_key,
+            None
+        );
+        let resp = d
+            .handle(bootstrap_report(
+                "laptop",
+                with_host_key(Some("ssh-ed25519 AAAANEW")),
+            ))
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        assert_eq!(
+            d.store
+                .machine_state("laptop")
+                .unwrap()
+                .unwrap()
+                .host_key
+                .as_deref(),
+            Some("ssh-ed25519 AAAANEW")
+        );
+    }
+
+    /// `--repin` is for a machine already in the flock.
+    #[tokio::test]
+    async fn repin_with_a_new_entry_is_a_usage_error() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        set_head_address(&d);
+        let resp = d
+            .handle(IpcRequest::MachineBootstrap {
+                name: "b".into(),
+                sudo: false,
+                service_user: None,
+                host_key: None,
+                machine: Some(MachineConfig {
+                    ssh: Some("me@b".into()),
+                    command: None,
+                    ..machine("b", 1)
+                }),
+                login: None,
+                repin: true,
+            })
+            .await;
+        assert_eq!(error_code(resp), "usage_error");
     }
 
     /// Only `pastor bootstrap` reports a machine's bootstrap: an agent's
@@ -11830,13 +12101,25 @@ mod tests {
     async fn daemon_with_removable_machine(
         runner: Arc<RecordingRunner>,
     ) -> (Daemon, tempfile::TempDir) {
-        let flock = Flock {
-            flocks: vec![],
-            machines: vec![MachineConfig {
+        daemon_with_removable(
+            runner,
+            MachineConfig {
                 ssh: Some("pastor-agent@pi-9".into()),
                 command: None,
                 ..machine("pi-9", 1)
-            }],
+            },
+        )
+        .await
+    }
+
+    /// `daemon_with_removable_machine` with `pi-9` as `entry` says.
+    async fn daemon_with_removable(
+        runner: Arc<RecordingRunner>,
+        entry: MachineConfig,
+    ) -> (Daemon, tempfile::TempDir) {
+        let flock = Flock {
+            flocks: vec![],
+            machines: vec![entry],
         };
         let (mut d, tmp) = daemon_with_flock(flock, &[("pi-9", 1, FakeHerdr::new())]).await;
 
@@ -11941,6 +12224,39 @@ mod tests {
         );
 
         assert!(d.store.machine_state("pi-9").unwrap().is_none());
+    }
+
+    /// A pull machine goes the same way as a pushed one: its lines and its
+    /// bootstrap row. The head never reached it over ssh, so there is no
+    /// host key or master to forget, and nothing is run.
+    #[tokio::test]
+    async fn remove_of_a_pull_machine_drops_its_state_and_lines() {
+        let runner = Arc::new(RecordingRunner::answering(resolves_to_port_2222));
+        let (d, _tmp) = daemon_with_removable(
+            runner.clone(),
+            MachineConfig {
+                pull: true,
+                ssh: None,
+                command: None,
+                ..machine("pi-9", 1)
+            },
+        )
+        .await;
+        let resp = d
+            .handle(IpcRequest::MachineRemove {
+                name: "pi-9".into(),
+            })
+            .await;
+        let IpcResponse::Text(text) = resp else {
+            panic!("{resp:?}")
+        };
+        assert!(!text.contains("could not"), "{text}");
+        assert!(d.store.machine_state("pi-9").unwrap().is_none());
+        assert_eq!(
+            std::fs::read_to_string(&d.authorized_keys).unwrap(),
+            "ssh-ed25519 AAAA me@laptop\n"
+        );
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
     }
 
     /// A host on port 22 is keyed by its bare name only, and ssh-keygen's

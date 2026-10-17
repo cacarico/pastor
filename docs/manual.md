@@ -370,6 +370,7 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `head_running` | `pastor serve` while a head already runs here |
 | `head_started` | a head started while a head-less edit waited; run the command again |
 | `head_too_old` | the head predates something the request needs; upgrade it |
+| `host_key_mismatch` | a bootstrap report names another host key than the one on record for the machine; nothing is changed: if the machine was reinstalled, run `machine bootstrap <name> --repin` |
 | `head_unreachable` | ssh to the remote head failed |
 | `head_unresponsive` | something holds the socket but does not answer a ping |
 | `herdr_error` | herdr could not be run, or answered a request with an error |
@@ -1098,8 +1099,11 @@ stopped instead of redoing what is already there.
 
 Either way, root (uid 0, or `--sudo` with working passwordless sudo) buys
 isolation: bootstrap makes a service user (the login user, or `pastor` with
-`--service-user pastor`) that holds the machine key and runs herdr and the
-shepherd, and `pastor-agent`, which every agent pane runs as; each gets its
+`--service-user pastor`, or when the login user is root, as with `curl … |
+sudo sh -s -- join`: the shepherd never runs as root, so `pastor` is made,
+or reused if it is there, and `--service-user root` is a `usage_error`)
+that holds the machine key and runs herdr and the shepherd, and
+`pastor-agent`, which every agent pane runs as; each gets its
 own `0700` state directory, so `pastor-agent` cannot read the service
 user's machine key. Without root, bootstrap makes neither: herdr and every
 agent run as the login user, so there is no isolation between them, and an
@@ -1139,10 +1143,13 @@ pastor and herdr builds for it from the head's cache over that ssh into
 `~/.cache/pastor-bootstrap/` (checking each sha256 there before it moves it
 into place), and runs `pastor bootstrap --json` there with `--sudo` and
 `--service-user` passed on. On success it adds the machine's agent line
-(`pastor:agent:<name>`) to the head's `authorized_keys`, records the
-bootstrap as ok, emits `machine.bootstrapped` and ends the ssh master of
-the login. In root mode the entry's `ssh` becomes `pastor-agent@<host>`,
-the user herdr and every agent run as; in user mode it keeps the login.
+(`pastor:agent:<name>`) to the head's `authorized_keys` (refused, as a
+join refuses it, when that key already logs in under another line),
+records the bootstrap as ok, emits `machine.bootstrapped` and ends the ssh
+master of the login. In root mode the entry's `ssh` becomes
+`pastor-agent@<host>`, the user herdr and every agent run as, last of all:
+if anything after it fails, the entry gets its old `ssh` back and the
+agent line goes. In user mode it keeps the login.
 From then on the head's own ssh to the machine offers its `head_key`
 (beside the user's keys, not instead) and checks the host against the key
 pinned in pastor's `known_hosts`. A machine that ssh cannot reach fails step
@@ -1169,14 +1176,23 @@ pastor machine add lab-1 me@lab-1 --bootstrap        # no root: user mode
 pastor machine bootstrap gpu-3 --ssh me@gpu-3 --sudo # rerun or upgrade
 ```
 
+The key is pinned under the name ssh itself looks it up by: the host and
+port `ssh -G` resolves the login to (`[host]:port` off port 22), or its
+`HostKeyAlias`, so a machine reached through an alias in your ssh config
+is checked like any other. Two pushes, or a push and a `machine remove`,
+edit pastor's `known_hosts` in turn (a lock on `known_hosts.lock`).
+
 A machine whose host key changed for a legitimate reason (reinstalled, its
 disk replaced) fails every push with a key mismatch instead of trusting the
-new one blindly. Forget the old key, then bootstrap again to pin the new
-one:
+new one blindly, and keeps the key on record until a new pin succeeds; a
+pull machine's report naming another key is refused (`host_key_mismatch`)
+and changes nothing. `--repin` is the only way to trust the new key: it
+drops the old one and pins the one the machine offers now (for a pull
+machine, it drops the key on record, and its next `pastor bootstrap`
+report pins the one it sends):
 
 ```bash
-ssh-keygen -f ~/.local/state/pastor/known_hosts -R gpu-3
-pastor machine bootstrap gpu-3 --ssh me@gpu-3 --sudo
+pastor machine bootstrap gpu-3 --ssh me@gpu-3 --sudo --repin
 ```
 
 `pastor machine remove <name>` on a head also revokes what let the
@@ -1196,8 +1212,10 @@ and agent keys and their `.pub` files. It checks every step, prints what it
 did and what failed, and ends in `leave_incomplete` if anything did. It
 refuses on the head (`leave_on_head`), and asks first unless `--yes`.
 
-With no head running, `flock add|join|leave|remove` and `machine remove`
-hold a lock (`fleet.lock` in the state dir) from their read of the queued
+With no head running, `machine remove` also drops the machine's
+`authorized_keys` lines and its bootstrap record (a pull machine has no
+host key or ssh master on the head to forget). `flock add|join|leave|remove`
+and `machine remove` hold a lock (`fleet.lock` in the state dir) from their read of the queued
 tasks to the save, and `pastor serve` holds the same lock from before it
 reads flock.toml until it listens. So a head starting meanwhile waits for the
 edit and reads the edited file, never queueing a task in a flock the edit
@@ -3927,10 +3945,15 @@ pastor join create --flock builders --tag gpu --ttl 1h
 
 - The head makes an ed25519 key pair for the token with `ssh-keygen`. The
   public half goes in the head's `authorized_keys`, marked
-  `pastor:join:<id>` and locked to `pastor bridge --join <id>`. The private
-  half goes into the token only (`pjt_...`, one word); the head keeps no copy.
+  `pastor:join:<id>` and locked to `pastor bridge --join <id>`, with
+  `expiry-time` set to the token's expiry, so sshd (OpenSSH 8.2 or later)
+  refuses the key after `--ttl` even before the sweep takes the line away.
+  The private half goes into the token only (`pjt_...`, one word); the head
+  keeps no copy.
 - The token also carries the head's ssh destination (`head_address`, else
-  `user@hostname`) and its ed25519 host key, for the machine to pin.
+  `user@hostname`) and its ed25519 host key, for the machine to pin. A head
+  whose sshd is not on port 22 sets `head_address` as
+  `ssh://user@host:port`; the key is then pinned as `[host]:port`.
 - The flock, the tags and `--replace` are fixed when the token is made.
   The joining machine chooses only its name. A name already in flock.toml
   is `machine_name_taken`, unless the token was made with `--replace` for
@@ -4104,10 +4127,12 @@ To set it up for machine `pi-1`:
    and edits no file.
 3. Append the line to the head user's `~/.ssh/authorized_keys`. It runs
    `<this pastor> bridge --agent --machine pi-1` whatever command the client
-   asks for, with no terminal and no forwarding:
+   asks for, with no terminal and no forwarding. The key's own comment gives
+   way to the marker `pastor:agent:pi-1`, so `pastor machine remove pi-1`
+   takes the line away again:
 
    ```
-   command="/path/to/pastor bridge --agent --machine pi-1",no-pty,no-user-rc,no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAA... user@pi-1
+   restrict,command="/path/to/pastor bridge --agent --machine pi-1",no-pty,no-user-rc,no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAA... pastor:agent:pi-1
    ```
 
 Give each machine its own key: the machine named in the line is the only one
@@ -4721,6 +4746,13 @@ the probes, `task attach`) goes as `sh -c '<command>'`, so a remote login
 shell that is not POSIX, such as fish, only parses one quoted word; sh
 parses the rest. For the same reason a machine's `session` may not contain a
 backslash, and a repo path with one needs a POSIX login shell.
+
+Every ssh pastor runs to a machine or a head sets `ForwardAgent=no`,
+`ForwardX11=no` and `ClearAllForwardings=yes`, whatever your ssh config
+says, so a `ForwardAgent yes` there never hands your agent to a machine
+whose panes run agents. A machine whose host key is pinned is not reached
+at all while the head cannot read that record, rather than reached without
+the pin.
 
 For an `ssh` machine those connections are cheap because all of them share
 one multiplexed ssh master (`ControlMaster=auto`,

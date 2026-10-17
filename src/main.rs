@@ -519,6 +519,9 @@ enum MachineCmd {
         /// The machine's ed25519 host key must be this (SHA256:... or the key itself)
         #[arg(long, value_name = "KEY")]
         host_key: Option<String>,
+        /// Drop the host key pinned for the machine and pin the one it offers now, after a reinstall
+        #[arg(long)]
+        repin: bool,
     },
     /// Remove a machine from flock.toml; tasks already on it keep their rows
     Remove {
@@ -2327,6 +2330,7 @@ async fn machine(client: &pastor::ipc::Client, cmd: MachineCmd, head: Head) -> a
                             host_key,
                             machine: Some(m.clone()),
                             login: None,
+                            repin: false,
                         },
                     )
                     .await?
@@ -2387,6 +2391,7 @@ async fn machine(client: &pastor::ipc::Client, cmd: MachineCmd, head: Head) -> a
             service_user,
             ssh,
             host_key,
+            repin,
         } => {
             println!(
                 "{}",
@@ -2399,6 +2404,7 @@ async fn machine(client: &pastor::ipc::Client, cmd: MachineCmd, head: Head) -> a
                         host_key,
                         machine: None,
                         login: ssh,
+                        repin,
                     },
                 )
                 .await?
@@ -2423,7 +2429,13 @@ async fn machine(client: &pastor::ipc::Client, cmd: MachineCmd, head: Head) -> a
             } else {
                 let _lock = offline_fleet_lock(paths)?;
                 let done = fleet_edit::remove_machine(&path, &name).map_err(edit_error)?;
-                println!("{done}; {}", reload_running_head(paths, head).await);
+                let mut done = vec![done];
+                done.extend(forget_removed_machine(paths, &name));
+                println!(
+                    "{}; {}",
+                    done.join("; "),
+                    reload_running_head(paths, head).await
+                );
             }
             if herdr {
                 // herdr removes by profile id; the label is all pastor knows.
@@ -2986,6 +2998,33 @@ async fn attach(client: &pastor::ipc::Client, task: &str) -> anyhow::Result<()> 
         )
     };
     Err(anyhow::anyhow!("exec failed: {err}"))
+}
+
+/// `machine remove` with no head running: what the head's own remove does
+/// besides the flock edit (`Daemon::cleanup_removed_machine`) that needs no
+/// ssh, so a pull machine's shepherd key stops logging in and its
+/// bootstrap row goes. Returns what failed, with what to do about it.
+fn forget_removed_machine(paths: &Paths, name: &str) -> Vec<String> {
+    let mut failed = Vec::new();
+    let keys = pastor::authkeys::default_file();
+    if keys.exists()
+        && let Err(err) = pastor::authkeys::remove_machine(&keys, name)
+    {
+        failed.push(format!(
+            "could not drop its authorized_keys lines: {err:#}; delete the lines ending in \
+             `pastor:machine:{name}` and `pastor:agent:{name}` from {} by hand",
+            keys.display()
+        ));
+    }
+    let db = paths.db_file();
+    if db.exists()
+        && let Err(err) = pastor::store::Store::open(&db).and_then(|s| s.drop_machine_state(name))
+    {
+        failed.push(format!(
+            "could not drop its bootstrap record: {err:#}; a later `machine add` of {name} starts from it"
+        ));
+    }
+    failed
 }
 
 /// `pastor machine authorized-key`: prints the line, and never edits

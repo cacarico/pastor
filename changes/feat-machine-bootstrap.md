@@ -53,6 +53,10 @@
   pins only a plain host key line for the token's head, removes its key
   dir on SIGINT, SIGTERM and SIGHUP (and one a killed join left), and caps
   the herdr download at the size the head answered and 512 MiB.
+- `pastor machine bootstrap NAME --repin`: drops the host key pinned for
+  the machine and pins the one it offers now, the only way a changed host
+  key is trusted again (for a pull machine it drops the key on record, and
+  its next report pins the one it sends). Gated at IPC protocol 32.
 
 ### Changed
 
@@ -62,3 +66,50 @@
   machine reached over ssh forgets its host key and ends its ssh master.
 - The ssh to a remote head uses pastor's `known_hosts` only beside a
   pastor machine or agent key, so a person's CLI keeps their own.
+- Bootstrap run as root (`curl … | sudo sh -s -- join`) with no
+  `--service-user` makes, or reuses, a `pastor` service user: the
+  shepherd never runs as root, and `--service-user root` is a
+  `usage_error`.
+- A head whose sshd is not on port 22 sets `head_address` as
+  `ssh://user@host:port`; a join token then pins its key as `[host]:port`.
+
+### Fixed
+
+- A push pins the machine's host key under the name `ssh -G` resolves the
+  login to (`[host]:port` off port 22, or its `HostKeyAlias`), so a machine
+  reached through an ssh config alias is checked against it.
+- Two pushes, or a push and a `machine remove`, no longer race on pastor's
+  `known_hosts`: they take turns on a lock.
+- A failed rerun keeps the host key on record until a new pin succeeds.
+- A root-mode push moves the entry to `pastor-agent@<host>` last, and puts
+  it back, with the agent line taken away, if the report after it fails.
+- `machine add --bootstrap` of a machine that exists names the rerun to
+  use, with `--ssh <login>` once the entry names `pastor-agent`.
+- A shepherd keeps its bootstrap report for later when the head is too old
+  for it (`head_too_old`), instead of putting it aside as refused.
+- `pastor join` stopped by SIGINT, SIGTERM or SIGHUP kills and reaps its
+  ssh instead of leaving it running.
+- `machine remove` with no head running drops the machine's
+  `authorized_keys` lines and bootstrap record too, so a removed pull
+  machine's shepherd key stops logging in.
+- Two artifacts of one version fetched at once no longer trip over each
+  other's cleanup of the cache dir, and a cache dir made part way is
+  removed.
+
+### Security
+
+- Every ssh pastor runs sets `ForwardAgent=no`, `ForwardX11=no` and
+  `ClearAllForwardings=yes`, so a `ForwardAgent` in the head user's ssh
+  config never hands its agent to a pastor-agent pane.
+- `pastor machine authorized-key` prints a `restrict` line marked
+  `pastor:agent:<name>`, which `machine remove` takes away again.
+- A bootstrap report naming another host key than the one on record is
+  refused (`host_key_mismatch`) and changes nothing.
+- A push refuses an agent key already in the head's `authorized_keys`
+  under another line, as a join does.
+- A join token's `authorized_keys` line carries `expiry-time`, so sshd
+  refuses the key after `--ttl` even before the sweep removes it.
+- Bootstrap reports lose zero-width and bidi control characters before the
+  head keeps or prints them.
+- A machine whose host key is pinned is not reached while the head cannot
+  read that record, rather than reached without the pin.

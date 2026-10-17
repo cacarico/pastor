@@ -107,6 +107,19 @@ pub fn line(
     key: &str,
     marker: &Marker,
 ) -> anyhow::Result<String> {
+    line_until(pastor, command_args, key, marker, None)
+}
+
+/// `line`, with `expiry-time` when `until` is set, so sshd itself refuses
+/// the key from then on (OpenSSH 8.2 and later), whether or not anything
+/// took the line away yet.
+pub fn line_until(
+    pastor: &Path,
+    command_args: &str,
+    key: &str,
+    marker: &Marker,
+    until: Option<chrono::DateTime<chrono::Utc>>,
+) -> anyhow::Result<String> {
     marker.check()?;
     let lines: Vec<&str> = key.lines().filter(|l| !l.trim().is_empty()).collect();
     let [key] = lines.as_slice() else {
@@ -136,8 +149,11 @@ pub fn line(
             ),
         ));
     }
+    let expiry = until
+        .map(|t| format!("expiry-time=\"{}\",", t.format("%Y%m%d%H%M%SZ")))
+        .unwrap_or_default();
     Ok(format!(
-        "restrict,command=\"{pastor} {command_args}\",{} {kind} {b64} {}",
+        "restrict,{expiry}command=\"{pastor} {command_args}\",{} {kind} {b64} {}",
         restrict_options(),
         marker.render()
     ))
@@ -148,8 +164,9 @@ fn has_marker(l: &str, marker: &str) -> bool {
     l.split_whitespace().last() == Some(marker)
 }
 
-/// The flock on `<file>.lock`, held until dropped.
-fn lock(file: &Path) -> anyhow::Result<std::fs::File> {
+/// The flock on `<file>.lock`, held until dropped. Also serialises pastor's
+/// own `known_hosts` (`bootstrap::push`, `machine remove`).
+pub(crate) fn lock(file: &Path) -> anyhow::Result<std::fs::File> {
     let mut name = file.as_os_str().to_owned();
     name.push(".lock");
     let path = PathBuf::from(name);
@@ -323,6 +340,31 @@ mod tests {
         assert!(l.ends_with(" ssh-ed25519 KEY pastor:join:j1"));
         let e = line(Path::new("/p"), "x", "a b\nc d", &m).unwrap_err();
         assert_eq!(e.downcast_ref::<CliError>().unwrap().code, "invalid_key");
+    }
+
+    /// sshd's own clock stops the key: `expiry-time` in UTC, as OpenSSH
+    /// reads it (`YYYYMMDDHHMMSSZ`).
+    #[test]
+    fn line_until_carries_the_expiry() {
+        let m = Marker::Join("j1".into());
+        let t = chrono::DateTime::parse_from_rfc3339("2026-10-17T13:04:05+02:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let l = line_until(
+            Path::new("/bin/pastor"),
+            "bridge",
+            "ssh-ed25519 K",
+            &m,
+            Some(t),
+        )
+        .unwrap();
+        assert!(
+            l.starts_with(
+                "restrict,expiry-time=\"20261017110405Z\",command=\"/bin/pastor bridge\","
+            ),
+            "{l}"
+        );
+        assert!(!mk(&m, "ssh-ed25519 K").contains("expiry-time"));
     }
 
     fn code(e: anyhow::Error) -> String {

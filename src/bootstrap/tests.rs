@@ -21,6 +21,13 @@ macro_rules! sudo_agent {
          HOME=/home/pastor-agent XDG_RUNTIME_DIR=/run/user/990 LANG=C"
     };
 }
+macro_rules! runuser_pastor {
+    () => {
+        "setsid -w runuser -u pastor -- env -i \
+         PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/pastor/.local/bin \
+         HOME=/home/pastor XDG_RUNTIME_DIR=/run/user/991 LANG=C"
+    };
+}
 macro_rules! runuser_agent {
     () => {
         "setsid -w runuser -u pastor-agent -- env -i \
@@ -556,6 +563,7 @@ fn root_without_sudo_uses_runuser() {
     let r = FakeRunner::new(&[
         ("id -un", true, "root"),
         ("id -u pastor-agent", false, ""),
+        ("id -u pastor", false, ""),
         ("id -u", true, "0"),
         ("sudo -n true", false, ""),
         (
@@ -563,7 +571,6 @@ fn root_without_sudo_uses_runuser() {
             true,
             "root:x:0:0:root:/root:/bin/bash",
         ),
-        ("stat -c %U %a /root/.local/state/pastor", true, "root 700"),
         (
             concat!(
                 runuser_agent!(),
@@ -572,11 +579,6 @@ fn root_without_sudo_uses_runuser() {
             ),
             true,
             "/home/pastor-agent/.local/state/pastor",
-        ),
-        (
-            "/var/tmp/pastor-bootstrap.X/pastor bootstrap --print-state-dir",
-            true,
-            "/root/.local/state/pastor",
         ),
     ]);
     let o = run(&r, &options(false));
@@ -598,7 +600,57 @@ fn root_without_sudo_uses_runuser() {
     )));
     // Root's own work runs as itself, with no wrapper.
     assert!(r.called("useradd --system --create-home --shell /bin/sh pastor-agent"));
-    assert!(r.called("ssh-keygen -t ed25519 -N  -f /root/.local/state/pastor/machine_key"));
+    // The shepherd never runs as root: the machine key is the service
+    // user's, `pastor`, made for it.
+    assert_eq!(o.service_user.as_deref(), Some("pastor"));
+    assert!(r.called("useradd --system --create-home --shell /bin/sh pastor"));
+    assert!(
+        r.called(&format!(
+            "{} ssh-keygen -t ed25519 -N  -f /home/pastor/.local/state/pastor/machine_key",
+            runuser_pastor!()
+        )),
+        "{:#?}",
+        r.calls()
+    );
+    assert!(!r.called_containing("/root/.local/state/pastor/machine_key"));
+}
+
+/// Run as root with a `pastor` user already there: it is the service
+/// user, reused, not made again.
+#[test]
+fn root_reuses_an_existing_pastor_service_user() {
+    let r = FakeRunner::new(&[
+        ("id -un", true, "root"),
+        ("id -u pastor-agent", true, "990"),
+        ("id -u pastor", true, "991"),
+        ("id -u", true, "0"),
+        ("sudo -n true", false, ""),
+    ]);
+    let o = run(&r, &options(false));
+    assert!(o.ok, "{:#?}", o.steps);
+    assert_eq!(o.service_user.as_deref(), Some("pastor"));
+    assert!(!r.called_containing("useradd"), "{:#?}", r.calls());
+}
+
+/// `--service-user root` is a usage error wherever it is given: the
+/// shepherd never runs as root.
+#[test]
+fn service_user_root_is_refused() {
+    let err = check_user("root").unwrap_err();
+    assert_eq!(code(&err), "usage_error");
+    let args = Args {
+        sudo: true,
+        service_user: Some("root".into()),
+        head_key: None,
+        herdr_from: None,
+        json: true,
+        write_client: None,
+        print_state_dir: false,
+        write_shepherd: None,
+        write_report: None,
+    };
+    let err = cli(&args, Some("me@head")).unwrap_err();
+    assert_eq!(code(&err), "usage_error");
 }
 
 #[test]

@@ -255,7 +255,8 @@ pub struct Created {
 }
 
 /// The head's host key as `ssh-keyscan` prints it for `head`: the host
-/// part of the destination, the key type and the key.
+/// part of the destination (`[host]:port` for a `ssh://` destination off
+/// port 22, which is how ssh looks it up), the key type and the key.
 fn keyscan_line(head: &str, file: &Path) -> anyhow::Result<String> {
     let text = std::fs::read_to_string(file).map_err(|e| {
         CliError::err(
@@ -273,8 +274,9 @@ fn keyscan_line(head: &str, file: &Path) -> anyhow::Result<String> {
             format!("{} is not an ssh public key", file.display()),
         ));
     };
-    let host = head.rsplit_once('@').map_or(head, |(_, h)| h);
-    Ok(format!("{host} {kind} {key}"))
+    let (host, port) = crate::ssh::destination_host_port(head);
+    let name = crate::ssh::known_hosts_name(host, port);
+    Ok(format!("{name} {kind} {key}"))
 }
 
 /// The head's ssh destination: `head_address`, else `user@hostname`.
@@ -338,15 +340,18 @@ pub fn create_with(
     }
     let (key, public) = made?;
     let marker = Marker::Join(id.clone());
-    let line = authkeys::line(
+    let expires = now
+        + chrono::Duration::from_std(ask.ttl)
+            .map_err(|_| CliError::err("invalid_args", "--ttl is too long"))?;
+    // sshd refuses the key after `expires` by itself; the sweep only tidies
+    // the line away.
+    let line = authkeys::line_until(
         &files.pastor,
         &format!("bridge --join {id}"),
         &public,
         &marker,
+        Some(expires),
     )?;
-    let expires = now
-        + chrono::Duration::from_std(ask.ttl)
-            .map_err(|_| CliError::err("invalid_args", "--ttl is too long"))?;
     let row = JoinToken {
         id: id.clone(),
         flock: ask.flock.clone(),
@@ -923,6 +928,28 @@ mod tests {
         }
     }
 
+    /// A head on another port than 22 is pinned under `[host]:port`, the
+    /// name ssh looks it up by; on 22 the host alone.
+    #[test]
+    fn the_host_key_line_names_the_port_off_22() {
+        let d = tempfile::tempdir().unwrap();
+        let f = files(d.path());
+        for (head, want) in [
+            ("me@head.example", "head.example ssh-ed25519 AAAAHOST"),
+            ("ssh://me@head.example", "head.example ssh-ed25519 AAAAHOST"),
+            (
+                "ssh://me@head.example:22",
+                "head.example ssh-ed25519 AAAAHOST",
+            ),
+            (
+                "ssh://me@head.example:2222",
+                "[head.example]:2222 ssh-ed25519 AAAAHOST",
+            ),
+        ] {
+            assert_eq!(keyscan_line(head, &f.host_key).unwrap(), want, "{head}");
+        }
+    }
+
     #[test]
     fn create_writes_the_line_and_keeps_no_private_key() {
         let d = tempfile::tempdir().unwrap();
@@ -951,7 +978,8 @@ mod tests {
         assert_eq!(
             line,
             format!(
-                "restrict,command=\"/usr/local/bin/pastor bridge --join {}\",{} ssh-ed25519 AAAAFAKEPUB pastor:join:{}",
+                "restrict,expiry-time=\"{}\",command=\"/usr/local/bin/pastor bridge --join {}\",{} ssh-ed25519 AAAAFAKEPUB pastor:join:{}",
+                (now + chrono::Duration::hours(1)).format("%Y%m%d%H%M%SZ"),
                 made.id,
                 crate::authkeys::restrict_options(),
                 made.id

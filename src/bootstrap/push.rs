@@ -78,6 +78,11 @@ pub struct PushOpts {
     /// `SHA256:` fingerprint or a `ssh-ed25519 AAAA…` key. Unset, the key
     /// is trusted the first time it is seen.
     pub host_key: Option<String>,
+    /// `machine bootstrap --repin`: the host key pinned for the machine is
+    /// dropped and the one it offers now is pinned instead. The only way a
+    /// changed host key is trusted again; without it a changed key stops
+    /// the push.
+    pub repin: bool,
     /// `machine add --bootstrap`: the entry to write when the flock has no
     /// machine of that name. `None` for `machine bootstrap`, whose machine
     /// must exist.
@@ -162,7 +167,8 @@ pub async fn push(
     }
     let head_key = head_key(paths, &opts.runner).await?;
     let before = record(paths, store, fleet, name, login, &opts).await?;
-    let pinned = match prepare(paths, login, &opts).await {
+    let stored = before.as_ref().and_then(|s| s.host_key.clone());
+    let pinned = match prepare(paths, name, login, stored.as_deref(), &opts).await {
         Ok(pinned) => pinned,
         Err(stop) => {
             let outcome = stopped(stop, &opts, None);
@@ -178,13 +184,25 @@ pub async fn push(
             return Ok(outcome);
         }
     };
+    // `--repin` pinned a new key: it is the one on record from now on, so
+    // the report below, and every ssh after it, checks against it.
+    let before = before.map(|mut s| {
+        s.host_key = Some(pinned.clone());
+        s
+    });
+    if let Some(s) = before
+        .as_ref()
+        .filter(|s| opts.repin && s.bootstrap != BootstrapState::Ok)
+    {
+        store.put_machine_state(s)?;
+    }
     if before
         .as_ref()
         .is_some_and(|s| s.bootstrap == BootstrapState::Ok)
     {
         store.put_machine_state(&pending(name, before.as_ref()))?;
     }
-    let mut wrote_line = false;
+    let mut finished: Option<Finished> = None;
     let outcome = match run_bootstrap(paths, login, &head_key, &opts).await {
         Ok(mut outcome) => {
             outcome.ok = succeeded(&outcome);
@@ -204,8 +222,8 @@ pub async fn push(
                     Some(outcome),
                 ),
                 _ if outcome.ok => match finish(paths, fleet, name, login, &outcome, &opts).await {
-                    Ok(()) => {
-                        wrote_line = true;
+                    Ok(done) => {
+                        finished = Some(done);
                         outcome
                     }
                     Err(stop) => stopped(stop, &opts, Some(outcome)),
@@ -216,12 +234,10 @@ pub async fn push(
         Err(stop) => stopped(stop, &opts, None),
     };
     if let Err(err) = fleet.report_bootstrap(name, outcome.clone()) {
-        // Not on record as ok, so its agent line does not stay either.
-        if wrote_line {
-            let marker = crate::authkeys::Marker::Agent(name.to_string());
-            if let Err(undo) = crate::authkeys::remove(&opts.authorized_keys, &marker) {
-                tracing::warn!(machine = %name, %undo, "could not take the agent line back");
-            }
+        // Not on record as ok, so its agent line and its new ssh do not
+        // stay either.
+        if let Some(done) = finished {
+            undo_finish(paths, fleet, name, &opts, done).await;
         }
         return Err(err);
     }
@@ -305,7 +321,18 @@ async fn record(
 ) -> anyhow::Result<Option<MachineState>> {
     let entry = fleet.flock().get(name).cloned();
     let before = store.machine_state(name)?;
-    let exists = || CliError::err("machine_exists", format!("machine {name} already exists"));
+    // A root-mode machine's entry names the agent user by now, which cannot
+    // rerun bootstrap: say which login can.
+    let exists = || {
+        let rerun = match entry.as_ref().and_then(|e| e.ssh.as_deref()) {
+            Some(ssh) if ssh == login => format!("pastor machine bootstrap {name}"),
+            _ => format!("pastor machine bootstrap {name} --ssh {login}"),
+        };
+        CliError::err(
+            "machine_exists",
+            format!("machine {name} already exists; to set it up again run `{rerun}`"),
+        )
+    };
     match (&entry, &opts.machine) {
         (Some(entry), Some(_)) => {
             let resumable = entry.ssh.as_deref() == Some(login)
@@ -397,8 +424,14 @@ async fn head_key(paths: &Paths, runner: &Arc<dyn PushRunner>) -> anyhow::Result
 
 /// Steps 2 to 4: pin, read, copy. Nothing on the machine changes before
 /// the end of these but a file under its cache. Returns the pinned key.
-async fn prepare(paths: &Paths, login: &str, opts: &PushOpts) -> Result<String, Stop> {
-    let pinned = pin_host_key(paths, login, opts).await?;
+async fn prepare(
+    paths: &Paths,
+    name: &str,
+    login: &str,
+    stored: Option<&str>,
+    opts: &PushOpts,
+) -> Result<String, Stop> {
+    let pinned = pin_host_key(paths, name, login, stored, opts).await?;
     let ssh = |remote: &str| ssh_args(paths, login, remote);
     let (pastor_target, herdr_target) = platform(opts, ssh("uname -sm; getconf LONG_BIT")).await?;
     let herdr_version = crate::artifacts::herdr_version(&opts.provision, &opts.fleet_versions);
@@ -512,14 +545,24 @@ fn tail(stderr: &str) -> String {
 }
 
 /// Step 2: `ssh-keyscan` the machine's ed25519 key into pastor's own
-/// known_hosts, under the host and port `ssh -G` resolves the login to.
-/// With `--host-key` the scanned key must be that one. A key that differs
-/// from one already pinned for the host stops the push: that is what a
-/// man in the middle looks like, as much as a reinstalled machine.
-async fn pin_host_key(paths: &Paths, login: &str, opts: &PushOpts) -> Result<String, Stop> {
+/// known_hosts, under the name ssh itself looks it up by (`pinned_name`
+/// of what `ssh -G` resolves the login to). With `--host-key` the scanned
+/// key must be that one. A key that differs from the one already pinned
+/// for the host, in known_hosts or on record for the machine (`stored`),
+/// stops the push: that is what a man in the middle looks like, as much
+/// as a reinstalled machine. Only `--repin` replaces it.
+async fn pin_host_key(
+    paths: &Paths,
+    machine: &str,
+    login: &str,
+    stored: Option<&str>,
+    opts: &PushOpts,
+) -> Result<String, Stop> {
     let stop = |why: String, fix: &str| Stop::new("host_key", why, fix);
-    let fallback = (host_part(login).to_string(), "22".to_string());
-    let (host, port) = match run(
+    let repin =
+        format!("if the machine was reinstalled, run `pastor machine bootstrap {machine} --repin`");
+    let fallback = || (host_part(login).to_string(), "22".to_string(), None);
+    let (host, port, alias) = match run(
         &opts.runner,
         "ssh",
         vec!["-G".into(), "--".into(), login.into()],
@@ -527,9 +570,12 @@ async fn pin_host_key(paths: &Paths, login: &str, opts: &PushOpts) -> Result<Str
     )
     .await
     {
-        Ok(out) if out.success => resolved_host(&out.stdout).unwrap_or(fallback),
-        _ => fallback,
+        Ok(out) if out.success => resolved_host(&out.stdout)
+            .map(|(h, p)| (h, p, host_key_alias(&out.stdout)))
+            .unwrap_or_else(fallback),
+        _ => fallback(),
     };
+    let names = pinned_name(&host, &port, alias.as_deref());
     let args = vec![
         "-p".into(),
         port.clone(),
@@ -546,7 +592,7 @@ async fn pin_host_key(paths: &Paths, login: &str, opts: &PushOpts) -> Result<Str
                 "install openssh-client on the head",
             )
         })?;
-    let Some((names, key)) = out.stdout.lines().find_map(scanned) else {
+    let Some((_, key)) = out.stdout.lines().find_map(scanned) else {
         return Err(stop(
             format!(
                 "ssh-keyscan got no ed25519 host key from {host} port {port}: {}",
@@ -564,47 +610,101 @@ async fn pin_host_key(paths: &Paths, login: &str, opts: &PushOpts) -> Result<Str
             ));
         }
     }
-    let file = paths.known_hosts_file();
-    let text = std::fs::read_to_string(&file).unwrap_or_default();
-    for line in text.lines() {
-        let Some((pinned_names, pinned)) = scanned(line) else {
-            continue;
-        };
-        if !pinned_names.split(',').any(|n| n == names) {
-            continue;
-        }
-        if pinned == key {
-            return Ok(key);
-        }
+    if !opts.repin
+        && let Some(stored) = stored.filter(|k| !same_key(k, &key))
+    {
         return Err(stop(
-            format!(
-                "the host key of {names} is not the one pastor pinned in {}",
-                file.display()
-            ),
-            &format!(
-                "if the machine was reinstalled, run ssh-keygen -f {} -R {names} and try again",
-                file.display()
-            ),
+            format!("{names} offered host key {key}, not the {stored} on record for {machine}"),
+            &repin,
         ));
     }
-    let append = || -> std::io::Result<()> {
-        use std::io::Write;
-        if let Some(dir) = file.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&file)?;
-        f.write_all(format!("{names} {key}\n").as_bytes())
-    };
-    append().map_err(|e| {
+    let file = paths.known_hosts_file();
+    let write_failed = |e: anyhow::Error| {
         stop(
-            format!("could not write {}: {e}", file.display()),
+            format!("could not write {}: {e:#}", file.display()),
             "check the head's state dir",
         )
-    })?;
+    };
+    if let Some(dir) = file.parent() {
+        crate::config::create_private_dir(dir).map_err(write_failed)?;
+    }
+    // Two pushes, or a push and a `machine remove`, edit the file in turn.
+    let _lock = crate::authkeys::lock(&file).map_err(write_failed)?;
+    let text = match std::fs::read_to_string(&file) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(write_failed(e.into())),
+    };
+    let named = |line: &str| {
+        scanned(line).filter(|(pinned_names, _)| pinned_names.split(',').any(|n| n == names))
+    };
+    if !opts.repin {
+        for line in text.lines() {
+            let Some((_, pinned)) = named(line) else {
+                continue;
+            };
+            if pinned == key {
+                return Ok(key);
+            }
+            return Err(stop(
+                format!(
+                    "the host key of {names} is not the one pastor pinned in {}",
+                    file.display()
+                ),
+                &repin,
+            ));
+        }
+    }
+    // Every other line stays as it was; a repin drops the old one for
+    // this name.
+    let mut out: String = text
+        .lines()
+        .filter(|l| named(l).is_none())
+        .flat_map(|l| [l, "\n"])
+        .collect();
+    out.push_str(&format!("{names} {key}\n"));
+    replace_file(&file, &out).map_err(write_failed)?;
     Ok(key)
+}
+
+/// Write `text` to `file` by rename, so a reader never sees half of it.
+fn replace_file(file: &Path, text: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = PathBuf::from(format!("{}.tmp.{}", file.display(), std::process::id()));
+    let result = (|| -> anyhow::Result<()> {
+        let _ = std::fs::remove_file(&tmp);
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, file).with_context(|| format!("rename onto {}", file.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// The name ssh looks a host up by in known_hosts: its `HostKeyAlias`
+/// when the config sets one, else the host, as `[host]:port` off port 22.
+pub(crate) fn pinned_name(host: &str, port: &str, alias: Option<&str>) -> String {
+    match alias {
+        Some(alias) => alias.to_string(),
+        None => crate::ssh::known_hosts_name(host, Some(port)),
+    }
+}
+
+/// `hostkeyalias` from `ssh -G`, when the config sets one.
+pub(crate) fn host_key_alias(out: &str) -> Option<String> {
+    out.lines()
+        .find_map(|l| l.strip_prefix("hostkeyalias "))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty() && v != "none")
 }
 
 /// `names keytype base64` from a known_hosts or keyscan line, as
@@ -666,7 +766,7 @@ async fn fingerprint(
 }
 
 /// `hostname` and `port` from `ssh -G`.
-fn resolved_host(out: &str) -> Option<(String, String)> {
+pub(crate) fn resolved_host(out: &str) -> Option<(String, String)> {
     let field = |key: &str| {
         out.lines()
             .find_map(|l| l.strip_prefix(key))
@@ -830,8 +930,17 @@ fn bootstrap_command(head_key: &str, opts: &PushOpts) -> String {
     cmd
 }
 
-/// Step 6, before the state is set: in root mode the entry's `ssh` moved
-/// to the agent user, then the agent line on the head.
+/// What `finish` changed, for `undo_finish` to put back.
+struct Finished {
+    /// The entry's `ssh` before a root-mode finish moved it to the agent
+    /// user.
+    moved_from: Option<String>,
+}
+
+/// Step 6, before the state is set: the agent line on the head, then, in
+/// root mode, the entry's `ssh` moved to the agent user, last of all, so
+/// nothing after it can fail and leave the entry pointing at a machine
+/// pastor never finished. A failure takes back what this step did.
 async fn finish(
     paths: &Paths,
     fleet: &Fleet,
@@ -839,7 +948,7 @@ async fn finish(
     login: &str,
     outcome: &Outcome,
     opts: &PushOpts,
-) -> Result<(), Stop> {
+) -> Result<Finished, Stop> {
     let stop = |why: String, fix: &str| Stop::new("register", why, fix);
     let Some(agent_key) = &outcome.agent_key else {
         return Err(stop(
@@ -853,25 +962,46 @@ async fn finish(
             "rerun the bootstrap",
         )
     })?;
-    // The entry first: an agent line is written only for a machine whose
-    // entry already says how it is reached.
-    if outcome.mode == Mode::Root {
-        let agent = format!("{AGENT_USER}@{}", host_part(login));
-        fleet
-            .edit_flock_file(&paths.flock_file(), |file| {
-                crate::fleet_edit::set_machine_ssh(file, name, &agent)
-            })
-            .await
-            .map_err(|e| {
-                stop(
-                    format!("could not set its ssh to {agent}: {e:#}"),
-                    "check flock.toml",
-                )
-            })?;
+    let marker = crate::authkeys::Marker::Agent(name.to_string());
+    // As a join checks: a key that already logs in under another line
+    // would keep that line's way in, whatever this one restricts.
+    let blob = crate::join::key_blob("the agent key", agent_key)
+        .map_err(|e| stop(format!("{e:#}"), "rerun the bootstrap"))?;
+    let own = [
+        marker.clone(),
+        crate::authkeys::Marker::Machine(name.to_string()),
+    ];
+    match crate::authkeys::holds_key(&opts.authorized_keys, blob, &own) {
+        Ok(false) => {}
+        Ok(true) => {
+            return Err(stop(
+                format!(
+                    "the agent key of {name} is already in {} on another line",
+                    opts.authorized_keys.display()
+                ),
+                "remove that line, or give the machine's agent user a new key, then rerun",
+            ));
+        }
+        Err(e) => {
+            return Err(stop(
+                format!("could not read {}: {e:#}", opts.authorized_keys.display()),
+                "check that the head's authorized_keys is readable",
+            ));
+        }
     }
+    // The entry must still be there, as the file has it now: a machine
+    // removed mid-push gets no line.
+    let entry = crate::config::flock::Flock::load(&paths.flock_file())
+        .ok()
+        .and_then(|f| f.get(name).cloned());
+    let Some(entry) = entry else {
+        return Err(stop(
+            format!("{name} left the flock while it was set up"),
+            "add it again",
+        ));
+    };
     // The marked form of `machine authorized-key`'s line: pastor edits
     // only lines it can find again by their marker.
-    let marker = crate::authkeys::Marker::Agent(name.to_string());
     crate::authkeys::line(
         &pastor,
         &format!("bridge --agent --machine {name}"),
@@ -888,7 +1018,44 @@ async fn finish(
             "check that the head's authorized_keys is writable",
         )
     })?;
-    Ok(())
+    let mut done = Finished { moved_from: None };
+    if outcome.mode == Mode::Root {
+        let agent = format!("{AGENT_USER}@{}", host_part(login));
+        let was = entry.ssh.clone();
+        let moved = fleet
+            .edit_flock_file(&paths.flock_file(), |file| {
+                crate::fleet_edit::set_machine_ssh(file, name, &agent)
+            })
+            .await;
+        if let Err(e) = moved {
+            undo_finish(paths, fleet, name, opts, done).await;
+            return Err(stop(
+                format!("could not set its ssh to {agent}: {e:#}"),
+                "check flock.toml",
+            ));
+        }
+        done.moved_from = was.filter(|w| *w != agent);
+    }
+    Ok(done)
+}
+
+/// Take back what `finish` did: the agent line, and the entry's `ssh` as
+/// it was. Each undo that fails is logged; there is nothing else to do.
+async fn undo_finish(paths: &Paths, fleet: &Fleet, name: &str, opts: &PushOpts, done: Finished) {
+    let marker = crate::authkeys::Marker::Agent(name.to_string());
+    if let Err(undo) = crate::authkeys::remove(&opts.authorized_keys, &marker) {
+        tracing::warn!(machine = %name, %undo, "could not take the agent line back");
+    }
+    if let Some(was) = done.moved_from {
+        let back = fleet
+            .edit_flock_file(&paths.flock_file(), |file| {
+                crate::fleet_edit::set_machine_ssh(file, name, &was)
+            })
+            .await;
+        if let Err(undo) = back {
+            tracing::warn!(machine = %name, undo = %format!("{undo:#}"), "could not put its ssh back to {was}");
+        }
+    }
 }
 
 /// End the ssh master the head may hold for the login, so the next

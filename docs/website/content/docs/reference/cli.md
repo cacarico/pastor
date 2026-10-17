@@ -279,6 +279,7 @@ Run bootstrap again on a machine over ssh: after a failed step, or to upgrade pa
 | `--service-user <NAME>` | The user that holds the machine key; created if missing |  |
 | `--ssh <DEST>` | The login to bootstrap as (default: the machine's ssh); needed once agents run as pastor-agent |  |
 | `--host-key <KEY>` | The machine's ed25519 host key must be this (SHA256:... or the key itself) |  |
+| `--repin` | Drop the host key pinned for the machine and pin the one it offers now, after a reinstall |  |
 
 ### pastor machine remove
 

@@ -271,12 +271,18 @@ struct Puller {
 
 /// Whether a `BootstrapReport` that failed with `code` failed on the way
 /// (no head, an unreachable or restarting one, a timeout, a dropped
-/// connection), so the next claim sends it again; any other code is the
-/// head refusing it.
+/// connection, a head not yet upgraded to take it), so the next claim
+/// sends it again; any other code is the head refusing it.
 fn report_failed_on_the_way(code: &str) -> bool {
     matches!(
         code,
-        "head_unreachable" | "no_head" | "timeout" | "runtime_error" | "daemon_not_running"
+        "head_unreachable"
+            | "no_head"
+            | "timeout"
+            | "runtime_error"
+            | "daemon_not_running"
+            // A head older than the report: it takes it once upgraded.
+            | "head_too_old"
     )
 }
 
@@ -850,6 +856,15 @@ impl Follower {
 
 #[cfg(all(test, feature = "fake-herdr"))]
 mod tests {
+    /// A head too old for the report takes it once upgraded: the report
+    /// waits for it, it is not put aside as refused. A real refusal is.
+    #[test]
+    fn a_head_too_old_for_the_report_is_tried_again() {
+        assert!(report_failed_on_the_way("head_too_old"));
+        assert!(report_failed_on_the_way("head_unreachable"));
+        assert!(!report_failed_on_the_way("host_key_mismatch"));
+        assert!(!report_failed_on_the_way("unknown_machine"));
+    }
     use super::*;
     use std::sync::Mutex;
 

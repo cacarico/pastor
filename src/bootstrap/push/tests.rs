@@ -29,6 +29,9 @@ struct FakePush {
     corrupt: AtomicBool,
     /// Run when the bootstrap call comes, to look at the head mid-push.
     on_bootstrap: Mutex<Option<Box<dyn FnMut() + Send>>>,
+    /// What `ssh -G` prints; unset, `<host>.lan` on port 22 for the
+    /// login's host.
+    resolved: Mutex<Option<String>>,
 }
 
 impl FakePush {
@@ -41,6 +44,7 @@ impl FakePush {
             unreachable: AtomicBool::new(false),
             corrupt: AtomicBool::new(false),
             on_bootstrap: Mutex::default(),
+            resolved: Mutex::default(),
         })
     }
 
@@ -105,7 +109,13 @@ impl PushRunner for FakePush {
                 }
             }
             "ssh" if args.first().map(String::as_str) == Some("-G") => {
-                answer(true, "user me\nhostname gpu-3.lan\nport 22\n")
+                match self.resolved.lock().unwrap().clone() {
+                    Some(out) => answer(true, out),
+                    None => {
+                        let host = remote.rsplit('@').next().unwrap_or(remote);
+                        answer(true, format!("user me\nhostname {host}.lan\nport 22\n"))
+                    }
+                }
             }
             "ssh" if args.iter().any(|a| a == "-O") => answer(true, ""),
             "ssh" if self.unreachable.load(Ordering::SeqCst) => CmdOutput {
@@ -275,6 +285,7 @@ impl Head {
             sudo,
             service_user: None,
             host_key: None,
+            repin: false,
             machine: Some(entry("gpu-3", "me@gpu-3")),
             head: "me@head".into(),
             provision: ProvisionConfig::default(),
@@ -821,4 +832,266 @@ async fn ok_machine_rerun_that_fails_in_its_steps_is_failed() {
     let state = h.state();
     assert_eq!(state.bootstrap, BootstrapState::Failed);
     assert_eq!(state.failed_step.as_deref(), Some("packages"));
+}
+
+/// `ssh -G` of `login` under the ssh config `config`, from the real ssh;
+/// `None` where there is no ssh to ask.
+fn real_ssh_g(config: &str, login: &str) -> Option<String> {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("config");
+    std::fs::write(&file, config).unwrap();
+    let out = std::process::Command::new("ssh")
+        .arg("-F")
+        .arg(&file)
+        .args(["-G", "--", login])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The key is pinned under the very name ssh looks it up by, as `ssh -G`
+/// resolves the login through the user's ssh config: the host off an
+/// alias, `[host]:port` off port 22, a `HostKeyAlias` as it is. So the
+/// pushes' `StrictHostKeyChecking=yes` finds it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_pinned_name_is_what_ssh_resolves_the_login_to() {
+    let config = "Host gpu-3\n  HostName 10.1.2.3\n  Port 2222\n\
+                  Host gpu-3-aliased\n  HostName 10.1.2.4\n  HostKeyAlias gpu-3-key\n\
+                  Host gpu-3-plain\n  HostName GPU-3.Example\n";
+    for (login, want, scanned) in [
+        (
+            "me@gpu-3",
+            "[10.1.2.3]:2222",
+            "-p 2222 -t ed25519 -- 10.1.2.3",
+        ),
+        (
+            "me@gpu-3-aliased",
+            "gpu-3-key",
+            "-p 22 -t ed25519 -- 10.1.2.4",
+        ),
+        (
+            "me@gpu-3-plain",
+            "gpu-3.example",
+            "-p 22 -t ed25519 -- gpu-3.example",
+        ),
+    ] {
+        let Some(resolved) = real_ssh_g(config, login) else {
+            eprintln!("no ssh here; skipped");
+            return;
+        };
+        let h = head().await;
+        let runner = FakePush::new(ok_outcome(Mode::User));
+        *runner.resolved.lock().unwrap() = Some(resolved);
+        let fleet = h.d.fleet();
+        let mut opts = h.opts(&runner, false);
+        opts.machine = Some(entry("gpu-3", login));
+        let out = push(&h.paths, &h.d.store(), &fleet, "gpu-3", login, opts)
+            .await
+            .unwrap();
+        assert!(out.ok, "{out:?}");
+        let pinned = std::fs::read_to_string(h.paths.known_hosts_file()).unwrap();
+        assert_eq!(
+            pinned,
+            format!("{want} ssh-ed25519 AAAAHOSTKEY\n"),
+            "{login}"
+        );
+        assert!(
+            runner.calls().contains(&format!("ssh-keyscan {scanned}")),
+            "{login}: {:?}",
+            runner.calls()
+        );
+    }
+}
+
+/// Pushes and a remove take turns on pastor's known_hosts: many machines
+/// pinned at once, from as many threads, all keep their line.
+#[test]
+fn concurrent_pins_keep_every_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+    let runner = FakePush::new(ok_outcome(Mode::User));
+    let barrier = std::sync::Barrier::new(16);
+    std::thread::scope(|s| {
+        for i in 0..16 {
+            let (paths, runner, barrier) = (&paths, runner.clone(), &barrier);
+            s.spawn(move || {
+                let opts = PushOpts {
+                    sudo: false,
+                    service_user: None,
+                    host_key: None,
+                    repin: false,
+                    machine: None,
+                    head: "me@head".into(),
+                    provision: ProvisionConfig::default(),
+                    fleet_versions: vec![],
+                    authorized_keys: paths.state_dir.join("authorized_keys"),
+                    runner,
+                    fetch: Arc::new(NoFetch),
+                };
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                barrier.wait();
+                let (name, login) = (format!("m{i}"), format!("me@m{i}"));
+                rt.block_on(pin_host_key(paths, &name, &login, None, &opts))
+                    .map_err(|Stop(s)| s.why)
+                    .unwrap();
+            });
+        }
+    });
+    let text = std::fs::read_to_string(paths.known_hosts_file()).unwrap();
+    for i in 0..16 {
+        assert!(
+            text.lines()
+                .any(|l| l == format!("m{i}.lan ssh-ed25519 AAAAHOSTKEY")),
+            "m{i}: {text}"
+        );
+    }
+    assert_eq!(text.lines().count(), 16, "{text}");
+}
+
+/// A machine whose host key changed stops at the pin, naming `--repin`,
+/// and keeps the key on record; `--repin` is the one way to trust the new
+/// key, which then replaces the old one everywhere.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_changed_host_key_needs_repin() {
+    let h = head().await;
+    let runner = FakePush::new(ok_outcome(Mode::User));
+    assert!(h.push(h.opts(&runner, false)).await.unwrap().ok);
+    *runner.host_key.lock().unwrap() = "ssh-ed25519 AAAANEWKEY".into();
+    let mut o = ok_outcome(Mode::User);
+    o.host_key = Some("ssh-ed25519 AAAANEWKEY".into());
+    *runner.outcome.lock().unwrap() = o;
+
+    let out = h.push(rerun_opts(&h, &runner)).await.unwrap();
+    assert!(!out.ok);
+    let step = out.steps.last().unwrap();
+    assert_eq!(step.step, "host_key");
+    let fix = step.fix.as_deref().unwrap();
+    assert!(
+        fix.contains("pastor machine bootstrap gpu-3 --repin"),
+        "{fix}"
+    );
+    assert_eq!(
+        h.state().host_key.as_deref(),
+        Some("ssh-ed25519 AAAAHOSTKEY")
+    );
+    assert_eq!(h.state().bootstrap, BootstrapState::Ok);
+
+    let out = h
+        .push(PushOpts {
+            repin: true,
+            ..rerun_opts(&h, &runner)
+        })
+        .await
+        .unwrap();
+    assert!(out.ok, "{out:?}");
+    assert_eq!(
+        h.state().host_key.as_deref(),
+        Some("ssh-ed25519 AAAANEWKEY")
+    );
+    assert_eq!(
+        std::fs::read_to_string(h.paths.known_hosts_file()).unwrap(),
+        "gpu-3.lan ssh-ed25519 AAAANEWKEY\n"
+    );
+}
+
+/// A key on record that known_hosts no longer has (removed by hand) is
+/// still the one the machine must offer.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_key_on_record_is_checked_even_off_known_hosts() {
+    let h = head().await;
+    let runner = FakePush::new(ok_outcome(Mode::User));
+    assert!(h.push(h.opts(&runner, false)).await.unwrap().ok);
+    std::fs::remove_file(h.paths.known_hosts_file()).unwrap();
+    *runner.host_key.lock().unwrap() = "ssh-ed25519 AAAANEWKEY".into();
+    let out = h.push(rerun_opts(&h, &runner)).await.unwrap();
+    assert!(!out.ok);
+    assert_eq!(out.steps.last().unwrap().step, "host_key");
+    assert!(!h.paths.known_hosts_file().exists());
+}
+
+/// A failed machine whose rerun stops before its pin keeps the key it had
+/// on record: only a new pin replaces it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_rerun_keeps_the_host_key() {
+    let h = head().await;
+    let runner = FakePush::new(failed_at_packages());
+    assert!(!h.push(h.opts(&runner, false)).await.unwrap().ok);
+    assert_eq!(
+        h.state().host_key.as_deref(),
+        Some("ssh-ed25519 AAAAHOSTKEY")
+    );
+    runner.host_key.lock().unwrap().clear();
+    let out = h.push(h.opts(&runner, false)).await.unwrap();
+    assert!(!out.ok);
+    assert_eq!(out.steps.last().unwrap().step, "host_key");
+    let state = h.state();
+    assert_eq!(state.bootstrap, BootstrapState::Failed);
+    assert_eq!(state.host_key.as_deref(), Some("ssh-ed25519 AAAAHOSTKEY"));
+}
+
+/// An agent key that already logs in under another line of the head's
+/// authorized_keys is refused, as a join refuses it: no agent line, and a
+/// root-mode entry keeps its login.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_agent_key_already_authorized_elsewhere_is_refused() {
+    let h = head().await;
+    let keys = h.paths.state_dir.join("authorized_keys");
+    std::fs::write(&keys, "ssh-ed25519 AAAAAGENT someone@else\n").unwrap();
+    let runner = FakePush::new(ok_outcome(Mode::Root));
+    let out = h.push(h.opts(&runner, true)).await.unwrap();
+    assert!(!out.ok, "{out:?}");
+    let step = out.steps.last().unwrap();
+    assert_eq!(step.step, "register");
+    assert!(step.why.as_deref().unwrap().contains("already"), "{step:?}");
+    let text = std::fs::read_to_string(&keys).unwrap();
+    assert_eq!(text, "ssh-ed25519 AAAAAGENT someone@else\n");
+    assert_eq!(h.ssh().as_deref(), Some("me@gpu-3"));
+}
+
+/// The report after a root-mode finish fails: the entry goes back to the
+/// login it had, and the agent line goes, so nothing points at a machine
+/// pastor never recorded as set up.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_report_puts_the_root_mode_ssh_back() {
+    let h = head().await;
+    let runner = FakePush::new(ok_outcome(Mode::Root));
+    {
+        // Another key lands on record mid-push, so the report is refused.
+        let store = h.d.store();
+        *runner.on_bootstrap.lock().unwrap() = Some(Box::new(move || {
+            let mut s = store.machine_state("gpu-3").unwrap().unwrap();
+            s.host_key = Some("ssh-ed25519 AAAAOTHER".into());
+            store.put_machine_state(&s).unwrap();
+        }));
+    }
+    let err = h.push(h.opts(&runner, true)).await.unwrap_err();
+    assert_eq!(code(&err), "host_key_mismatch", "{err:#}");
+    assert_eq!(h.ssh().as_deref(), Some("me@gpu-3"));
+    let keys =
+        std::fs::read_to_string(h.paths.state_dir.join("authorized_keys")).unwrap_or_default();
+    assert!(!keys.contains("pastor:agent:gpu-3"), "{keys}");
+}
+
+/// `machine add --bootstrap` of a root-mode machine already set up: its
+/// entry is reached as the agent user by now, so the error names the
+/// rerun with the login.
+#[tokio::test(flavor = "multi_thread")]
+async fn machine_exists_after_root_mode_names_the_rerun_with_its_login() {
+    let h = head().await;
+    let runner = FakePush::new(ok_outcome(Mode::Root));
+    assert!(h.push(h.opts(&runner, true)).await.unwrap().ok);
+    assert_eq!(h.ssh().as_deref(), Some("pastor-agent@gpu-3"));
+    let err = h.push(h.opts(&runner, true)).await.unwrap_err();
+    assert_eq!(code(&err), "machine_exists", "{err:#}");
+    assert!(
+        err.to_string()
+            .contains("pastor machine bootstrap gpu-3 --ssh me@gpu-3"),
+        "{err:#}"
+    );
 }

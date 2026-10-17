@@ -3961,7 +3961,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__machine__subcmd__bootstrap)
-            opts="-h --sudo --service-user --ssh --host-key --head --help"
+            opts="-h --sudo --service-user --ssh --host-key --repin --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
