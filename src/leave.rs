@@ -1,15 +1,17 @@
 //! `pastor leave`: a clean teardown of this machine, so a `pastor machine
 //! remove` on the head does not just orphan a service that keeps running
 //! underneath it. Touches only what bootstrap could have left here: the
-//! pastor and herdr user services of this login and, in root mode, of
-//! `pastor-agent`, and the machine and agent keys.
+//! pastor and herdr user services of this login, of the shepherd's service
+//! user when that is another user (root mode's `pastor`, say) and, in root
+//! mode, of `pastor-agent`, their machine and agent keys, and root mode's
+//! sudoers drop-in.
 //!
 //! Every step is checked. What worked is printed, what failed is printed
 //! with it, and one failure makes the command end in `leave_incomplete`.
 
 use std::path::{Path, PathBuf};
 
-use crate::bootstrap::AGENT_USER;
+use crate::bootstrap::{AGENT_USER, ROOT_SERVICE_USER};
 use crate::cli::CliError;
 use crate::config::Paths;
 use crate::ipc::{HeadPing, SHEPHERD_ROLE};
@@ -59,6 +61,8 @@ pub struct Here {
     pub os: Os,
     /// This login's unit dir: where `pastor setup` writes its units.
     pub unit_dir: PathBuf,
+    /// Where root mode's sudoers drop-in names the shepherd's service user.
+    pub sudoers_dir: PathBuf,
 }
 
 impl Here {
@@ -71,7 +75,11 @@ impl Here {
                 .ok_or_else(|| anyhow::anyhow!("no home dir"))?
                 .join("Library/LaunchAgents"),
         };
-        Ok(Here { os, unit_dir })
+        Ok(Here {
+            os,
+            unit_dir,
+            sudoers_dir: PathBuf::from("/etc/sudoers.d"),
+        })
     }
 }
 
@@ -174,8 +182,8 @@ fn confirm(yes: bool) -> anyhow::Result<()> {
     // JSON error that must be the only thing on stderr.
     print!(
         "About to disable and remove this machine's pastor and herdr services \
-         (this login's, and pastor-agent's if bootstrap made one), and delete \
-         its machine and agent keys.\nContinue? Type 'yes' to proceed: "
+         (this login's, the shepherd's service user's and pastor-agent's if \
+         bootstrap made them), and delete its machine and agent keys.\nContinue? Type 'yes' to proceed: "
     );
     std::io::Write::flush(&mut std::io::stdout())?;
     let mut answer = String::new();
@@ -254,7 +262,10 @@ impl Who {
     }
 }
 
-/// The teardown itself: this login, then pastor-agent if there is one.
+/// The teardown itself: this login, then the shepherd's service user if
+/// bootstrap made one apart from this login, then pastor-agent if there is
+/// one. The service user goes before pastor-agent, since its shepherd
+/// drives pastor-agent's herdr.
 pub fn run(paths: &Paths, here: &Here, r: &dyn Runner) -> Report {
     let mut report = Report::default();
     let uid = crate::bootstrap::facts::stdout(r, "id", &["-u"]).unwrap_or_default();
@@ -272,64 +283,190 @@ pub fn run(paths: &Paths, here: &Here, r: &dyn Runner) -> Report {
     remove_units(r, here.os, &me, &mut report);
     remove_own_keys(paths, &mut report);
 
+    let root = uid == "0";
+    for (name, recorded) in service_users(here, &login) {
+        leave_service_user(r, here, root, &name, recorded, &mut report);
+    }
     if login == AGENT_USER {
         return report;
     }
-    let Some((agent_uid, home)) = crate::bootstrap::facts::passwd(r, here.os.uname(), AGENT_USER)
-    else {
+    let Some(agent) = other(r, here, root, AGENT_USER) else {
         // User mode: bootstrap made no pastor-agent.
         return report;
     };
-    let agent = Who {
-        name: AGENT_USER.into(),
-        uid: agent_uid.to_string(),
-        other: Some(Other {
-            home: home.clone(),
-            uid: agent_uid,
-            root: uid == "0",
-        }),
-        unit_dir: here.os.unit_dir(&home),
+    let Some(state) = state_dir(r, &agent, &mut report) else {
+        return report;
     };
-    // Its own pastor says where its state (and so its key) is; this also
-    // proves commands reach it, so a `test -e` that fails below means the
-    // file is not there, not that sudo said no.
-    let state = match agent.run(r, "pastor", &["bootstrap", "--print-state-dir"]) {
-        Ok(o) if o.success && o.stdout.trim().starts_with('/') => PathBuf::from(o.stdout.trim()),
+    remove_units(r, here.os, &agent, &mut report);
+    remove_keys(r, &agent, &state, &["agent_key"], &mut report);
+    report
+}
+
+/// The users that may run this machine's shepherd apart from this login,
+/// each with whether bootstrap recorded it. Root mode's sudoers drop-in,
+/// `pastor-<user>`, names its service user, and is the record; `pastor`,
+/// the user a root bootstrap picks when it is given none, is a guess,
+/// checked before anything is touched. A non-root bootstrap runs the
+/// shepherd as its own login, which `run` already did.
+fn service_users(here: &Here, login: &str) -> Vec<(String, bool)> {
+    let mut users: Vec<(String, bool)> = Vec::new();
+    // Readable by root only: a non-root leave sees no record and guesses.
+    if let Ok(dir) = std::fs::read_dir(&here.sudoers_dir) {
+        let mut named: Vec<String> = dir
+            .flatten()
+            .filter_map(|e| {
+                e.file_name()
+                    .to_str()?
+                    .strip_prefix("pastor-")
+                    .map(String::from)
+            })
+            .filter(|u| !u.is_empty())
+            .collect();
+        named.sort();
+        users.extend(named.into_iter().map(|u| (u, true)));
+    }
+    if !users.iter().any(|(u, _)| u == ROOT_SERVICE_USER) {
+        users.push((ROOT_SERVICE_USER.to_string(), false));
+    }
+    users.retain(|(u, _)| u != login && u != AGENT_USER);
+    users
+}
+
+/// Tear down `name`'s shepherd: its units, its machine and agent keys, and
+/// (as root) its sudoers drop-in. A guessed user that has no pastor and no
+/// pastor unit in its home is someone else's and left alone; one that this
+/// process cannot reach to check is a failure, so leave never reports
+/// success with a shepherd still running.
+fn leave_service_user(
+    r: &dyn Runner,
+    here: &Here,
+    root: bool,
+    name: &str,
+    recorded: bool,
+    report: &mut Report,
+) {
+    let Some(who) = other(r, here, root, name) else {
+        if recorded {
+            report.failed.push(format!(
+                "{name}: its sudoers drop-in names it, but the user database has no such user; \
+                 remove its pastor and herdr units and its keys by hand"
+            ));
+        }
+        remove_drop_in(here, root, name, report);
+        return;
+    };
+    if !recorded {
+        if !who.run(r, "true", &[]).is_ok_and(|o| o.success) {
+            report.failed.push(format!(
+                "{name}: could not check whether it runs pastor's shepherd (no way to run \
+                 commands as {name}); run leave as root, or remove its pastor and herdr units \
+                 and its machine key by hand"
+            ));
+            return;
+        }
+        let home = &who.other.as_ref().expect("another user").home;
+        let ours = who.exists(r, &home.join(".local/bin/pastor"))
+            || [Unit::Pastor, Unit::Herdr].iter().any(|u| {
+                let file = match here.os {
+                    Os::Linux => u.file_name(),
+                    Os::Macos => u.plist_name(),
+                };
+                who.exists(r, &who.unit_dir.join(file))
+            });
+        if !ours {
+            return;
+        }
+    }
+    let Some(state) = state_dir(r, &who, report) else {
+        return;
+    };
+    remove_units(r, here.os, &who, report);
+    remove_keys(r, &who, &state, &["machine_key", "agent_key"], report);
+    remove_drop_in(here, root, name, report);
+}
+
+/// `name` as another user leave acts as, or `None` when the user database
+/// has no such user.
+fn other(r: &dyn Runner, here: &Here, root: bool, name: &str) -> Option<Who> {
+    let (uid, home) = crate::bootstrap::facts::passwd(r, here.os.uname(), name)?;
+    Some(Who {
+        name: name.into(),
+        uid: uid.to_string(),
+        unit_dir: here.os.unit_dir(&home),
+        other: Some(Other { home, uid, root }),
+    })
+}
+
+/// `who`'s state dir, as its own pastor says. This also proves commands
+/// reach it, so a `test -e` that fails later means the file is not there,
+/// not that sudo said no. `None`, with the failure in `report`, when it
+/// cannot be asked: leave never guesses the path.
+fn state_dir(r: &dyn Runner, who: &Who, report: &mut Report) -> Option<PathBuf> {
+    let name = &who.name;
+    match who.run(r, "pastor", &["bootstrap", "--print-state-dir"]) {
+        Ok(o) if o.success && o.stdout.trim().starts_with('/') => {
+            Some(PathBuf::from(o.stdout.trim()))
+        }
         Ok(o) if o.success => {
             report.failed.push(format!(
-                "{AGENT_USER}: its pastor printed no state dir ({:?}); remove its pastor and \
-                 herdr units and its agent_key and agent_key.pub by hand",
+                "{name}: its pastor printed no state dir ({:?}); remove its pastor and \
+                 herdr units and its keys by hand",
                 o.stdout.trim()
             ));
-            return report;
+            None
         }
         out => {
             report.failed.push(format!(
-                "{AGENT_USER}: could not ask its pastor for its state dir \
-                 (`pastor bootstrap --print-state-dir` as {AGENT_USER}): {}; remove its pastor \
-                 and herdr units and its agent_key and agent_key.pub by hand",
+                "{name}: could not ask its pastor for its state dir \
+                 (`pastor bootstrap --print-state-dir` as {name}): {}; remove its pastor \
+                 and herdr units and its keys by hand",
                 why(out)
             ));
-            return report;
+            None
         }
-    };
-    remove_units(r, here.os, &agent, &mut report);
-    let keys = [state.join("agent_key"), state.join("agent_key.pub")];
-    if keys.iter().any(|k| agent.exists(r, k)) {
-        let out = agent.remove(r, &keys);
+    }
+}
+
+/// Delete each of `keys` (with its `.pub`) under `state` that is there, as
+/// `who`.
+fn remove_keys(r: &dyn Runner, who: &Who, state: &Path, keys: &[&str], report: &mut Report) {
+    for key in keys {
+        let files = [state.join(key), state.join(format!("{key}.pub"))];
+        if !files.iter().any(|k| who.exists(r, k)) {
+            continue;
+        }
+        let what = key.replace('_', " ");
+        let out = who.remove(r, &files);
         report.check(
             out,
-            format!(
-                "{AGENT_USER}: deleted its agent key ({})",
-                keys[0].display()
-            ),
+            format!("{}: deleted its {what} ({})", who.name, files[0].display()),
             &format!(
-                "{AGENT_USER}: could not delete its agent key {}",
-                keys[0].display()
+                "{}: could not delete its {what} {}",
+                who.name,
+                files[0].display()
             ),
         );
     }
-    report
+}
+
+/// Root mode's sudoers drop-in for `name`, which only root can see or
+/// remove: it lets `name` run pastor-agent's herdr, and means nothing once
+/// the shepherd is gone.
+fn remove_drop_in(here: &Here, root: bool, name: &str, report: &mut Report) {
+    if !root {
+        return;
+    }
+    let path = here.sudoers_dir.join(format!("pastor-{name}"));
+    match std::fs::remove_file(&path) {
+        Ok(()) => report
+            .done
+            .push(format!("{name}: removed {}", path.display())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => report.failed.push(format!(
+            "{name}: could not remove {}: {err}",
+            path.display()
+        )),
+    }
 }
 
 /// Stop, disable and remove `who`'s pastor and herdr units, then reload its
