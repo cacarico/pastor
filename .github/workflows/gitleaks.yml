@@ -61,6 +61,14 @@ jobs:
           tar -xzf gitleaks.tgz gitleaks
           curl -sSfL --retry 5 --retry-delay 5 --retry-all-errors -o gitleaks.toml "https://raw.githubusercontent.com/gitleaks/gitleaks/v${GITLEAKS_VERSION}/config/gitleaks.toml"
           mkdir -p no-ignore
+          # Findings the owner has read and judged not secret, one exact
+          # fingerprint (commit:file:rule:line) each, so the same text in
+          # any other commit still fails. Kept here, not in the checkout,
+          # so a pull request cannot add one without changing this file.
+          # A fake key in a test fixture (src/join.rs), since split.
+          printf '%s\n' \
+            'abb4e22a78382b7ce7254d45bbad58c509cf6cec:src/join.rs:private-key:652' \
+            > no-ignore/.gitleaksignore
       - name: Scan every ref
         run: |
           git fetch --quiet origin '+refs/heads/*:refs/remotes/origin/*'

@@ -99,9 +99,14 @@ impl Head {
         let state = tmp.path().join("s");
         let data = tmp.path().join("d");
         std::fs::create_dir_all(&config).unwrap();
+        let user = ok(run(Command::new("id").arg("-un"))).trim().to_string();
+        // `head_address` is what a join token tells a machine to reach:
+        // `head`, which a joining machine's ssh config sends to this sshd.
         std::fs::write(
             config.join("pastor.toml"),
-            "tick = \"1s\"\nsettle = \"1s\"\nreconcile_every = \"1s\"\n",
+            format!(
+                "tick = \"1s\"\nsettle = \"1s\"\nreconcile_every = \"1s\"\nhead_address = \"{user}@head\"\n"
+            ),
         )
         .unwrap();
         let socket = tmp.path().join("herdr.sock");
@@ -121,19 +126,23 @@ impl Head {
             ),
         )
         .unwrap();
+        let host_key = tmp.path().join("host_ed25519");
+        let host_pub = keygen(&host_key);
+        let known_host = format!("pastor-test-head {}", host_pub.trim());
+        std::fs::write(tmp.path().join("authorized_keys"), "").unwrap();
+        // Join tokens edit sshd's own authorized_keys, and carry its host key.
         let serve = pastor()
             .args(["serve", "--foreground"])
             .env("PASTOR_CONFIG_DIR", &config)
             .env("PASTOR_STATE_DIR", &state)
             .env("PASTOR_DATA_DIR", &data)
+            .env("PASTOR_AUTHORIZED_KEYS", tmp.path().join("authorized_keys"))
+            .env("PASTOR_SSH_HOST_KEY", host_key.with_extension("pub"))
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(tmp.path().join("serve.log")).unwrap())
             .spawn()
             .unwrap();
 
-        let host_key = tmp.path().join("host_ed25519");
-        let host_pub = keygen(&host_key);
-        let known_host = format!("pastor-test-head {}", host_pub.trim());
         // Taken and let go: sshd binds it next. Another process could take it
         // in between, which would only fail this run.
         let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -165,7 +174,6 @@ impl Head {
             ),
         )
         .unwrap();
-        std::fs::write(tmp.path().join("authorized_keys"), "").unwrap();
         // sshd re-execs itself, so it wants an absolute path.
         let sshd = Command::new(find("sshd"))
             .args(["-D", "-e", "-f"])
@@ -449,4 +457,189 @@ fn a_head_over_real_ssh_runs_reads_and_ends_a_task() {
     let list = ok(deep.cmd(&["task", "list", "--all", "--json"]));
     assert!(list.contains("\"t-1\""), "{list}");
     assert!(!deep.state.join("ssh").exists(), "no control dir made");
+}
+
+/// A new machine joining the head over the real sshd: `pastor join` with a
+/// token from `join create`, then a shepherd that reports the join's
+/// outcome on its first claim. `--skip-bootstrap`, since a real bootstrap
+/// would install pastor and herdr into this user's own home.
+#[test]
+#[ignore = "needs sshd; run with make test-ssh"]
+fn pull_join_end_to_end() {
+    let mut head = Head::start();
+    let made: serde_json::Value =
+        serde_json::from_str(&ok(head.cmd(&["join", "create", "--json"]))).unwrap();
+    let token = made["token"].as_str().unwrap().to_string();
+    let id = made["id"].as_str().unwrap().to_string();
+    let keys = head.tmp.path().join("authorized_keys");
+    assert!(
+        std::fs::read_to_string(&keys)
+            .unwrap()
+            .contains(&format!("pastor:join:{id}")),
+        "the token's line is in sshd's authorized_keys"
+    );
+
+    // The machine: its own dirs, and an ssh that sends `head` to the test
+    // sshd and knows nothing of the user's keys or hosts. Only `pastor
+    // join` pins the head's host key, under the token's name for it.
+    let m = tempfile::Builder::new()
+        .prefix("m")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let (config, state, data, bin) = (
+        m.path().join("c"),
+        m.path().join("s"),
+        m.path().join("d"),
+        m.path().join("bin"),
+    );
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&config).unwrap();
+    let ssh_config = m.path().join("ssh_config");
+    std::fs::write(
+        &ssh_config,
+        format!(
+            "Host head\n\
+             \tHostName 127.0.0.1\n\
+             \tPort {}\n\
+             \tIdentityAgent none\n\
+             \tHostKeyAlias head\n\
+             \tGlobalKnownHostsFile /dev/null\n",
+            head.port
+        ),
+    )
+    .unwrap();
+    write_exec(
+        &bin.join("ssh"),
+        &format!(
+            "#!/bin/sh\nexec '{}' -F '{}' \"$@\"\n",
+            find("ssh").display(),
+            ssh_config.display()
+        ),
+    );
+    let mut path = std::ffi::OsString::from(&bin);
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    // The shepherd's own herdr.
+    let socket = m.path().join("herdr.sock");
+    head.children.push(
+        Command::new(env!("CARGO_BIN_EXE_fake-herdr"))
+            .arg("--listen")
+            .arg(&socket)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    std::fs::write(
+        config.join("pastor.toml"),
+        format!(
+            "tick = \"1s\"\n\n[shepherd]\ncommand = [\"{}\", \"--connect\", \"{}\"]\n",
+            env!("CARGO_BIN_EXE_fake-herdr"),
+            socket.display()
+        ),
+    )
+    .unwrap();
+    let on_machine = |cmd: &mut Command| {
+        cmd.env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .env("PASTOR_DATA_DIR", &data)
+            .env("PATH", &path)
+            .env_remove("PASTOR_HEAD")
+            .env_remove("PASTOR_JOIN_TOKEN");
+    };
+    let join = |token: &str| {
+        use std::io::Write;
+        let mut cmd = pastor();
+        cmd.args([
+            "join",
+            "--token-stdin",
+            "--name",
+            "pull-1",
+            "--skip-bootstrap",
+        ]);
+        on_machine(&mut cmd);
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(child.stdin.take().unwrap(), "{token}").unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let out = join(&token);
+    let text = ok(out);
+    assert!(text.contains("keys:"), "{text}");
+
+    let flock = std::fs::read_to_string(head.config.join("flock.toml")).unwrap();
+    let entry = flock
+        .split("[[machine]]")
+        .find(|e| e.contains("\"pull-1\""))
+        .expect(&flock);
+    assert!(entry.contains("pull = true"), "{flock}");
+    let lines = std::fs::read_to_string(&keys).unwrap();
+    assert!(
+        !lines.contains("pastor:join:"),
+        "the token's line is gone: {lines}"
+    );
+    assert!(lines.contains("pastor:machine:pull-1"), "{lines}");
+    assert!(lines.contains("pastor:agent:pull-1"), "{lines}");
+    let pinned = std::fs::read_to_string(state.join("known_hosts")).unwrap();
+    assert!(pinned.starts_with("head ssh-ed25519 "), "{pinned}");
+    let config_text = std::fs::read_to_string(config.join("pastor.toml")).unwrap();
+    assert!(
+        config_text.contains("machine = \"pull-1\""),
+        "{config_text}"
+    );
+    assert!(state.join("bootstrap.json").exists());
+    let describe = ok(head.cmd(&["machine", "describe", "pull-1"]));
+    assert!(
+        describe.contains("bootstrap:") && describe.contains("pending"),
+        "{describe}"
+    );
+
+    // The same token again: sshd no longer has its line.
+    let again = join(&token);
+    assert_eq!(error_code(&again), "join_token_invalid", "{again:?}");
+
+    // The shepherd, on the machine key and the pinned host key alone (no
+    // ssh config but the destination), reports the outcome after its
+    // first claim.
+    let user = ok(run(Command::new("id").arg("-un"))).trim().to_string();
+    let mut serve = pastor();
+    serve.args(["serve", "--foreground"]);
+    on_machine(&mut serve);
+    let shepherd = serve
+        .env("PASTOR_HEAD", format!("{user}@head"))
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(m.path().join("shepherd.log")).unwrap())
+        .spawn()
+        .unwrap();
+    head.children.push(shepherd);
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let describe = ok_or_empty(head.cmd(&["machine", "describe", "pull-1"]));
+        if describe.contains("ok, user mode") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "never reported\n--- describe ---\n{describe}\n--- shepherd ---\n{}\n--- sshd ---\n{}",
+            std::fs::read_to_string(m.path().join("shepherd.log")).unwrap_or_default(),
+            head.log("sshd.log")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(!state.join("bootstrap.json").exists(), "sent, so gone");
+    // Stop the shepherd's ssh master, which would outlive the test.
+    if let Ok(dir) = std::fs::read_dir(state.join("ssh")) {
+        for socket in dir.flatten() {
+            let _ = Command::new(bin.join("ssh"))
+                .arg("-o")
+                .arg(format!("ControlPath={}", socket.path().display()))
+                .args(["-O", "exit", "head"])
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
 }

@@ -222,6 +222,14 @@ pub fn remove_machine(file: &Path, name: &str) -> anyhow::Result<String> {
     Ok(format!("removed {name}"))
 }
 
+/// A push bootstrap's move of `name` to the agent user (`ssh = dest`).
+pub fn set_machine_ssh(file: &Path, name: &str, dest: &str) -> anyhow::Result<String> {
+    let mut doc = FlockDoc::open(file)?;
+    doc.set_machine_ssh(name, dest)?;
+    doc.save(file)?;
+    Ok(format!("{name} is reached as {dest}"))
+}
+
 /// `machine move`.
 pub fn move_machine(file: &Path, name: &str, flock: &str) -> anyhow::Result<String> {
     let mut doc = FlockDoc::open(file)?;
