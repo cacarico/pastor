@@ -63,8 +63,10 @@ const V18_TABLES: &str = "CREATE TABLE IF NOT EXISTS answered_dialogs (
 /// per machine), and the one-use tokens `pastor join` redeems
 /// (`join_tokens`). Times are RFC 3339 UTC strings, so they compare as text.
 /// `generation` is a pull machine's enrollment, which its shepherd's
-/// forced command carries (`--gen`): 0 until a join sets it, bumped by each
-/// join that takes the name over. `bootstrap_login` is the ssh login a push
+/// forced command carries (`--gen`): 0 until a join sets it. Each join takes
+/// a fresh one from `enrollment_seq` (`Store::next_generation`), one counter
+/// for the whole store, so a name removed and joined again never gets back a
+/// generation an older line still carries. `bootstrap_login` is the ssh login a push
 /// bootstrap last got through as, kept apart from flock.toml's `ssh`, which
 /// root mode moves to the agent user. Neither is in `MachineState`: a
 /// report never sets them (`Store::put_machine_state`).
@@ -90,7 +92,13 @@ const V19_TABLES: &str = "CREATE TABLE IF NOT EXISTS machine_state (
         replace TEXT,
         expires_at TEXT NOT NULL,
         used_at TEXT
-     );";
+     );
+     CREATE TABLE IF NOT EXISTS enrollment_seq (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        last INTEGER NOT NULL
+     );
+     INSERT OR IGNORE INTO enrollment_seq (id, last)
+        SELECT 1, COALESCE(MAX(generation), 0) FROM machine_state;";
 
 /// Schema 8: the last sequence number given to an event record
 /// (`Store::next_event_seq`), one row, so numbers keep growing across head
@@ -2018,6 +2026,20 @@ impl Store {
         })
     }
 
+    /// A generation no join has had yet: one more than the last one given,
+    /// saved before it is returned, from one counter for every machine, so a
+    /// removal (which drops the record) never lets a name start over. The
+    /// first is 1.
+    pub fn next_generation(&self) -> anyhow::Result<i64> {
+        blocking(|| {
+            Ok(self.conn.lock().recover().query_row(
+                "UPDATE enrollment_seq SET last = last + 1 WHERE id = 1 RETURNING last",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+    }
+
     /// Set `machine`'s enrollment generation; a machine with no record is
     /// left alone.
     pub fn set_machine_generation(&self, machine: &str, generation: i64) -> anyhow::Result<()> {
@@ -2755,6 +2777,30 @@ mod tests {
         assert_eq!(s.machine_generation("pi-1").unwrap(), None);
     }
 
+    /// Generations come from one counter for the whole store, so none is
+    /// given twice, whichever machine asks, and a file that already has
+    /// generations (an unreleased schema 19) starts past them.
+    #[test]
+    fn generations_are_never_given_twice() {
+        let s = Store::open_in_memory().unwrap();
+        assert_eq!(s.next_generation().unwrap(), 1);
+        assert_eq!(s.next_generation().unwrap(), 2);
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("pastor.db");
+        {
+            let s = Store::open(&db).unwrap();
+            s.put_machine_state(&sample_state()).unwrap();
+            s.set_machine_generation("pi-1", 7).unwrap();
+            let conn = s.conn.lock().recover();
+            conn.execute("DROP TABLE enrollment_seq", []).unwrap();
+        }
+        let s = Store::open(&db).unwrap();
+        assert_eq!(s.next_generation().unwrap(), 8);
+        drop(s);
+        let s = Store::open(&db).unwrap();
+        assert_eq!(s.next_generation().unwrap(), 9, "across restarts too");
+    }
+
     fn token(id: &str, expires_at: &str) -> JoinToken {
         JoinToken {
             id: id.into(),
@@ -3488,6 +3534,7 @@ mod tests {
             table_names(&path),
             vec![
                 "answered_dialogs",
+                "enrollment_seq",
                 "event_seq",
                 "join_tokens",
                 "limits",
@@ -3504,6 +3551,7 @@ mod tests {
             table_names(&path),
             vec![
                 "answered_dialogs",
+                "enrollment_seq",
                 "event_seq",
                 "job_state",
                 "join_tokens",
@@ -3550,6 +3598,7 @@ mod tests {
             table_names(&fresh),
             vec![
                 "answered_dialogs",
+                "enrollment_seq",
                 "event_seq",
                 "job_state",
                 "join_tokens",
