@@ -50,10 +50,12 @@ the cost of the head holding the login's account.
 the first time (or checks it against `--host-key SHA256:...`) and pins it in
 pastor's own `known_hosts`; after that, every ssh to the machine accepts
 that key only, and a pinned host is never keyscanned again. A changed key
-stops the push, and a pull machine's report naming another key is refused
-(`host_key_mismatch`). If the machine really changed (reinstalled, a new
-disk), check the new key out of band, then run `pastor machine bootstrap
-NAME --repin`, the one way to trust it. A machine on a port other than 22 is
+stops the push. A pull machine's host key is the one its join brought, and
+only a join sets it: its shepherd's bootstrap report never sets or changes
+it. If the machine really changed (reinstalled, a new disk), check the new
+key out of band, then run `pastor machine bootstrap NAME --repin`, the one
+way to trust it (for a pull machine, it drops the key, and the next join
+with a `--replace` token sets the new one). A machine on a port other than 22 is
 pinned as `[host]:port`, as ssh itself looks it up, so remove or check that
 form when you edit the file by hand.
 
@@ -65,9 +67,22 @@ token's own `--replace` targets). Once it is used or revoked, the same
 token's ssh gets `Permission denied`: its line is gone from
 `authorized_keys`, and no later request, successful or not, adds a second
 machine or extends its life. Past its `--ttl` it is refused at once, not on
-the next sweep: the line carries `expiry-time`, which sshd (OpenSSH 8.2 or
-later) honours, and the head checks the expiry again itself. The line is
-then removed on the next scheduler pass.
+the next sweep: the line carries `expiry-time`, which sshd honours, and the
+head checks the expiry again itself. The line is then removed on the next
+scheduler pass. OpenSSH 8.2 is therefore the head's minimum for joins: an
+older sshd rejects the whole line, so no join gets through at all
+(`join_token_invalid`).
+
+**A root-mode pull machine's shepherd keeps the right to gain privileges.**
+Its shepherd reaches `pastor-agent`'s herdr through sudo (`sudo -n -H -u
+pastor-agent herdr --session default remote-api-bridge`, the one command its
+sudoers drop-in allows), and sudo needs its setuid bit, which
+`NoNewPrivileges=yes` would make the kernel ignore. So `pastor setup
+systemd` writes that shepherd's `pastor.service` without `NoNewPrivileges`
+(only when pastor.toml's `[shepherd] command` starts with `sudo`; every
+other unit keeps it). A process in that unit that is compromised can run
+any setuid program the machine has, bounded by sudoers for sudo itself: the
+cost of keeping agents in a user apart from the machine key.
 
 **A hijacked pull machine's shepherd** reaches the head through its own
 `bridge --shepherd --machine NAME` key, which answers for `NAME` and nothing

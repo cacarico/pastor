@@ -4953,7 +4953,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__setup__subcmd__systemd)
-            opts="-y -h --herdr --enable --start --now --stop --yes --require-linger --head --help"
+            opts="-y -h --herdr --enable --start --now --stop --yes --require-linger --restart --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

@@ -200,6 +200,35 @@ impl RemoteHead {
         .args(&format!("{} bridge", self.pastor))
     }
 
+    /// End the ssh master to the head (`ssh -O exit`), so the next request
+    /// authenticates afresh and runs whatever forced command the head's
+    /// authorized_keys holds now. A master keeps the forced command it
+    /// authenticated with, so after a rejoin it would go on speaking with
+    /// the old, revoked line. No master is nothing to end.
+    pub async fn close_master(&self) {
+        let Some(control_path) = &self.control_path else {
+            return;
+        };
+        let out = tokio::process::Command::new("ssh")
+            .arg("-S")
+            .arg(control_path)
+            .args(["-O", "exit", "--", self.ssh.as_str()])
+            .stdin(Stdio::null())
+            .output()
+            .await;
+        match out {
+            Ok(out) if out.status.success() => {
+                tracing::info!(head = %self.ssh, "ended the ssh master to the head");
+            }
+            Ok(out) => tracing::debug!(
+                head = %self.ssh,
+                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                "no ssh master to the head to end"
+            ),
+            Err(e) => tracing::warn!(head = %self.ssh, "could not run ssh -O exit: {e}"),
+        }
+    }
+
     /// One request, one reply, over ssh to `pastor bridge` on the head.
     /// ssh that exits with no reply is `RequestError::Unreachable` with its
     /// stderr; an error the bridge itself writes (`no_head`) is

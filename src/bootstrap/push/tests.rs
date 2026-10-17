@@ -901,6 +901,40 @@ async fn ok_machine_rerun_stays_ok_until_its_own_steps_start() {
     assert_eq!(runner.bootstrap_calls().len(), 2);
 }
 
+/// A rerun keeps the mode on record: without --sudo a root-mode machine
+/// still runs `bootstrap --sudo`, and --sudo on a user-mode one is refused
+/// before anything runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rerun_keeps_the_mode_on_record() {
+    let h = head().await;
+    let runner = FakePush::new(ok_outcome(Mode::Root));
+    assert!(h.push(h.opts(&runner, true)).await.unwrap().ok);
+    assert!(h.push(rerun_opts(&h, &runner)).await.unwrap().ok);
+    let calls = runner.bootstrap_calls();
+    assert_eq!(calls.len(), 2);
+    assert!(calls.iter().all(|c| c.contains(" --sudo")), "{calls:#?}");
+    assert_eq!(h.state().mode.as_deref(), Some("root"));
+
+    let h = head().await;
+    let runner = FakePush::new(ok_outcome(Mode::User));
+    assert!(h.push(h.opts(&runner, false)).await.unwrap().ok);
+    let before = runner.calls().len();
+    let err = h
+        .push(PushOpts {
+            sudo: true,
+            ..rerun_opts(&h, &runner)
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(code(&err), "usage_error", "{err:#}");
+    assert!(
+        err.to_string().contains("pastor machine remove gpu-3"),
+        "{err:#}"
+    );
+    assert_eq!(runner.calls().len(), before, "nothing ran");
+    assert_eq!(h.state().mode.as_deref(), Some("user"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn ok_machine_rerun_that_fails_before_its_steps_stays_ok() {
     let h = head().await;
@@ -1107,6 +1141,41 @@ async fn a_changed_host_key_needs_repin() {
         std::fs::read_to_string(h.paths.known_hosts_file()).unwrap(),
         "gpu-3.lan ssh-ed25519 AAAANEWKEY\n"
     );
+}
+
+/// A `--repin` that fails after its pin (here the copy) leaves known_hosts
+/// and the record agreeing on the new key, so the next rerun, without
+/// `--repin`, goes through instead of stopping on a key it just trusted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repin_that_fails_after_the_pin_records_the_new_key() {
+    let h = head().await;
+    let runner = FakePush::new(ok_outcome(Mode::User));
+    assert!(h.push(h.opts(&runner, false)).await.unwrap().ok);
+    *runner.host_key.lock().unwrap() = "ssh-ed25519 AAAANEWKEY".into();
+    let mut o = ok_outcome(Mode::User);
+    o.host_key = Some("ssh-ed25519 AAAANEWKEY".into());
+    *runner.outcome.lock().unwrap() = o;
+    runner.corrupt.store(true, Ordering::SeqCst);
+    let out = h
+        .push(PushOpts {
+            repin: true,
+            ..rerun_opts(&h, &runner)
+        })
+        .await
+        .unwrap();
+    assert!(!out.ok, "{out:?}");
+    assert_eq!(out.steps.last().unwrap().step, "checksum", "{out:?}");
+    assert_eq!(
+        std::fs::read_to_string(h.paths.known_hosts_file()).unwrap(),
+        "gpu-3.lan ssh-ed25519 AAAANEWKEY\n"
+    );
+    assert_eq!(
+        h.state().host_key.as_deref(),
+        Some("ssh-ed25519 AAAANEWKEY")
+    );
+    runner.corrupt.store(false, Ordering::SeqCst);
+    let out = h.push(rerun_opts(&h, &runner)).await.unwrap();
+    assert!(out.ok, "{out:?}");
 }
 
 /// A key on record that known_hosts no longer has (removed by hand) is

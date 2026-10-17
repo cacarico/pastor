@@ -111,7 +111,7 @@ The person made these on 2026-10-16. Each is binding on every build.
 | 12 | agy signs in by credentials file import | Tested on 2026-10-16: a copy of `~/.gemini/antigravity-cli/antigravity-oauth-token` (mode 0600) signs agy in on another machine with no login step, and both machines keep working. The check is `agy -p "reply with OK"`. The file is not tied to the machine, and agy keeps no secret in the OS keyring. agy refreshes the file on its own, so pastor copies the newest version. |
 | 13 | The first build is bootstrap | `pastor join` and `machine add --bootstrap`. |
 | 14 | Agents run as their own user, from the first build | A `pastor-agent` user runs herdr and every agent. It cannot read the shepherd's machine key. |
-| 15 | The shepherd never runs as root | A non-root login runs it as itself, and `--service-user` may name only that login. A root login (`curl … \| sudo sh -s -- join`) runs it as `--service-user`, else as a `pastor` user it creates or reuses. `--service-user root` is refused. |
+| 15 | The shepherd never runs as root | User mode runs it as the login, and `--service-user` may name only that login. Root mode runs it as `--service-user`, else as the login, or, for a root login (`curl … \| sudo sh -s -- join`), as a `pastor` user it creates or reuses. A push with `--sudo` may name any user but root and `pastor-agent`. A pull join reads the service user's machine key as whoever runs it, so a join not run as root (with `--sudo` or without) may name only its own login; a root join may name any. `--service-user root` is refused. |
 | 16 | First-build platforms: Linux with systemd, and macOS in user mode | Alpine/OpenRC, macOS root mode, armv7 and riscv64 are reported as unsupported. herdr ships no armv7 or riscv64 build. |
 
 ## The whole design
@@ -215,9 +215,9 @@ config bundles → SSH certificates.
 Push, from the head:
 
 ```sh
-pastor machine add gpu-3 --ssh me@gpu-3 --flock builders --tag gpu --bootstrap --sudo
-pastor machine add pi-7  --ssh pi@pi-7  --bootstrap --sudo --service-user pastor
-pastor machine add lab-1 --ssh me@lab-1 --bootstrap          # no root: user mode
+pastor machine add gpu-3 me@gpu-3 --flock builders --tag gpu --bootstrap --sudo
+pastor machine add pi-7  pi@pi-7  --bootstrap --sudo --service-user pastor   # a push with --sudo may name any user
+pastor machine add lab-1 me@lab-1 --bootstrap          # no root: user mode
 ```
 
 Pull, on the head first, then on the machine (or in its cloud-init):
@@ -257,7 +257,7 @@ Decisions 14 and 15 give a machine up to three users:
 | Role | Who | Holds | Runs |
 |---|---|---|---|
 | Login user | the ssh user (`me`), or root for `sudo sh` | nothing pastor needs | only bootstrap |
-| Service user | a non-root login: that login (`--service-user` may name only it). A root login, as under `sudo sh`: `--service-user`, else `pastor` (created if missing, reused if there). Never root: `--service-user root` is refused | the **machine key** (`bridge --shepherd`) | the shepherd (pull machines) |
+| Service user | user mode: the login (`--service-user` may name only it). Root mode: `--service-user`, else the login, or `pastor` for a root login, as under `sudo sh` (created if missing, reused if there). A push with `--sudo` may name any user; a pull join not run as root may name only its own login, since it reads that user's key. Never root (`--service-user root` is refused) and never `pastor-agent` | the **machine key** (`bridge --shepherd`) | the shepherd (pull machines) |
 | Agent user | `pastor-agent`, always created in root mode | the **agent key** (`bridge --agent`, as today) | herdr, and every agent pane |
 
 herdr runs as the agent user, because a pane starts as whoever runs herdr.
@@ -281,9 +281,14 @@ drop-in (`/etc/sudoers.d/pastor-<service user>`, named after the service
 user and never with a `.` in it, since sudo skips files in `sudoers.d`
 whose name holds one), NOPASSWD, checked with `visudo -c` before it is put
 in place, naming exactly one
-command — running herdr as `pastor-agent` — and nothing else, and the
-`client` step writes `[shepherd] command = [...]` for that one command so
-the shepherd uses it instead of its own, absent, local session. User mode
+command — running herdr as `pastor-agent` — and nothing else. A pull-only
+`shepherd_herdr` step, right after `client`, writes it, checks that sudo
+reads it (`sudo -n -l -U <service user> -u pastor-agent <herdr> …`), and
+writes `[shepherd] command = [...]` for that one command so the shepherd
+uses it instead of its own, absent, local session. sudo needs its setuid
+bit, so the shepherd's unit is written without `NoNewPrivileges` when its
+`[shepherd] command` starts with `sudo` (every other unit keeps it): the
+cost of a root-mode pull machine, which SECURITY.md states. User mode
 needs none of this: the login and agent user are the same person there.
 
 **User mode** (no root, no sudo) cannot create users. Everything runs as
@@ -466,13 +471,15 @@ not open.
   of being silently re-trusted. `ssh-keyscan` alone proves nothing, since
   it neither authenticates its answer nor goes through the client's own
   host-key check.
-- A pull machine's host key arrives with `Join`. A later bootstrap report
-  naming another key is refused with `host_key_mismatch` and changes
-  nothing.
+- A pull machine's host key arrives with `Join`, and only a `Join` sets it:
+  a `BootstrapReport` (the shepherd's own word) never sets or changes a
+  pull machine's key.
 - `pastor machine bootstrap NAME --repin` is the one way to trust a changed
   host key (a reinstalled machine, a replaced disk): it drops the pinned key
-  and pins the one the machine offers now; for a pull machine it drops the
-  key on record, and the next bootstrap report pins the one it sends.
+  and pins the one the machine offers now, in `known_hosts` and
+  `machine_state` together, so a step that fails after the pin leaves the
+  two agreeing. For a pull machine it drops the key on record, and the next
+  join, with a `--replace` token, sets the one it brings.
 - `machine remove` and `--replace` delete the entry, drop `machine_state`
   (remove) or bump its `generation` (replace), and close the ssh
   ControlMaster the **head** holds outward to that machine (`ssh -O exit`).
@@ -493,9 +500,14 @@ not open.
 | plain | a person's own key | everything, as today |
 
 Rules for `--shepherd`:
-- The bridge refuses with `machine_revoked` when `N` does not match
-  `machine_state.generation` for `X`, or when `X` has no `machine_state` row
-  at all. Enrollment sets the generation, `--replace` bumps it, `remove`
+- The bridge refuses with `machine_revoked` when `X` is not in the head's
+  flock.toml, whatever its line says; when `N` does not match
+  `machine_state.generation` for `X`, or `X` has no `machine_state` row
+  at all. A line with no `--gen` (`machine authorized-key --shepherd`, or
+  one written by hand) passes only while `X` is a pull machine in
+  flock.toml that no join has enrolled (generation 0 or no row): pull
+  machines set up by hand before this feature keep working, and a removed
+  one's gen-less line does not. Enrollment sets the generation, `--replace` bumps it, `remove`
   drops the row. This check runs on every request, not only at ssh
   authentication, so it is the one thing that reaches a connection that
   authenticated before a replace or removal: that connection keeps sending
@@ -556,10 +568,17 @@ authorized-key --shepherd` prints the new locked line, for moving them over.
 - drops its `machine_state` row.
 
 A removed pull machine's shepherd then fails to log in. It backs off and
-says why. `pastor leave` on the machine stops and removes its services, for
+says why. A shepherd answered `machine_revoked` (a rejoin replaced its line,
+or the machine was removed) ends its ssh master to the head, whose session
+would keep the old forced command, and backs off before reconnecting; after
+five in a row it exits, for systemd to start it afresh. A join restarts the
+shepherd's unit itself, so a rejoined box takes its new line at once. `pastor leave` on the machine stops and removes its services, for
 a clean teardown.
 
-**Upgrades** in the first build: rerun `pastor machine bootstrap NAME`, and
+**Upgrades** in the first build: rerun `pastor machine bootstrap NAME`
+(which keeps the mode on record: no `--sudo` on a root-mode machine still
+runs root mode, and `--sudo` on a user-mode one is refused; a change of
+mode is a remove and an add), and
 herdr upgrades with `herdr update --handoff` semantics, so running panes
 carry on. Upgrades driven by the machine spec and reconcile come with the
 later builds.

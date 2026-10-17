@@ -538,3 +538,66 @@ fn leave_reports_a_recorded_service_user_that_is_gone() {
         "{failed}"
     );
 }
+
+/// A non-root login that bootstrapped with `--sudo`: the service user's
+/// drop-in goes through `sudo -n`, and one sudo will not remove is
+/// `leave_incomplete` naming the file.
+#[test]
+fn a_sudo_login_removes_the_drop_in_through_sudo() {
+    let as_pi = |wrapped: Option<&str>, prog: &str, args: &[&str]| match (wrapped, prog, args) {
+        (None, "id", ["-u"]) => ok("1000\n"),
+        (None, "id", ["-un"]) => ok("pi\n"),
+        _ => root_login(wrapped, prog, args),
+    };
+    let e = env(Os::Linux);
+    let r = FakeRunner::new(as_pi);
+    let report = run(&e.paths, &e.here, &r);
+    assert!(report.failed.is_empty(), "{report:?}");
+    let drop_in = e.here.sudoers_dir.join("pastor-pastor");
+    let shown = drop_in.to_string_lossy();
+    let direct = r.direct();
+    assert!(
+        direct.contains(&v(&["sudo", "-n", "rm", "-f", "--", &shown])),
+        "{direct:?}"
+    );
+    assert!(
+        report
+            .done
+            .iter()
+            .any(|l| l == &format!("pastor: removed {shown}")),
+        "{report:?}"
+    );
+
+    // sudo will not run rm: the file is named, and leave is incomplete.
+    let e = env(Os::Linux);
+    let r = FakeRunner::new(move |wrapped, prog, args| match (wrapped, prog, args) {
+        (None, "sudo", ["-n", "rm", ..]) => fail("sudo: a password is required"),
+        _ => as_pi(wrapped, prog, args),
+    });
+    let report = run(&e.paths, &e.here, &r);
+    let failed = report.failed.join("\n");
+    let shown = e.here.sudoers_dir.join("pastor-pastor");
+    assert!(
+        failed.contains(&format!("could not remove {}", shown.display())),
+        "{failed}"
+    );
+    let err = report.finish().unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<CliError>().unwrap().code,
+        "leave_incomplete"
+    );
+
+    // Not there (test says no, sudo says nothing): nothing to do.
+    let e = env(Os::Linux);
+    let r = FakeRunner::new(move |wrapped, prog, args| match (wrapped, prog, args) {
+        (None, "sudo", ["-n", "test", ..]) => fail(""),
+        _ => as_pi(wrapped, prog, args),
+    });
+    let report = run(&e.paths, &e.here, &r);
+    assert!(report.failed.is_empty(), "{report:?}");
+    assert!(
+        !r.direct()
+            .iter()
+            .any(|c| c.starts_with(&v(&["sudo", "-n", "rm"])))
+    );
+}

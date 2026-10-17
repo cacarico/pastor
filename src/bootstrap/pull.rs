@@ -766,7 +766,7 @@ fn join_ssh_error(head: &str, err: &anyhow::Error) -> anyhow::Error {
         return CliError::err(
             crate::join::INVALID,
             format!(
-                "the head {head} refused the join token's key ({text}): the token was used, revoked or has expired; make a new one with `pastor join create` on the head"
+                "the head {head} refused the join token's key ({text}): the token was used, revoked or has expired; make a new one with `pastor join create` on the head. A new token refused the same way: is the head's sshd older than OpenSSH 8.2? It rejects the join line's `expiry-time`"
             ),
         );
     }
@@ -1176,12 +1176,15 @@ fn shepherd_herdr_inner(r: &dyn Runner, c: &Ctx) -> StepOutcome {
         )?;
         changed = true;
     }
-    // sudo skips /etc/sudoers.d unless /etc/sudoers includes it.
+    // sudo skips /etc/sudoers.d unless /etc/sudoers includes it. Without
+    // `-u` sudo checks the command as root, which the rule does not allow.
     let check = [
         "-n",
         "-l",
         "-U",
         service.name.as_str(),
+        "-u",
+        AGENT_USER,
         herdr.as_str(),
         "--session",
         "default",
@@ -1250,7 +1253,9 @@ fn shepherd_inner(r: &dyn Runner, c: &Ctx) -> StepOutcome {
         }
         steps::wait_runtime_dir(r, c, &u)?;
         // Lingering is on (the users step, in root mode) or setup refuses.
-        &["setup", "systemd", "--yes", "--require-linger"]
+        // A join gives the machine a new line on the head (a rejoin revokes
+        // the old one), so a shepherd already running restarts to take it.
+        &["setup", "systemd", "--yes", "--require-linger", "--restart"]
     };
     let out = must(
         c.as_user(r, &u, &pastor, args),
@@ -1467,6 +1472,11 @@ mod tests {
         let link = FakeLink::new(Err("me@head: Permission denied (publickey).".into()));
         let err = join_with(&p, &token(), &opts(), &r, &link).unwrap_err();
         assert_eq!(code(&err), "join_token_invalid", "{err:#}");
+        // sshd before 8.2 refuses the whole line for its `expiry-time`.
+        assert!(
+            format!("{err:#}").contains("older than OpenSSH 8.2"),
+            "{err:#}"
+        );
     }
 
     #[test]
@@ -1598,7 +1608,8 @@ mod tests {
         );
         assert!(
             calls.contains(
-                &"/home/me/.local/bin/pastor setup systemd --yes --require-linger".to_string()
+                &"/home/me/.local/bin/pastor setup systemd --yes --require-linger --restart"
+                    .to_string()
             ),
             "the shepherd's unit: {calls:#?}"
         );
@@ -1886,7 +1897,9 @@ mod tests {
                 && c.ends_with(&format!("sh {rule} /etc/sudoers.d/pastor-pastor"))
         });
         let checked = at(&|c| {
-            c == format!("sudo -n -l -U pastor {herdr} --session default remote-api-bridge")
+            c == format!(
+                "sudo -n -l -U pastor -u pastor-agent {herdr} --session default remote-api-bridge"
+            )
         });
         let command = at(&|c| {
             runs_as(c) == "pastor"
@@ -1894,7 +1907,7 @@ mod tests {
         });
         let client = at(&|c| c.ends_with("bootstrap --write-client me@head"));
         let herdr_unit = at(&|c| c.ends_with("setup systemd --herdr --yes --require-linger"));
-        let shepherd_unit = at(&|c| c.ends_with("setup systemd --yes --require-linger"));
+        let shepherd_unit = at(&|c| c.ends_with("setup systemd --yes --require-linger --restart"));
         assert!(
             client < sudoers && sudoers < checked && checked < command,
             "{calls:#?}"
