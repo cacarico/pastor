@@ -299,6 +299,9 @@ fn entry(name: &str, ssh: &str) -> MachineConfig {
         agents: Default::default(),
         profile: None,
         description: None,
+        min_disk: None,
+        min_memory: None,
+        unknown_room: None,
     }
 }
 
