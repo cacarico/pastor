@@ -4642,8 +4642,13 @@ impl Daemon {
         as_machine.check()?;
         // Each join of a name is a new enrollment: its shepherd line
         // carries the generation, and a bridge started under an older one
-        // is refused at its next request (`ShepherdCheck`).
-        let generation = self.store.machine_generation(name)?.unwrap_or(0) + 1;
+        // is refused at its next request (`ShepherdCheck`). The number is
+        // store-wide and never given twice: a per-name count would start
+        // over after `machine remove` drops the record, and let a
+        // connection from before the removal (sshd never rereads
+        // authorized_keys for it) speak for the name again. A join that
+        // fails from here only burns one.
+        let generation = self.store.next_generation()?;
         let machine_line = line(
             pastor,
             &format!("bridge --shepherd --machine {name} --gen {generation}"),
@@ -16279,6 +16284,77 @@ mod tests {
         );
         let flock = std::fs::read_to_string(d.paths.flock_file()).unwrap();
         assert!(flock.contains("pull = true"), "{flock}");
+    }
+
+    /// No generation is given twice for a name: a `--replace` join gets a
+    /// new one, and so does a join after `machine remove`, which drops the
+    /// record. A bridge whose connection authenticated under an older line
+    /// (sshd never rereads authorized_keys for it) is refused from then on.
+    #[tokio::test]
+    async fn a_generation_is_never_reused_for_a_name() {
+        let runner = Arc::new(RecordingRunner::answering(resolves_to_port_2222));
+        let (d, _tmp) = daemon_with_removable_machine(runner).await;
+        let join = |id: &'static str, replace: Option<&str>| {
+            d.store()
+                .put_join_token(&crate::store::JoinToken {
+                    id: id.into(),
+                    flock: None,
+                    tags: vec![],
+                    replace: replace.map(str::to_string),
+                    expires_at: "2999-01-01T00:00:00.000000+00:00".into(),
+                    used_at: None,
+                })
+                .unwrap();
+            let keys = d.authorized_keys.clone();
+            let d = &d;
+            async move {
+                d.join_with(
+                    std::path::Path::new("/usr/local/bin/pastor"),
+                    &keys,
+                    id,
+                    "pi-9",
+                    &format!("ssh-ed25519 AAAAMACHINE{id} m"),
+                    &format!("ssh-ed25519 AAAAAGENT{id} a"),
+                    "ssh-ed25519 AAAAHOST",
+                    None,
+                )
+                .await
+                .unwrap();
+                d.store().machine_generation("pi-9").unwrap().unwrap()
+            }
+        };
+        let revoked = |generation: i64| {
+            matches!(
+                d.shepherd_check("pi-9", Some(generation)),
+                IpcResponse::Error { ref code, .. } if code == "machine_revoked"
+            )
+        };
+        let first = join("00112233445566a1", Some("pi-9")).await;
+        let replaced = join("00112233445566a2", Some("pi-9")).await;
+        assert!(replaced > first, "{replaced} after {first}");
+        assert!(revoked(first));
+        let removed = d
+            .handle(IpcRequest::MachineRemove {
+                name: "pi-9".into(),
+            })
+            .await;
+        assert!(!matches!(removed, IpcResponse::Error { .. }), "{removed:?}");
+        assert_eq!(d.store().machine_generation("pi-9").unwrap(), None);
+        assert!(revoked(first) && revoked(replaced), "no record: removed");
+        let again = join("00112233445566a3", None).await;
+        assert!(again > replaced, "{again} after {replaced}");
+        let text = std::fs::read_to_string(&d.authorized_keys).unwrap();
+        assert!(
+            text.contains(&format!("--machine pi-9 --gen {again}\"")),
+            "{text}"
+        );
+        for old in [first, replaced] {
+            assert!(revoked(old), "generation {old} speaks for pi-9 again");
+        }
+        assert!(matches!(
+            d.shepherd_check("pi-9", Some(again)),
+            IpcResponse::Text(_)
+        ));
     }
 
     /// The herdr a joined machine fetches is the head's choice: `[provision]
