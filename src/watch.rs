@@ -676,6 +676,7 @@ async fn events(client: &crate::ipc::Client, after: u64, limit: u32) -> Result<E
             after,
             limit,
             task: None,
+            machine: None,
         },
     )
     .await?

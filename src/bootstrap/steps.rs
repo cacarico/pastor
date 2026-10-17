@@ -13,7 +13,9 @@ use crate::setup::{CmdOutput, Runner};
 /// A step. The run loop fills in its name.
 pub(super) type Step = fn(&dyn Runner, &Ctx) -> StepResult;
 
-/// The steps in the order they run.
+/// The steps in the order they run. The keys and each user's client.toml
+/// come before the services: a unit starts the moment its step runs, and
+/// pastor reads at startup whether it is a head's client or a shepherd.
 pub(super) const STEPS: [(&str, Step); 9] = [
     ("facts", facts),
     ("platform", platform),
@@ -21,9 +23,9 @@ pub(super) const STEPS: [(&str, Step); 9] = [
     ("users", users),
     ("pastor", pastor),
     ("herdr", herdr),
-    ("services", services),
     ("keys", keys),
     ("client", client),
+    ("services", services),
 ];
 
 /// The step of [`STEPS`] called `name`.
@@ -216,7 +218,7 @@ impl Ctx<'_> {
         self.user(r, &self.service_name())
     }
 
-    fn agent(&self, r: &dyn Runner) -> Result<User, StepResult> {
+    pub(super) fn agent(&self, r: &dyn Runner) -> Result<User, StepResult> {
         self.user(r, &self.agent_name())
     }
 

@@ -58,18 +58,135 @@ pub async fn run_agent(
     .await
 }
 
-/// `run` for the shepherd on `machine`: each line goes through
-/// `answer_shepherd`.
+/// `run` for the shepherd on `machine`, enrolled as `generation` (the
+/// forced command's `--gen`): each line goes through `answer_shepherd`, once
+/// the head says that generation is still the machine's (`check_generation`).
+/// A refused check is the last reply: the bridge stops there, and no later
+/// line is read.
 pub async fn run_shepherd(
     socket: &Path,
     machine: &str,
-    input: impl AsyncBufRead + Unpin,
-    output: impl AsyncWrite + Unpin,
+    generation: Option<i64>,
+    mut input: impl AsyncBufRead + Unpin,
+    mut output: impl AsyncWrite + Unpin,
 ) -> anyhow::Result<()> {
-    serve(input, output, async |line: &[u8]| {
-        answer_shepherd(socket, machine, line).await
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if input.read_until(b'\n', &mut line).await? == 0 {
+            return Ok(());
+        }
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let (reply, stop) = match check_generation(socket, machine, generation).await? {
+            Ok(()) => (answer_shepherd(socket, machine, &line).await?, false),
+            Err(refused) => (refused, true),
+        };
+        output.write_all(&reply).await?;
+        output.flush().await?;
+        if stop {
+            return Ok(());
+        }
+    }
+}
+
+/// Asks the head whether `generation` still speaks for `machine`
+/// (`IpcRequest::ShepherdCheck`). OpenSSH fixes a connection's forced
+/// command when it authenticates, and never reads authorized_keys again
+/// for channels opened on it later, so editing the file cannot reach a
+/// connection a `--replace` or a `machine remove` moved past; this check,
+/// before every request, does. `Err` is the reply that refuses the request:
+/// the head's own error (`machine_revoked`, or whatever an older head says),
+/// or `machine_revoked` for an answer that is not the one the check expects.
+pub async fn check_generation(
+    socket: &Path,
+    machine: &str,
+    generation: Option<i64>,
+) -> anyhow::Result<Result<(), Vec<u8>>> {
+    let req = IpcRequest::ShepherdCheck {
+        machine: machine.to_string(),
+        generation,
+    };
+    let reply = ask(socket, &req, None).await?;
+    Ok(match serde_json::from_slice::<IpcResponse>(&reply) {
+        Ok(IpcResponse::Text(_)) => Ok(()),
+        Ok(IpcResponse::Error { .. }) => Err(reply),
+        _ => Err(refuse(
+            MACHINE_REVOKED,
+            "the head answered the generation check with something else",
+        )?),
     })
-    .await
+}
+
+/// The code a shepherd's request is refused with once its key's line is
+/// from an enrollment the head has moved past, or its machine is gone.
+pub const MACHINE_REVOKED: &str = "machine_revoked";
+
+/// The `op` of the one line a pull machine's key sends to fetch an
+/// artifact through its forced `bridge --shepherd` (`fetch_line`): sshd
+/// passes a forced command no argv of the client's, so the fetch goes as a
+/// request line, like everything else.
+pub const FETCH_OP: &str = "artifact_fetch";
+
+/// The request line that fetches `artifact` through a shepherd's bridge.
+pub fn fetch_line(artifact: &Artifact) -> String {
+    let mut line = serde_json::json!({
+        "op": FETCH_OP,
+        "name": artifact.name,
+        "version": artifact.version,
+        "target": artifact.target,
+    })
+    .to_string();
+    line.push('\n');
+    line
+}
+
+/// `line` as a fetch (`fetch_line`): `None` for any other request, which
+/// the line bridge answers; `Some(Err)` for a fetch whose parts are not
+/// plain names (`Artifact::new`), or that carries anything else.
+pub fn fetch_request(line: &[u8]) -> Option<Result<Artifact, String>> {
+    let v: serde_json::Value = serde_json::from_slice(line).ok()?;
+    let obj = v.as_object()?;
+    if obj.get("op").and_then(|o| o.as_str()) != Some(FETCH_OP) {
+        return None;
+    }
+    let part = |k: &str| obj.get(k).and_then(|v| v.as_str());
+    let parts = (part("name"), part("version"), part("target"));
+    let (Some(name), Some(version), Some(target)) = parts else {
+        return Some(Err("a fetch names a name, a version and a target".into()));
+    };
+    if obj.len() != 4 {
+        return Some(Err(
+            "a fetch carries a name, a version and a target, nothing else".into(),
+        ));
+    }
+    Some(Artifact::new(name, version, target).map_err(|e| e.to_string()))
+}
+
+/// The first line of `input` that is not blank, newline included, read no
+/// further than `max` bytes; `None` at the end of input.
+pub async fn first_line(
+    mut input: impl AsyncBufRead + Unpin,
+    max: usize,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    use tokio::io::AsyncReadExt;
+    loop {
+        let mut line = Vec::new();
+        let mut limited = (&mut input).take(max as u64 + 1);
+        if limited.read_until(b'\n', &mut line).await? == 0 {
+            return Ok(None);
+        }
+        if line.len() > max {
+            return Err(CliError::err(
+                "request_too_large",
+                format!("a request is at most {max} bytes"),
+            ));
+        }
+        if !line.iter().all(u8::is_ascii_whitespace) {
+            return Ok(Some(line));
+        }
+    }
 }
 
 async fn serve(
@@ -334,16 +451,27 @@ pub async fn answer_shepherd(socket: &Path, machine: &str, line: &[u8]) -> anyho
             )
             .await
         }
-        IpcRequest::EventsSince { after, limit, task } => {
+        IpcRequest::EventsSince {
+            after, limit, task, ..
+        } => {
+            // The head cuts the page to `machine` before its limit, so a
+            // page of only other machines' records never comes back empty
+            // with the machine's own still to come. The cut here as well is
+            // for a head that would drop the field.
             let reply = ask(
                 socket,
-                &IpcRequest::EventsSince { after, limit, task },
+                &IpcRequest::EventsSince {
+                    after,
+                    limit,
+                    task,
+                    machine: Some(machine.to_string()),
+                },
                 None,
             )
             .await?;
             match serde_json::from_slice::<IpcResponse>(&reply) {
                 Ok(IpcResponse::Events(mut page)) => {
-                    page.events.retain(|e| event_machine(e) == Some(machine));
+                    page.events.retain(|e| e.machine_name() == Some(machine));
                     reply_line(&IpcResponse::Events(page))
                 }
                 Ok(IpcResponse::Error { .. }) => Ok(reply),
@@ -447,18 +575,18 @@ fn open_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 /// What a pull machine's key runs. Its forced command is the fixed `bridge
-/// --shepherd --machine X`, so whatever the shepherd asked for arrives in
-/// `SSH_ORIGINAL_COMMAND` (`original`), split on whitespace and never run
-/// through a shell. `Ok(None)` is the line bridge: `original` unset or
-/// blank, or `bridge` alone. `Ok(Some)` is a fetch: exactly `bridge --fetch
-/// NAME VERSION TARGET`, each part checked by `Artifact::new`. Either may
-/// start with the pastor program (`pastor`, or a path ending `/pastor`) and
-/// come wrapped as `sh -c '...'`, which is how the shepherd's own ssh sends
-/// them (`ssh::Ssh::args`, `posix_command`); the program is never run, the
-/// forced command picks it. Anything else is `Err` with the reason.
-pub fn forced_fetch(original: Option<&str>) -> Result<Option<Artifact>, String> {
+/// --shepherd --machine X --gen N`, so whatever the shepherd's ssh asked
+/// for arrives in `SSH_ORIGINAL_COMMAND` (`original`), split on whitespace
+/// and never run: the forced command picks the program. `Ok` is the line
+/// bridge: `original` unset or blank, or `bridge` alone, which may start
+/// with the pastor program (`pastor`, or a path ending `/pastor`) and come
+/// wrapped as `sh -c '...'`, as the shepherd's own ssh sends it
+/// (`ssh::Ssh::args`, `posix_command`). Anything else, a `--fetch` as argv
+/// included, is `Err` with the reason: a fetch goes as a request line
+/// (`fetch_line`), like every other request.
+pub fn forced_command(original: Option<&str>) -> Result<(), String> {
     let Some(original) = original.map(str::trim).filter(|o| !o.is_empty()) else {
-        return Ok(None);
+        return Ok(());
     };
     let inner = original
         .strip_prefix("sh -c '")
@@ -476,12 +604,9 @@ pub fn forced_fetch(original: Option<&str>) -> Result<Option<Artifact>, String> 
         all => all,
     };
     match words {
-        ["bridge"] => Ok(None),
-        ["bridge", "--fetch", name, version, target] => Artifact::new(name, version, target)
-            .map(Some)
-            .map_err(|e| e.to_string()),
+        ["bridge"] => Ok(()),
         _ => Err(format!(
-            "a shepherd's key runs only the bridge or `bridge --fetch NAME VERSION TARGET`, not {original:?}"
+            "a shepherd's key runs only the line bridge, not {original:?}; a fetch goes as a request line"
         )),
     }
 }
@@ -601,16 +726,6 @@ async fn pin_dispatch(
     }
     table.insert("machine".into(), machine.into());
     Ok(Ok(serde_json::Value::Object(table)))
-}
-
-/// The machine an event record is about, for `EventsSince` filtering: a
-/// `machine.*` event's own machine, else its task's. A record about neither
-/// (a job event with no task) matches no machine.
-fn event_machine(e: &crate::events::EventRecord) -> Option<&str> {
-    e.machine
-        .as_ref()
-        .map(|m| m.name.as_str())
-        .or_else(|| e.task.as_ref().and_then(|t| t.machine.as_deref()))
 }
 
 /// The request's `op`, as it crosses the socket.
@@ -1215,6 +1330,7 @@ mod tests {
             after: 0,
             limit: 50,
             task: None,
+            machine: Some("pi-2".into()),
         };
         let IpcResponse::Events(page) = head.ask_as_shepherd("pi-1", &req).await else {
             panic!()
@@ -1226,6 +1342,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1]
         );
+        // The head is asked to cut the page itself, to the bridge's own
+        // machine whatever the request said, so the cut comes before the
+        // limit and a page of other machines' records still moves the
+        // cursor on.
+        assert_eq!(head.last()["machine"], "pi-1");
         let IpcResponse::Events(page) = head.ask_as_shepherd("pi-2", &req).await else {
             panic!()
         };
@@ -1388,6 +1509,7 @@ mod tests {
             after: 0,
             limit: 50,
             task: None,
+            machine: Some("pi-2".into()),
         };
         let IpcResponse::Events(page) = head.ask_as_shepherd("pi-1", &req).await else {
             panic!()
@@ -1622,24 +1744,9 @@ mod tests {
     /// blank runs the line bridge, exactly `[pastor] bridge --fetch NAME
     /// VERSION TARGET` a fetch, and anything else is refused.
     #[test]
-    fn forced_fetch_parses_only_the_fetch_line() {
-        assert_eq!(forced_fetch(None), Ok(None));
-        assert_eq!(forced_fetch(Some(" \t")), Ok(None));
-        let want = Some(Artifact::new("herdr", "0.9.5", "linux-x86_64").unwrap());
-        assert_eq!(
-            forced_fetch(Some("bridge --fetch herdr 0.9.5 linux-x86_64")),
-            Ok(want.clone())
-        );
-        assert_eq!(
-            forced_fetch(Some("pastor bridge --fetch herdr 0.9.5 linux-x86_64")),
-            Ok(want.clone())
-        );
-        assert_eq!(
-            forced_fetch(Some(
-                "sh -c '/opt/bin/pastor bridge --fetch herdr 0.9.5 linux-x86_64'"
-            )),
-            Ok(want)
-        );
+    fn forced_command_takes_only_the_line_bridge() {
+        assert_eq!(forced_command(None), Ok(()));
+        assert_eq!(forced_command(Some(" \t")), Ok(()));
         // The shepherd's own line bridge, as its ssh sends it.
         for line in [
             "bridge",
@@ -1647,14 +1754,15 @@ mod tests {
             "sh -c 'pastor bridge'",
             "sh -c '~/.cargo/bin/pastor bridge'",
         ] {
-            assert_eq!(forced_fetch(Some(line)), Ok(None), "{line}");
+            assert_eq!(forced_command(Some(line)), Ok(()), "{line}");
         }
         for bad in [
-            "bridge --fetch herdr 0.9.5 linux-x86_64 x",
+            "bridge --fetch herdr 0.9.5 linux-x86_64",
+            "pastor bridge --fetch herdr 0.9.5 linux-x86_64",
+            "sh -c '/opt/bin/pastor bridge --fetch herdr 0.9.5 linux-x86_64'",
             "bridge --fetch herdr 0.9.5",
             "bridge --agent --machine pi-1",
             "bridge --machine pi-2 --fetch herdr 0.9.5",
-            "bridge --fetch herdr .. linux-x86_64",
             "bridge --fetch herdr 0.9.5 x;id",
             "sh -c 'pastor bridge;id'",
             "sh -c 'pastor bridge' ; id",
@@ -1663,7 +1771,30 @@ mod tests {
             "/bin/sh bridge",
             "tick",
         ] {
-            assert!(forced_fetch(Some(bad)).is_err(), "{bad}");
+            assert!(forced_command(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    /// A fetch goes as one request line, which names a plain artifact and
+    /// nothing else; any other line is not a fetch.
+    #[test]
+    fn fetch_request_reads_only_its_own_line() {
+        let a = Artifact::new("herdr", "0.9.5", "linux-x86_64").unwrap();
+        let line = fetch_line(&a);
+        assert!(line.ends_with('\n'));
+        assert_eq!(fetch_request(line.as_bytes()), Some(Ok(a)));
+        assert_eq!(fetch_request(b"{\"op\":\"ping\"}\n"), None);
+        assert_eq!(fetch_request(b"not json"), None);
+        for bad in [
+            r#"{"op":"artifact_fetch","name":"herdr","version":"..","target":"x"}"#,
+            r#"{"op":"artifact_fetch","name":"herdr","version":"0.9.5"}"#,
+            r#"{"op":"artifact_fetch","name":"herdr","version":"0.9.5","target":"x;id"}"#,
+            r#"{"op":"artifact_fetch","name":"herdr","version":"0.9.5","target":"x","machine":"pi-2"}"#,
+        ] {
+            assert!(
+                matches!(fetch_request(bad.as_bytes()), Some(Err(_))),
+                "{bad}"
+            );
         }
     }
 }

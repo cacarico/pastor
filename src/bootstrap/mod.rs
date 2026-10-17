@@ -212,6 +212,14 @@ pub struct Args {
         conflicts_with_all = ["sudo", "service_user", "head_key", "herdr_from", "json", "write_client", "print_state_dir", "write_shepherd"]
     )]
     pub write_report: Option<String>,
+    /// Set pastor.toml's [shepherd] command to run the agent user's herdr at this path through sudo, and print `written` or `unchanged`; `pastor join` runs it as the service user in root mode
+    #[arg(
+        long,
+        value_name = "PATH",
+        hide = true,
+        conflicts_with_all = ["sudo", "service_user", "head_key", "herdr_from", "json", "write_client", "print_state_dir", "write_shepherd", "write_report"]
+    )]
+    pub write_shepherd_herdr: Option<String>,
 }
 
 /// Entry point for `pastor bootstrap`; `head` is the global `--head`.
@@ -237,6 +245,12 @@ pub fn cli(args: &Args, head: Option<&str>) -> anyhow::Result<()> {
         }
         let paths = crate::config::Paths::from_env()?;
         let wrote = pull::write_shepherd(&paths.config_file(), name)?;
+        println!("{}", if wrote { "written" } else { "unchanged" });
+        return Ok(());
+    }
+    if let Some(herdr) = &args.write_shepherd_herdr {
+        let paths = crate::config::Paths::from_env()?;
+        let wrote = pull::write_shepherd_herdr(&paths.config_file(), herdr)?;
         println!("{}", if wrote { "written" } else { "unchanged" });
         return Ok(());
     }

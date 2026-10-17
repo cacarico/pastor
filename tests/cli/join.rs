@@ -292,7 +292,7 @@ fn token_line_removed_after_use() {
         .find(|l| l.ends_with(" pastor:machine:gpu-3"))
         .unwrap_or_else(|| panic!("no machine line in {keys}"));
     assert!(
-        machine.contains(" bridge --shepherd --machine gpu-3\","),
+        machine.contains(" bridge --shepherd --machine gpu-3 --gen 1\","),
         "{machine}"
     );
     let agent = keys
@@ -356,7 +356,114 @@ fn name_taken_refused() {
     assert!(m.get("tags").is_none(), "{m}");
     assert!(!h.keys_text().contains("pastor:machine:taken"));
     // A name no marker or forced command can carry is refused as such.
-    assert_eq!(error_code(&h.join(&id, "a b")), "invalid_machine");
+    assert_eq!(error_code(&h.join(&id, "a b")), "machine_name_invalid");
+}
+
+/// A shepherd bridge as sshd runs it, with its stdin and stdout kept open:
+/// one connection that sends a line, reads its reply, and sends more later.
+struct Live {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+}
+
+impl Live {
+    fn start(h: &Head, args: &[&str]) -> Live {
+        let mut c = pastor();
+        let mut child = h
+            .env(&mut c)
+            .arg("bridge")
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        Live {
+            child,
+            stdin,
+            stdout,
+        }
+    }
+
+    /// One request and its reply, parsed; `Null` once the bridge has hung up.
+    fn ask(&mut self, line: &str) -> serde_json::Value {
+        use std::io::BufRead;
+        let _ = writeln!(self.stdin, "{line}");
+        let _ = self.stdin.flush();
+        let mut reply = String::new();
+        self.stdout.read_line(&mut reply).unwrap();
+        serde_json::from_str(reply.trim()).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// OpenSSH fixes a connection's forced command when it authenticates, so a
+/// shepherd connected before a `--replace` keeps the old `--gen`: the head
+/// refuses its next request `machine_revoked` and the bridge hangs up,
+/// while a bridge under the new generation is served. A removed machine's
+/// bridge is refused the same way.
+#[test]
+fn a_replace_cuts_off_a_shepherd_connection_that_already_authenticated() {
+    let h = Head::start("1h");
+    let (id, _) = h.create(&[]);
+    assert_eq!(h.join(&id, "gpu-3")["kind"], "joined");
+    let machine_line = |h: &Head| {
+        h.keys_text()
+            .lines()
+            .find(|l| l.ends_with(" pastor:machine:gpu-3"))
+            .map(str::to_string)
+            .unwrap()
+    };
+    assert!(
+        machine_line(&h).contains("--gen 1\""),
+        "{}",
+        machine_line(&h)
+    );
+    let mut old = Live::start(&h, &["--shepherd", "--machine", "gpu-3", "--gen", "1"]);
+    let ping = "{\"op\":\"ping\"}";
+    assert_eq!(old.ask(ping)["kind"], "pong");
+    // A gen-less line, as one made by hand, no longer speaks for a joined
+    // machine.
+    let out = h.bridge(&["--shepherd", "--machine", "gpu-3"], &format!("{ping}\n"));
+    assert_eq!(error_code(&reply(&out)), "machine_revoked");
+
+    let (id, _) = h.create(&["--replace", "gpu-3"]);
+    // Keys of its own: the old ones are still on the old lines.
+    let r = h.join_keys(
+        &id,
+        "gpu-3",
+        "ssh-ed25519 AAAANEWM m",
+        "ssh-ed25519 AAAANEWA a",
+    );
+    assert_eq!(r["kind"], "joined", "{r}");
+    assert!(
+        machine_line(&h).contains("--gen 2\""),
+        "{}",
+        machine_line(&h)
+    );
+    // The same live connection, past the replace.
+    assert_eq!(error_code(&old.ask(ping)), "machine_revoked");
+    // And nothing more is read on it.
+    assert_eq!(old.ask(ping), serde_json::Value::Null);
+    let mut new = Live::start(&h, &["--shepherd", "--machine", "gpu-3", "--gen", "2"]);
+    assert_eq!(new.ask(ping)["kind"], "pong");
+
+    let out = h.cmd(&["machine", "remove", "gpu-3"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(error_code(&new.ask(ping)), "machine_revoked");
 }
 
 #[test]
@@ -436,9 +543,35 @@ fn create_with_an_unknown_flock_is_refused() {
 fn a_name_that_reads_as_an_option_is_refused() {
     let h = Head::start("1h");
     let (id, _) = h.create(&[]);
-    assert_eq!(error_code(&h.join(&id, "-oops")), "invalid_machine");
+    assert_eq!(error_code(&h.join(&id, "-oops")), "machine_name_invalid");
     assert!(machine(&h.flock(), "-oops").is_none());
     assert_eq!(h.join(&id, "gpu-3")["kind"], "joined");
+}
+
+/// A name with a shell metacharacter would reach the shell sshd runs the
+/// forced command with: refused before the token is used or anything is
+/// written, so the token still joins a good name after.
+#[test]
+fn a_name_with_a_shell_metacharacter_is_refused_before_the_token_is_used() {
+    let h = Head::start("1h");
+    let (id, _) = h.create(&[]);
+    let keys = h.keys_text();
+    let flock = h.flock();
+    for bad in [
+        "a;id", "a`id`", "$(id)", "a$(id)", "a|b", "a'b", "a\\b", ".hidden", "_x",
+    ] {
+        assert_eq!(
+            error_code(&h.join(&id, bad)),
+            "machine_name_invalid",
+            "{bad}"
+        );
+        assert_eq!(h.keys_text(), keys, "{bad}");
+        assert_eq!(h.flock(), flock, "{bad}");
+    }
+    let list = h.cmd(&["join", "list", "--json"]);
+    let rows: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert!(rows[0]["used_at"].is_null(), "{rows}");
+    assert_eq!(h.join(&id, "gpu-3.lan_2")["kind"], "joined");
 }
 
 #[test]

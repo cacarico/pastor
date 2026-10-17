@@ -57,6 +57,22 @@ impl FakePush {
             .collect()
     }
 
+    /// Whether the known_hosts this ssh checks pins gpu-3.lan with a key
+    /// other than the one the machine offers now.
+    fn pinned_otherwise(&self, args: &[String]) -> bool {
+        let Some(file) = args
+            .iter()
+            .find_map(|a| a.strip_prefix("UserKnownHostsFile="))
+        else {
+            return false;
+        };
+        let text = std::fs::read_to_string(file).unwrap_or_default();
+        let offered = self.host_key.lock().unwrap().clone();
+        text.lines()
+            .filter_map(|l| l.strip_prefix("gpu-3.lan "))
+            .any(|key| key.trim() != offered)
+    }
+
     fn bootstrap_calls(&self) -> Vec<String> {
         self.calls()
             .into_iter()
@@ -118,6 +134,13 @@ impl PushRunner for FakePush {
                 }
             }
             "ssh" if args.iter().any(|a| a == "-O") => answer(true, ""),
+            // ssh's own strict check against pastor's known_hosts: a host
+            // pinned with another key than it now offers is refused.
+            "ssh" if self.pinned_otherwise(args) => CmdOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: "Host key verification failed.\n".into(),
+            },
             "ssh" if self.unreachable.load(Ordering::SeqCst) => CmdOutput {
                 success: false,
                 stdout: String::new(),
@@ -437,6 +460,48 @@ async fn host_key_mismatch_stops() {
     assert!(pinned.is_empty(), "{pinned}");
 }
 
+/// A rerun against a host already pinned never scans it again: it checks
+/// against the pinned key, so a key that changed since stops the rerun
+/// instead of being trusted, and the pin stays as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rerun_checks_the_pinned_key_and_never_scans_again() {
+    let h = head().await;
+    let runner = FakePush::new(ok_outcome(Mode::User));
+    assert!(h.push(h.opts(&runner, false)).await.unwrap().ok);
+    let scans = || {
+        runner
+            .calls()
+            .iter()
+            .filter(|c| c.starts_with("ssh-keyscan"))
+            .count()
+    };
+    assert_eq!(scans(), 1);
+    // The same key: the rerun goes through, with no scan.
+    assert!(h.push(rerun_opts(&h, &runner)).await.unwrap().ok);
+    assert_eq!(scans(), 1);
+    // A new key, with no --host-key: stopped at the first connection.
+    *runner.host_key.lock().unwrap() = "ssh-ed25519 AAAANEWKEY".into();
+    let out = h.push(rerun_opts(&h, &runner)).await.unwrap();
+    assert!(!out.ok, "{out:?}");
+    let last = out.steps.last().unwrap();
+    assert_eq!(last.step, "connect", "{out:?}");
+    assert!(
+        last.why
+            .as_deref()
+            .unwrap_or("")
+            .contains("Host key verification failed"),
+        "{last:?}"
+    );
+    assert_eq!(scans(), 1);
+    let pinned = std::fs::read_to_string(h.paths.known_hosts_file()).unwrap();
+    assert_eq!(pinned, "gpu-3.lan ssh-ed25519 AAAAHOSTKEY\n");
+    // A --host-key that is not the pinned key stops before any ssh.
+    let mut opts = rerun_opts(&h, &runner);
+    opts.host_key = Some("SHA256:otherfp".into());
+    let out = h.push(opts).await.unwrap();
+    assert_eq!(out.steps.last().unwrap().step, "host_key", "{out:?}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn host_key_that_matches_is_pinned() {
     let h = head().await;
@@ -558,12 +623,44 @@ async fn a_bad_service_user_is_refused_before_anything_runs() {
 #[test]
 fn login_for_a_root_mode_entry_needs_ssh() {
     let e = entry("gpu-3", "pastor-agent@gpu-3");
-    let err = login_for(&e, None).unwrap_err();
+    let err = login_for(&e, None, None).unwrap_err();
     assert_eq!(code(&err), "usage_error");
-    assert_eq!(login_for(&e, Some("me@gpu-3")).unwrap(), "me@gpu-3");
+    assert_eq!(login_for(&e, Some("me@gpu-3"), None).unwrap(), "me@gpu-3");
     assert_eq!(
-        login_for(&entry("gpu-3", "me@gpu-3"), None).unwrap(),
+        login_for(&entry("gpu-3", "me@gpu-3"), None, None).unwrap(),
         "me@gpu-3"
+    );
+    // The stored bootstrap login stands in for --ssh; --ssh still wins.
+    assert_eq!(login_for(&e, None, Some("me@gpu-3")).unwrap(), "me@gpu-3");
+    assert_eq!(
+        login_for(&e, Some("other@gpu-3"), Some("me@gpu-3")).unwrap(),
+        "other@gpu-3"
+    );
+}
+
+/// A root-mode push moves the entry's ssh to the agent user and keeps the
+/// login it went through as, so `machine bootstrap gpu-3` with no --ssh
+/// reconnects as that login, not as the agent user.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_root_mode_push_keeps_its_login_for_the_next_run() {
+    let h = head().await;
+    let runner = FakePush::new(ok_outcome(Mode::Root));
+    assert!(h.push(h.opts(&runner, true)).await.unwrap().ok);
+    assert_eq!(h.ssh().as_deref(), Some("pastor-agent@gpu-3"));
+    let store = h.d.store();
+    assert_eq!(
+        store.bootstrap_login("gpu-3").unwrap().as_deref(),
+        Some("me@gpu-3")
+    );
+    // Another report (the next run's pending row, its outcome) keeps it.
+    let flock = Flock::load(&h.paths.flock_file()).unwrap();
+    let e = flock.get("gpu-3").unwrap();
+    let stored = store.bootstrap_login("gpu-3").unwrap();
+    assert_eq!(login_for(e, None, stored.as_deref()).unwrap(), "me@gpu-3");
+    assert!(h.push(rerun_opts(&h, &runner)).await.unwrap().ok);
+    assert_eq!(
+        store.bootstrap_login("gpu-3").unwrap().as_deref(),
+        Some("me@gpu-3")
     );
 }
 

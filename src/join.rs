@@ -139,6 +139,29 @@ pub fn new_id() -> anyhow::Result<String> {
     Ok(b.iter().map(|x| format!("{x:02x}")).collect())
 }
 
+/// The code of a joining machine's name that cannot be one.
+pub const NAME_INVALID: &str = "machine_name_invalid";
+
+/// Fail unless `name` is `^[A-Za-z0-9][A-Za-z0-9._-]*$`, the charset the
+/// artifact cache takes: it goes into a forced command in authorized_keys,
+/// which sshd runs through a shell, and onto ssh and herdr command lines,
+/// so `;`, `$(...)`, quotes, spaces and a leading `-` or `.` never get
+/// that far. The head checks it before the token is spent.
+pub fn check_name(name: &str) -> anyhow::Result<()> {
+    let mut chars = name.chars();
+    let ok = chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+    if !ok {
+        return Err(CliError::err(
+            NAME_INVALID,
+            format!(
+                "{name:?} cannot be a machine name: use letters, digits, '.', '_' and '-', starting with a letter or digit"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Whether `s` is an id `new_id` could give, and so one that may go in a
 /// marker and a forced command.
 pub fn is_join_id(s: &str) -> bool {
@@ -555,6 +578,7 @@ pub async fn bridge(
                 agent_key,
                 host_key,
                 facts,
+                service_user,
                 ..
             },
             _,
@@ -566,6 +590,7 @@ pub async fn bridge(
                 agent_key,
                 host_key,
                 facts,
+                service_user,
             };
             let line = crate::ipc::request_line(&req, None)?;
             match crate::ipc::relay_line(socket, line.as_bytes()).await {
