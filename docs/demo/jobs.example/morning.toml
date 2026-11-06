@@ -4,5 +4,5 @@ cron = "0 9 * * 1-5"
 use = "clock"
 
 [dispatch]
-repo = "~/ghq/github.com/cacarico/pastor"
+repo = "~/src/pastor"
 prompt = "It is {{ item.key }}. Summarize the last commit in one line."

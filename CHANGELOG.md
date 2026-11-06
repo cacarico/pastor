@@ -72,7 +72,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `limits` table until their reset; a new task does not start on one: it
   starts on the first free model of its `fallback` list (`task describe`:
   `model: gpt (fallback 2 of 2; me exhausted until 03:00)`) or stays queued
-  with `waiting: me exhausted until 03:00 (5-hour limit, seen by t-412)`,
+  with `waiting: me exhausted until 03:00 (5-hour limit, seen by t-12)`,
   which `pastor queue` shows too. An orchestrator stopped on a quota records
   its account, and one whose account is exhausted starts no agent before
   the reset.
@@ -497,7 +497,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   back on a job it disabled without waiting for a person. A plain agent is
   still refused both.
 - The herdr workspace pastor makes for a task is labelled
-  `<flock>/t-N`, such as `personal/t-285`, instead of `t-N`, so tasks of
+  `<flock>/t-N`, such as `personal/t-85`, instead of `t-N`, so tasks of
   several flocks on one machine can be told apart in herdr's sidebar. The
   agent is still named `t-N`, and a task that joins a workspace leaves its
   label alone.
@@ -1058,7 +1058,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - A second agent skill, `skills/spec` (`/pastor:spec` once the repo is
   installed as a Claude Code plugin; `.claude-plugin/plugin.json` makes it
-  one). It starts from a superpowers brainstorm and writes a plan whose tasks
+  one). It starts from a brainstorm and writes a plan whose tasks
   each carry a flock, repo, branch, model, timeout and a prompt file that
   needs no answers, run with `pastor task run --prompt-file`. The plan, its
   prompts and a ledger live on a plan branch so any machine can resume;
@@ -1108,8 +1108,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `[agents.<name>] allow_flag` and `deny_flag` name them for another agent,
   and a task whose agent has none for a list it carries is refused
   (`agent_tools_unsupported`). `pastor task show` prints both lists.
-- Agent definitions can set `kind` and `env`: `[agents.claude-personal]`
-  with `kind = "claude"` and `env = { CLAUDE_CONFIG_DIR = "~/.claude-personal" }`
+- Agent definitions can set `kind` and `env`: `[agents.claude-alt]`
+  with `kind = "claude"` and `env = { CLAUDE_CONFIG_DIR = "~/.claude-alt" }`
   starts a claude whose pane has that env, `~` expanded against the task
   machine's home. Built-in trust keys and tool flags follow the kind, and a
   task, job or flock names the definition like any agent. A worktree task

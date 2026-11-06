@@ -676,6 +676,7 @@ async fn events(client: &crate::ipc::Client, after: u64, limit: u32) -> Result<E
             after,
             limit,
             task: None,
+            machine: None,
         },
     )
     .await?
@@ -781,6 +782,14 @@ mod tests {
                     cwd: None,
                     keep_pane: None,
                     keep_pane_from: None,
+                    remove_worktree: None,
+                    remove_worktree_from: None,
+                    load: None,
+                    load_from: None,
+                    fetch: Default::default(),
+                    start_prompt: None,
+                    workdir: None,
+                    workdir_bundles: Vec::new(),
                     rounds: Default::default(),
                 },
                 flock: "default".into(),

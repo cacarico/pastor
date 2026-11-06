@@ -93,6 +93,19 @@ pub struct DispatchTable {
     /// the flock's, else `[defaults] keep_pane`
     /// (`Defaults::resolve_keep_pane`).
     pub keep_pane: Option<bool>,
+    /// Whether the job's tasks lose their worktree once they end, failed
+    /// or stale too; `None` takes the flock's, else `[defaults]
+    /// remove_worktree` (`Defaults::resolve_remove_worktree`).
+    pub remove_worktree: Option<bool>,
+    /// Whether the job's tasks skip fetching the repo's remote before their
+    /// worktree is made; unset, they fetch it.
+    pub no_fetch: Option<bool>,
+    /// A workdir set placed in each task's folder before its agent starts:
+    /// a set file or directory, relative to the jobs directory.
+    pub workdir_set: Option<String>,
+    /// Stored workdir bundles placed in each task's folder before its own
+    /// set, after its flock's `workdir_bundles`, by id.
+    pub workdir_bundles: Option<Vec<String>>,
     pub max_tasks_per_run: Option<u32>,
     pub backfill: Option<String>,
     /// The template of each task's description; `None` is
@@ -147,6 +160,10 @@ pub struct Job {
     /// JobSubmit`), so the head applies its own `[defaults]` to what the
     /// file leaves out. `Null` for a job the head built from a `JobTask`.
     pub dispatch: Value,
+    /// `dispatch.workdir_set` as written, relative to the jobs directory.
+    /// `load_file` reads the set into `spec.workdir`; a job parsed from its
+    /// text alone has the path and no set.
+    pub workdir_set: Option<String>,
 }
 
 impl Job {
@@ -217,6 +234,12 @@ impl Job {
         table.insert("prompt".into(), Value::String(prompt.to_string()));
         let d: DispatchTable =
             serde_json::from_value(Value::Object(table)).map_err(|e| e.to_string())?;
+        if d.workdir_set.is_some() {
+            return Err(format!(
+                "dispatch.workdir_set: a job run on another machine names its set by a path there, which the head cannot read; run the job on the head ({})",
+                crate::bundle::workdir::WORKDIR_UNSUPPORTED
+            ));
+        }
         Job::from_dispatch(
             name.to_string(),
             Schedule::Every(Duration::MAX),
@@ -366,6 +389,17 @@ impl Job {
         }
         check_tools("dispatch.allow", &d.allow)?;
         check_tools("dispatch.deny", &d.deny)?;
+        if let Some(set) = &d.workdir_set {
+            check_workdir_set(set)?;
+        }
+        let workdir_bundles = d.workdir_bundles.clone().unwrap_or_default();
+        for (i, id) in workdir_bundles.iter().enumerate() {
+            crate::connector::manifest::check_id(id)
+                .map_err(|e| format!("dispatch.workdir_bundles: {e}"))?;
+            if workdir_bundles[..i].contains(id) {
+                return Err(format!("dispatch.workdir_bundles: {id} is listed twice"));
+            }
+        }
         let agent = AgentChoice {
             agent: d.agent,
             agent_args: d.agent_args,
@@ -395,6 +429,7 @@ impl Job {
             summary: d.summary,
             agent,
             dispatch: Value::Null,
+            workdir_set: d.workdir_set,
             spec: DispatchSpec {
                 now: false,
                 agent: pick.agent,
@@ -420,7 +455,21 @@ impl Job {
                 cwd: None,
                 keep_pane: d.keep_pane,
                 keep_pane_from: None,
+                remove_worktree: d.remove_worktree,
+                remove_worktree_from: None,
+                load: None,
+                load_from: None,
+                fetch: crate::task::FetchNote {
+                    skip: d.no_fetch == Some(true),
+                    warning: None,
+                },
                 rounds: Default::default(),
+                start_prompt: None,
+                workdir: None,
+                workdir_bundles: workdir_bundles
+                    .iter()
+                    .map(|id| crate::task::WorkdirBundle::named(id))
+                    .collect(),
             },
         })
     }
@@ -558,6 +607,48 @@ impl Loaded {
     }
 }
 
+/// `dispatch.workdir_set`: a path inside the jobs directory, so a job file
+/// names only what sits beside it.
+fn check_workdir_set(set: &str) -> Result<(), String> {
+    let path = Path::new(set);
+    let inside = !set.trim().is_empty()
+        && path.is_relative()
+        && path
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)));
+    if inside {
+        Ok(())
+    } else {
+        Err(format!(
+            "dispatch.workdir_set: {set:?}: a path relative to the jobs directory, with no `..`"
+        ))
+    }
+}
+
+impl Job {
+    /// The job with its `workdir_set` read from `dir`, the jobs directory,
+    /// into `spec.workdir`: a set that does not read makes the job invalid.
+    pub fn with_workdir_set(mut self, dir: &Path) -> Result<Job, String> {
+        let Some(rel) = &self.workdir_set else {
+            return Ok(self);
+        };
+        let src = dir.join(rel);
+        let set = crate::bundle::workdir::Set::load(&src.to_string_lossy()).map_err(|e| {
+            let why = match e.downcast_ref::<crate::cli::CliError>() {
+                Some(c) => c.message.clone(),
+                None => format!("{e:#}"),
+            };
+            format!("dispatch.workdir_set: {rel}: {why}")
+        })?;
+        self.spec.workdir = Some(Box::new(crate::task::TaskWorkdir {
+            set: set.to_doc(),
+            placed_in: None,
+            render: None,
+        }));
+        Ok(self)
+    }
+}
+
 pub fn job_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{name}.toml"))
 }
@@ -589,10 +680,37 @@ pub fn load_dir(
     Ok(out)
 }
 
+/// The jobs in `dir` whose `[dispatch] workdir_bundles` name bundle `id`,
+/// sorted. Read from the TOML alone, with no agent catalog, so a job that
+/// does not load for another reason still counts.
+pub fn naming_workdir_bundle(dir: &Path, id: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("toml"))
+        .filter_map(|p| {
+            let stem = p.file_stem()?.to_str()?.to_string();
+            let doc: toml::Table = std::fs::read_to_string(&p).ok()?.parse().ok()?;
+            let names = doc
+                .get("dispatch")?
+                .get("workdir_bundles")?
+                .as_array()?
+                .iter()
+                .any(|b| b.as_str() == Some(id));
+            names.then_some(stem)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 pub fn load_file(path: &Path, stem: &str, defaults: &Defaults, catalog: &dyn Catalog) -> Loaded {
     let parsed = std::fs::read_to_string(path)
         .map_err(|e| e.to_string())
-        .and_then(|text| Job::parse(&text, stem, defaults, catalog));
+        .and_then(|text| Job::parse(&text, stem, defaults, catalog))
+        .and_then(|job| job.with_workdir_set(path.parent().unwrap_or(Path::new("."))));
     match parsed {
         Ok(job) => Loaded::Valid(Box::new(job)),
         Err(error) => Loaded::Invalid {
@@ -602,9 +720,12 @@ pub fn load_file(path: &Path, stem: &str, defaults: &Defaults, catalog: &dyn Cat
     }
 }
 
-/// `pastor job enable|disable`: rewrite the top-level `enabled` line (or insert
-/// one before the first table) and nothing else, so comments and layout the
-/// user wrote survive. The result must still parse or the file is left alone.
+/// `pastor job enable|disable`: set the root table's `enabled` and nothing
+/// else, so comments, layout and any multi-line string the user wrote
+/// survive untouched. `toml_edit` always prints a table's own keys before
+/// its nested tables regardless of insertion order, so a freshly inserted
+/// `enabled` lands before the first `[table]` header without extra work.
+/// The result must still parse or the file is left alone.
 pub fn set_enabled(path: &Path, enabled: bool) -> anyhow::Result<()> {
     // Resolve the real file first: `path` may be a symlink (e.g. into a
     // dotfiles repo), and writing the temp file next to `path` then renaming
@@ -617,40 +738,11 @@ pub fn set_enabled(path: &Path, enabled: bool) -> anyhow::Result<()> {
     let _lock = crate::edit::lock_file(&target)?;
     let text =
         std::fs::read_to_string(&target).with_context(|| format!("read {}", target.display()))?;
-    let line = format!("enabled = {enabled}");
-    let mut out: Vec<String> = Vec::new();
-    let mut replaced = false;
-    let mut top_level = true;
-    for l in text.lines() {
-        let t = l.trim_start();
-        if t.starts_with('[') {
-            top_level = false;
-        }
-        let is_enabled_key = t
-            .strip_prefix("enabled")
-            .is_some_and(|rest| rest.trim_start().starts_with('='));
-        if top_level && !replaced && is_enabled_key {
-            out.push(line.clone());
-            replaced = true;
-        } else {
-            out.push(l.to_string());
-        }
-    }
-    if !replaced {
-        // Insert before whatever ends the top-level block first: a table
-        // header, or the blank line conventionally left before one. Inserting
-        // only before the header would land the new key after that blank
-        // line, inside what reads as the table's own paragraph.
-        let at = out
-            .iter()
-            .position(|l| l.trim().is_empty() || l.trim_start().starts_with('['))
-            .unwrap_or(out.len());
-        out.insert(at, line);
-    }
-    let mut new_text = out.join("\n");
-    if text.ends_with('\n') || !text.is_empty() {
-        new_text.push('\n');
-    }
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .with_context(|| format!("{} would not parse", path.display()))?;
+    doc["enabled"] = toml_edit::value(enabled);
+    let new_text = doc.to_string();
     // A syntax check only: full `JobFile` validation would reject unrelated
     // fields the user has every right to keep (e.g. a `dispatch` key pastor
     // does not know yet), which is not what "leave a broken edit alone" means.
@@ -1166,9 +1258,11 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
             profile: None,
             min_disk: None,
             min_memory: None,
+            env: Default::default(),
             label: None,
             summary: None,
             keep_pane: None,
+            remove_worktree: None,
         };
         let job = Job::parse(text, "hourly", &d, &Builtins).unwrap();
         assert_eq!(job.spec.agent, "codex");
@@ -1228,6 +1322,151 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
             Some(true)
         );
         assert!(parse("keep_panes = true\n").is_err());
+    }
+
+    /// `[dispatch] remove_worktree` is the job's own ask, `false` included;
+    /// a job without it leaves it to the flock and `[defaults]`.
+    #[test]
+    fn remove_worktree_is_the_job_s_own_ask() {
+        let text = |extra: &str| {
+            format!(
+                "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"p\"\n{extra}"
+            )
+        };
+        let d = Defaults {
+            remove_worktree: Some(true),
+            ..defaults()
+        };
+        let parse = |extra: &str| Job::parse(&text(extra), "j", &d, &Builtins);
+        assert_eq!(parse("").unwrap().spec.remove_worktree, None);
+        assert_eq!(
+            parse("remove_worktree = false\n")
+                .unwrap()
+                .spec
+                .remove_worktree,
+            Some(false)
+        );
+        assert_eq!(
+            parse("remove_worktree = true\n")
+                .unwrap()
+                .spec
+                .remove_worktree,
+            Some(true)
+        );
+        assert!(parse("remove_worktrees = true\n").is_err());
+    }
+
+    /// `[dispatch] workdir_set` names a set beside the job file, read when
+    /// the job loads into its tasks' spec. A set that does not read, or a
+    /// path out of the jobs directory, makes the job invalid; a job another
+    /// machine submits may not name one.
+    #[test]
+    fn a_jobs_workdir_set_is_read_when_it_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = job_path(tmp.path(), "nightly");
+        let job = |set: &str| {
+            format!(
+                "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"p\"\nworkdir_set = {set:?}\n"
+            )
+        };
+        std::fs::create_dir_all(tmp.path().join("sets")).unwrap();
+        std::fs::write(
+            tmp.path().join("sets/reviewer.json"),
+            r#"{"id": "reviewer", "kind": "claude", "files": [{"path": ".claude/agents/checker.md", "content": "Check.\n"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(&path, job("sets/reviewer.json")).unwrap();
+        let Loaded::Valid(j) = load_file(&path, "nightly", &defaults(), &Builtins) else {
+            panic!("the set reads")
+        };
+        let w = j.spec.workdir.as_ref().expect("the set is on the spec");
+        assert_eq!(w.set["id"], "reviewer");
+        assert_eq!(j.workdir_set.as_deref(), Some("sets/reviewer.json"));
+
+        std::fs::write(&path, job("sets/missing.json")).unwrap();
+        let Loaded::Invalid { error, .. } = load_file(&path, "nightly", &defaults(), &Builtins)
+        else {
+            panic!("a missing set is invalid")
+        };
+        assert!(
+            error.starts_with("dispatch.workdir_set: sets/missing.json"),
+            "{error}"
+        );
+        for out in ["../reviewer.json", "/etc/reviewer.json", ""] {
+            std::fs::write(&path, job(out)).unwrap();
+            assert!(
+                matches!(
+                    load_file(&path, "nightly", &defaults(), &Builtins),
+                    Loaded::Invalid { .. }
+                ),
+                "{out:?}"
+            );
+        }
+        let err = Job::submitted(
+            "remote",
+            &serde_json::json!({"workdir_set": "sets/reviewer.json"}),
+            "p",
+            &defaults(),
+        )
+        .unwrap_err();
+        assert!(err.contains("workdir_unsupported"), "{err}");
+    }
+
+    /// `[dispatch] workdir_bundles` names stored workdir bundles by id, each
+    /// once, onto the job's spec; a job another machine submits may name
+    /// them too, since they are the head's.
+    #[test]
+    fn a_jobs_workdir_bundles_are_ids_on_its_spec() {
+        let text = |extra: &str| {
+            format!(
+                "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"p\"\n{extra}"
+            )
+        };
+        let job = Job::parse(
+            &text("workdir_bundles = [\"repo-notes\", \"style\"]\n"),
+            "nightly",
+            &defaults(),
+            &Builtins,
+        )
+        .unwrap();
+        let ids: Vec<&str> = job
+            .spec
+            .workdir_bundles
+            .iter()
+            .map(|b| b.id.as_str())
+            .collect();
+        assert_eq!(ids, ["repo-notes", "style"]);
+        for (bad, want) in [
+            ("workdir_bundles = [\"Repo\"]\n", "must match"),
+            ("workdir_bundles = [\"a\", \"a\"]\n", "listed twice"),
+        ] {
+            let err = Job::parse(&text(bad), "nightly", &defaults(), &Builtins).unwrap_err();
+            assert!(err.contains(want), "{bad} => {err}");
+        }
+        let job = Job::submitted(
+            "remote",
+            &serde_json::json!({"workdir_bundles": ["repo-notes"]}),
+            "p",
+            &defaults(),
+        )
+        .unwrap();
+        assert_eq!(job.spec.workdir_bundles[0].id, "repo-notes");
+    }
+
+    /// `[dispatch] no_fetch` makes the job's tasks skip fetching their
+    /// worktree's base; without it, or with `false`, they fetch.
+    #[test]
+    fn no_fetch_is_the_job_s_own_ask() {
+        let text = |extra: &str| {
+            format!(
+                "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"p\"\n{extra}"
+            )
+        };
+        let parse = |extra: &str| Job::parse(&text(extra), "j", &defaults(), &Builtins);
+        assert!(!parse("").unwrap().spec.fetch.skip);
+        assert!(!parse("no_fetch = false\n").unwrap().spec.fetch.skip);
+        assert!(parse("no_fetch = true\n").unwrap().spec.fetch.skip);
+        assert!(parse("no_fetchs = true\n").is_err());
     }
 
     /// `[dispatch] label` is the job's label template, kept unrendered for
@@ -1527,6 +1766,55 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "every = \"1h\"\n[connector\n"
+        );
+    }
+
+    #[test]
+    fn set_enabled_leaves_a_multiline_string_alone_when_enabled_is_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("j.toml");
+        // The description holds a blank line, an `enabled = false` line and a
+        // `[x]` line, each of which used to be mistaken for the real
+        // top-level key or a table header by the old line-by-line writer.
+        let description = "intro\n\nenabled = false\n[x]\ntail";
+        let original = format!(
+            "name = \"j\"\ndescription = \"\"\"\n{description}\n\"\"\"\nevery = \"1h\"\nenabled = true\n\n[connector]\nuse = \"clock\"\n\n[dispatch]\nprompt = \"p\"\n"
+        );
+        std::fs::write(&path, &original).unwrap();
+
+        set_enabled(&path, false).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let job = Job::parse(&text, "j", &defaults(), &Builtins).unwrap();
+        assert!(!job.enabled, "the top-level enabled flipped");
+        assert_eq!(
+            job.description.as_deref(),
+            Some(description),
+            "the multi-line string must survive untouched"
+        );
+    }
+
+    #[test]
+    fn set_enabled_inserts_before_a_multiline_string_with_no_top_level_enabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("j.toml");
+        let description = "intro\n\nenabled = false\n[x]\ntail";
+        // No top-level `enabled` at all, so the writer must insert one
+        // without mistaking anything inside the string for it.
+        let original = format!(
+            "name = \"j\"\ndescription = \"\"\"\n{description}\n\"\"\"\nevery = \"1h\"\n\n[connector]\nuse = \"clock\"\n\n[dispatch]\nprompt = \"p\"\n"
+        );
+        std::fs::write(&path, &original).unwrap();
+
+        set_enabled(&path, true).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let job = Job::parse(&text, "j", &defaults(), &Builtins).unwrap();
+        assert!(job.enabled, "enabled must be inserted as true");
+        assert_eq!(
+            job.description.as_deref(),
+            Some(description),
+            "the multi-line string must survive untouched"
         );
     }
 

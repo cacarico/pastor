@@ -1,0 +1,41 @@
+#! question: no
+#! shell: yes
+#! trust: no
+  ⎿  Allowed by auto mode classifier
+
+● Bash({ git diff; cat src/sweep.py tests/test_sweep.py; } | grep -inE
+      "secret|token|password")
+  ⎿  scan done
+  ⎿  Allowed by auto mode classifier
+
+● Clean. Waiting for the fast tier to finish before
+  committing.
+
+  Listed 1 directory (ctrl+o to expand)
+
+● The fast tier is still running; I'll pick up once it
+  reports.
+
+✻ Sautéed for 14m 37s · done 1:48 PM · 1 shell still
+  running
+
+───────────────────────────────────────────────────────────
+ We recommend compacting earlier
+
+   Each message re-sends the whole conversation, so long
+   conversations use up your plan's usage limits
+   faster. With your current settings, Claude Code
+   autocompacts (replaces older messages with a summary)
+   at 600k tokens. Compacting earlier can reduce usage,
+   but it happens more often, and some details can be
+   lost each time.
+
+   Want to autocompact at 400k tokens instead? Your
+   model doesn't change. Switch back any time with
+   /autocompact.
+
+   ❯ Autocompact at ‹ 400k › tokens
+     Keep 600k tokens
+
+   ↑/↓ choose · ←/→ change size · enter confirm · esc
+   not now

@@ -21,6 +21,60 @@ fed by issues or chat messages from outside your team; run herdr for that
 work as a separate user and add it as an ssh machine instead. Connectors also
 run as that user, so installing one grants it control of the fleet.
 
+## What a machine is trusted with
+
+The head holds every machine's trust. `flock.toml` says which machines exist;
+each ssh machine's host key is pinned in pastor's own `known_hosts` (a key
+trusted the first time it is seen, unless `--host-key` names it, and never
+replaced by a later run: a changed key stops the next connection, and a
+reinstalled machine is removed and added again); the head's `authorized_keys`
+holds a marked line for each machine's agent key and each pull machine's
+shepherd key; `machine_state` in the store records how each machine's bootstrap
+ended. Whoever controls the head's user controls all of it, as above.
+
+A machine's way back to the head is one ssh key locked, by its `authorized_keys`
+line, to one command (`restrict`, no terminal, no forwarding): the agent bridge
+for its agents, the shepherd bridge for a pull machine's headless serve. The
+bridge, on the head, passes on only a short list of requests and only about
+that machine: its tasks, its flock's task list, and for a shepherd its claims
+and reports, its saved trust, jobs pinned to it, the events about it, its
+bootstrap report and files from the head's artifact cache. Everything else is
+refused before it reaches the head, and a shepherd's key stops working when the
+head moves its enrollment on or the machine is removed. No machine can name
+another machine, change the flock or queue work elsewhere through its key.
+
+`pastor bootstrap` makes those keys as the machine's login user, and the agents
+on the machine run as that user (`isolation: none`). So an agent, or a prompt
+that steers one, can read the machine key and the agent key and use them: it can
+do on the head what the machine's own agents and shepherd can, for that
+machine, such as end its tasks, report them done or failed, claim work for it or
+report it bootstrapped, and it can read everything else that user can,
+`~/.ssh` and the agent CLIs' logins included. It cannot reach another machine.
+To keep agents from the machine's keys, run them as another user on the machine
+and add that user as its own ssh machine, as for a `local = true` machine
+above.
+
+A pull machine can join with a one-time token (`pastor join create` on the head).
+The token holds the private half of an ed25519 key whose public half sits in the
+head's `authorized_keys` locked to `bridge --join <id>` with sshd's `expiry-time`,
+so it can do one thing, once, until it expires: send a join request. It is a
+secret and pastor treats it as one: the head keeps only its id, and the machine
+that joins reads it from stdin, `PASTOR_JOIN_TOKEN` or the terminal, never from
+an argument, takes the variable out of its own environment before it starts any
+command, writes the key to a 0600 file in a 0700 directory only for the length
+of the ssh that uses it, deletes that directory on every way out that can be
+caught, and writes it in no log and no file it keeps. The head's host key
+travels in the token and is pinned before the first connection, so a join does
+not trust the network. Whoever has the token before its machine uses it can
+take the name it was made for: give it over a channel you trust, make it short
+lived, and revoke it (`pastor join revoke`) if it leaves your hands.
+
+Bootstrap, by hand or from the head, runs as the login user and calls no
+`sudo`; what needs root is left to the machine's owner. The push copies pastor
+and herdr from the head's artifact cache, which hashes each download against
+its published sum before it is cached, and hashes them again on the machine
+before they are moved into place.
+
 ## What connectors inherit
 
 A connector command (a connector's run or one of its hooks) runs on the head,
@@ -75,9 +129,12 @@ credentials, prompts, logs, workspaces, agents or other machines are exposed.
 Dependabot watches the crates in `Cargo.lock` and the GitHub Actions the
 workflows use (`.github/dependabot.yml`): it opens security updates as soon as
 an advisory lands, and version updates weekly, grouping minor and patch bumps
-into one pull request per ecosystem. Its pull requests go through CI and
-merge here like any other. Its malware alerts flag a dependency version
-that has been reported as malicious.
+into one pull request per ecosystem. Its pull requests go through CI like any
+other. Work happens in a private copy of the repository, which publishes to
+the public one, so in the public repository Dependabot's pull requests are
+closed by a workflow (`.github/workflows/dependabot-close.yml`): the same
+update is merged in the private copy and arrives with the next sync. Its malware alerts flag a dependency version that has been reported as
+malicious.
 
 New dependencies should be justified in the pull request. Reviewers should
 consider maintenance status, transitive dependencies, license compatibility, and

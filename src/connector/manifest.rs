@@ -325,14 +325,16 @@ pub fn check_id(id: &str) -> Result<(), String> {
     }
 }
 
-fn check_command(field: &str, argv: &[String]) -> Result<(), String> {
+/// An argv with a program in its first place. Shared with the provisioner
+/// manifest, whose checks and fixes are argv arrays too.
+pub(crate) fn check_command(field: &str, argv: &[String]) -> Result<(), String> {
     match argv.first() {
         Some(p) if !p.is_empty() => Ok(()),
         _ => Err(format!("{field}: needs a program, as an argv array")),
     }
 }
 
-fn check_env_name(name: &str) -> Result<(), String> {
+pub(crate) fn check_env_name(name: &str) -> Result<(), String> {
     let ok = name
         .chars()
         .next()

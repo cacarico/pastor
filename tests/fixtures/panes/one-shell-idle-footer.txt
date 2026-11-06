@@ -1,0 +1,14 @@
+#! question: no
+#! shell: yes
+#! trust: no
+● Bash(make check)
+  ⎿  Running in the background (↓ to manage)
+
+● make check is running in the background; I will commit once it passes.
+
+✻ Worked for 1m 12s
+
+──────────────────────────────────────────────────────────────────────────────
+❯ 
+──────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on · 1 shell · ↓ to manage

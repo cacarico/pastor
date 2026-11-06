@@ -243,6 +243,30 @@ fn job_describe_enable_and_disable_go_through_a_head() {
     );
 }
 
+/// A headless serve whose flock.toml does not load does not start: it exits
+/// 1 saying which file and why, and leaves no socket or database.
+#[test]
+fn a_headless_serve_refuses_a_flock_that_does_not_load() {
+    let env = start();
+    let c = client(Some(&env));
+    ok(c.head_set("head-up", &[]));
+    std::fs::write(c.config.join("flock.toml"), "[[flock]\nname = ").unwrap();
+    let mut serve = c.serve();
+    let deadline = Instant::now() + WAIT;
+    let status = loop {
+        if let Some(status) = serve.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "serve never exited");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(status.code(), Some(1), "{}", serve.log());
+    let log = serve.log();
+    assert!(log.contains("flock.toml") && log.contains("parse"), "{log}");
+    assert!(log.contains("not started"), "{log}");
+    assert!(!c.state.join("shepherd.db").exists());
+}
+
 /// With a head set, `pastor serve` runs headless: this machine's jobs run
 /// here, their tasks go to the head, and this machine's hooks hear the
 /// head's events. It keeps job state in its own small database, answers

@@ -349,7 +349,8 @@ Stdin is one JSON object on one line:
   agent ended on a question). It is `""` when pastor read none, as for a task
   that failed, and after a restart of the head.
 - `summary` is how the round ended (see Task summaries): what the agent said
-  with `task done --summary`, or `no summary` and the pane's last lines;
+  with `task done --summary`, or `no summary` (`no head` when the agent
+  could not reach the head) and the pane's last lines;
   `null` when pastor has none.
 
 It runs once per task, the first time pastor sees it `done` or `failed`. A task

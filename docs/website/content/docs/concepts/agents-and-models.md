@@ -103,7 +103,7 @@ login elsewhere. pastor never reads the account as a credential.
 The head keeps a row per exhausted account (or one model of it) until its
 reset, and a new task does not start on it: it takes the first free model
 of its `fallback` list, or stays queued, and `pastor queue` says why, like
-`waiting: me-personal exhausted until 03:00 (5-hour limit, seen by t-412)`.
+`waiting: me-personal exhausted until 03:00 (5-hour limit, seen by t-12)`.
 A Claude task whose agent stops on a limit (`You've hit your limit ·
 resets 3am`) goes `waiting`, not `done`: pastor closes its pane, keeps its
 worktree, and resumes its session on the same machine at the reset. An agy

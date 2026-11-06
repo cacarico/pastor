@@ -149,8 +149,29 @@ impl Paths {
                 }
             })
             .collect();
-        let dir = self.ssh_dir().to_string_lossy().replace('%', "%%");
+        let dir = crate::ssh::escape_tokens(&self.ssh_dir().to_string_lossy());
         PathBuf::from(format!("{dir}/{safe}-%C"))
+    }
+
+    /// Pastor's own `known_hosts`, apart from the user's, so pastor never
+    /// touches `~/.ssh/known_hosts`.
+    pub fn known_hosts_file(&self) -> PathBuf {
+        self.state_dir.join("known_hosts")
+    }
+
+    /// The key the head offers to the machines it reaches.
+    pub fn head_key(&self) -> PathBuf {
+        self.state_dir.join("head_key")
+    }
+
+    /// The key a machine uses to reach the head.
+    pub fn machine_key(&self) -> PathBuf {
+        self.state_dir.join("machine_key")
+    }
+
+    /// The key an agent uses to reach the head.
+    pub fn agent_key(&self) -> PathBuf {
+        self.state_dir.join("agent_key")
     }
 
     pub fn data_dir(&self) -> PathBuf {
@@ -161,6 +182,35 @@ impl Paths {
     /// `connector link`.
     pub fn connectors_dir(&self) -> PathBuf {
         self.data_dir.join("connectors")
+    }
+
+    /// One directory per provisioner copied by hand, each with its
+    /// `pastor-provisioner.toml`; the built-in ones need no directory.
+    pub fn provisioners_dir(&self) -> PathBuf {
+        self.data_dir.join("provisioners")
+    }
+
+    /// Harness manifests the user keeps: `<id>.toml` files that replace a
+    /// built-in harness or add one (`harness_manifest`).
+    pub fn harnesses_dir(&self) -> PathBuf {
+        self.config_dir.join("harnesses")
+    }
+
+    /// One directory per bundle, as it is now, each with its
+    /// `pastor-bundle.toml` (`bundle::store`).
+    pub fn bundles_dir(&self) -> PathBuf {
+        self.config_dir.join("bundles")
+    }
+
+    /// Where the versions of every bundle are kept.
+    pub fn bundle_versions_root(&self) -> PathBuf {
+        self.state_dir.join("bundles")
+    }
+
+    /// The versions kept of one bundle, one directory per content hash and
+    /// `versions.json`.
+    pub fn bundle_versions_dir(&self, id: &str) -> PathBuf {
+        self.bundle_versions_root().join(id)
     }
 
     /// Secrets and settings for one connector, written by the user.
@@ -516,6 +566,11 @@ pub struct Defaults {
     /// pane once they end; unset, no. See `resolve_keep_pane`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keep_pane: Option<bool>,
+    /// Whether tasks whose run flags, job and flock say nothing lose their
+    /// worktree once they end, failed or stale too; unset, no. See
+    /// `resolve_remove_worktree`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remove_worktree: Option<bool>,
     /// The disk a machine with a floor must have free, on each of `$HOME`
     /// and `/tmp`, as a size (`"4G"`), for machines whose entry sets none;
     /// unset, `DEFAULT_MIN_DISK`. `"0"` turns the disk floor off. It never
@@ -525,6 +580,13 @@ pub struct Defaults {
     /// Like `min_disk`, for free memory; unset, `DEFAULT_MIN_MEMORY`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_memory: Option<String>,
+    /// Environment for every agent's pane, the lowest layer: a flock's `env`
+    /// is merged over it, a machine's over that, and the agent's own
+    /// (`[agents.<name>] env`) over all (`EnvLayers`). Names are variable
+    /// names; a value that looks like a secret is refused at load. `~/` is
+    /// expanded as in an agent's.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, String>,
 }
 
 /// A machine's room floor, resolved (`Defaults::resolve_floor`): the least
@@ -699,7 +761,49 @@ impl AgentPick {
         spec.allow = self.allow.clone();
         spec.deny = self.deny.clone();
     }
+
+    /// What `spec` gets from this pick past `apply_to` and its
+    /// `agent_source`: its model's args (`Models::apply`), its profile's
+    /// lists (`Profiles::apply`, `own` the machine's own profile), and, for
+    /// an agy agent under a profile, the check that the profile denies
+    /// what the machine's own does (`agy::profile_mismatch`). The head
+    /// settles a task this way when it queues it (`Daemon::settle`), and
+    /// `machine check` its `profile` rows, so the two cannot disagree.
+    pub fn settle(
+        &self,
+        agents: &Agents,
+        models: &Models,
+        profiles: &profile::Profiles,
+        own: Option<&str>,
+        machine: Option<&str>,
+        spec: &mut crate::task::DispatchSpec,
+    ) -> Result<(), AgentRefusal> {
+        models.apply(self, agents, spec)?;
+        profiles.apply(self, own, spec)?;
+        if agents.agy_profile(spec)
+            && let Some(own) = own
+        {
+            let own_deny = profiles.resolve(own)?.deny;
+            if let Some(refusal) = agy::profile_mismatch(
+                &spec.deny,
+                spec.profile().unwrap_or_default(),
+                own,
+                &own_deny,
+                machine,
+            ) {
+                return Err(refusal);
+            }
+        }
+        Ok(())
+    }
 }
+
+/// The tool every Claude task is allowed, whatever its profile, so the
+/// explicit way to end a task never stops at a permission prompt or is missing
+/// from a profile like `review` (`Agents::launch_args`). A task may end only
+/// itself (`IpcRequest::ends_own_task`). agy gets its rule from the
+/// provisioner (`config::agy::TASK_DONE_RULE`).
+pub const TASK_DONE_ALLOW: &str = "Bash(pastor task done:*)";
 
 /// Refuse a tool pattern the agent's command line would misread: an empty
 /// one, or one that starts with `-` and reads as a flag. `key` names where
@@ -714,8 +818,42 @@ pub fn check_tools(key: &str, patterns: &[String]) -> Result<(), String> {
                 "{key}: tool pattern {p:?} starts with '-'; agent flags go in agent_args"
             ));
         }
+        if let Some(problem) = mcp_pattern_problem(p) {
+            return Err(format!("{key}: tool pattern {p:?} {problem}"));
+        }
     }
     Ok(())
+}
+
+/// Why `pattern`, which starts with `mcp__`, is not the form Claude Code
+/// reads: `mcp__<server>` for every tool of a server, `mcp__<server>__<tool>`
+/// for one, or `mcp__<server>__*`. Neither takes an argument in parentheses,
+/// and a name is made of letters, digits, `_` and `-`, the characters Claude
+/// Code keeps in the names it builds. `None` for a pattern that is not an MCP
+/// one, or a good one.
+fn mcp_pattern_problem(pattern: &str) -> Option<String> {
+    let rest = pattern.strip_prefix("mcp__")?;
+    let name = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    };
+    let (server, tool) = match rest.split_once("__") {
+        Some((server, tool)) => (server, Some(tool)),
+        None => (rest, None),
+    };
+    let form = "is not mcp__<server>, mcp__<server>__<tool> or mcp__<server>__*";
+    if !name(server) {
+        return Some(format!(
+            "{form}: the server name must be letters, digits, '_' and '-'"
+        ));
+    }
+    match tool {
+        Some(t) if t != "*" && !name(t) => Some(format!(
+            "{form}: the tool name must be letters, digits, '_' and '-', or '*'"
+        )),
+        _ => None,
+    }
 }
 
 impl Defaults {
@@ -1122,6 +1260,24 @@ impl Defaults {
         .find_map(|(layer, keep)| Some((keep?, layer)))
     }
 
+    /// Whether a task's worktree goes once it ends, failed or stale too:
+    /// from the first of `ask` (`task run --remove-worktree`, a job's
+    /// `remove_worktree`), `flock` and these defaults that sets it, and the
+    /// layer that did; `None` is no. Layered like `resolve_keep_pane`.
+    pub fn resolve_remove_worktree(
+        &self,
+        ask: Option<bool>,
+        flock: Option<&flock::FlockEntry>,
+    ) -> Option<(bool, Layer)> {
+        [
+            (Layer::Ask, ask),
+            (Layer::Flock, flock.and_then(|f| f.remove_worktree)),
+            (Layer::Defaults, self.remove_worktree),
+        ]
+        .into_iter()
+        .find_map(|(layer, remove)| Some((remove?, layer)))
+    }
+
     /// `machine`'s room floor, or `None` while it has none: the floor is
     /// off until the machine's own entry sets `min_disk` or `min_memory`,
     /// and `[defaults]` alone never turns it on. On, each side is the
@@ -1175,10 +1331,133 @@ impl Default for Defaults {
             place: crate::task::Place::Repo,
             label: None,
             keep_pane: None,
+            remove_worktree: None,
             min_disk: None,
             min_memory: None,
+            env: Default::default(),
         }
     }
+}
+
+/// The env layers under an agent's own, for one machine: `[defaults] env`,
+/// the `env` of each `[[flock]]` the machine is in, and the machine's own.
+/// A task takes `[defaults]`, then its flock's, then the machine's, each key
+/// over the one below (`merged`), and the agent's `env` over all of it
+/// (`Agents::launch_over`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EnvLayers {
+    pub defaults: std::collections::BTreeMap<String, String>,
+    /// By flock name, for the flocks the machine is in that set any.
+    pub flocks: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    pub machine: std::collections::BTreeMap<String, String>,
+}
+
+impl EnvLayers {
+    /// The layers that reach machine `m`.
+    pub fn of(defaults: &Defaults, flock: &flock::Flock, m: &flock::MachineConfig) -> EnvLayers {
+        EnvLayers {
+            defaults: defaults.env.clone(),
+            flocks: flock
+                .flocks_of(m)
+                .into_iter()
+                .filter_map(|(name, _)| {
+                    let env = &flock.entry(name)?.env;
+                    (!env.is_empty()).then(|| (name.to_string(), env.clone()))
+                })
+                .collect(),
+            machine: m.env.clone(),
+        }
+    }
+
+    /// The env for a task of `flock` on the machine: `[defaults]`, the
+    /// flock's over it, the machine's over that. A task with no flock gets no
+    /// flock layer.
+    pub fn merged(&self, flock: Option<&str>) -> std::collections::BTreeMap<String, String> {
+        self.merged_from(flock, "")
+            .into_iter()
+            .map(|(k, (v, _))| (k, v))
+            .collect()
+    }
+
+    /// `merged`, each key with its value and the layer that gave it:
+    /// `defaults`, `flock <name>` or `machine <machine>`.
+    pub fn merged_from(
+        &self,
+        flock: Option<&str>,
+        machine: &str,
+    ) -> std::collections::BTreeMap<String, (String, String)> {
+        let mut env = std::collections::BTreeMap::new();
+        let mut layer = |from: String, vars: &std::collections::BTreeMap<String, String>| {
+            for (k, v) in vars {
+                env.insert(k.clone(), (v.clone(), from.clone()));
+            }
+        };
+        layer("defaults".into(), &self.defaults);
+        if let Some(name) = flock
+            && let Some(vars) = self.flocks.get(name)
+        {
+            layer(format!("flock {name}"), vars);
+        }
+        layer(format!("machine {machine}"), &self.machine);
+        env
+    }
+
+    /// The layers a pull machine's own serve applies, from its own config:
+    /// `[defaults]`; its entry in its own flock.toml when it has one (its
+    /// flocks and its own env), else every flock its flock.toml names that
+    /// sets env, for a claimed task to pick by its flock's name.
+    pub fn of_pull(defaults: &Defaults, flock: &flock::Flock, machine: &str) -> EnvLayers {
+        match flock.get(machine) {
+            Some(m) => EnvLayers::of(defaults, flock, m),
+            None => EnvLayers {
+                defaults: defaults.env.clone(),
+                flocks: flock
+                    .flocks
+                    .iter()
+                    .filter(|f| !f.env.is_empty())
+                    .map(|f| (f.name.clone(), f.env.clone()))
+                    .collect(),
+                machine: Default::default(),
+            },
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self == &EnvLayers::default()
+    }
+}
+
+/// Whether `name` is a variable name: letters, digits and `_`, not starting
+/// with a digit.
+pub fn is_env_name(name: &str) -> bool {
+    name.chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The load check of an `env` table that applies to every agent it reaches
+/// (`[defaults]`, a flock, a machine; `what` names which): each name is a
+/// variable name, and no value looks like a secret, which would be written
+/// into a file read by whoever reads the config. The message names the key
+/// and what was seen, never the value.
+pub fn check_env(
+    what: &str,
+    env: &std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
+    for (key, value) in env {
+        if !is_env_name(key) {
+            return Err(format!(
+                "{what}: env: {key:?} is not a variable name (letters, digits and _, not starting with a digit)"
+            ));
+        }
+        if let Some(seen) = crate::bundle::secrets::env_finding(key, value) {
+            return Err(format!(
+                "{what}: env: {key} holds {seen}; a secret does not belong in a config file, and an agent's own `env` or the machine's environment can carry it"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// One agent's definition under `[agents.<name>]` in `pastor.toml`. The
@@ -1188,7 +1467,7 @@ impl Default for Defaults {
 pub struct AgentDef {
     /// The herdr agent kind to start (`claude`, `codex`); unset, the name
     /// itself. Built-in trust keys and tool flags follow it, so
-    /// `[agents.claude-personal] kind = "claude"` gets Claude's.
+    /// `[agents.claude-alt] kind = "claude"` gets Claude's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     /// Environment for the task's pane, set when pastor creates it. A value
@@ -1234,6 +1513,37 @@ pub struct AgentDef {
     /// the machine it was seen on. pastor never reads it as a credential.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
+    /// How pastor hands the agent a prompt (`Agents::delivery`). Unset, a
+    /// Claude agent gets its inbox socket and every other kind typing;
+    /// `type` keeps a Claude agent on typing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<Delivery>,
+    /// Text the agent's login screen shows, and no other screen does: a
+    /// pane that ends on it is signed out (`limit::signed_out_in`). Unset
+    /// keeps the built-in of its kind (Claude's and agy's); empty means
+    /// none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub login_marker: Option<String>,
+    /// A shell command run on the machine, with the agent's `env`, that
+    /// exits 0 when the agent is signed in there (`pastor agent
+    /// signed-in`). Unset keeps the built-in of its kind (Claude's `claude
+    /// auth status`); empty means none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub login_check: Option<String>,
+    /// The load of a task that runs this agent and asks for none
+    /// (`task run --load`), before its repo's (`resolve_load`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load: Option<String>,
+}
+
+/// How a prompt reaches an agent: as one message to a Claude session's
+/// inbox socket (`pastor inbox send`), falling back to typing when that
+/// does not take it, or typed into the pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Delivery {
+    Socket,
+    Type,
 }
 
 /// `[agents.<name>]`, by agent name (`claude`, `codex`).
@@ -1259,6 +1569,15 @@ const CLAUDE_TRUST_KEYS: [&str; 2] = ["Down", "Enter"];
 /// accept that; saved trust presses them only while this is on screen.
 const CLAUDE_TRUST_MARKER: &str = "Yes, I trust this folder";
 
+/// agy's folder-trust dialog opens on "Yes, I trust this folder"; Enter
+/// takes it.
+const AGY_TRUST_KEYS: [&str; 1] = ["Enter"];
+
+/// The label of the option agy's folder-trust dialog opens on (1.4.12), the
+/// one Enter takes. herdr reads that dialog idle and ready, so this is also
+/// what holds an agy prompt while it shows (`Agents::startup_markers`).
+const AGY_TRUST_MARKER: &str = "Yes, I trust this folder";
+
 /// Env every Claude task's pane gets, under the definition's own `env`:
 /// the classic renderer. Claude 2.1's fullscreen renderer draws on the
 /// alternate screen with no scrollback, which pastor's pane reads need,
@@ -1271,7 +1590,7 @@ pub const CLAUDE_CLASSIC_RENDERER_ENV: (&str, &str) = ("CLAUDE_CODE_DISABLE_ALTE
 /// fullscreen row is a fallback for a pane whose env lost
 /// `CLAUDE_CLASSIC_RENDERER_ENV`. The bypass-permissions warning is not
 /// here: accepting it is a person's call.
-const CLAUDE_DIALOGS: [(&str, &str, &str); 4] = [
+const CLAUDE_DIALOGS: [(&str, &str, &str); 5] = [
     ("fullscreen", "Try the new fullscreen renderer?", "Not now"),
     (
         "auto-mode-default",
@@ -1288,6 +1607,9 @@ const CLAUDE_DIALOGS: [(&str, &str, &str); 4] = [
         "Switch your default effort to",
         "No, keep",
     ),
+    // Offered under a finished turn, in place of the input box, to compact
+    // at 400k tokens instead of the model's own limit.
+    ("autocompact", "We recommend compacting earlier", "Keep"),
 ];
 
 /// The names of the dialogs built in for agents of `kind`.
@@ -1362,25 +1684,93 @@ const CODEX_TRUST_MARKERS: [&str; 2] = [
     "allow Codex to work in this folder",
 ];
 
+/// Lowercases and drops whitespace, so a marker matches across the case and
+/// spacing a redraw or a narrow pane's wrapping may change.
+fn squash(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 /// Does the prompt at the bottom of `screen` (a pane's text, scrollback
 /// included) show `marker`? Only `bottom_prompt` is searched, so a trust
 /// prompt answered earlier and still in scrollback does not count for the
 /// dialog below it. Case and whitespace are ignored, since a narrow pane
 /// wraps the line and a redraw may space it differently.
 pub fn shows_trust_marker(screen: &str, marker: &str) -> bool {
-    let squash = |s: &str| {
-        s.chars()
-            .filter(|c| !c.is_whitespace())
-            .flat_map(char::to_lowercase)
-            .collect::<String>()
-    };
     let marker = squash(marker);
     !marker.is_empty() && squash(&bottom_prompt(screen)).contains(&marker)
 }
 
+/// Text only Claude's login screen shows, above its list of ways to sign in.
+const CLAUDE_LOGIN_MARKER: &str = "Select login method:";
+
+/// Text agy shows when it starts with no account signed in.
+const AGY_LOGIN_MARKER: &str = "You are currently not signed in";
+
+/// Whether Claude is signed in on a machine: `claude auth status` answers
+/// JSON with `loggedIn`, and exits 0 either way, so the answer is read.
+/// The PATH gains `~/.local/bin`, where Claude's installer puts it, which
+/// a non-login shell over ssh usually lacks.
+const CLAUDE_LOGIN_CHECK: &str = r#"PATH="$HOME/.local/bin:$PATH" claude auth status --json 2>/dev/null | grep -q '"loggedIn": *true'"#;
+
 /// Does `screen` show one of `markers` at its bottom (`shows_trust_marker`)?
 pub fn shows_startup_question(screen: &str, markers: &[String]) -> bool {
     markers.iter().any(|m| shows_trust_marker(screen, m))
+}
+
+/// Is `marker` not merely on screen but the dialog's *selected* option: the
+/// menu option at the bottom prompt that carries the cursor (`❯`, `›` or
+/// `>`), its wrapped continuation lines included? `shows_trust_marker` only
+/// checks the dialog is up, which still holds after a `Down` that never
+/// reached the pane; this is what `--trust` checks before pressing the key
+/// that confirms the selection, so a lost key is caught before it is sent
+/// rather than after the agent has acted on it. A narrow pane wraps a
+/// selected option's label onto the lines below it, with no cursor or
+/// number of their own, so they count too, up to the next option or the end
+/// of the prompt.
+pub fn trust_option_selected(screen: &str, marker: &str) -> bool {
+    let marker = squash(marker);
+    if marker.is_empty() {
+        return false;
+    }
+    let prompt = bottom_prompt(screen);
+    let lines: Vec<&str> = prompt.lines().collect();
+    let Some(start) = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with(['\u{276f}', '\u{203a}', '>']))
+    else {
+        return false;
+    };
+    // An unnumbered menu has nothing to tell a wrapped label from the
+    // option below it, so each of its lines is an option, as
+    // `picker::at_bottom` reads it: only a numbered option takes the lines
+    // under it, up to the next number.
+    let end = if option_number(lines[start]).is_none() {
+        start + 1
+    } else {
+        lines[start + 1..]
+            .iter()
+            .position(|line| line.trim().is_empty() || option_number(line).is_some())
+            .map_or(lines.len(), |i| start + 1 + i)
+    };
+    squash(&lines[start..end].join(" ")).contains(&marker)
+}
+
+/// The option number a menu line opens with (`2.` or `2)`), its cursor
+/// (`❯`, `›` or `>`) stripped first when it carries one. `None` for a
+/// wrapped continuation line, which has neither.
+fn option_number(line: &str) -> Option<u32> {
+    let t = line
+        .trim_start()
+        .trim_start_matches(['\u{276f}', '\u{203a}', '>'])
+        .trim_start();
+    let n = t.bytes().take_while(u8::is_ascii_digit).count();
+    match t[n..].chars().next() {
+        Some('.' | ')') if n > 0 => t[..n].parse().ok(),
+        _ => None,
+    }
 }
 
 /// The trailing lines of `screen` that make up the prompt at its bottom:
@@ -1391,22 +1781,14 @@ pub fn shows_startup_question(screen: &str, markers: &[String]) -> bool {
 /// draws most of its dialogs without numbers. The whole screen when none
 /// of those is there.
 fn bottom_prompt(screen: &str) -> String {
-    let lines: Vec<&str> = screen.lines().collect();
-    let option = |line: &str| -> Option<u32> {
-        let t = line
-            .trim_start()
-            .trim_start_matches(['\u{276f}', '\u{203a}', '>'])
-            .trim_start();
-        let n = t.bytes().take_while(u8::is_ascii_digit).count();
-        match t[n..].chars().next() {
-            Some('.' | ')') if n > 0 => t[..n].parse().ok(),
-            _ => None,
-        }
-    };
+    let mended = crate::picker::mend_hints(screen);
+    let lines: Vec<&str> = mended.lines().collect();
     let output = |line: &str| line.trim_start().starts_with(['\u{25cf}', '\u{23fa}']);
     let mut start = lines.iter().rposition(|l| output(l)).map_or(0, |i| i + 1);
-    if let Some(menu) = lines.iter().rposition(|l| option(l) == Some(1))
-        && let Some(prev) = lines[..menu].iter().rposition(|l| option(l).is_some())
+    if let Some(menu) = lines.iter().rposition(|l| option_number(l) == Some(1))
+        && let Some(prev) = lines[..menu]
+            .iter()
+            .rposition(|l| option_number(l).is_some())
     {
         start = start.max(prev + 1);
     }
@@ -1451,6 +1833,18 @@ fn is_permission_arg(arg: &str) -> bool {
         || arg == "--allow-dangerously-skip-permissions"
 }
 
+/// Does Claude started with `args` bypass its permission prompts? Such a
+/// session holds every inbox message whose sender does not say it bypasses
+/// too (`inbox::Mode`).
+pub fn claude_bypasses(args: &[String]) -> bool {
+    args.iter().enumerate().any(|(i, arg)| {
+        arg == "--dangerously-skip-permissions"
+            || arg == "--permission-mode=bypassPermissions"
+            || (arg == "--permission-mode"
+                && args.get(i + 1).is_some_and(|m| m == "bypassPermissions"))
+    })
+}
+
 /// What a Codex agent under a permission profile starts with: it never
 /// asks for approval, and runs its commands in a sandbox that may write only
 /// the workspace. Codex has no per-command allow or deny flag, so the sandbox
@@ -1493,6 +1887,13 @@ impl Agents {
         }
     }
 
+    /// What a signed-out mark of `agent` on `machine` is kept under:
+    /// `<machine>/<agent>`, whatever its `account`. A login lives on one
+    /// machine, so signing out there says nothing of the others.
+    pub fn signed_out_key(&self, machine: &str, agent: &str) -> String {
+        format!("{machine}/{agent}")
+    }
+
     /// The herdr kind `agent` starts: its definition's `kind`, else its name.
     pub fn kind<'a>(&'a self, agent: &'a str) -> &'a str {
         self.0
@@ -1501,26 +1902,43 @@ impl Agents {
             .unwrap_or(agent)
     }
 
+    /// How `agent`'s prompts are delivered: its `delivery`, else the inbox
+    /// socket for kind `claude` and typing for the rest. Config load refuses
+    /// `socket` on another kind.
+    pub fn delivery(&self, agent: &str) -> Delivery {
+        match self.0.get(agent).and_then(|d| d.delivery) {
+            Some(d) => d,
+            None if self.kind(agent) == "claude" => Delivery::Socket,
+            None => Delivery::Type,
+        }
+    }
+
     /// The keys that accept `agent`'s folder-trust prompt: its own
-    /// `trust_keys`, else the built-in ones of its kind (only `claude` has
-    /// any). `None` when it has none.
+    /// `trust_keys`, else the built-in ones of its kind (`claude` and `agy`
+    /// have them). `None` when it has none.
     pub fn trust_keys(&self, agent: &str) -> Option<Vec<String>> {
         let keys = match self.0.get(agent).and_then(|d| d.trust_keys.clone()) {
             Some(keys) => keys,
-            None if self.kind(agent) == "claude" => CLAUDE_TRUST_KEYS.map(str::to_string).to_vec(),
-            None => return None,
+            None => match self.kind(agent) {
+                "claude" => CLAUDE_TRUST_KEYS.map(str::to_string).to_vec(),
+                "agy" => AGY_TRUST_KEYS.map(str::to_string).to_vec(),
+                _ => return None,
+            },
         };
         (!keys.is_empty()).then_some(keys)
     }
 
     /// What the pane must show before saved trust presses `agent`'s trust
-    /// keys: its own `trust_marker`, else the built-in of its kind (only
-    /// `claude` has one). `None` when it has none.
+    /// keys: its own `trust_marker`, else the built-in of its kind (`claude`
+    /// and `agy` have one). `None` when it has none.
     pub fn trust_marker(&self, agent: &str) -> Option<String> {
         let marker = match self.0.get(agent).and_then(|d| d.trust_marker.clone()) {
             Some(marker) => marker,
-            None if self.kind(agent) == "claude" => CLAUDE_TRUST_MARKER.to_string(),
-            None => return None,
+            None => match self.kind(agent) {
+                "claude" => CLAUDE_TRUST_MARKER.to_string(),
+                "agy" => AGY_TRUST_MARKER.to_string(),
+                _ => return None,
+            },
         };
         (!marker.trim().is_empty()).then_some(marker)
     }
@@ -1575,25 +1993,122 @@ impl Agents {
         out
     }
 
-    /// What shows that `agent` sits at a startup question herdr reads idle
-    /// and ready, so its prompt waits (`shows_startup_question`): its own
-    /// `trust_marker`, and Codex's dialog for the `codex` kind. None for
-    /// Claude, whose dialog herdr reads `blocked`.
-    pub fn startup_markers(&self, agent: &str) -> Vec<String> {
-        let kind = self.kind(agent);
-        if kind == "claude" {
-            return vec![];
-        }
-        let own = self.0.get(agent).and_then(|d| d.trust_marker.clone());
-        let builtin: &[&str] = if kind == "codex" {
+    /// Whether `agent`'s `trust_marker` is known to be the exact label of
+    /// its correct option, not merely text its dialog shows somewhere (a
+    /// heading, say): only the built-in Claude and agy markers, since a configured
+    /// one keeps the looser contract the field documents. `--trust` checks
+    /// the marker sits on the selected option (`trust_option_selected`)
+    /// only when this is true; otherwise it falls back to checking the
+    /// dialog is merely up (`shows_trust_marker`), as it did before that
+    /// stricter check existed, so a custom agent whose marker names a
+    /// heading above several trust keys is not refused on every attempt.
+    pub fn trust_marker_is_option_text(&self, agent: &str) -> bool {
+        self.0
+            .get(agent)
+            .and_then(|d| d.trust_marker.clone())
+            .is_none()
+            && matches!(self.kind(agent), "claude" | "agy")
+    }
+
+    /// What shows that `agent` sits at a startup question herdr may read
+    /// idle and ready, so its prompt waits (`shows_startup_question`): its
+    /// `trust_marker` (Claude's and agy's built in), Codex's dialog for the
+    /// `codex` kind, and the marker of each of its other startup dialogs
+    /// (`dialogs`: the built-ins of its kind as its own rows leave them, and
+    /// its own rows) not in `answered`. herdr reads agy's dialogs idle and
+    /// ready, and Claude's `blocked` only once it has noticed them, which can
+    /// be after the agent first reads ready; a prompt typed into one is lost.
+    /// pastor answers a row once per task, so a row already answered holds
+    /// nothing: a second banner with the same text would hold it for good.
+    pub fn startup_markers(&self, agent: &str, answered: &[String]) -> Vec<String> {
+        let trust = self.trust_marker(agent);
+        let builtin: &[&str] = if self.kind(agent) == "codex" {
             &CODEX_TRUST_MARKERS
         } else {
             &[]
         };
-        own.into_iter()
+        let rows = self
+            .dialogs(agent)
+            .into_iter()
+            .filter(|d| !d.needs_trust && !answered.contains(&d.name))
+            .filter_map(|d| d.marker);
+        trust
+            .into_iter()
             .chain(builtin.iter().map(|m| m.to_string()))
+            .chain(rows)
             .filter(|m| !m.trim().is_empty())
             .collect()
+    }
+
+    /// What shows that `agent` sits at its login screen
+    /// (`limit::signed_out_in`): its own `login_marker`, else the built-in
+    /// of its kind (Claude's and agy's). Empty when it has none.
+    pub fn login_markers(&self, agent: &str) -> Vec<String> {
+        let builtin = match self.kind(agent) {
+            "claude" => Some(CLAUDE_LOGIN_MARKER),
+            "agy" => Some(AGY_LOGIN_MARKER),
+            _ => None,
+        };
+        let marker = match self.0.get(agent).and_then(|d| d.login_marker.clone()) {
+            Some(marker) => Some(marker),
+            None => builtin.map(str::to_string),
+        };
+        marker
+            .into_iter()
+            .filter(|m| !m.trim().is_empty())
+            .collect()
+    }
+
+    /// The command that says `agent` is signed in on a machine: its own
+    /// `login_check`, else the `login.check` of its kind's `manifest`, else
+    /// the built-in of its kind (only `claude` has one). `None` when it has
+    /// none.
+    pub fn login_check(
+        &self,
+        agent: &str,
+        manifest: Option<&crate::harness_manifest::Manifest>,
+    ) -> Option<String> {
+        let check = match self.0.get(agent).and_then(|d| d.login_check.clone()) {
+            Some(check) => check,
+            None => match manifest.and_then(|m| m.login_check_command()) {
+                Some(check) => check,
+                None if self.kind(agent) == "claude" => CLAUDE_LOGIN_CHECK.to_string(),
+                None => return None,
+            },
+        };
+        (!check.trim().is_empty()).then_some(check)
+    }
+
+    /// `agent`'s `env` as its pane gets it, `~` not yet expanded.
+    pub fn env(&self, agent: &str) -> std::collections::BTreeMap<String, String> {
+        self.0.get(agent).map(|d| d.env.clone()).unwrap_or_default()
+    }
+
+    /// `agent`'s login check (`login_check`) as one command for the
+    /// machine's shell, run with the agent's `env` as its pane gets it:
+    /// `env K=V sh -c '<check>'`, a value under `~/` against the machine's
+    /// `$HOME`. `None` when it has no check.
+    pub fn login_check_command(
+        &self,
+        agent: &str,
+        manifest: Option<&crate::harness_manifest::Manifest>,
+    ) -> Option<String> {
+        use crate::herdr::transport::shell_quote;
+        let check = self.login_check(agent, manifest)?;
+        let env = self.env(agent);
+        let mut words = vec!["env".to_string()];
+        for (key, value) in &env {
+            let value = if value == "~" {
+                "\"$HOME\"".to_string()
+            } else if let Some(rest) = value.strip_prefix("~/") {
+                format!("\"$HOME\"/{}", shell_quote(rest))
+            } else {
+                shell_quote(value)
+            };
+            words.push(format!("{}={value}", shell_quote(key)));
+        }
+        words.extend(["sh".into(), "-c".into(), shell_quote(&check)]);
+        Some(words.join(" "))
     }
 
     /// The flags that carry `agent`'s allow and deny lists: its own, else the
@@ -1620,15 +2135,17 @@ impl Agents {
     /// must-deny keys (`opencode::MachineDenyKeys`), which `launch` cannot:
     /// it has no connector to ask.
     pub fn launch(&self, spec: &crate::task::DispatchSpec) -> Result<Launch, AgentRefusal> {
-        let mut env = self
-            .0
-            .get(&spec.agent)
-            .map(|d| d.env.clone())
-            .unwrap_or_default();
-        if self.kind(&spec.agent) == "claude" {
-            let (key, value) = CLAUDE_CLASSIC_RENDERER_ENV;
-            env.entry(key.into()).or_insert_with(|| value.into());
-        }
+        self.launch_over(spec, &Default::default())
+    }
+
+    /// `launch`, with `under` (the env layers below the agent's own: see
+    /// `EnvLayers::merged`) beneath the definition's `env`.
+    pub fn launch_over(
+        &self,
+        spec: &crate::task::DispatchSpec,
+        under: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Launch, AgentRefusal> {
+        let mut env = self.env_over(&spec.agent, under);
         if self.opencode_profile(spec) {
             for key in opencode::CONFIG_ENV {
                 env.insert(key.into(), String::new());
@@ -1644,6 +2161,25 @@ impl Agents {
             args: self.launch_args(spec)?,
             env,
         })
+    }
+
+    /// `agent`'s pane env: `under` (the layers below it) with the
+    /// definition's own `env` over it, key by key, and over what pastor sets
+    /// for its kind when nothing else does (Claude's classic renderer).
+    pub fn env_over(
+        &self,
+        agent: &str,
+        under: &std::collections::BTreeMap<String, String>,
+    ) -> std::collections::BTreeMap<String, String> {
+        let mut env = under.clone();
+        if let Some(def) = self.0.get(agent) {
+            env.extend(def.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        if self.kind(agent) == "claude" {
+            let (key, value) = CLAUDE_CLASSIC_RENDERER_ENV;
+            env.entry(key.into()).or_insert_with(|| value.into());
+        }
+        env
     }
 
     /// `OPENCODE_PERMISSION` for `spec`'s settled lists, denying
@@ -1722,7 +2258,7 @@ impl Agents {
     }
 
     /// Are `agent`'s permissions in its own settings (`own_permissions`)?
-    fn own_permissions(&self, agent: &str) -> bool {
+    pub fn own_permissions(&self, agent: &str) -> bool {
         self.0.get(agent).is_some_and(|d| d.own_permissions)
     }
 
@@ -1824,8 +2360,15 @@ impl Agents {
         if self.opencode_profile(spec) {
             return Ok(args);
         }
+        // A Claude task may always end itself: with no profile it would stop
+        // at a permission prompt for `pastor task done`, and under `review`
+        // it has no Bash. Only its own id is ended (`ends_own_task`).
+        let mut allow = spec.allow.clone();
+        if self.kind(&spec.agent) == "claude" && !allow.iter().any(|p| p == TASK_DONE_ALLOW) {
+            allow.push(TASK_DONE_ALLOW.into());
+        }
         for (list, flag, key) in [
-            (&spec.allow, allow_flag, "allow_flag"),
+            (&allow, allow_flag, "allow_flag"),
             (&spec.deny, deny_flag, "deny_flag"),
         ] {
             if list.is_empty() {
@@ -2039,12 +2582,6 @@ pub struct PastorConfig {
     /// a `TaskClaim` or `TaskReport` before the head counts it lost and its
     /// starting and running tasks go stale.
     pub pull_lost_after: String,
-    /// Whether an agent pastor started (`ipc::TASK_ENV` in its pane) may
-    /// change the fleet: run, send to, retry, close or prune tasks, run jobs,
-    /// and edit machines, flocks and jobs. Off by default, so the head
-    /// refuses it. A guard against an agent acting on its own; the agent runs
-    /// as the same user, so it is not a security boundary.
-    pub agents_change_fleet: bool,
     /// How many orchestrator agents (`role = "orchestrator"`) the head runs
     /// at once, of both kinds. Each also takes a slot under `max_agents` on
     /// its machine, like any task. A scheduled orchestrator's run past it
@@ -2059,6 +2596,10 @@ pub struct PastorConfig {
     pub agents: Agents,
     #[serde(skip_serializing_if = "Models::is_empty")]
     pub models: Models,
+    /// `[repos."<path>"]`: what pastor knows of a repo, by the path a task
+    /// names it with (`--repo`).
+    #[serde(skip_serializing_if = "Repos::is_empty")]
+    pub repos: Repos,
     /// `[profiles.<name>]`: permission profiles beside the built-in ones.
     #[serde(skip_serializing_if = "profile::Profiles::is_empty")]
     pub profiles: profile::Profiles,
@@ -2072,6 +2613,45 @@ pub struct PastorConfig {
     /// `[limits]`: how the head treats an agent that ran out of usage.
     #[serde(skip_serializing_if = "LimitsConfig::is_default")]
     pub limits: LimitsConfig,
+    /// `[artifacts]`: which herdr the head puts on machines, and where it
+    /// gets it (`artifacts`).
+    #[serde(skip_serializing_if = "ArtifactsConfig::is_empty")]
+    pub artifacts: ArtifactsConfig,
+}
+
+/// `[artifacts]` in pastor.toml. Unset keys take the built-in defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ArtifactsConfig {
+    /// The herdr version to put on machines; unset, the version most of the
+    /// fleet already runs, else `artifacts::DEFAULT_HERDR_VERSION`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub herdr: Option<String>,
+    /// The URL of herdr's release index, for a mirror; unset,
+    /// `artifacts::DEFAULT_HERDR_INDEX`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub herdr_index: Option<String>,
+}
+
+impl ArtifactsConfig {
+    pub fn is_empty(&self) -> bool {
+        self == &ArtifactsConfig::default()
+    }
+
+    /// A version that can name a cache dir, and an https index: what
+    /// `artifacts` downloads from must be https.
+    fn check(&self) -> Result<(), String> {
+        if let Some(v) = &self.herdr {
+            crate::artifacts::Artifact::new("herdr", v, "any")
+                .map_err(|_| format!("herdr: {v:?} is not a version ([A-Za-z0-9._-]+)"))?;
+        }
+        if let Some(url) = &self.herdr_index
+            && !url.starts_with("https://")
+        {
+            return Err(format!("herdr_index: {url:?} must be an https:// URL"));
+        }
+        Ok(())
+    }
 }
 
 /// `[limits]` in pastor.toml: what the head does about usage limits. Every
@@ -2191,10 +2771,23 @@ impl ShepherdConfig {
     }
 }
 
-/// This machine's hostname, read from the kernel and files rather than a
-/// new dependency for `gethostname`; `-` when none says.
+/// This machine's hostname: the kernel's file, /etc/hostname, `HOSTNAME`,
+/// then `gethostname(3)`; `-` when none says.
 pub fn hostname() -> String {
-    ["/proc/sys/kernel/hostname", "/etc/hostname"]
+    hostname_from(
+        &[
+            Path::new("/proc/sys/kernel/hostname"),
+            Path::new("/etc/hostname"),
+        ],
+        std::env::var("HOSTNAME").ok(),
+    )
+}
+
+/// `hostname` from the given files and `HOSTNAME` value, then the kernel's
+/// own answer: macOS has neither file, and a non-interactive shell there
+/// does not set `HOSTNAME`.
+pub(crate) fn hostname_from(files: &[&Path], env: Option<String>) -> String {
+    files
         .iter()
         .find_map(|p| {
             std::fs::read_to_string(p)
@@ -2202,8 +2795,23 @@ pub fn hostname() -> String {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
         })
-        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
+        .or_else(|| env.filter(|s| !s.is_empty()))
+        .or_else(gethostname)
         .unwrap_or_else(|| "-".into())
+}
+
+fn gethostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: the pointer and length describe `buf`, which outlives the call.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    // POSIX lets a truncated name come back without its 0, so no 0 means
+    // the whole buffer is the name.
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..end]).trim().to_string();
+    (!name.is_empty()).then_some(name)
 }
 
 /// `[watch]` in pastor.toml.
@@ -2228,6 +2836,62 @@ pub struct WatchConnector {
     pub name: String,
 }
 
+/// One repo's entry under `[repos."<path>"]` in `pastor.toml`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RepoDef {
+    /// The load of a task in this repo whose run and agent name none
+    /// (`resolve_load`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load: Option<String>,
+}
+
+/// `[repos]`, by the path a task names the repo with. The path is a
+/// machine's, so it is matched as written, but for a trailing `/`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Repos(pub std::collections::BTreeMap<String, RepoDef>);
+
+impl Repos {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The entry for `repo`, a task's `--repo`.
+    pub fn get(&self, repo: &str) -> Option<&RepoDef> {
+        let bare = |p: &str| p.trim_end_matches('/').to_string();
+        let want = bare(repo);
+        self.0
+            .iter()
+            .find(|(path, _)| bare(path) == want)
+            .map(|(_, def)| def)
+    }
+}
+
+/// A task's load as it is queued, and where it came from: what its run
+/// asked for, else its agent's `load`, else its repo's. `asked_by` labels
+/// the first, as `AgentSource` does.
+pub fn resolve_load(
+    ask: Option<&str>,
+    agent: &str,
+    agents: &Agents,
+    repo: Option<&str>,
+    repos: &Repos,
+    asked_by: &str,
+) -> Option<(String, String)> {
+    if let Some(load) = ask {
+        return Some((load.to_string(), asked_by.to_string()));
+    }
+    if let Some(load) = agents.0.get(agent).and_then(|a| a.load.as_ref()) {
+        return Some((load.clone(), format!("agent {agent}")));
+    }
+    let repo = repo?;
+    repos
+        .get(repo)
+        .and_then(|r| r.load.as_ref())
+        .map(|load| (load.clone(), format!("repo {repo}")))
+}
+
 fn is_empty_agents(a: &Agents) -> bool {
     a.0.is_empty()
 }
@@ -2244,16 +2908,17 @@ impl Default for PastorConfig {
             close_done_after: "5s".into(),
             close_failed_after: "5s".into(),
             pull_lost_after: "10m".into(),
-            agents_change_fleet: false,
             max_orchestrators: 1,
             head_address: None,
             defaults: Defaults::default(),
             agents: Agents::default(),
             models: Models::default(),
+            repos: Repos::default(),
             profiles: profile::Profiles::default(),
             watch: WatchConfig::default(),
             shepherd: ShepherdConfig::default(),
             limits: LimitsConfig::default(),
+            artifacts: ArtifactsConfig::default(),
         }
     }
 }
@@ -2289,8 +2954,8 @@ impl PastorConfig {
     pub fn parse(path: &Path, text: &str) -> anyhow::Result<PastorConfig> {
         // The toml error in the message, not a context under it: the reload
         // logs `%err`, which shows only the top, and the key must be there.
-        let cfg: PastorConfig =
-            toml::from_str(text).map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
+        let cfg: PastorConfig = toml::from_str(&without_removed_keys(path, text)?)
+            .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
         // tick, settle and reconcile_every all drive `tokio::time::interval`,
         // which panics on a zero period. Reject zero here so a bad config
         // fails to load instead of crashing the daemon at startup.
@@ -2338,6 +3003,9 @@ impl PastorConfig {
             parse_duration(v)
                 .map_err(|e| anyhow::anyhow!("{}: limits.rate_backoff: {e}", path.display()))?;
         }
+        cfg.artifacts
+            .check()
+            .map_err(|e| anyhow::anyhow!("{}: artifacts.{e}", path.display()))?;
         if let Some(v) = &cfg.defaults.age_after {
             check_age_after(v)
                 .map_err(|e| anyhow::anyhow!("{}: defaults.age_after: {e}", path.display()))?;
@@ -2366,17 +3034,27 @@ impl PastorConfig {
                 path.display()
             );
         }
+        check_env("defaults", &cfg.defaults.env)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        for (repo, def) in &cfg.repos.0 {
+            if repo.trim().is_empty() {
+                anyhow::bail!("{}: repos: a repo's path must not be empty", path.display());
+            }
+            if let Some(load) = &def.load {
+                crate::task::check_load(load)
+                    .map_err(|e| anyhow::anyhow!("{}: repos.{repo:?}.load: {e}", path.display()))?;
+            }
+        }
         for (name, def) in &cfg.agents.0 {
             if def.kind.as_deref().is_some_and(|k| k.trim().is_empty()) {
                 anyhow::bail!("{}: agents.{name}.kind must not be empty", path.display());
             }
+            if let Some(load) = &def.load {
+                crate::task::check_load(load)
+                    .map_err(|e| anyhow::anyhow!("{}: agents.{name}.load: {e}", path.display()))?;
+            }
             for key in def.env.keys() {
-                let ok = key
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-                    && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-                if !ok {
+                if !is_env_name(key) {
                     anyhow::bail!(
                         "{}: agents.{name}.env: {key:?} is not a variable name (letters, digits and _, not starting with a digit)",
                         path.display()
@@ -2402,6 +3080,14 @@ impl PastorConfig {
             {
                 anyhow::bail!(
                     "{}: agents.{name}.account must not be empty or hold a /",
+                    path.display()
+                );
+            }
+            if def.delivery == Some(Delivery::Socket)
+                && def.kind.as_deref().unwrap_or(name) != "claude"
+            {
+                anyhow::bail!(
+                    "{}: agents.{name}.delivery: only a claude agent has an inbox socket; use \"type\"",
                     path.display()
                 );
             }
@@ -2652,15 +3338,262 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("{s:?}: size too large"))
 }
 
+/// The key of the setting that let agents change the fleet, removed.
+pub const AGENTS_CHANGE_FLEET: &str = "agents_change_fleet";
+
+/// `text` without the removed `agents_change_fleet` key. An old pastor.toml
+/// that still says `= false` loads, with a warning that the key does nothing;
+/// one that says `= true` does not, since it was written to switch the guard
+/// off and the guard is always on now: loading it would leave its author
+/// believing agents can change the fleet. The key's line is blanked, not cut,
+/// so the line numbers of any other error stay right.
+fn without_removed_keys(path: &Path, text: &str) -> anyhow::Result<String> {
+    if !text.contains(AGENTS_CHANGE_FLEET) {
+        return Ok(text.to_string());
+    }
+    let Ok(table) = text.parse::<toml::Table>() else {
+        // Not TOML: the parse that follows says where.
+        return Ok(text.to_string());
+    };
+    let Some(value) = table.get(AGENTS_CHANGE_FLEET) else {
+        return Ok(text.to_string());
+    };
+    if value.as_bool() != Some(false) {
+        anyhow::bail!(
+            "parse {}: {AGENTS_CHANGE_FLEET} was removed: agents pastor started can no longer \
+             change the fleet, and nothing turns that off; delete the key",
+            path.display()
+        );
+    }
+    tracing::warn!(
+        file = %path.display(),
+        "{AGENTS_CHANGE_FLEET} = false is ignored: the setting was removed, and agents pastor \
+         started cannot change the fleet; delete the key"
+    );
+    let lines: Vec<&str> = text.split('\n').collect();
+    let at = lines.iter().position(|l| {
+        l.trim_start()
+            .strip_prefix(AGENTS_CHANGE_FLEET)
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    });
+    Ok(lines
+        .iter()
+        .enumerate()
+        .map(|(i, l)| if Some(i) == at { "" } else { l })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
 #[cfg(test)]
 mod tests {
-    /// Agents pastor started may not change the fleet unless pastor.toml
-    /// says so.
+    /// A token the way a provider issues one, built in pieces so no scanner
+    /// reads this file as holding one.
+    fn a_token() -> String {
+        format!("gh{}_{}", "p", "aB3dE6gH9jK2mN5pQ8sT1vW4yZ7cF0hJ3kL6")
+    }
+
+    /// `[defaults] env` is read, kept in a round trip, and checked at load:
+    /// a name that is no variable name, or a value that looks like a secret,
+    /// fails naming the key, never the value.
     #[test]
-    fn agents_change_fleet_is_off_unless_set() {
-        assert!(!PastorConfig::default().agents_change_fleet);
-        let cfg: PastorConfig = toml::from_str("agents_change_fleet = true").unwrap();
-        assert!(cfg.agents_change_fleet);
+    fn defaults_env_is_read_and_checked() {
+        let p = |text: &str| PastorConfig::parse(Path::new("pastor.toml"), text);
+        let c = p("[defaults]\nenv = { NOTES_URL = \"http://notes.example:8790\", CARGO_BUILD_JOBS = \"2\" }\n")
+            .unwrap();
+        assert_eq!(c.defaults.env["NOTES_URL"], "http://notes.example:8790");
+        assert_eq!(p(&toml::to_string(&c).unwrap()).unwrap(), c);
+        assert!(
+            !toml::to_string(&PastorConfig::default())
+                .unwrap()
+                .contains("env"),
+            "no env writes none"
+        );
+        let err = p("[defaults]\nenv = { \"1BAD\" = \"x\" }\n").unwrap_err();
+        assert!(format!("{err:#}").contains("defaults: env: \"1BAD\" is not a variable name"));
+        let secret = a_token();
+        let err = p(&format!("[defaults]\nenv = {{ GH = \"{secret}\" }}\n")).unwrap_err();
+        let said = format!("{err:#}");
+        assert!(
+            said.contains("defaults: env: GH holds a GitHub token"),
+            "{said}"
+        );
+        assert!(!said.contains(&secret), "the value is never said: {said}");
+    }
+
+    /// The layers under an agent: `[defaults]`, then the task's flock, then
+    /// the machine, each key over the one below; a flock the machine is not
+    /// in adds nothing, and a task with no flock gets no flock layer.
+    #[test]
+    fn env_layers_merge_key_by_key_in_order() {
+        let defaults = Defaults {
+            env: [("A", "d"), ("B", "d"), ("C", "d"), ("D", "d")]
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .into(),
+            ..Default::default()
+        };
+        let flock = flock::Flock::parse(
+            Path::new("flock.toml"),
+            "[[flock]]\nname = \"work\"\ndefault = true\nmachines = { pi-3 = 1 }\n\
+             env = { B = \"work\", C = \"work\" }\n\
+             [[flock]]\nname = \"play\"\nmachines = { pi-3 = 1 }\nenv = { C = \"play\", E = \"play\" }\n\
+             [[flock]]\nname = \"far\"\nmachines = { pi-9 = 1 }\nenv = { F = \"far\" }\n\
+             [[machine]]\nname = \"pi-3\"\nssh = \"a@pi-3\"\nenv = { C = \"pi-3\", D = \"pi-3\" }\n\
+             [[machine]]\nname = \"pi-9\"\nssh = \"a@pi-9\"\n",
+        )
+        .unwrap();
+        let layers = EnvLayers::of(&defaults, &flock, flock.get("pi-3").unwrap());
+        let merged =
+            |f: Option<&str>| -> Vec<(String, String)> { layers.merged(f).into_iter().collect() };
+        let want = |kv: &[(&str, &str)]| -> Vec<(String, String)> {
+            kv.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        // defaults < flock < machine, key by key.
+        assert_eq!(
+            merged(Some("work")),
+            want(&[("A", "d"), ("B", "work"), ("C", "pi-3"), ("D", "pi-3")])
+        );
+        // The task's own flock decides which flock layer.
+        assert_eq!(
+            merged(Some("play")),
+            want(&[
+                ("A", "d"),
+                ("B", "d"),
+                ("C", "pi-3"),
+                ("D", "pi-3"),
+                ("E", "play")
+            ])
+        );
+        // No flock, no flock layer; a flock the machine is not in is none.
+        assert_eq!(
+            merged(None),
+            want(&[("A", "d"), ("B", "d"), ("C", "pi-3"), ("D", "pi-3")])
+        );
+        assert_eq!(layers.merged(Some("far")), layers.merged(None));
+        assert!(!layers.flocks.contains_key("far"));
+        assert!(EnvLayers::default().is_empty());
+        assert!(!layers.is_empty());
+    }
+
+    /// The agent's own `env` is over every layer; a layer is over what
+    /// pastor sets for the kind when nothing else does.
+    #[test]
+    fn an_agents_env_is_over_the_layers_and_they_over_the_kind_default() {
+        let mut agents = Agents::default();
+        agents.0.insert(
+            "claude".into(),
+            AgentDef {
+                env: [("B".to_string(), "agent".to_string())].into(),
+                ..Default::default()
+            },
+        );
+        let under: std::collections::BTreeMap<String, String> = [
+            ("A", "layer"),
+            ("B", "layer"),
+            (CLAUDE_CLASSIC_RENDERER_ENV.0, "0"),
+        ]
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .into();
+        let env = agents.env_over("claude", &under);
+        assert_eq!(
+            env["A"], "layer",
+            "a layer reaches an agent that sets other keys"
+        );
+        assert_eq!(env["B"], "agent", "the agent's own wins");
+        assert_eq!(
+            env[CLAUDE_CLASSIC_RENDERER_ENV.0], "0",
+            "a layer beats the kind default"
+        );
+        let bare = Agents::default().env_over("claude", &Default::default());
+        assert_eq!(
+            bare[CLAUDE_CLASSIC_RENDERER_ENV.0], "1",
+            "the default stands alone"
+        );
+        // An agent of another kind has no such default, and still gets layers.
+        let other = Agents::default().env_over("codex", &under);
+        assert_eq!(other["A"], "layer");
+        assert!(!other.contains_key("X"));
+    }
+
+    /// An old pastor.toml that still has `agents_change_fleet`: `= false`
+    /// loads (the key does nothing, and its line is blanked so other errors
+    /// keep their line numbers); `= true`, or anything else, fails naming the
+    /// key, so nobody believes the guard is off. It is no key of the config.
+    #[test]
+    fn the_removed_agents_change_fleet_key_loads_only_as_false() {
+        let p = |text: &str| PastorConfig::parse(Path::new("pastor.toml"), text);
+        assert!(p("agents_change_fleet = false\ntick = \"3s\"\n").is_ok());
+        assert_eq!(
+            p("# keep it off\nagents_change_fleet=false # sure\ntick = \"3s\"\n")
+                .unwrap()
+                .tick,
+            "3s"
+        );
+        for text in [
+            "agents_change_fleet = true\n",
+            "agents_change_fleet = \"yes\"\n",
+        ] {
+            let err = format!("{:#}", p(text).unwrap_err());
+            assert!(
+                err.contains("agents_change_fleet was removed") && err.contains("pastor.toml"),
+                "{text}: {err}"
+            );
+        }
+        // Another error after the key still names its own line.
+        let err = format!(
+            "{:#}",
+            p("agents_change_fleet = false\n\nnope = 1\n").unwrap_err()
+        );
+        assert!(err.contains("line 3"), "{err}");
+        // A file without the key is read as it was written, and nothing
+        // writes the key back.
+        assert!(
+            !toml::to_string(&PastorConfig::default())
+                .unwrap()
+                .contains("agents_change_fleet")
+        );
+        // The key in a table is unknown there, as any other.
+        assert!(p("[defaults]\nagents_change_fleet = false\n").is_err());
+    }
+
+    /// `[artifacts]` reads both keys, round-trips, and refuses a stray key,
+    /// a version that cannot name a cache dir, and an index that is not
+    /// https.
+    #[test]
+    fn artifacts_parse_and_check() {
+        let p = |text: &str| PastorConfig::parse(Path::new("pastor.toml"), text);
+        let cfg = p(
+            "[artifacts]\nherdr = \"0.9.5\"\nherdr_index = \"https://mirror.example/herdr.json\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.artifacts.herdr.as_deref(), Some("0.9.5"));
+        assert_eq!(
+            cfg.artifacts.herdr_index.as_deref(),
+            Some("https://mirror.example/herdr.json")
+        );
+        let text = toml::to_string(&cfg).unwrap();
+        assert_eq!(p(&text).unwrap().artifacts, cfg.artifacts);
+        assert!(PastorConfig::default().artifacts.is_empty());
+        assert!(
+            !toml::to_string(&PastorConfig::default())
+                .unwrap()
+                .contains("artifacts")
+        );
+        for (text, want) in [
+            ("[artifacts]\nnope = 1\n", "unknown field"),
+            (
+                "[artifacts]\nherdr = \"../1\"\n",
+                "artifacts.herdr: \"../1\" is not a version",
+            ),
+            (
+                "[artifacts]\nherdr_index = \"http://mirror.example/h.json\"\n",
+                "artifacts.herdr_index",
+            ),
+        ] {
+            let err = format!("{:#}", p(text).unwrap_err());
+            assert!(err.contains(want), "{text} => {err}");
+        }
     }
 
     /// `[limits]` takes every key, each checked as it loads; unset keys keep
@@ -2738,12 +3671,12 @@ mod tests {
         let path = Path::new("pastor.toml");
         let cfg = PastorConfig::parse(
             path,
-            "[agents.claude-personal]\nkind = \"claude\"\naccount = \"me-at-home\"\n",
+            "[agents.claude-alt]\nkind = \"claude\"\naccount = \"me-at-home\"\n",
         )
         .unwrap();
         let a = &cfg.agents;
-        assert_eq!(a.limit_key("pi-1", "claude-personal"), "me-at-home");
-        assert_eq!(a.limit_key("pi-2", "claude-personal"), "me-at-home");
+        assert_eq!(a.limit_key("pi-1", "claude-alt"), "me-at-home");
+        assert_eq!(a.limit_key("pi-2", "claude-alt"), "me-at-home");
         assert_eq!(a.limit_key("pi-1", "claude"), "pi-1/claude");
         assert_eq!(a.limit_key("pi-2", "claude"), "pi-2/claude");
         for bad in ["\"\"", "\"a/b\""] {
@@ -2751,6 +3684,54 @@ mod tests {
                 PastorConfig::parse(path, &format!("[agents.x]\naccount = {bad}\n")).unwrap_err();
             assert!(err.to_string().contains("agents.x.account"), "{bad}: {err}");
         }
+    }
+
+    /// A Claude agent's prompts go through its inbox socket unless its
+    /// definition says `type`; every other kind types them, since only
+    /// Claude has the socket.
+    #[test]
+    fn delivery_is_the_socket_for_claude_and_typing_for_the_rest() {
+        let path = Path::new("pastor.toml");
+        let cfg = PastorConfig::parse(
+            path,
+            "[agents.claude-typed]\nkind = \"claude\"\ndelivery = \"type\"\n\
+             [agents.claude-alt]\nkind = \"claude\"\n\
+             [agents.codex]\ndelivery = \"type\"\n",
+        )
+        .unwrap();
+        let a = &cfg.agents;
+        assert_eq!(a.delivery("claude"), Delivery::Socket);
+        assert_eq!(a.delivery("claude-alt"), Delivery::Socket);
+        assert_eq!(a.delivery("claude-typed"), Delivery::Type);
+        assert_eq!(a.delivery("codex"), Delivery::Type);
+        assert_eq!(a.delivery("agy"), Delivery::Type);
+
+        let err = PastorConfig::parse(path, "[agents.codex]\ndelivery = \"socket\"\n").unwrap_err();
+        assert!(err.to_string().contains("agents.codex.delivery"), "{err}");
+        let err = PastorConfig::parse(path, "[agents.claude]\ndelivery = \"carrier pigeon\"\n")
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("delivery"), "{err:#}");
+    }
+
+    /// Only args that start Claude bypassing make it bypass; one that only
+    /// allows switching to it later does not.
+    #[test]
+    fn claude_bypasses_with_the_args_that_start_it_so() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(claude_bypasses(&args(&["--dangerously-skip-permissions"])));
+        assert!(claude_bypasses(&args(&[
+            "--permission-mode",
+            "bypassPermissions"
+        ])));
+        assert!(claude_bypasses(&args(&[
+            "--permission-mode=bypassPermissions"
+        ])));
+        assert!(!claude_bypasses(&args(&["--permission-mode", "dontAsk"])));
+        assert!(!claude_bypasses(&args(&[
+            "--allow-dangerously-skip-permissions"
+        ])));
+        assert!(!claude_bypasses(&args(&["--model", "bypassPermissions"])));
+        assert!(!claude_bypasses(&[]));
     }
 
     /// `head_address` is an ssh destination: optional, and when set a
@@ -2879,7 +3860,7 @@ mod tests {
 
     #[test]
     fn a_typo_in_an_agent_is_a_load_error() {
-        let err = typo_error("[agents.claude-personal]\nknd = \"claude\"\n");
+        let err = typo_error("[agents.claude-alt]\nknd = \"claude\"\n");
         assert!(err.contains("knd"), "{err}");
     }
 
@@ -3028,6 +4009,15 @@ mod tests {
     }
 
     #[test]
+    fn pastors_ssh_files_live_in_the_state_dir() {
+        let p = Paths::new("/c", "/s");
+        assert_eq!(p.known_hosts_file(), PathBuf::from("/s/known_hosts"));
+        assert_eq!(p.head_key(), PathBuf::from("/s/head_key"));
+        assert_eq!(p.machine_key(), PathBuf::from("/s/machine_key"));
+        assert_eq!(p.agent_key(), PathBuf::from("/s/agent_key"));
+    }
+
+    #[test]
     fn control_path_escapes_percent_in_the_state_dir() {
         // ssh expands `%` in a ControlPath, so a state dir that contains one has
         // to arrive escaped or the socket lands somewhere unintended.
@@ -3146,6 +4136,42 @@ mod tests {
         std::fs::write(&path, "[defaults]\nkeep_panes = true\n").unwrap();
         let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
         assert!(err.contains("keep_panes"), "{err}");
+    }
+
+    /// `remove_worktree` comes from the first of the ask, the flock and
+    /// `[defaults]` that sets it, and `[defaults] remove_worktree` loads.
+    #[test]
+    fn remove_worktree_comes_from_its_layers() {
+        let removing = flock::FlockEntry {
+            name: "removing".into(),
+            remove_worktree: Some(true),
+            ..Default::default()
+        };
+        let bare = flock::FlockEntry {
+            name: "bare".into(),
+            ..Default::default()
+        };
+        let d = Defaults {
+            remove_worktree: Some(true),
+            ..Default::default()
+        };
+        let got =
+            |d: &Defaults, ask, f: &flock::FlockEntry| d.resolve_remove_worktree(ask, Some(f));
+        assert_eq!(got(&d, Some(false), &removing), Some((false, Layer::Ask)));
+        assert_eq!(
+            got(&Defaults::default(), None, &removing),
+            Some((true, Layer::Flock))
+        );
+        assert_eq!(got(&d, None, &bare), Some((true, Layer::Defaults)));
+        assert_eq!(got(&Defaults::default(), None, &bare), None);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(&path, "[defaults]\nremove_worktree = true\n").unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        assert_eq!(cfg.defaults.remove_worktree, Some(true));
+        std::fs::write(&path, "[defaults]\nremove_worktrees = true\n").unwrap();
+        assert!(PastorConfig::load(&path).is_err());
     }
 
     /// `[defaults] label` is checked on load like any other template.
@@ -3574,16 +4600,15 @@ mod tests {
             "[gpt]\nkind = \"opencode\"\nargs = [\"--model\", \"openai/gpt-5.5\"]\n",
         )
         .unwrap();
-        let agents: Agents = toml::from_str(
-            "[claude-personal]\nkind = \"claude\"\n[oc-work]\nkind = \"opencode\"\n",
-        )
-        .unwrap();
+        let agents: Agents =
+            toml::from_str("[claude-alt]\nkind = \"claude\"\n[oc-work]\nkind = \"opencode\"\n")
+                .unwrap();
         let d = Defaults {
             agent_args: vec!["--permission-mode".into(), "auto".into()],
             ..Default::default()
         };
         let flock: flock::FlockEntry =
-            toml::from_str("name = \"p\"\nagent = \"claude-personal\"\nagent_args = [\"-v\"]\n")
+            toml::from_str("name = \"p\"\nagent = \"claude-alt\"\nagent_args = [\"-v\"]\n")
                 .unwrap();
         let machine = |extra: &str| -> flock::MachineConfig {
             toml::from_str(&format!("name = \"m\"\nlocal = true\n{extra}")).unwrap()
@@ -3621,7 +4646,7 @@ mod tests {
 
         // A flock's agents entry when the machine has none.
         let flock_oc: flock::FlockEntry = toml::from_str(
-            "name = \"p\"\nagent = \"claude-personal\"\nagents = { opencode = \"oc-work\" }\n",
+            "name = \"p\"\nagent = \"claude-alt\"\nagents = { opencode = \"oc-work\" }\n",
         )
         .unwrap();
         let p = d.resolve_agent_for(&gpt, Some(&machine("")), Some(&flock_oc), &models, &agents);
@@ -3632,7 +4657,7 @@ mod tests {
 
         // No layer has one: the default agent, for `apply` to refuse.
         let p = pick(&gpt, &machine(""));
-        assert_eq!(p.agent, "claude-personal");
+        assert_eq!(p.agent, "claude-alt");
         let err = models.apply(&p, &agents, &mut spec).unwrap_err();
         assert_eq!(err.code, MODEL_KIND_MISMATCH);
         assert!(err.message.contains("no layer's agents.opencode"), "{err}");
@@ -3689,10 +4714,9 @@ mod tests {
     #[test]
     fn a_flocks_agent_kind_takes_the_machines_agent_of_that_kind() {
         let models = Models::default();
-        let agents: Agents = toml::from_str(
-            "[claude-personal]\nkind = \"claude\"\n[oc-work]\nkind = \"opencode\"\n",
-        )
-        .unwrap();
+        let agents: Agents =
+            toml::from_str("[claude-alt]\nkind = \"claude\"\n[oc-work]\nkind = \"opencode\"\n")
+                .unwrap();
         let d = Defaults::default();
         let flock: flock::FlockEntry =
             toml::from_str("name = \"p\"\nagent = \"opencode\"\nagent_args = [\"-q\"]\n").unwrap();
@@ -3721,7 +4745,7 @@ mod tests {
         let p = pick(
             &none,
             &machine(
-                "agent = \"claude-personal\"\nagent_args = [\"-v\"]\nagents = { opencode = \"oc-work\" }\n",
+                "agent = \"claude-alt\"\nagent_args = [\"-v\"]\nagents = { opencode = \"oc-work\" }\n",
             ),
         );
         assert_eq!(
@@ -3732,7 +4756,7 @@ mod tests {
         assert_eq!(p.missing_kind, None);
 
         // No opencode agent there: the machine cannot run the task.
-        let p = pick(&none, &machine("agent = \"claude-personal\"\n"));
+        let p = pick(&none, &machine("agent = \"claude-alt\"\n"));
         assert_eq!(p.missing_kind.as_deref(), Some("opencode"));
 
         // A machine that names no agent runs the flock's, with its args.
@@ -3746,7 +4770,7 @@ mod tests {
             agent: Some("claude".into()),
             ..Default::default()
         };
-        let p = pick(&asked, &machine("agent = \"claude-personal\"\n"));
+        let p = pick(&asked, &machine("agent = \"claude-alt\"\n"));
         assert_eq!((p.agent.as_str(), p.missing_kind), ("claude", None));
 
         // A flock with no agent leaves the machine's alone.
@@ -3756,15 +4780,12 @@ mod tests {
         };
         let p = d.resolve_agent_for(
             &none,
-            Some(&machine("agent = \"claude-personal\"\n")),
+            Some(&machine("agent = \"claude-alt\"\n")),
             Some(&plain),
             &models,
             &agents,
         );
-        assert_eq!(
-            (p.agent.as_str(), p.missing_kind),
-            ("claude-personal", None)
-        );
+        assert_eq!((p.agent.as_str(), p.missing_kind), ("claude-alt", None));
     }
 
     /// An `agents` entry whose agent is of another kind than its key, and
@@ -3773,7 +4794,7 @@ mod tests {
     #[test]
     fn a_bad_agents_entry_fails_the_load() {
         let path = Path::new("pastor.toml");
-        let agents = "[agents.claude-personal]\nkind = \"claude\"\n";
+        let agents = "[agents.claude-alt]\nkind = \"claude\"\n";
         let cfg = PastorConfig::parse(
             path,
             &format!("[defaults]\nagents = {{ opencode = \"opencode\" }}\n{agents}"),
@@ -3782,11 +4803,11 @@ mod tests {
         assert_eq!(cfg.defaults.agents["opencode"], "opencode");
         for (defaults, says) in [
             (
-                "agents = { opencode = \"claude-personal\" }",
-                "defaults.agents.opencode: agent claude-personal is claude, not opencode",
+                "agents = { opencode = \"claude-alt\" }",
+                "defaults.agents.opencode: agent claude-alt is claude, not opencode",
             ),
             (
-                "agents = { claude = \"claude-personal\" }",
+                "agents = { claude = \"claude-alt\" }",
                 "defaults.agents.claude: its own agent claude is already claude",
             ),
             (
@@ -3806,20 +4827,25 @@ mod tests {
         let flock = |text: &str| {
             flock::Flock::parse(Path::new("flock.toml"), text)
                 .unwrap()
-                .check_config(&config.models, &config.agents, &config.profiles)
+                .check_config(
+                    &config.models,
+                    &config.agents,
+                    &config.profiles,
+                    &crate::provision::Catalog::builtin(),
+                )
         };
         flock(
-            "[[flock]]\nname = \"p\"\ndefault = true\nagent = \"claude-personal\"\nagents = { opencode = \"opencode\" }\n",
+            "[[flock]]\nname = \"p\"\ndefault = true\nagent = \"claude-alt\"\nagents = { opencode = \"opencode\" }\n",
         )
         .unwrap();
         for (text, says) in [
             (
-                "[[machine]]\nname = \"m\"\nlocal = true\nagents = { opencode = \"claude-personal\" }\n",
-                "machine m: agents.opencode: agent claude-personal is claude, not opencode",
+                "[[machine]]\nname = \"m\"\nlocal = true\nagents = { opencode = \"claude-alt\" }\n",
+                "machine m: agents.opencode: agent claude-alt is claude, not opencode",
             ),
             (
-                "[[flock]]\nname = \"p\"\ndefault = true\nagent = \"claude-personal\"\nagents = { claude = \"claude\" }\n",
-                "flock p: agents.claude: its own agent claude-personal is already claude",
+                "[[flock]]\nname = \"p\"\ndefault = true\nagent = \"claude-alt\"\nagents = { claude = \"claude\" }\n",
+                "flock p: agents.claude: its own agent claude-alt is already claude",
             ),
         ] {
             let err = flock(text).unwrap_err().to_string();
@@ -3850,8 +4876,37 @@ mod tests {
             cwd: None,
             keep_pane: None,
             keep_pane_from: None,
+            remove_worktree: None,
+            remove_worktree_from: None,
+            load: None,
+            load_from: None,
+            fetch: Default::default(),
+            start_prompt: None,
+            workdir: None,
+            workdir_bundles: Vec::new(),
             rounds: Default::default(),
         }
+    }
+
+    /// `spec` as a task under profile `name` is made: the name in its
+    /// `agent_source`, where `Agents::launch_args` reads it.
+    fn under_profile(mut spec: crate::task::DispatchSpec, name: &str) -> crate::task::DispatchSpec {
+        spec.agent_source = Some(Box::new(crate::task::AgentSource {
+            ask: AgentChoice::default(),
+            agent: "defaults".into(),
+            agent_args: None,
+            model: None,
+            model_from: None,
+            fallback: vec![],
+            fallback_from: None,
+            fallback_use: None,
+            profile: Some(name.into()),
+            profile_from: Some("defaults".into()),
+            timeout_from: None,
+            place_from: None,
+            lists_unapplied: None,
+        }));
+        spec
     }
 
     /// Claude gets its own flags, one per pattern after its args; an agent
@@ -3870,6 +4925,8 @@ mod tests {
                 "Bash(git log:*)",
                 "--allowedTools",
                 "Edit",
+                "--allowedTools",
+                "Bash(pastor task done:*)",
                 "--disallowedTools",
                 "Bash(rm:*)",
             ]
@@ -3898,6 +4955,122 @@ mod tests {
         assert!(own.launch_args(&spec_with("codex", &["y"], &[])).is_err());
     }
 
+    /// A profile that allows or denies an MCP tool reaches a Claude task as
+    /// the same flags as any other pattern: `mcp__nexus__post` allowed,
+    /// everything else of the `nexus` server denied. The deny stays a deny
+    /// beside an allow of one of its tools.
+    #[test]
+    fn a_profile_hands_claude_its_mcp_tools() {
+        let profiles: profile::Profiles = toml::from_str(
+            "[poster]\nextends = \"review\"\nallow = [\"mcp__nexus__post\", \"mcp__board__*\"]\n\
+             deny = [\"mcp__nexus\"]\n",
+        )
+        .unwrap();
+        profiles.validate().unwrap();
+        let mut pick = Defaults::default().resolve_agent(&AgentChoice::default(), None);
+        pick.profile = Some(("poster".into(), Layer::Ask));
+        let mut spec = spec_with("claude", &[], &[]);
+        spec.agent_args = vec![];
+        profiles.apply(&pick, None, &mut spec).unwrap();
+        let args = Agents::default()
+            .launch_args(&under_profile(spec, "poster"))
+            .unwrap();
+        let after = |flag: &str| -> Vec<&str> {
+            args.windows(2)
+                .filter(|w| w[0] == flag)
+                .map(|w| w[1].as_str())
+                .collect()
+        };
+        assert!(
+            after("--allowedTools").contains(&"mcp__board__*"),
+            "{args:?}"
+        );
+        assert!(
+            after("--disallowedTools").contains(&"mcp__nexus"),
+            "{args:?}"
+        );
+        // The exact pattern the deny names would be dropped from the allow;
+        // a tool under a denied server is passed on and Claude's deny wins.
+        assert!(
+            after("--allowedTools").contains(&"mcp__nexus__post"),
+            "{args:?}"
+        );
+    }
+
+    /// An MCP pattern is `mcp__<server>`, `mcp__<server>__<tool>` or
+    /// `mcp__<server>__*`; any other form fails the load of every list that
+    /// takes tool patterns, naming the list.
+    #[test]
+    fn an_mcp_pattern_has_one_of_three_forms() {
+        for good in [
+            "mcp__nexus",
+            "mcp__nexus__post",
+            "mcp__nexus__*",
+            "mcp__claude-in-chrome__tabs_create",
+            "mcp__plugin_x__y__z",
+            "mcp",
+            "mcp_x",
+            "Bash(mcp__x:*)",
+        ] {
+            check_tools("allow", &[good.to_string()]).unwrap_or_else(|e| panic!("{good}: {e}"));
+        }
+        for bad in [
+            "mcp__",
+            "mcp____post",
+            "mcp__*",
+            "mcp__nexus__",
+            "mcp__nexus__po st",
+            "mcp__nexus(post)",
+            "mcp__nexus__post(x)",
+            "mcp__ne*xus__post",
+            "mcp__nexus__post*",
+            "mcp__nexus/post",
+        ] {
+            let err = check_tools("profiles.p.allow", &[bad.to_string()]).unwrap_err();
+            assert!(err.contains("profiles.p.allow"), "{bad}: {err}");
+            assert!(err.contains("mcp__<server>"), "{bad}: {err}");
+        }
+    }
+
+    /// Every Claude task may run `pastor task done`, whatever its profile or
+    /// lack of one: `review` allows no Bash, and a task with no profile would
+    /// stop at a permission prompt. Once, and not twice if a list already has
+    /// it. An agent with its own permissions keeps its args alone; another
+    /// kind gets nothing.
+    #[test]
+    fn every_claude_task_is_allowed_to_end_itself() {
+        let agents = Agents::default();
+        let done = ["--allowedTools", TASK_DONE_ALLOW];
+        let args_of = |spec: &crate::task::DispatchSpec| agents.launch_args(spec).unwrap();
+        let has_done = |args: &[String]| {
+            args.windows(2)
+                .filter(|w| w[0] == done[0] && w[1] == done[1])
+                .count()
+        };
+        // No profile, no lists.
+        assert_eq!(has_done(&args_of(&spec_with("claude", &[], &[]))), 1);
+        // `review`: read tools and git reads, and Edit and Write denied.
+        let profiles = profile::Profiles::default();
+        let mut spec = under_profile(spec_with("claude", &[], &[]), "review");
+        let pick = {
+            let mut pick = Defaults::default().resolve_agent(&AgentChoice::default(), None);
+            pick.profile = Some(("review".into(), Layer::Ask));
+            pick
+        };
+        profiles.apply(&pick, None, &mut spec).unwrap();
+        let args = args_of(&spec);
+        assert!(!spec.allow.iter().any(|p| p == "Bash"), "no general Bash");
+        assert_eq!(has_done(&args), 1, "{args:?}");
+        // A list that already has it does not get it twice.
+        let spec = spec_with("claude", &[TASK_DONE_ALLOW], &[]);
+        assert_eq!(has_done(&args_of(&spec)), 1);
+        // Not for another kind, nor an agent whose permissions are its own.
+        assert_eq!(has_done(&args_of(&spec_with("codex", &[], &[]))), 0);
+        let own: Agents = toml::from_str("[claude]\nown_permissions = true\n").unwrap();
+        let spec = under_profile(spec_with("claude", &[], &[]), "develop");
+        assert_eq!(has_done(&own.launch_args(&spec).unwrap()), 0);
+    }
+
     /// Under a profile a Claude agent starts with `--permission-mode
     /// dontAsk` after its args and before its tool flags; args that pick a
     /// permission mode of their own are refused. A Codex agent with flags of
@@ -3907,22 +5080,7 @@ mod tests {
         let with_profile = |agent: &str, args: &[&str]| {
             let mut spec = spec_with(agent, &["Edit"], &["Bash(sudo:*)"]);
             spec.agent_args = args.iter().map(|s| s.to_string()).collect();
-            spec.agent_source = Some(Box::new(crate::task::AgentSource {
-                ask: AgentChoice::default(),
-                agent: "defaults".into(),
-                agent_args: None,
-                model: None,
-                model_from: None,
-                fallback: vec![],
-                fallback_from: None,
-                fallback_use: None,
-                profile: Some("develop".into()),
-                profile_from: Some("defaults".into()),
-                timeout_from: None,
-                place_from: None,
-                lists_unapplied: None,
-            }));
-            spec
+            under_profile(spec, "develop")
         };
         let agents = Agents::default();
         assert_eq!(
@@ -3936,6 +5094,8 @@ mod tests {
                 "dontAsk",
                 "--allowedTools",
                 "Edit",
+                "--allowedTools",
+                "Bash(pastor task done:*)",
                 "--disallowedTools",
                 "Bash(sudo:*)"
             ]
@@ -3959,10 +5119,10 @@ mod tests {
             ["--dangerously-skip-permissions"]
         );
         // A definition of kind claude is claude.
-        let personal: Agents = toml::from_str("[claude-personal]\nkind = \"claude\"\n").unwrap();
+        let personal: Agents = toml::from_str("[claude-alt]\nkind = \"claude\"\n").unwrap();
         assert!(
             personal
-                .launch_args(&with_profile("claude-personal", &[]))
+                .launch_args(&with_profile("claude-alt", &[]))
                 .unwrap()
                 .contains(&"dontAsk".to_string())
         );
@@ -4410,22 +5570,32 @@ mod tests {
         let path = tmp.path().join("pastor.toml");
         std::fs::write(
             &path,
-            "[agents.claude-personal]\nkind = \"claude\"\nenv = { CLAUDE_CONFIG_DIR = \"~/.claude-personal\" }\n",
+            "[agents.claude-alt]\nkind = \"claude\"\nenv = { CLAUDE_CONFIG_DIR = \"~/.claude-alt\" }\n",
         )
         .unwrap();
         let agents = PastorConfig::load(&path).unwrap().agents;
-        assert_eq!(agents.kind("claude-personal"), "claude");
+        assert_eq!(agents.kind("claude-alt"), "claude");
         assert_eq!(agents.kind("codex"), "codex", "no definition: the name");
         assert_eq!(
-            agents.trust_keys("claude-personal"),
+            agents.trust_keys("claude-alt"),
             Some(vec!["Down".into(), "Enter".into()])
         );
         let launch = agents
-            .launch(&spec_with("claude-personal", &["Edit"], &[]))
+            .launch(&spec_with("claude-alt", &["Edit"], &[]))
             .unwrap();
         assert_eq!(launch.kind, "claude");
-        assert_eq!(launch.args, vec!["--model", "m", "--allowedTools", "Edit"]);
-        assert_eq!(launch.env["CLAUDE_CONFIG_DIR"], "~/.claude-personal");
+        assert_eq!(
+            launch.args,
+            vec![
+                "--model",
+                "m",
+                "--allowedTools",
+                "Edit",
+                "--allowedTools",
+                "Bash(pastor task done:*)"
+            ]
+        );
+        assert_eq!(launch.env["CLAUDE_CONFIG_DIR"], "~/.claude-alt");
         assert!(
             agents
                 .launch(&spec_with("codex", &[], &[]))
@@ -4509,15 +5679,56 @@ mod tests {
         );
     }
 
+    /// Only the built-in Claude and agy markers are known to be their
+    /// option's own label: a configured one, even on `claude` itself, may
+    /// just name a heading, so `--trust` must not require it on the cursor
+    /// line (`trust_marker_is_option_text`, used by `run_trust_send`).
+    #[test]
+    fn only_the_built_in_markers_are_known_option_labels() {
+        let cfg = PastorConfig::default();
+        assert!(cfg.agents.trust_marker_is_option_text("claude"));
+        assert!(cfg.agents.trust_marker_is_option_text("agy"));
+        assert_eq!(
+            cfg.agents.trust_keys("agy"),
+            Some(vec!["Enter".to_string()])
+        );
+        assert!(!cfg.agents.trust_marker_is_option_text("codex"));
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(
+            &path,
+            "[agents.claude]\ntrust_marker = \"Trust this directory?\"\n[agents.codex]\ntrust_keys = [\"Down\", \"Down\", \"Enter\"]\ntrust_marker = \"Trust this directory?\"\n",
+        )
+        .unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        assert!(
+            !cfg.agents.trust_marker_is_option_text("claude"),
+            "a configured marker, even claude's own, is not known to be an option's label"
+        );
+        assert!(!cfg.agents.trust_marker_is_option_text("codex"));
+    }
+
     /// A prompt waits for Codex's folder-trust dialog, which herdr reads
-    /// idle, and for any agent's own `trust_marker`; never for Claude,
-    /// whose dialog herdr reads `blocked`.
+    /// idle, and for any agent's own `trust_marker`, Claude's too: herdr
+    /// can read its dialog ready before it reads it `blocked`.
     #[test]
     fn codex_and_agents_with_a_trust_marker_hold_their_prompt() {
         let cfg = PastorConfig::default();
-        assert!(cfg.agents.startup_markers("claude").is_empty());
-        assert!(cfg.agents.startup_markers("agy").is_empty());
-        let codex = cfg.agents.startup_markers("codex");
+        let claude_dialogs = [
+            "Try the new fullscreen renderer?",
+            "Make auto mode your default permission mode?",
+            "Teach auto mode about your environment?",
+            "Switch your default effort to",
+            "We recommend compacting earlier",
+        ];
+        let mut claude = vec!["Yes, I trust this folder"];
+        claude.extend(claude_dialogs);
+        assert_eq!(cfg.agents.startup_markers("claude", &[]), claude);
+        assert_eq!(
+            cfg.agents.startup_markers("agy", &[]),
+            vec!["Yes, I trust this folder"]
+        );
+        let codex = cfg.agents.startup_markers("codex", &[]);
         let screen = "  Do you trust the contents of this directory? Working with\n\u{203a} 1. Yes, continue\n  2. No, quit\n";
         assert!(shows_startup_question(screen, &codex));
         assert!(!shows_startup_question(
@@ -4533,10 +5744,142 @@ mod tests {
         .unwrap();
         let cfg = PastorConfig::load(&path).unwrap();
         assert_eq!(
-            cfg.agents.startup_markers("agy"),
+            cfg.agents.startup_markers("agy", &[]),
             vec!["Trust this workspace?"]
         );
-        assert!(cfg.agents.startup_markers("claude").is_empty());
+        let mut claude = vec!["Other"];
+        claude.extend(claude_dialogs);
+        assert_eq!(cfg.agents.startup_markers("claude", &[]), claude);
+    }
+
+    /// An agent's startup dialogs, built in or its own, hold its prompt too,
+    /// until pastor has answered them for the task; a row that removes a
+    /// dialog holds none.
+    #[test]
+    fn own_dialog_rows_hold_the_prompt_until_answered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(
+            &path,
+            "[agents.agy]\ntrust_marker = \"Do you trust\"\n[[agents.agy.dialogs]]\nname = \"banner\"\nmarker = \"esc to dismiss\"\nkeys = [\"esc\"]\n[agents.claude]\n[[agents.claude.dialogs]]\nname = \"fullscreen\"\nmarker = \"x\"\npick = \"\"\n[[agents.claude.dialogs]]\nname = \"tips\"\nmarker = \"Tip of the day\"\nkeys = [\"Enter\"]\n",
+        )
+        .unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        assert_eq!(
+            cfg.agents.startup_markers("agy", &[]),
+            vec!["Do you trust", "esc to dismiss"]
+        );
+        assert_eq!(
+            cfg.agents.startup_markers("agy", &["banner".into()]),
+            vec!["Do you trust"]
+        );
+        // Claude's built-ins hold it too, less the one its row removes,
+        // until each is answered.
+        assert_eq!(
+            cfg.agents.startup_markers("claude", &[]),
+            vec![
+                "Yes, I trust this folder",
+                "Make auto mode your default permission mode?",
+                "Teach auto mode about your environment?",
+                "Switch your default effort to",
+                "We recommend compacting earlier",
+                "Tip of the day"
+            ]
+        );
+        assert_eq!(
+            cfg.agents.startup_markers(
+                "claude",
+                &[
+                    "auto-mode-default".into(),
+                    "auto-mode-setup".into(),
+                    "effort-default".into(),
+                    "autocompact".into(),
+                    "tips".into()
+                ]
+            ),
+            vec!["Yes, I trust this folder"]
+        );
+    }
+
+    /// Claude and agy have a built-in login marker, Claude a login check;
+    /// an agent's own replace them, and empty turns them off. The check
+    /// runs with the agent's env, `~/` against the machine's home.
+    #[test]
+    fn login_markers_and_checks_are_built_in_or_the_agents_own() {
+        let cfg = PastorConfig::default();
+        assert_eq!(
+            cfg.agents.login_markers("claude"),
+            vec!["Select login method:"]
+        );
+        assert_eq!(
+            cfg.agents.login_markers("agy"),
+            vec!["You are currently not signed in"]
+        );
+        assert!(cfg.agents.login_markers("codex").is_empty());
+        assert!(
+            cfg.agents
+                .login_check("claude", None)
+                .unwrap()
+                .contains("claude auth status")
+        );
+        assert_eq!(cfg.agents.login_check("agy", None), None);
+        // The manifest's check comes before the built-in, and gives agy one.
+        let harnesses = crate::harness_manifest::Harnesses::builtin();
+        let claude = cfg
+            .agents
+            .login_check("claude", harnesses.get("claude"))
+            .unwrap();
+        assert!(claude.ends_with(" claude auth status --text"), "{claude}");
+        assert!(
+            cfg.agents
+                .login_check("agy", harnesses.get("agy"))
+                .unwrap()
+                .contains("agy models")
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(
+            &path,
+            "[agents.claude-alt]\nkind = \"claude\"\nenv = { CLAUDE_CONFIG_DIR = \"~/.claude-alt\" }\n[agents.codex]\nlogin_marker = \"Sign in with ChatGPT\"\nlogin_check = \"codex login status\"\n[agents.agy]\nlogin_marker = \"\"\nlogin_check = \"\"\n",
+        )
+        .unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        assert_eq!(
+            cfg.agents.login_markers("codex"),
+            vec!["Sign in with ChatGPT"]
+        );
+        assert!(
+            cfg.agents.login_markers("agy").is_empty(),
+            "empty turns it off"
+        );
+        // The agent's own check comes before its manifest's.
+        assert_eq!(
+            cfg.agents
+                .login_check_command("codex", harnesses.get("codex"))
+                .as_deref(),
+            Some("env sh -c 'codex login status'")
+        );
+        let personal = cfg.agents.login_check_command("claude-alt", None).unwrap();
+        assert!(
+            personal.starts_with("env CLAUDE_CONFIG_DIR=\"$HOME\"/.claude-alt sh -c 'PATH="),
+            "{personal}"
+        );
+        assert_eq!(
+            cfg.agents.login_check_command("agy", harnesses.get("agy")),
+            None,
+            "empty turns the manifest's check off too"
+        );
+    }
+
+    /// The autocompact offer's marker is on screen even where a narrow
+    /// pane wrapped its key hints.
+    #[test]
+    fn the_autocompact_offer_is_found_under_wrapped_hints() {
+        let screen = "● done\n\n We recommend compacting earlier\n\n ❯ Autocompact at ‹ 400k › tokens\n   Keep 600k tokens\n\n ↑/↓ choose · ←/→ change size · enter confirm · esc\n not now\n";
+        assert!(shows_trust_marker(
+            screen,
+            "We recommend compacting earlier"
+        ));
     }
 
     #[test]
@@ -4551,7 +5894,8 @@ mod tests {
                 "fullscreen",
                 "auto-mode-default",
                 "auto-mode-setup",
-                "effort-default"
+                "effort-default",
+                "autocompact"
             ]
         );
         assert!(d[0].needs_trust && !d[1].needs_trust);
@@ -4567,7 +5911,12 @@ mod tests {
         );
         assert_eq!(d[2].answer, Answer::Pick("No, keep".into()));
         assert!(cfg.agents.dialogs("codex").is_empty());
-        assert!(cfg.agents.dialogs("agy").is_empty());
+        // agy's trust dialog is built in; nothing after it.
+        let agy = cfg.agents.dialogs("agy");
+        assert_eq!(agy.len(), 1);
+        assert!(agy[0].needs_trust);
+        assert_eq!(agy[0].answer, Answer::Keys(vec!["Enter".into()]));
+        assert_eq!(agy[0].marker.as_deref(), Some("Yes, I trust this folder"));
     }
 
     #[test]
@@ -4615,16 +5964,23 @@ mod tests {
                 "fullscreen",
                 "auto-mode-default",
                 "effort-default",
+                "autocompact",
                 "bypass"
             ]
         );
         assert_eq!(d[1].marker.as_deref(), Some("fullscreen renderer"));
         assert_eq!(d[1].answer, Answer::Pick("Yes, try it".into()));
         assert_eq!(
-            d[4].answer,
+            d[5].answer,
             Answer::Keys(vec!["Down".into(), "Enter".into()])
         );
-        assert_eq!(cfg.agents.dialogs("agy").len(), 1);
+        let agy: Vec<String> = cfg
+            .agents
+            .dialogs("agy")
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(agy, ["trust", "welcome"]);
     }
 
     #[test]
@@ -4787,6 +6143,61 @@ mod tests {
         ));
     }
 
+    /// `trust_option_selected` tells a marker merely on screen apart from
+    /// one the dialog's cursor is actually on: the difference a lost `Down`
+    /// would otherwise hide from `shows_trust_marker`.
+    #[test]
+    fn trust_option_selected_needs_the_cursor_on_the_marker() {
+        let marker = "Yes, I trust this folder";
+        let not_moved =
+            "Quick safety check: ...\n\u{276f} 1. No, exit\n  2. Yes, I trust this folder\n";
+        let moved =
+            "Quick safety check: ...\n  1. No, exit\n\u{276f} 2. Yes, I trust this folder\n";
+        assert!(shows_trust_marker(not_moved, marker), "still shown");
+        assert!(!trust_option_selected(not_moved, marker), "not selected");
+        assert!(trust_option_selected(moved, marker));
+        // A narrow pane's cursor marker and spacing vary; both still count.
+        let narrow =
+            "Quick safety check: ...\n\u{203a}  1. No, exit\n   2.  Yes, I trust\n this folder\n";
+        assert!(!trust_option_selected(narrow, marker));
+        assert!(!trust_option_selected("", marker));
+    }
+
+    /// A narrow pane wraps the *selected* option's own label onto the line
+    /// below it, with neither a cursor nor a number of its own: the
+    /// continuation still counts toward the marker, stopping before the
+    /// next option.
+    #[test]
+    fn trust_option_selected_spans_a_wrapped_selected_label() {
+        let marker = "Yes, I trust this folder";
+        let wrapped =
+            "Quick safety check: ...\n  1. No, exit\n\u{276f} 2. Yes, I trust\n    this folder\n";
+        assert!(trust_option_selected(wrapped, marker));
+        // The continuation stops before the next option: a marker that only
+        // matches once its text is joined with the option below is not
+        // wrongly pulled in.
+        let next_option_follows = "Quick safety check: ...\n  1. No\n\u{276f} 2. Yes, I trust\n    this folder\n  3. and more\n";
+        assert!(!trust_option_selected(
+            next_option_follows,
+            "this folder and more"
+        ));
+    }
+
+    /// In a menu without numbers, the line under the cursor is the next
+    /// option, not more of the selected one: the cursor on "No, exit" with
+    /// the trust option below it is not on the trust option.
+    #[test]
+    fn trust_option_selected_takes_one_line_of_an_unnumbered_menu() {
+        let marker = "Yes, I trust this folder";
+        let on_no = "Do you trust the contents of this project?\n\n> No, exit\n  Yes, I trust this folder\n\n  enter Confirm\n";
+        assert!(shows_trust_marker(on_no, marker));
+        assert!(!trust_option_selected(on_no, marker));
+        let on_yes = "Do you trust the contents of this project?\n\n> Yes, I trust this folder\n  No, exit\n\n  enter Confirm\n";
+        assert!(trust_option_selected(on_yes, marker));
+        let claude = "Make auto mode your default permission mode?\n\n \u{276f} No, keep default\n   Yes, set auto mode as my default permission mode\n\n Enter to confirm \u{b7} Esc to cancel\n";
+        assert!(!trust_option_selected(claude, "Yes, set auto mode"));
+    }
+
     #[test]
     fn defaults_agent_args_parse_and_apply_only_when_none_are_given() {
         assert!(Defaults::default().agent_args.is_empty());
@@ -4927,7 +6338,7 @@ mod tests {
         let machine = |extra: &str| -> flock::MachineConfig {
             toml::from_str(&format!("name = \"m\"\nlocal = true\n{extra}")).unwrap()
         };
-        let own = machine("agent = \"claude-personal\"\nagent_args = [\"-v\"]");
+        let own = machine("agent = \"claude-alt\"\nagent_args = [\"-v\"]");
         let plain = machine("");
         let none = AgentChoice::default();
         let pick = |ask: &AgentChoice, m: Option<&flock::MachineConfig>, f| {
@@ -4937,7 +6348,7 @@ mod tests {
         assert_eq!(
             pick(&none, Some(&own), Some(&flock)),
             (
-                "claude-personal".into(),
+                "claude-alt".into(),
                 "-v".into(),
                 Layer::Machine,
                 Some(Layer::Machine)
@@ -4971,7 +6382,7 @@ mod tests {
         assert_eq!(
             pick(&args, Some(&own), Some(&flock)),
             (
-                "claude-personal".into(),
+                "claude-alt".into(),
                 "--fast".into(),
                 Layer::Machine,
                 Some(Layer::Ask)
@@ -5607,8 +7018,6 @@ mod tests {
             );
         }
         assert!(text.contains("\npull = true"), "no pull machine example");
-        let flag = ["--", "shepherd"].concat();
-        assert!(!text.contains(&flag), "the manual names {flag}");
     }
 
     #[test]
@@ -5642,6 +7051,50 @@ mod tests {
     /// A fresh install on a machine shows in `machine list` within
     /// `version_every` of a reconcile: two minutes by default, one ssh per
     /// machine per interval, and a `pastor.toml` key when that is too often.
+    /// A task's load is its run's, else its agent's, else its repo's; the
+    /// repo is matched as the task names it, but for a trailing `/`.
+    #[test]
+    fn a_load_is_the_run_s_then_the_agent_s_then_the_repo_s() {
+        let cfg = PastorConfig::parse(
+            Path::new("pastor.toml"),
+            r#"
+[agents.builder]
+kind = "claude"
+load = "rust"
+
+[repos."~/src/site"]
+load = "light"
+"#,
+        )
+        .unwrap();
+        let load = |ask: Option<&str>, agent: &str, repo: Option<&str>| {
+            resolve_load(ask, agent, &cfg.agents, repo, &cfg.repos, "task run")
+        };
+        let pair = |l: &str, from: &str| Some((l.to_string(), from.to_string()));
+        let site = Some("~/src/site");
+        assert_eq!(load(Some("gpu"), "builder", site), pair("gpu", "task run"));
+        assert_eq!(load(None, "builder", site), pair("rust", "agent builder"));
+        assert_eq!(load(None, "claude", site), pair("light", "repo ~/src/site"));
+        assert_eq!(
+            load(None, "claude", Some("~/src/site/")),
+            pair("light", "repo ~/src/site/")
+        );
+        assert_eq!(load(None, "claude", Some("~/src/other")), None);
+        assert_eq!(load(None, "claude", None), None);
+    }
+
+    /// An agent's or a repo's load is a load name.
+    #[test]
+    fn a_load_in_pastor_toml_is_checked() {
+        let p = |text: &str| PastorConfig::parse(Path::new("pastor.toml"), text);
+        let err = p("[agents.a]\nload = \"no space\"\n").unwrap_err();
+        assert!(err.to_string().contains("agents.a.load"), "{err}");
+        let err = p("[repos.\"~/r\"]\nload = \"\"\n").unwrap_err();
+        assert!(err.to_string().contains("repos.\"~/r\".load"), "{err}");
+        let err = p("[repos.\"~/r\"]\nloads = \"rust\"\n").unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
     #[test]
     fn version_every_is_two_minutes_unless_set() {
         assert_eq!(PastorConfig::default().version_every, "2m");
@@ -5742,11 +7195,13 @@ mod tests {
         }
 
         /// `check_tools` refuses a pattern exactly when it is blank or
-        /// starts with `-`.
+        /// starts with `-`, or is a malformed MCP one (see
+        /// `an_mcp_pattern_has_one_of_three_forms`).
         #[test]
         fn prop_check_tools_refuses_only_blank_and_dash_patterns(
             p in proptest::prop_oneof![".*", "[ \t\n]*", "-.*", "[ \t]+-?.*"],
         ) {
+            proptest::prop_assume!(!p.starts_with("mcp__"));
             let refused = p.trim().is_empty() || p.starts_with('-');
             proptest::prop_assert_eq!(
                 check_tools("allow", std::slice::from_ref(&p)).is_err(),

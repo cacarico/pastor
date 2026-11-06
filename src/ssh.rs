@@ -40,6 +40,25 @@ pub struct Ssh<'a> {
     pub keepalive: bool,
     /// `-T`: no pseudo-terminal.
     pub no_tty: bool,
+    /// Pastor's own key: `-i` plus `IdentitiesOnly=yes`, so ssh offers no
+    /// other key and an agent full of keys cannot trip the server's
+    /// `MaxAuthTries`.
+    pub identity: Option<&'a Path>,
+    /// A key offered besides the user's own: `-i` alone, without
+    /// `IdentitiesOnly`, so an agent's keys and the `IdentityFile` lines of the
+    /// user's ssh config are still tried. Any `-i` makes ssh skip its default
+    /// key files (`~/.ssh/id_ed25519` and the like), so a caller that sets this
+    /// must offer those itself if it still needs them.
+    pub extra_identity: Option<&'a Path>,
+    /// Pastor's own `known_hosts` file, instead of the user's, the system's
+    /// and any `KnownHostsCommand`.
+    pub known_hosts: Option<&'a Path>,
+    /// With `known_hosts`: trust a host seen for the first time
+    /// (`accept-new`), else only hosts already in the file (`yes`).
+    pub accept_new: bool,
+    /// `-F`: this file as the ssh configuration, instead of the user's and
+    /// the system's (`/etc/ssh/ssh_config` and its `ssh_config.d`).
+    pub config_file: Option<&'a Path>,
 }
 
 impl Ssh<'_> {
@@ -68,7 +87,36 @@ impl Ssh<'_> {
                 opts.push("ControlPath=none".into());
             }
         }
+        if self.identity.is_some() {
+            opts.push("IdentitiesOnly=yes".into());
+        }
+        if let Some(path) = self.known_hosts {
+            // Pastor's file is the only source of host keys: ssh would also
+            // accept one from the system's known_hosts or a
+            // `KnownHostsCommand`. `IgnoreUnknown` comes first, so an
+            // OpenSSH older than 8.5, which has no `KnownHostsCommand`,
+            // still takes the line.
+            opts.push("IgnoreUnknown=KnownHostsCommand".into());
+            opts.push(format!("UserKnownHostsFile={}", option_word(path)));
+            opts.push("GlobalKnownHostsFile=/dev/null".into());
+            opts.push("KnownHostsCommand=none".into());
+            // Names left readable, so `machine remove` and `pastor leave` can
+            // find a host's entry again (a hashed one hides its name).
+            opts.push("HashKnownHosts=no".into());
+            let mode = if self.accept_new { "accept-new" } else { "yes" };
+            opts.push(format!("StrictHostKeyChecking={mode}"));
+        }
         let mut args = Vec::new();
+        if let Some(path) = self.config_file {
+            args.push("-F".to_string());
+            // As given: ssh opens `-F`'s argument as it is and expands no `%`
+            // in it, unlike the paths of `-i` and the options.
+            args.push(path.display().to_string());
+        }
+        for key in [self.identity, self.extra_identity].into_iter().flatten() {
+            args.push("-i".to_string());
+            args.push(escape_tokens(&key.display().to_string()));
+        }
         for opt in opts {
             args.push("-o".to_string());
             args.push(opt);
@@ -81,6 +129,25 @@ impl Ssh<'_> {
         args.push(posix_command(remote));
         args
     }
+}
+
+/// `s` as ssh will read it where it expands `%` tokens (`-i`, `ControlPath`,
+/// `UserKnownHostsFile`): a literal `%` is `%%`. Every path pastor hands ssh
+/// goes through this, or a state dir with a `%` in it names a file that is not
+/// there.
+pub(crate) fn escape_tokens(s: &str) -> String {
+    s.replace('%', "%%")
+}
+
+/// A path as the value of an ssh option that takes a list (`-o
+/// UserKnownHostsFile=...` splits on whitespace): quoted, with `"` and `\`
+/// escaped, when it holds any of those, else as it is.
+fn option_word(path: &Path) -> String {
+    let s = escape_tokens(&path.display().to_string());
+    if !s.contains(|c: char| c.is_whitespace() || c == '"' || c == '\\') {
+        return s;
+    }
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 /// The length of `path` as ssh will have expanded it: `%%` is one byte, `%C` is
@@ -149,6 +216,15 @@ pub(crate) fn check_socket_path(path: &Path, hint: &str) -> anyhow::Result<()> {
     ))
 }
 
+/// Is the directory of `control_path` (in ssh's escaped form, like
+/// `ensure_control_dir`'s) there, whoever owns it?
+pub fn control_dir_exists(control_path: &Path) -> bool {
+    control_path.parent().is_some_and(|parent| {
+        let literal = PathBuf::from(parent.to_string_lossy().replace("%%", "%"));
+        std::fs::symlink_metadata(literal).is_ok()
+    })
+}
+
 /// The master socket lives in the ControlPath's directory; ssh creates the
 /// socket itself but not the directory, and it must not be world-readable.
 /// Every ssh that carries a ControlPath can be the one that starts the master,
@@ -178,7 +254,156 @@ mod tests {
             control_persist: "600",
             keepalive: false,
             no_tty: false,
+            identity: None,
+            extra_identity: None,
+            known_hosts: None,
+            accept_new: false,
+            config_file: None,
         }
+    }
+
+    fn has_seq(args: &[String], seq: &[&str]) -> bool {
+        args.windows(seq.len()).any(|w| w == seq)
+    }
+
+    #[test]
+    fn a_config_file_comes_first_and_keeps_percent_literal() {
+        let args = Ssh {
+            config_file: Some(Path::new("/h/100%/config")),
+            ..ssh("fleet@pi-3", None)
+        }
+        .args("true");
+        assert_eq!(&args[..2], ["-F", "/h/100%/config"], "{args:?}");
+        assert!(!ssh("fleet@pi-3", None).args("true").contains(&"-F".into()));
+    }
+
+    #[test]
+    fn identity_adds_identities_only() {
+        let args = Ssh {
+            identity: Some(Path::new("/k")),
+            ..ssh("fleet@pi-3", None)
+        }
+        .args("true");
+        assert!(has_seq(&args, &["-i", "/k"]), "{args:?}");
+        assert!(opt(&args, "IdentitiesOnly=yes"), "{args:?}");
+    }
+
+    #[test]
+    fn extra_identity_does_not_restrict_keys() {
+        let args = Ssh {
+            extra_identity: Some(Path::new("/k")),
+            ..ssh("fleet@pi-3", None)
+        }
+        .args("true");
+        assert!(has_seq(&args, &["-i", "/k"]), "{args:?}");
+        assert!(!args.iter().any(|a| a.starts_with("IdentitiesOnly")));
+    }
+
+    #[test]
+    fn known_hosts_strict_by_default() {
+        let args = Ssh {
+            known_hosts: Some(Path::new("/kh")),
+            ..ssh("fleet@pi-3", None)
+        }
+        .args("true");
+        assert!(opt(&args, "UserKnownHostsFile=/kh"), "{args:?}");
+        assert!(opt(&args, "StrictHostKeyChecking=yes"), "{args:?}");
+    }
+
+    /// Pastor's pin file is the only place a host key can come from: no
+    /// system known_hosts and no `KnownHostsCommand`, the latter after an
+    /// `IgnoreUnknown` so an OpenSSH without it still runs. Without a pin
+    /// file, none of these is set.
+    #[test]
+    fn known_hosts_is_the_only_source_of_host_keys() {
+        let args = Ssh {
+            known_hosts: Some(Path::new("/kh")),
+            ..ssh("fleet@pi-3", None)
+        }
+        .args("true");
+        let at = |o: &str| {
+            args.windows(2)
+                .position(|w| w == ["-o", o])
+                .unwrap_or_else(|| panic!("no -o {o}: {args:?}"))
+        };
+        assert!(at("IgnoreUnknown=KnownHostsCommand") < at("KnownHostsCommand=none"));
+        at("GlobalKnownHostsFile=/dev/null");
+        at("UserKnownHostsFile=/kh");
+        at("HashKnownHosts=no");
+
+        let plain = ssh("fleet@pi-3", None).args("true");
+        assert!(!plain.iter().any(|a| a.contains("KnownHosts")), "{plain:?}");
+    }
+
+    /// ssh expands `%` in `-i` and `UserKnownHostsFile`, and splits the latter
+    /// on whitespace: a state dir with either still names the file pastor
+    /// checked.
+    #[test]
+    fn paths_reach_ssh_as_the_literal_file() {
+        let args = Ssh {
+            identity: Some(Path::new("/s%h/k")),
+            extra_identity: Some(Path::new("/s%h/e")),
+            known_hosts: Some(Path::new("/a b%h/kh")),
+            ..ssh("fleet@pi-3", None)
+        }
+        .args("true");
+        assert!(has_seq(&args, &["-i", "/s%%h/k"]), "{args:?}");
+        assert!(has_seq(&args, &["-i", "/s%%h/e"]), "{args:?}");
+        assert!(opt(&args, "UserKnownHostsFile=\"/a b%%h/kh\""), "{args:?}");
+        let odd = Ssh {
+            known_hosts: Some(Path::new("/q\"\\ x/kh")),
+            ..ssh("fleet@pi-3", None)
+        }
+        .args("true");
+        assert!(
+            opt(&odd, "UserKnownHostsFile=\"/q\\\"\\\\ x/kh\""),
+            "{odd:?}"
+        );
+    }
+
+    #[test]
+    fn accept_new_when_asked() {
+        let args = Ssh {
+            known_hosts: Some(Path::new("/kh")),
+            accept_new: true,
+            ..ssh("fleet@pi-3", None)
+        }
+        .args("true");
+        assert!(opt(&args, "StrictHostKeyChecking=accept-new"), "{args:?}");
+        assert!(!opt(&args, "StrictHostKeyChecking=yes"), "{args:?}");
+    }
+
+    /// With none of the new options set the argv is what it was before them,
+    /// byte for byte.
+    #[test]
+    fn no_options_unchanged() {
+        let args = Ssh {
+            keepalive: true,
+            no_tty: true,
+            ..ssh("fleet@pi-3", Some(Path::new("/tmp/s/ssh/pi-3-%C")))
+        }
+        .args("true");
+        assert_eq!(
+            args,
+            [
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=3",
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                "ControlPath=/tmp/s/ssh/pi-3-%C",
+                "-o",
+                "ControlPersist=600",
+                "-T",
+                "--",
+                "fleet@pi-3",
+                "sh -c true"
+            ]
+        );
     }
 
     #[test]

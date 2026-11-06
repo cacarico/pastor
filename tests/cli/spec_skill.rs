@@ -3,7 +3,7 @@ use crate::helpers::*;
 /// The spec skill's worked example is a plan whose first task must run as
 /// written: its Dispatch command goes through `pastor task run` unchanged
 /// apart from the paths. In a real repo the prompt file sits under
-/// `docs/superpowers/plans/`, and the repo is a path on the flock machine.
+/// `docs/plans/`, and the repo is a path on the flock machine.
 #[test]
 fn spec_example_plan_runs_its_first_task() {
     let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("skills/spec/example");
@@ -22,7 +22,7 @@ fn spec_example_plan_runs_its_first_task() {
     let in_repo = args[at].clone();
     let file = example.join(
         in_repo
-            .strip_prefix("docs/superpowers/plans/")
+            .strip_prefix("docs/plans/")
             .unwrap_or_else(|| panic!("prompt file {in_repo} is outside the plans dir")),
     );
     args[at] = file.to_string_lossy().into_owned();
@@ -158,7 +158,7 @@ fn next_task_reads_the_example_plan_and_its_ledger() {
     // Task 1 has never run.
     assert_eq!(
         run(&header, None),
-        format!("RUN 1 docs/superpowers/plans/{stem}/task-1.md")
+        format!("RUN 1 docs/plans/{stem}/task-1.md")
     );
 
     // Its agent is still working.
@@ -174,7 +174,7 @@ fn next_task_reads_the_example_plan_and_its_ledger() {
     );
     assert_eq!(
         run(&task2, None),
-        format!("RUN 2 docs/superpowers/plans/{stem}/task-2.md")
+        format!("RUN 2 docs/plans/{stem}/task-2.md")
     );
 
     // The ledger itself says task 2 is blocked.

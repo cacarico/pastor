@@ -139,6 +139,66 @@ pub struct MachineDescription {
     /// Its recent `machine.*` events that carried an error, and its failed
     /// tasks, oldest first.
     pub recent_errors: Vec<EventRecord>,
+    /// Its bundles: what it is meant to have, how it takes a change, the
+    /// last apply and each harness home. Missing when no bundle is meant for
+    /// it and none was applied, and from an older head.
+    #[serde(default)]
+    pub config: Option<crate::bundle::keep::ConfigDescription>,
+    /// The workdir sets the head placed on it, as last read: `None` when it
+    /// placed none. Missing from an older head.
+    #[serde(default)]
+    pub workdirs: Option<crate::bundle::workdir_keep::WorkdirsDescription>,
+    /// The agents found signed out on it (`signed_out_on`). Missing from an
+    /// older head.
+    #[serde(default)]
+    pub signed_out: Vec<crate::limit::AccountLimit>,
+    /// How its bootstrap stands, if it has a state: `None` for a machine
+    /// that never had one, and from an older head.
+    #[serde(default)]
+    pub bootstrap: Option<crate::store::MachineState>,
+}
+
+/// A cordon in one line: `since 2026-10-31 10:00: kernel update`.
+pub fn cordon_line(c: &crate::store::Cordon) -> String {
+    let since = c.since.format("%Y-%m-%d %H:%M");
+    match &c.reason {
+        Some(reason) => format!("since {since}: {reason}"),
+        None => format!("since {since}"),
+    }
+}
+
+/// A machine's bootstrap in one line: `ok (user mode; isolation: none)`,
+/// `pending`, or `failed at <step>: <why>`, the why already carrying the
+/// step's fix as `; fix: <fix>`.
+pub fn bootstrap_line(s: &crate::store::MachineState) -> String {
+    use crate::store::BootstrapState;
+    match s.bootstrap {
+        BootstrapState::Ok => format!(
+            "ok (user mode; isolation: {})",
+            s.isolation.as_deref().unwrap_or("none")
+        ),
+        BootstrapState::Pending => "pending".to_string(),
+        BootstrapState::Failed => format!(
+            "failed at {}: {}",
+            s.failed_step.as_deref().unwrap_or("bootstrap"),
+            s.why.as_deref().unwrap_or("no reason given")
+        ),
+    }
+}
+
+/// Of `limits`, the signed-out rows about machine `name`: seen there, or
+/// kept under one of its agents (`<name>/<agent>`).
+pub fn signed_out_on(
+    limits: Vec<crate::limit::AccountLimit>,
+    name: &str,
+) -> Vec<crate::limit::AccountLimit> {
+    let own = format!("{name}/");
+    limits
+        .into_iter()
+        .filter(|l| {
+            l.signed_out && (l.machine.as_deref() == Some(name) || l.account.starts_with(&own))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -606,7 +666,12 @@ pub fn machine_text(m: &MachineDescription) -> String {
         Some(n) => format!("{n} of {room}"),
         None => format!("- of {room}"),
     };
-    let mut out = fields(&[
+    let agents = if r.reserved > 0 {
+        format!("{agents}, {} reserved for other panes", r.reserved)
+    } else {
+        agents
+    };
+    let mut rows = vec![
         ("name", r.name.clone()),
         ("description", description(&r.description)),
         ("host", r.host.clone()),
@@ -633,15 +698,94 @@ pub fn machine_text(m: &MachineDescription) -> String {
         ("agents", agents),
         ("orphans", dash(Some(r.orphans.join(",")))),
         ("tags", dash(Some(r.tags.join(",")))),
-        ("error", dash(r.error.clone().map(|e| one_line(&e)))),
-    ]);
+        ("error", dash(r.problems().map(|e| one_line(&e)))),
+    ];
+    // Only for a machine that has been bootstrapped or is being: the rest
+    // never had a state.
+    if let Some(b) = &m.bootstrap {
+        rows.insert(rows.len() - 1, ("bootstrap", bootstrap_line(b)));
+    }
+    // Likewise only for a machine an operator cordoned.
+    if let Some(c) = &r.cordon {
+        rows.insert(rows.len() - 1, ("cordoned", cordon_line(c)));
+    }
+    let mut out = fields(&rows);
+    if let Some(c) = &m.config {
+        section(&mut out, "bundles", config_lines(c));
+    }
+    if let Some(w) = &m.workdirs {
+        section(
+            &mut out,
+            "workdirs",
+            crate::bundle::workdir_keep::describe_lines(w),
+        );
+    }
     section(&mut out, "tasks", task_table(&m.tasks));
+    // Only when there is one: most machines never have any.
+    if !m.signed_out.is_empty() {
+        let now = chrono::Utc::now();
+        section(
+            &mut out,
+            "signed out",
+            m.signed_out
+                .iter()
+                .map(|l| {
+                    let agent = l.agent.as_deref().unwrap_or("-");
+                    format!("{agent}: {}", l.note(now))
+                })
+                .collect(),
+        );
+    }
     section(
         &mut out,
         "recent errors",
         m.recent_errors.iter().map(EventRecord::line).collect(),
     );
     out.join("\n")
+}
+
+/// The `bundles` section of a machine's text: how it takes a plan, the last
+/// apply, the bundles and each home.
+fn config_lines(c: &crate::bundle::keep::ConfigDescription) -> Vec<String> {
+    let mode = match c.apply_mode {
+        crate::bundle::Apply::Auto => "auto",
+        crate::bundle::Apply::Manual => "manual",
+    };
+    let last = match &c.last_apply {
+        None => "never applied".to_string(),
+        Some(a) if a.ok => format!("applied {}", ago(Some(a.at))),
+        Some(a) => format!(
+            "failed {}: {}",
+            ago(Some(a.at)),
+            one_line(a.error.as_deref().unwrap_or("-"))
+        ),
+    };
+    let mut lines = vec![format!(
+        "apply: {mode}; {}; {last}",
+        if c.stale { "stale" } else { "up to date" }
+    )];
+    for b in &c.bundles {
+        let was = b
+            .applied_hash
+            .as_deref()
+            .map(|h| format!(" (applied {})", &h[..h.len().min(12)]))
+            .unwrap_or_default();
+        lines.push(format!(
+            "bundle {} {} {}{was}",
+            b.id,
+            b.version,
+            &b.hash[..b.hash.len().min(12)]
+        ));
+    }
+    for h in &c.homes {
+        let state = h.state.map_or("unread", |s| s.word());
+        lines.push(format!(
+            "home {} ({}): {state}",
+            h.path,
+            h.agents.join(", ")
+        ));
+    }
+    lines
 }
 
 pub fn flock_text(f: &FlockDescription) -> String {
@@ -840,6 +984,35 @@ mod tests {
         assert_eq!(out[2..], ["tasks: none", "events:", "  x"]);
     }
 
+    /// `machine describe` of an `ssh` machine whose agents cannot reach
+    /// the head says so on its error line.
+    #[test]
+    fn a_machine_cut_off_from_the_head_says_so() {
+        let row: crate::cli::MachineRow = serde_json::from_value(serde_json::json!({
+            "name": "pi", "host": "user@pi", "endpoint": "ssh user@pi",
+            "flock": "default", "channel": "connected", "herdr_version": null,
+            "pastor_version": null, "protocol": null, "error": null, "live": 0,
+            "max_agents": 1, "tags": [], "orphans": [], "no_head_address": true,
+        }))
+        .unwrap();
+        let d = MachineDescription {
+            row,
+            session: "default".into(),
+            model: None,
+            fallback: None,
+            agents_by_kind: Default::default(),
+            tasks: vec![],
+            recent_errors: vec![],
+            config: None,
+            workdirs: None,
+            signed_out: vec![],
+            bootstrap: None,
+        };
+        let text = machine_text(&d);
+        let error = text.lines().find(|l| l.starts_with("error:")).unwrap();
+        assert!(error.ends_with(crate::cli::CUT_OFF), "{text}");
+    }
+
     #[test]
     fn toml_lines_flatten_nested_tables() {
         let v = serde_json::json!({"use": "gh", "query": {"label": "bug", "n": 3}});
@@ -930,5 +1103,155 @@ mod tests {
         assert_eq!(kept.len(), RECENT);
         assert_eq!(kept[0].kind, "job.4");
         assert_eq!(kept[RECENT - 1].kind, "job.13");
+    }
+
+    /// `machine describe` has a `bootstrap` line for a machine with a state:
+    /// ok says its mode and isolation, a failure its step, why and fix; a
+    /// machine with none has no such line.
+    #[test]
+    fn describe_shows_bootstrap_line() {
+        use crate::store::{BootstrapState, MachineState};
+        let state = |bootstrap, step: Option<&str>, why: Option<&str>| MachineState {
+            machine: "pi-3".into(),
+            bootstrap,
+            isolation: Some("none".into()),
+            failed_step: step.map(str::to_string),
+            why: why.map(str::to_string),
+            host_key: None,
+            herdr_version: None,
+            pastor_version: None,
+            generation: 1,
+            updated_at: chrono::Utc::now(),
+        };
+        assert_eq!(
+            bootstrap_line(&state(BootstrapState::Ok, None, None)),
+            "ok (user mode; isolation: none)"
+        );
+        assert_eq!(
+            bootstrap_line(&state(BootstrapState::Pending, None, None)),
+            "pending"
+        );
+        let failed = state(
+            BootstrapState::Failed,
+            Some("herdr"),
+            Some("herdr is not on the PATH; fix: pastor machine install pi-3 --kind herdr"),
+        );
+        assert_eq!(
+            bootstrap_line(&failed),
+            "failed at herdr: herdr is not on the PATH; fix: pastor machine install pi-3 --kind herdr"
+        );
+
+        let row: crate::cli::MachineRow = serde_json::from_value(serde_json::json!({
+            "name": "pi-3", "host": "user@pi-3", "endpoint": "ssh user@pi-3",
+            "flock": "default", "channel": "connected", "herdr_version": null,
+            "pastor_version": null, "protocol": null, "error": null, "live": 0,
+            "max_agents": 1, "tags": [], "orphans": [],
+        }))
+        .unwrap();
+        let describe = |bootstrap| MachineDescription {
+            row: row.clone(),
+            session: "default".into(),
+            model: None,
+            fallback: None,
+            agents_by_kind: Default::default(),
+            tasks: vec![],
+            recent_errors: vec![],
+            config: None,
+            workdirs: None,
+            signed_out: vec![],
+            bootstrap,
+        };
+        let text = machine_text(&describe(Some(failed)));
+        assert!(
+            text.lines().any(|l| l.starts_with("bootstrap:")
+                && l.ends_with("failed at herdr: herdr is not on the PATH; fix: pastor machine install pi-3 --kind herdr")),
+            "{text}"
+        );
+        assert!(!machine_text(&describe(None)).contains("bootstrap:"));
+        // An older head's JSON has no bootstrap.
+        let mut json = serde_json::to_value(describe(None)).unwrap();
+        json.as_object_mut().unwrap().remove("bootstrap");
+        let back: MachineDescription = serde_json::from_value(json).unwrap();
+        assert!(back.bootstrap.is_none());
+    }
+
+    /// A cordoned machine says since when and why; any other has no line.
+    #[test]
+    fn describe_shows_a_cordon() {
+        let row = |cordon: serde_json::Value| -> crate::cli::MachineRow {
+            serde_json::from_value(serde_json::json!({
+                "name": "pi", "host": "user@pi", "endpoint": "ssh user@pi",
+                "flock": "default", "channel": "connected", "herdr_version": null,
+                "pastor_version": null, "protocol": null, "error": null, "live": 1,
+                "max_agents": 3, "tags": [], "orphans": [], "cordon": cordon,
+            }))
+            .unwrap()
+        };
+        let text = |cordon| {
+            machine_text(&MachineDescription {
+                row: row(cordon),
+                session: "default".into(),
+                model: None,
+                fallback: None,
+                agents_by_kind: Default::default(),
+                tasks: vec![],
+                recent_errors: vec![],
+                config: None,
+                workdirs: None,
+                signed_out: vec![],
+                bootstrap: None,
+            })
+        };
+        let cordoned = text(serde_json::json!({
+            "machine": "pi", "reason": "kernel update", "since": "2026-10-31T10:00:00Z",
+        }));
+        assert!(
+            cordoned.lines().any(|l| l.starts_with("cordoned:")
+                && l.ends_with("since 2026-10-31 10:00: kernel update")),
+            "{cordoned}"
+        );
+        let bare = text(serde_json::json!({
+            "machine": "pi", "reason": null, "since": "2026-10-31T10:00:00Z",
+        }));
+        assert!(bare.contains("since 2026-10-31 10:00\n"), "{bare}");
+        assert!(!text(serde_json::Value::Null).contains("cordoned"));
+    }
+
+    /// A machine with slots reserved says so on its agents line.
+    #[test]
+    fn describe_says_how_many_slots_are_reserved() {
+        let row = |reserved: u32| -> crate::cli::MachineRow {
+            serde_json::from_value(serde_json::json!({
+                "name": "pi", "host": "user@pi", "endpoint": "ssh user@pi",
+                "flock": "default", "channel": "connected", "herdr_version": null,
+                "pastor_version": null, "protocol": null, "error": null, "live": 1,
+                "max_agents": 3, "reserved": reserved, "tags": [], "orphans": [],
+            }))
+            .unwrap()
+        };
+        let text = |reserved| {
+            machine_text(&MachineDescription {
+                row: row(reserved),
+                session: "default".into(),
+                model: None,
+                fallback: None,
+                agents_by_kind: Default::default(),
+                tasks: vec![],
+                recent_errors: vec![],
+                config: None,
+                workdirs: None,
+                signed_out: vec![],
+                bootstrap: None,
+            })
+        };
+        assert!(
+            text(1)
+                .lines()
+                .any(|l| l.starts_with("agents:")
+                    && l.ends_with("1 of 3, 1 reserved for other panes")),
+            "{}",
+            text(1)
+        );
+        assert!(text(0).contains("agents:       1 of 3\n"), "{}", text(0));
     }
 }

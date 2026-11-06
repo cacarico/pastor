@@ -21,6 +21,6 @@
   to read as the machine lost.
 - `skills/pastor/SKILL.md` and the manual say an opencode task's permission
   rule for external directories should cover both a common parent of its
-  checkouts (such as `~/ghq`) and any other reference directory it opens,
+  checkouts (such as `~/src`) and any other reference directory it opens,
   such as a notes vault, so opencode's "Access external directory" dialog
   never blocks a task reading both.

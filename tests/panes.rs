@@ -170,15 +170,24 @@ panes! {
         question, shell, trust,
     },
     one_shell_running_split_count: "one-shell-running-split-count.txt" {
-        question,
-        #[ignore = "background_shell_running wants the count on the same line as the phrase"]
-        shell,
-        trust,
+        question, shell, trust,
     },
     two_shells_running: "two-shells-running.txt" {
         question, shell, trust,
     },
     shell_phrase_quoted_in_message: "shell-phrase-quoted-in-message.txt" {
+        question, shell, trust,
+    },
+    shell_running_under_a_dialog: "shell-running-under-a-dialog.txt" {
+        question, shell, trust,
+    },
+    one_shell_idle_footer: "one-shell-idle-footer.txt" {
+        question, shell, trust,
+    },
+    one_shell_working_footer: "one-shell-working-footer.txt" {
+        question, shell, trust,
+    },
+    shell_count_quoted_in_message: "shell-count-quoted-in-message.txt" {
         question, shell, trust,
     },
     trust_dialog_fresh: "trust-dialog-fresh.txt" {

@@ -629,6 +629,8 @@ impl Offline {
 
     /// An editor script that writes `edits[n]` over the file on its n-th
     /// run (the last one for every later run), and logs what it was given.
+    /// Its run count is replaced whole (written aside, then renamed), so a
+    /// test reading it while the editor runs never sees it half written.
     pub(crate) fn editor(&self, edits: &[&str]) -> String {
         use std::os::unix::fs::PermissionsExt;
         let dir = self.tmp.path().join("editor");
@@ -640,7 +642,7 @@ impl Offline {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\nd={dir}\nn=$(cat $d/count 2>/dev/null || echo 0)\necho $((n+1)) > $d/count\ncp \"$1\" $d/seen$n\nf=$d/edit$n\n[ -f $f ] || f=$d/edit{last}\ncp $f \"$1\"\n",
+                "#!/bin/sh\nd={dir}\nn=$(cat $d/count 2>/dev/null || echo 0)\necho $((n+1)) > $d/count.tmp\nmv $d/count.tmp $d/count\ncp \"$1\" $d/seen$n\nf=$d/edit$n\n[ -f $f ] || f=$d/edit{last}\ncp $f \"$1\"\n",
                 dir = dir.display(),
                 last = edits.len() - 1
             ),
@@ -685,6 +687,7 @@ pub(crate) fn seed_limit(state: &std::path::Path) {
             model: None,
             hard: true,
             no_credit: false,
+            signed_out: false,
             until: Some(now + chrono::Duration::hours(1)),
             retry_at: now + chrono::Duration::hours(1),
             line: "5-hour limit reached".into(),
@@ -749,6 +752,8 @@ pub(crate) fn fallback_completion_config()
         "[models.sonnet]\nkind = \"claude\"\nargs = []\n[models.gpt]\nkind = \"opencode\"\nargs = []\n",
     )
     .unwrap();
+    // A name with a comma, from before machine names had a rule: it still
+    // loads (with a warning), and completion has to cope with it.
     std::fs::write(
         config.join("flock.toml"),
         "[[flock]]\nname = \"home\"\ndefault = true\n\n\

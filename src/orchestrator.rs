@@ -1627,6 +1627,14 @@ impl Runner {
             cwd: None,
             keep_pane: None,
             keep_pane_from: None,
+            remove_worktree: None,
+            remove_worktree_from: None,
+            load: None,
+            load_from: None,
+            fetch: Default::default(),
+            start_prompt: None,
+            workdir: None,
+            workdir_bundles: Vec::new(),
             rounds: Default::default(),
         };
         let task = self
@@ -2909,6 +2917,14 @@ prompt = "You are the night orchestrator."
                         cwd: None,
                         keep_pane: None,
                         keep_pane_from: None,
+                        remove_worktree: None,
+                        remove_worktree_from: None,
+                        load: None,
+                        load_from: None,
+                        fetch: Default::default(),
+                        start_prompt: None,
+                        workdir: None,
+                        workdir_bundles: Vec::new(),
                         rounds: Default::default(),
                     },
                     flock: "default".into(),
@@ -2982,6 +2998,7 @@ prompt = "You are the night orchestrator."
                 model: None,
                 hard: true,
                 no_credit: false,
+                signed_out: false,
                 until: Some(reset),
                 retry_at: reset,
                 line: "You've hit your limit".into(),
@@ -3014,7 +3031,7 @@ prompt = "You are the night orchestrator."
         pane: &str,
     ) -> (Vec<String>, Option<DateTime<Utc>>) {
         let mut head = Head::new(&scheduled(), "echo 'PR #31'", "");
-        let config = "[agents.claude-personal]\nkind = \"claude\"\n";
+        let config = "[agents.claude-alt]\nkind = \"claude\"\n";
         let config = PastorConfig::parse(Path::new("pastor.toml"), config).unwrap();
         head.runner.fleet.set_config(&config);
         let id = head.run().await.task.unwrap();
@@ -3057,7 +3074,7 @@ prompt = "You are the night orchestrator."
             (quota.map(String::from).to_vec(), reset)
         );
         assert_eq!(
-            ended_with("claude-personal", None, pane).await,
+            ended_with("claude-alt", None, pane).await,
             (quota.map(String::from).to_vec(), reset)
         );
         // Only Claude's messages are known.

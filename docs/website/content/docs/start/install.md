@@ -30,6 +30,22 @@ sudo. It warns when the folder is not on your `PATH`.
 On a Raspberry Pi with a 64-bit kernel and a 32-bit userland, it picks the
 armv7 build, since a 64-bit binary would not run there.
 
+## join a head
+
+A machine the head cannot reach over ssh joins with a one-time token from
+`pastor join create` on the head. As the login user there, never root:
+
+```sh
+curl -fsSL https://cacari.co/pastor/install.sh | sh -s -- join
+```
+
+It installs pastor as above, then runs `pastor join`, which asks for the token
+with echo off. The token is a secret: it is never an argument, which `ps`
+shows. `PASTOR_JOIN_TOKEN` or `pastor join --token-stdin` give it without a
+terminal. The join pins the head's host key, fetches herdr from the head,
+bootstraps the machine and starts its serve; `docs/manual.md` ("Joining with
+a token") has the steps.
+
 ## with cargo
 
 The crate is called `pastor-cli`; the command is `pastor`.

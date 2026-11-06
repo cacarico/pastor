@@ -1,4 +1,4 @@
-//! `pastor task retry|close|prune|send`: argument types and handlers. `main.rs` only
+//! `pastor task retry|close|prune|sweep|send`: argument types and handlers. `main.rs` only
 //! holds one `TaskCmd` variant per command and calls these.
 use clap::{ArgGroup, Args};
 
@@ -7,7 +7,7 @@ use crate::config::parse_duration;
 use crate::ipc::{Client, Head, IpcRequest, IpcResponse};
 use crate::machine::SendInput;
 use crate::store::{PruneOutcome, Store};
-use crate::task::{Priority, TaskState, UNKNOWN_PRIORITY, parse_task_id};
+use crate::task::{Checkout, Outcome, Priority, TaskState, UNKNOWN_PRIORITY, parse_task_id};
 
 #[derive(Args, Debug)]
 pub struct RetryArgs {
@@ -56,6 +56,7 @@ pub struct CloseArgs {
 pub struct DoneArgs {
     /// A task, like t-12 or 12: the one to end (default: the task this pane
     /// runs, from PASTOR_TASK)
+    #[arg(conflicts_with = "current")]
     pub task: Option<String>,
     /// What you did, its first line the outcome: done, partial, blocked or
     /// nothing to do (kept to 2,000 characters)
@@ -64,6 +65,13 @@ pub struct DoneArgs {
     /// Read the summary from a file, or - for stdin
     #[arg(long, value_name = "PATH")]
     pub summary_file: Option<String>,
+    /// Do the whole end of a task in one step, for the task this pane runs
+    /// (from PASTOR_TASK): check its worktree, if it has one, has nothing
+    /// uncommitted, push its branch if it is not pushed yet, send the
+    /// summary, and print DONE last. A dirty worktree or a failed push
+    /// leaves the task as it was, with a clear error, instead of ending it
+    #[arg(long, conflicts_with = "task")]
+    pub current: bool,
     /// Print as a JSON object
     #[arg(long)]
     pub json: bool,
@@ -154,6 +162,95 @@ pub struct PruneArgs {
     /// Print as a JSON object
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct SweepArgs {
+    /// Only this machine's worktrees
+    #[arg(long)]
+    pub machine: Option<String>,
+    /// Remove what can be removed; without it nothing is removed and the
+    /// worktrees are only listed
+    #[arg(long)]
+    pub yes: bool,
+    /// List and remove nothing (this is what no flag does too)
+    #[arg(long, conflicts_with = "yes")]
+    pub dry_run: bool,
+    /// Print as a JSON object, {entries, failed}
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// How long the CLI waits for a sweep: the head asks each machine several
+/// things for each worktree.
+const SWEEP_WAIT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// `pastor task sweep [--machine M] [--yes]`: the worktrees pastor kept for
+/// tasks that ended, on the machines the head connects to. Always through
+/// the head, which is the one that can reach the machines.
+pub async fn sweep(client: &Client, a: SweepArgs) -> anyhow::Result<()> {
+    let req = IpcRequest::TaskSweep {
+        machine: a.machine.clone(),
+        yes: a.yes,
+    };
+    let got = crate::ipc::request_head_with_timeout(client, &req, SWEEP_WAIT).await;
+    let IpcResponse::Swept { entries, failed } = crate::cli::reply(got)? else {
+        anyhow::bail!("the head answered a sweep with something else");
+    };
+    if a.json {
+        println!(
+            "{}",
+            serde_json::json!({"yes": a.yes, "entries": entries, "failed": failed})
+        );
+    } else {
+        print!("{}", sweep_text(&entries, &failed, a.yes));
+    }
+    Ok(())
+}
+
+/// What `task sweep` prints: one line per worktree with what became of it,
+/// the machines it could not ask, and a last line counting them, which in a
+/// dry run says how to remove.
+pub fn sweep_text(
+    entries: &[crate::machine::SweepEntry],
+    failed: &[(String, String)],
+    yes: bool,
+) -> String {
+    use crate::machine::SweepAction;
+    let mut out = String::new();
+    for e in entries {
+        let what = match e.action {
+            SweepAction::Removed => "removed".to_string(),
+            SweepAction::WouldRemove => "would remove".to_string(),
+            SweepAction::Kept => format!("kept: {}", e.why.as_deref().unwrap_or("")),
+        };
+        out.push_str(&format!(
+            "{}  {}  ({}, {})  {what}\n",
+            e.machine,
+            e.path,
+            e.tasks.join(" "),
+            e.branch
+        ));
+    }
+    for (machine, why) in failed {
+        out.push_str(&format!("{machine}: not swept: {why}\n"));
+    }
+    let count = |action| entries.iter().filter(|e| e.action == action).count();
+    let (gone, would, kept) = (
+        count(SweepAction::Removed),
+        count(SweepAction::WouldRemove),
+        count(SweepAction::Kept),
+    );
+    if entries.is_empty() && failed.is_empty() {
+        out.push_str("no worktrees kept for tasks that ended\n");
+    } else if yes {
+        out.push_str(&format!("{gone} removed, {kept} kept\n"));
+    } else {
+        out.push_str(&format!(
+            "{would} would be removed, {kept} kept; nothing was removed: run it again with --yes to remove them\n"
+        ));
+    }
+    out
 }
 
 /// A level as `--priority` and `task priority` take it, or
@@ -280,8 +377,12 @@ async fn close_one(
     .await?)
 }
 
-/// `pastor task done [t-N]`: the task given, or the one this pane runs.
+/// `pastor task done [t-N] | --current`: the task given, or the one this
+/// pane runs, or (`--current`) the whole end-of-task wrap-up for it.
 pub async fn done(client: &Client, a: DoneArgs) -> anyhow::Result<()> {
+    if a.current {
+        return done_current(client, a).await;
+    }
     let task = match a.task.clone().or_else(|| client.caller.task.clone()) {
         Some(t) => t,
         None => {
@@ -300,6 +401,121 @@ pub async fn done(client: &Client, a: DoneArgs) -> anyhow::Result<()> {
         IpcResponse::Task(t) => print_task(&t, a.json),
         other => Err(unexpected(other)),
     }
+}
+
+/// `pastor task done --current`: everything an agent must do to end its
+/// own task (from `PASTOR_TASK`), so a prompt says one thing instead of
+/// several. Pushes the task's branch, if it has a worktree, when it is not
+/// pushed yet; sends the summary (`--summary` or `--summary-file` as
+/// `done` takes them, validated the same way, and refused if its first
+/// line names no outcome); and, for text output, prints `DONE` as the last
+/// line, so the pane's last line is right without the agent remembering to
+/// add it. `--json` leaves it out, so stdout stays one JSON value.
+///
+/// A dirty worktree or a failed push leaves the task exactly as it was:
+/// nothing is sent and it is not ended, and the error says why, so fixing
+/// it and running `--current` again picks up cleanly.
+async fn done_current(client: &Client, a: DoneArgs) -> anyhow::Result<()> {
+    let Some(own) = client.caller.task.clone() else {
+        return Err(CliError::err(
+            "usage_error",
+            format!(
+                "--current ends the task this pane runs; it needs {} set, which only a task pastor started has",
+                crate::ipc::TASK_ENV
+            ),
+        ));
+    };
+    let id = task_id(&own)?;
+    let summary = a.summary_text()?;
+    if let Some(s) = &summary
+        && Outcome::parse(s) == Outcome::Unknown
+    {
+        return Err(CliError::err(
+            "summary_unknown_outcome",
+            "the summary's first line names no outcome: done, partial, blocked or nothing to do",
+        ));
+    }
+    let task = match ask(client, IpcRequest::TaskShow { id }).await? {
+        IpcResponse::Task(t) => t,
+        other => return Err(unexpected(other)),
+    };
+    if let Some(checkout) = &task.spec.checkout {
+        wrap_up_worktree(checkout).await?;
+    }
+    match ask(client, IpcRequest::TaskDone { id, summary }).await? {
+        IpcResponse::Task(t) => {
+            print_task(&t, a.json)?;
+            if !a.json {
+                println!("DONE");
+            }
+            Ok(())
+        }
+        other => Err(unexpected(other)),
+    }
+}
+
+/// `done_current`'s git half, run in `checkout`'s worktree: refused
+/// (`worktree_dirty`) while it has uncommitted changes, so an agent's
+/// unfinished edits are never silently left unpushed and the task ended
+/// anyway; then `git push origin HEAD:<branch>`, refused (`push_failed`)
+/// if it fails, a no-op if the branch is already pushed.
+async fn wrap_up_worktree(checkout: &Checkout) -> anyhow::Result<()> {
+    let status = tokio::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&checkout.path)
+        .output()
+        .await
+        .map_err(|e| {
+            CliError::err(
+                "worktree_dirty",
+                format!(
+                    "could not check {} for uncommitted changes: {e}",
+                    checkout.path
+                ),
+            )
+        })?;
+    if !status.status.success() {
+        return Err(CliError::err(
+            "worktree_dirty",
+            format!(
+                "blocked: git status in {} failed: {}",
+                checkout.path,
+                String::from_utf8_lossy(&status.stderr).trim()
+            ),
+        ));
+    }
+    if !status.stdout.is_empty() {
+        return Err(CliError::err(
+            "worktree_dirty",
+            format!(
+                "blocked: {} has uncommitted changes; commit or stash them, then run `pastor task done --current` again",
+                checkout.path
+            ),
+        ));
+    }
+    let push = tokio::process::Command::new("git")
+        .args(["push", "origin", &format!("HEAD:{}", checkout.branch)])
+        .current_dir(&checkout.path)
+        .output()
+        .await
+        .map_err(|e| {
+            CliError::err(
+                "push_failed",
+                format!("could not run git push for {}: {e}", checkout.branch),
+            )
+        })?;
+    if !push.status.success() {
+        return Err(CliError::err(
+            "push_failed",
+            format!(
+                "partial: git push origin HEAD:{} in {} failed: {}",
+                checkout.branch,
+                checkout.path,
+                String::from_utf8_lossy(&push.stderr).trim()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// `pastor task send t-N [TEXT] [--key K]... [--no-enter] | --trust | --pick OPTION`.
@@ -466,5 +682,200 @@ mod tests {
         let err = task_id("x-1").unwrap_err();
         assert_eq!(err.downcast_ref::<CliError>().unwrap().code, "usage_error");
         assert_eq!(task_id("t-7").unwrap(), 7);
+    }
+
+    #[derive(Parser, Debug)]
+    struct D {
+        #[command(flatten)]
+        a: DoneArgs,
+    }
+
+    #[test]
+    fn current_conflicts_with_a_task_argument() {
+        assert!(D::try_parse_from(["d", "t-1", "--current"]).is_err());
+        let d = D::try_parse_from(["d", "--current", "--summary", "done: x"]).unwrap();
+        assert!(d.a.current);
+        assert!(d.a.task.is_none());
+    }
+
+    fn done_args(current: bool, summary: Option<&str>) -> DoneArgs {
+        DoneArgs {
+            task: None,
+            summary: summary.map(str::to_string),
+            summary_file: None,
+            current,
+            json: false,
+        }
+    }
+
+    fn client_with_task(task: Option<&str>) -> Client {
+        let tmp = tempfile::tempdir().unwrap();
+        Client {
+            paths: crate::config::Paths::new(tmp.path().join("c"), tmp.path().join("s")),
+            head: None,
+            caller: crate::ipc::Caller {
+                task: task.map(str::to_string),
+                orchestrator: None,
+            },
+        }
+    }
+
+    /// `--current` ends the task the pane runs, from `PASTOR_TASK`: outside
+    /// one, it fails with a clear error instead of asking which task.
+    #[tokio::test]
+    async fn current_outside_a_task_pane_is_a_clear_error() {
+        let client = client_with_task(None);
+        let err = done(&client, done_args(true, Some("done: x")))
+            .await
+            .unwrap_err();
+        assert_eq!(err.downcast_ref::<CliError>().unwrap().code, "usage_error");
+    }
+
+    /// `--current` refuses a summary whose first line names no outcome,
+    /// before it touches the worktree or the daemon.
+    #[tokio::test]
+    async fn current_refuses_a_summary_naming_no_outcome() {
+        let client = client_with_task(Some("t-1"));
+        let err = done(&client, done_args(true, Some("maybe: who knows")))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<CliError>().unwrap().code,
+            "summary_unknown_outcome"
+        );
+    }
+
+    /// A throwaway repo, isolated from the developer's own git config
+    /// (commit signing, hooks), as `src/herdr/transport.rs` sets one up for
+    /// the same reason.
+    fn git_test_repo(dir: &std::path::Path, args: &[&str]) {
+        let st = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(st.status.success(), "{args:?}: {st:?}");
+    }
+
+    fn checkout_at(path: &std::path::Path, branch: &str) -> Checkout {
+        Checkout {
+            branch: branch.into(),
+            path: path.to_str().unwrap().into(),
+            already_open: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn wrap_up_worktree_refuses_uncommitted_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        git_test_repo(dir.path(), &["init", "-q", "work"]);
+        git_test_repo(
+            dir.path(),
+            &["-C", "work", "commit", "-q", "--allow-empty", "-m", "one"],
+        );
+        std::fs::write(dir.path().join("work/dirty.txt"), "x").unwrap();
+        let checkout = checkout_at(&dir.path().join("work"), "main");
+        let err = wrap_up_worktree(&checkout).await.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<CliError>().unwrap().code,
+            "worktree_dirty"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrap_up_worktree_pushes_a_clean_unpushed_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        git_test_repo(dir.path(), &["init", "-q", "work"]);
+        git_test_repo(dir.path(), &["init", "-q", "--bare", "origin.git"]);
+        git_test_repo(
+            dir.path(),
+            &["-C", "work", "remote", "add", "origin", "../origin.git"],
+        );
+        git_test_repo(
+            dir.path(),
+            &["-C", "work", "commit", "-q", "--allow-empty", "-m", "one"],
+        );
+        let checkout = checkout_at(&dir.path().join("work"), "main");
+        wrap_up_worktree(&checkout).await.unwrap();
+        let out = std::process::Command::new("git")
+            .args(["-C", dir.path().join("origin.git").to_str().unwrap()])
+            .args(["rev-parse", "main"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        // A branch already pushed is a no-op, not a failure.
+        wrap_up_worktree(&checkout).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wrap_up_worktree_reports_a_push_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        git_test_repo(dir.path(), &["init", "-q", "work"]);
+        git_test_repo(
+            dir.path(),
+            &[
+                "-C",
+                "work",
+                "remote",
+                "add",
+                "origin",
+                "../no-such-origin.git",
+            ],
+        );
+        git_test_repo(
+            dir.path(),
+            &["-C", "work", "commit", "-q", "--allow-empty", "-m", "one"],
+        );
+        let checkout = checkout_at(&dir.path().join("work"), "main");
+        let err = wrap_up_worktree(&checkout).await.unwrap_err();
+        assert_eq!(err.downcast_ref::<CliError>().unwrap().code, "push_failed");
+    }
+
+    /// What `task sweep` prints: a line per worktree with what became of it,
+    /// the machines it could not ask, and a count that, in a dry run, says
+    /// nothing was removed and how to remove.
+    #[test]
+    fn sweep_text_says_what_became_of_each_worktree() {
+        use crate::machine::{SweepAction, SweepEntry};
+        let entry = |action, why: Option<&str>| SweepEntry {
+            machine: "pi-3".into(),
+            path: "/w/t-1".into(),
+            branch: "pastor/t-1".into(),
+            tasks: vec!["t-1".into(), "t-2".into()],
+            action,
+            why: why.map(str::to_string),
+        };
+        assert_eq!(
+            sweep_text(&[], &[], false),
+            "no worktrees kept for tasks that ended\n"
+        );
+        let entries = [
+            entry(SweepAction::WouldRemove, None),
+            entry(SweepAction::Kept, Some("commits on no remote")),
+        ];
+        let failed = [("pi-4".to_string(), "not connected".to_string())];
+        let dry = sweep_text(&entries, &failed, false);
+        assert!(
+            dry.contains("pi-3  /w/t-1  (t-1 t-2, pastor/t-1)  would remove\n"),
+            "{dry}"
+        );
+        assert!(dry.contains("kept: commits on no remote\n"), "{dry}");
+        assert!(dry.contains("pi-4: not swept: not connected\n"), "{dry}");
+        assert!(
+            dry.ends_with("1 would be removed, 1 kept; nothing was removed: run it again with --yes to remove them\n"),
+            "{dry}"
+        );
+        let done = sweep_text(&[entry(SweepAction::Removed, None)], &[], true);
+        assert!(done.ends_with("1 removed, 0 kept\n"), "{done}");
     }
 }

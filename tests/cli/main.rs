@@ -2,6 +2,7 @@
 
 mod agents_and_models;
 mod bridge;
+mod bundle;
 #[path = "../common/mod.rs"]
 mod common;
 mod completions_and_help;
@@ -11,6 +12,7 @@ mod describe;
 mod edit;
 mod flock;
 mod helpers;
+mod inbox;
 mod jobs_and_pull_machines;
 mod machine;
 mod orchestrators;
@@ -22,3 +24,4 @@ mod spec_skill;
 mod status;
 mod task;
 mod trust;
+mod workdir;

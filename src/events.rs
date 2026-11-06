@@ -153,6 +153,16 @@ impl EventRecord {
         self.task.as_ref().map(|t| t.id)
     }
 
+    /// Whether the record is about `machine`: a `machine.*` event of it, or
+    /// one whose task is placed there.
+    pub fn is_about(&self, machine: &str) -> bool {
+        self.machine.as_ref().is_some_and(|m| m.name == machine)
+            || self
+                .task
+                .as_ref()
+                .is_some_and(|t| t.machine.as_deref() == Some(machine))
+    }
+
     /// One human-readable line: time, type, and whatever the event is about.
     pub fn line(&self) -> String {
         let mut cols = vec![
@@ -434,6 +444,20 @@ impl EventsPage {
 /// returned. `gap` is decided on the whole log, whatever `task` is: it is set
 /// when the oldest numbered record left is past `after + 1`.
 pub fn since(path: &Path, after: u64, limit: u32, task: Option<i64>) -> anyhow::Result<EventsPage> {
+    since_about(path, after, limit, task, None)
+}
+
+/// `since`, and with `machine` only the records about it
+/// (`EventRecord::is_about`). The cut comes before `limit`, so a page never
+/// fills up with other machines' records while one about `machine` is still
+/// to come: a reader's cursor always moves on.
+pub fn since_about(
+    path: &Path,
+    after: u64,
+    limit: u32,
+    task: Option<i64>,
+    machine: Option<&str>,
+) -> anyhow::Result<EventsPage> {
     let all = read(path, None)?;
     let oldest = all.iter().map(|r| r.seq).filter(|&s| s > 0).min();
     let newest = all.iter().map(|r| r.seq).max().filter(|&s| s > 0);
@@ -441,6 +465,7 @@ pub fn since(path: &Path, after: u64, limit: u32, task: Option<i64>) -> anyhow::
     let events = all
         .into_iter()
         .filter(|r| r.seq > after && matches(r, task))
+        .filter(|r| machine.is_none_or(|m| r.is_about(m)))
         .take(limit as usize)
         .collect();
     Ok(EventsPage {
@@ -637,6 +662,7 @@ pub async fn cli(client: &crate::ipc::Client, args: EventsArgs) -> anyhow::Resul
                 after,
                 limit: REMOTE_PAGE,
                 task,
+                machine: None,
             };
             async move {
                 let resp = crate::ipc::request_head(client, &req)
@@ -713,6 +739,14 @@ mod tests {
                     cwd: None,
                     keep_pane: None,
                     keep_pane_from: None,
+                    remove_worktree: None,
+                    remove_worktree_from: None,
+                    load: None,
+                    load_from: None,
+                    fetch: Default::default(),
+                    start_prompt: None,
+                    workdir: None,
+                    workdir_bundles: Vec::new(),
                     rounds: Default::default(),
                 },
                 flock: "work".into(),
@@ -799,8 +833,11 @@ mod tests {
             tx,
             now_tx,
             status: Arc::new(RwLock::new(MachineStatus {
+                cordon: None,
+                reserved: 0,
                 now: Vec::new(),
                 description: None,
+                no_head_address: false,
                 name: name.into(),
                 host: name.into(),
                 endpoint: format!("ssh {name}"),
@@ -809,6 +846,7 @@ mod tests {
                 pastor_version: None,
                 pastor_read_at: None,
                 room: None,
+                reach: None,
                 protocol: Some(22),
                 error: Some("ssh: connection refused".into()),
                 live: 1,
@@ -823,6 +861,7 @@ mod tests {
                 live_by_flock: vec![],
                 shutting_down: false,
                 profile: None,
+                harness: vec![],
             })),
             task: None,
         }
@@ -1357,6 +1396,64 @@ mod tests {
             seq,
             ..record(kind, task)
         }
+    }
+
+    /// A record about `machine`: a `machine.*` event of it.
+    fn machine_record(seq: u64, machine: &str) -> EventRecord {
+        let status = serde_json::from_value(serde_json::json!({
+            "name": machine, "endpoint": "", "channel": "reconnecting", "herdr_version": null,
+            "protocol": null, "error": null, "live": 0, "max_agents": 2, "tags": [],
+            "flock": "home", "shutting_down": false,
+        }))
+        .unwrap();
+        EventRecord {
+            machine: Some(status),
+            ..numbered(seq, "machine.lost", None)
+        }
+    }
+
+    /// With a machine, `since_about` answers only the records about it: its
+    /// own `machine.*` events and those of tasks placed on it, never another
+    /// machine's or one about no machine.
+    #[test]
+    fn shepherd_events_filtered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let (_, mut mine) = store_with_task("j");
+        mine.machine = Some("pi-1".into());
+        let mut other = mine.clone();
+        other.id = mine.id + 1;
+        other.machine = Some("pi-2".into());
+        let w = LogWriter::new(path.clone(), DEFAULT_MAX_BYTES);
+        w.append(&numbered(1, "task.running", Some(&mine))).unwrap();
+        w.append(&numbered(2, "task.running", Some(&other)))
+            .unwrap();
+        w.append(&machine_record(3, "pi-1")).unwrap();
+        w.append(&machine_record(4, "pi-2")).unwrap();
+        w.append(&numbered(5, "job.failed", None)).unwrap();
+        let seqs = |p: &EventsPage| p.events.iter().map(|r| r.seq).collect::<Vec<_>>();
+        let page = since_about(&path, 0, 100, None, Some("pi-1")).unwrap();
+        assert_eq!(seqs(&page), [1, 3]);
+        let page = since_about(&path, 0, 100, None, None).unwrap();
+        assert_eq!(seqs(&page), [1, 2, 3, 4, 5], "no machine: every record");
+    }
+
+    /// The cut comes before the limit: a page's worth of other machines'
+    /// records still lets the next one about the machine through, so a
+    /// reader's cursor moves past them instead of reading an empty page
+    /// at the same place for ever.
+    #[test]
+    fn shepherd_events_cursor_advances_past_a_page_of_other_machines_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let w = LogWriter::new(path.clone(), DEFAULT_MAX_BYTES);
+        for seq in 1..=5 {
+            w.append(&machine_record(seq, "pi-2")).unwrap();
+        }
+        w.append(&machine_record(6, "pi-1")).unwrap();
+        let page = since_about(&path, 0, 2, None, Some("pi-1")).unwrap();
+        assert_eq!(page.events.iter().map(|r| r.seq).collect::<Vec<_>>(), [6]);
+        assert_eq!(page.newest, Some(6));
     }
 
     /// `since` returns what follows the cursor, oldest first, bounded by the

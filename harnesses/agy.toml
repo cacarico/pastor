@@ -1,0 +1,44 @@
+# agy. It has no login status of its own: listing its models needs a
+# signed-in account, and says so when there is none. The check exits 0 when
+# signed in, 1 when it is not and 2 on any other failure, such as no network.
+# It reads no secret and takes none. agy has no installer whose sum pastor
+# knows, so no install source is named.
+
+id = "agy"
+name = "agy"
+binary = "agy"
+bin_dirs = ["~/.local/bin", "~/.cargo/bin"]
+
+[version]
+args = ["--version"]
+
+[login]
+check = ["sh", "-c", """
+out=$(agy models 2>&1) && { echo "signed in"; exit 0; }
+if printf '%s\\n' "$out" | grep -qi "sign in"; then
+  printf '%s\\n' "$out" | grep -i "sign in" | head -n 1
+  exit 1
+fi
+printf '%s\\n' "$out" | grep -v "^Fetching" | head -n 1
+exit 2
+"""]
+# `pastor login` starts agy itself, which opens on a list of ways to sign
+# in; Enter picks the first, Google OAuth, and agy then shows its URL.
+start = ["agy"]
+pick = "Select login method:"
+keys = ["Enter"]
+
+# Bundle MCP servers go in one JSON file shared by every home, outside the
+# home. agy takes env values in it, not names, so a server that needs env by
+# name is left out.
+[mcp]
+method = "file"
+file = "~/.gemini/config/mcp_config.json"
+
+# One home, no env var to move it. Its permissions and trusted workspaces are
+# in settings.json; it has no skills or hooks dir and no instruction file.
+[paths]
+home = "~/.gemini/antigravity-cli"
+settings = "settings.json"
+# Its login; pastor never reads it, nor writes over it.
+secrets = ["antigravity-oauth-token"]

@@ -156,8 +156,17 @@ pub fn posix_command(command: &str) -> String {
     format!("sh -c {}", shell_quote(command))
 }
 
+/// What pastor's own commands on an ssh machine start with: the directory of
+/// mise's shims (`$MISE_DATA_DIR/shims`, else `~/.local/share/mise/shims`)
+/// first on the PATH when it is there. ssh runs the command in a shell that
+/// is neither a login nor an interactive one, so it reads none of the files
+/// that put the shims on the PATH, and a harness or herdr that mise provides
+/// is not found. The shell's files are left as they are.
+pub(crate) const MISE_SHIMS: &str = r#"s="${MISE_DATA_DIR:-$HOME/.local/share/mise}/shims"; [ -d "$s" ] && PATH="$s:$PATH"; export PATH; "#;
+
 /// ssh argv that runs `remote` (a POSIX shell command, run through
-/// `posix_command`) over the shared master when there is one.
+/// `posix_command`) over the shared master when there is one, with the mise
+/// shims on its PATH (`MISE_SHIMS`).
 fn ssh_argv_running(target: &str, control_path: Option<&Path>, remote: String) -> Vec<String> {
     let ssh = crate::ssh::Ssh {
         target,
@@ -165,9 +174,14 @@ fn ssh_argv_running(target: &str, control_path: Option<&Path>, remote: String) -
         control_persist: CONTROL_PERSIST,
         keepalive: true,
         no_tty: true,
+        identity: None,
+        extra_identity: None,
+        known_hosts: None,
+        accept_new: false,
+        config_file: None,
     };
     let mut argv = vec!["ssh".to_string()];
-    argv.extend(ssh.args(&remote));
+    argv.extend(ssh.args(&format!("{MISE_SHIMS}{remote}")));
     argv
 }
 
@@ -181,12 +195,12 @@ fn ensure_control_dir(control_path: Option<&Path>) -> Result<(), ConnectError> {
 
 /// The most a probe may write to stdout, and to stderr. Its answer is a
 /// path, a version or `yes`/`no`, plus whatever the rc files print.
-const PROBE_OUTPUT_LIMIT: usize = 64 * 1024;
+pub(crate) const PROBE_OUTPUT_LIMIT: usize = 64 * 1024;
 
 /// How long a probe may take, ssh handshake included. ssh's own keepalive
 /// gives up on a dead link after 45s; this also covers a machine whose shell
 /// answers the connection and then never exits.
-const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Run a probe to completion and collect its output, like `Command::output`
 /// but refusing more than `PROBE_OUTPUT_LIMIT` bytes on either stream and
@@ -201,10 +215,42 @@ async fn probe_output_within(
     argv: &[String],
     time: std::time::Duration,
 ) -> Result<std::process::Output, ConnectError> {
-    use tokio::io::AsyncReadExt;
+    probe_output_feeding(argv, &[], time).await
+}
+
+/// `probe_output_within` with `input` on the probe's stdin (none when empty),
+/// for a probe that takes a file, such as `tar -xf -` unpacking a
+/// provisioner. The input is written while the output is read, so a probe
+/// that answers before it has read everything cannot deadlock on a full pipe;
+/// one that stops reading early (it failed) only loses the rest.
+pub(crate) async fn probe_output_feeding(
+    argv: &[String],
+    input: &[u8],
+    time: std::time::Duration,
+) -> Result<std::process::Output, ConnectError> {
+    probe_output_limited(argv, input, time, PROBE_OUTPUT_LIMIT).await
+}
+
+/// The most a probe that reads a file may write: a harness's store grows by
+/// an entry for every folder it has been in, and is already past
+/// `PROBE_OUTPUT_LIMIT`.
+pub(crate) const FILE_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
+
+/// `probe_output_feeding` with its own limit on each output stream.
+pub(crate) async fn probe_output_limited(
+    argv: &[String],
+    input: &[u8],
+    time: std::time::Duration,
+    limit: usize,
+) -> Result<std::process::Output, ConnectError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut child = tokio::process::Command::new(&argv[0])
         .args(&argv[1..])
-        .stdin(Stdio::null())
+        .stdin(if input.is_empty() {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
@@ -215,11 +261,9 @@ async fn probe_output_within(
     let read = |pipe: Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>>| async move {
         let mut buf = Vec::new();
         if let Some(pipe) = pipe {
-            pipe.take(PROBE_OUTPUT_LIMIT as u64 + 1)
-                .read_to_end(&mut buf)
-                .await?;
+            pipe.take(limit as u64 + 1).read_to_end(&mut buf).await?;
         }
-        if buf.len() > PROBE_OUTPUT_LIMIT {
+        if buf.len() > limit {
             // An error, so `try_join!` stops waiting on the other stream,
             // which the probe may hold open for as long as it likes.
             return Err(ProbeError::TooLarge);
@@ -228,8 +272,17 @@ async fn probe_output_within(
     };
     let stdout = child.stdout.take().map(|p| Box::new(p) as _);
     let stderr = child.stderr.take().map(|p| Box::new(p) as _);
+    let stdin = child.stdin.take();
+    let write = async move {
+        if let Some(mut stdin) = stdin {
+            // A broken pipe is the probe's own failure, which its exit
+            // status reports; dropping stdin closes it, so `tar` sees the end.
+            let _ = stdin.write_all(input).await;
+        }
+        Ok::<_, ProbeError>(())
+    };
     let collected = tokio::time::timeout(time, async {
-        let (stdout, stderr) = tokio::try_join!(read(stdout), read(stderr))?;
+        let (stdout, stderr, ()) = tokio::try_join!(read(stdout), read(stderr), write)?;
         let status = child.wait().await?;
         Ok::<_, ProbeError>(std::process::Output {
             status,
@@ -241,10 +294,7 @@ async fn probe_output_within(
     let message = match collected {
         Ok(Ok(out)) => return Ok(out),
         Ok(Err(ProbeError::TooLarge)) => {
-            format!(
-                "{}: probe wrote more than {PROBE_OUTPUT_LIMIT} bytes",
-                argv[0]
-            )
+            format!("{}: probe wrote more than {limit} bytes", argv[0])
         }
         Ok(Err(ProbeError::Io(e))) => format!("{}: {e}", argv[0]),
         Err(_) => format!("{}: probe timed out after {time:?}", argv[0]),
@@ -281,26 +331,53 @@ struct Probed {
 /// Every probe of the machine goes through here, so a change to how one
 /// reaches a machine lands once.
 async fn probe(ep: &Endpoint, command: String) -> Result<Option<Probed>, ConnectError> {
-    let (target, argv) = match ep {
-        Endpoint::Local { .. } => (
-            "local".to_string(),
-            vec!["sh".to_string(), "-c".into(), command],
-        ),
+    probe_with(ep, command, &[], PROBE_OUTPUT_LIMIT).await
+}
+
+/// `probe` with `input` on the command's stdin and its own output limit: how
+/// a file's content goes to a machine and comes back, never on a command
+/// line.
+async fn probe_with(
+    ep: &Endpoint,
+    command: String,
+    input: &[u8],
+    limit: usize,
+) -> Result<Option<Probed>, ConnectError> {
+    let Some(argv) = shell_argv(ep, command)? else {
+        return Ok(None);
+    };
+    let target = match ep {
+        Endpoint::Ssh { target, .. } => target.clone(),
+        _ => "local".to_string(),
+    };
+    let out = probe_output_limited(&argv, input, PROBE_TIMEOUT, limit).await?;
+    Ok(Some(Probed { target, out }))
+}
+
+/// The argv that runs `command` (a POSIX shell command) on the machine
+/// behind `ep`: `sh -c` for a local machine, ssh (the shared master when
+/// there is one) for an ssh machine, `None` for a command machine. Any of
+/// them may be the first ssh to the machine, and so start the master.
+pub(crate) fn shell_argv(
+    ep: &Endpoint,
+    command: String,
+) -> Result<Option<Vec<String>>, ConnectError> {
+    match ep {
+        Endpoint::Local { .. } => Ok(Some(vec!["sh".to_string(), "-c".into(), command])),
         Endpoint::Ssh {
             target,
             control_path,
             ..
         } => {
-            // Any probe may be the first ssh to this machine, and so start
-            // the master.
             ensure_control_dir(control_path.as_deref())?;
-            let argv = ssh_argv_running(target, control_path.as_deref(), command);
-            (target.clone(), argv)
+            Ok(Some(ssh_argv_running(
+                target,
+                control_path.as_deref(),
+                command,
+            )))
         }
-        Endpoint::Command { .. } => return Ok(None),
-    };
-    let out = probe_output(&argv).await?;
-    Ok(Some(Probed { target, out }))
+        Endpoint::Command { .. } => Ok(None),
+    }
 }
 
 /// Was the machine reached? 255 is ssh's own failure code, and no code at all
@@ -351,6 +428,22 @@ pub type HomeFuture<'a> =
 pub type DirFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Option<bool>, ConnectError>> + Send + 'a>>;
 
+/// What `Connector::fetch_base` found: `None` for a machine that cannot be
+/// asked.
+pub type FetchFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<Fetched>, ConnectError>> + Send + 'a>>;
+
+/// The answer to fetching a repo's base ref before a worktree is made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fetched {
+    /// The remote (named) was fetched.
+    Done(String),
+    /// The repo has no remote to fetch from: nothing to do, nothing wrong.
+    NoRemote,
+    /// git could not fetch the remote (named); why.
+    Failed(String, String),
+}
+
 pub type VersionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Option<String>, ConnectError>> + Send + 'a>>;
 
@@ -374,12 +467,32 @@ pub type UsageFuture<'a> = Pin<
     Box<dyn Future<Output = Result<Option<crate::usage::TaskUsage>, ConnectError>> + Send + 'a>,
 >;
 
+pub type InboxFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<crate::inbox::Outcome>, ConnectError>> + Send + 'a>>;
+
 pub type RoomFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Option<crate::machine::Room>, ConnectError>> + Send + 'a>>;
 pub type MachineDenyKeysFuture<'a> = Pin<
     Box<
         dyn Future<Output = Result<crate::config::opencode::MachineDenyKeys, ConnectError>>
             + Send
+            + 'a,
+    >,
+>;
+
+pub type FindFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<Option<Vec<crate::reap::Candidate>>, ConnectError>> + Send + 'a>,
+>;
+
+pub type ReapFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<Option<Vec<crate::reap::Killed>>, ConnectError>> + Send + 'a>,
+>;
+
+pub type ConfigCheckFuture<'a> = Pin<
+    Box<
+        dyn Future<
+                Output = Result<Option<Vec<crate::config::opencode::ConfigCheckHit>>, ConnectError>,
+            > + Send
             + 'a,
     >,
 >;
@@ -429,6 +542,22 @@ pub trait Connector: Send + Sync {
     fn unpushed_commits(&self, _path: &str) -> DirFuture<'_> {
         Box::pin(async { Ok(None) })
     }
+    /// Whether the git checkout at `path` has uncommitted or untracked files
+    /// (`git status --porcelain`; ignored files, a build's `target/`
+    /// among them, do not count): what `git worktree remove` refuses on,
+    /// asked first so a listing can say so without removing anything.
+    /// `None` when it cannot be known.
+    fn checkout_dirty(&self, _path: &str) -> DirFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
+    /// Fetch the remote the repo's current branch tracks (else `origin`)
+    /// before a worktree is made off it, so the base is not days old.
+    /// Nothing is merged or moved: only the remote-tracking refs change.
+    /// `None` when it cannot be known (a machine that takes no shell
+    /// command).
+    fn fetch_base(&self, _repo: &str) -> FetchFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
     /// Put back a removed git worktree: `git worktree add <path> <branch>`
     /// in the checkout at `repo`, so `task attach` can resume a session
     /// Claude stored under that path. `Some(false)` when the branch is gone,
@@ -436,11 +565,32 @@ pub trait Connector: Send + Sync {
     fn restore_worktree(&self, _repo: &str, _path: &str, _branch: &str) -> DirFuture<'_> {
         Box::pin(async { Ok(None) })
     }
-    /// Whether the machine's managed opencode config, or on macOS its
-    /// managed preferences, sets permission rules: those are merged after
-    /// `OPENCODE_CONFIG_CONTENT`, so pastor cannot neutralise them
-    /// (`config::opencode`). `None` when it cannot be known.
-    fn opencode_permission_rules(&self) -> DirFuture<'_> {
+    /// Remove the git worktree at `path` with `git worktree remove`, never
+    /// `--force`, for a checkout whose herdr workspace is gone. Its branch
+    /// stays. `Some(true)` when it is gone (or was already), `Some(false)`
+    /// when git refused (uncommitted or untracked files, or it is not a
+    /// linked worktree), `None` when it cannot be known.
+    fn remove_checkout(&self, _path: &str) -> DirFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
+    /// List what runs under a pane's shell and, for a checkout going away,
+    /// in it (`reap`), without signalling anything. `None` when the machine
+    /// takes no shell command.
+    fn find_processes(&self, _spec: &crate::reap::Spec) -> FindFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
+    /// Signal those of `candidates` that still run, as the same processes
+    /// (`reap::end_command`). The ones that were running; `None` when the
+    /// machine takes no shell command.
+    fn end_processes(&self, _candidates: &[crate::reap::Candidate]) -> ReapFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
+    /// Every hit `config::opencode::CONFIG_CHECK_COMMAND` finds in the
+    /// machine's managed opencode config, or on macOS its managed
+    /// preferences: those are merged after `OPENCODE_CONFIG_CONTENT`, so
+    /// pastor cannot neutralise them (`config::opencode`). `Some(vec![])`
+    /// when it is clean; `None` when it cannot be known.
+    fn opencode_permission_rules(&self) -> ConfigCheckFuture<'_> {
         Box::pin(async { Ok(None) })
     }
     /// agy's global settings file on the machine
@@ -454,6 +604,24 @@ pub trait Connector: Send + Sync {
     /// (`provision::agy::write_command`). `None` when it cannot be done or
     /// known.
     fn write_agy_settings(&self, _expected: Option<&str>, _new: &str) -> AgyWriteFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
+    /// The file at `path` on the machine (`~/` is its home), as
+    /// `agy_settings` reads agy's: its content, and whether it is a symlink.
+    /// For the stores of the harnesses' trust (`trust_write`). `None` when it
+    /// cannot be known (a `command` machine).
+    fn home_file(&self, _path: &str) -> AgySettingsFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
+    /// `write_agy_settings` for the file at `path`; with `lock`, holding the
+    /// lock a program that saves it takes (`<path>.lock`, a directory).
+    fn write_home_file(
+        &self,
+        _path: &str,
+        _expected: Option<&str>,
+        _new: &str,
+        _lock: bool,
+    ) -> AgyWriteFuture<'_> {
         Box::pin(async { Ok(None) })
     }
     /// What agy's settings on the machine say, as `config::agy::RULES_COMMAND`
@@ -476,6 +644,13 @@ pub trait Connector: Send + Sync {
     fn pastor_version(&self) -> VersionFuture<'_> {
         Box::pin(async { Ok(None) })
     }
+    /// The version of the CLI `harness` describes installed on the machine,
+    /// for the pins a flock sets, read as its manifest says. `None` when it
+    /// is not there, the manifest has no version command, or it cannot be
+    /// known.
+    fn harness_version(&self, _harness: &crate::harness_manifest::Manifest) -> VersionFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
     /// What the machine has free: disk under `$HOME` and `/tmp` and memory
     /// (`machine::Room`), read before placing a task there. `None` when it
     /// cannot be known. The numbers only; the caller stamps `asked_at`.
@@ -487,6 +662,27 @@ pub trait Connector: Send + Sync {
     /// written, `~/.claude` when `None`) by `usage::usage_command`. `None`
     /// when there is no such session there or it cannot be known.
     fn claude_usage(&self, _config_dir: Option<&str>, _session: &str) -> UsageFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
+    /// Hand `text` to Claude session `session` on the machine through its
+    /// inbox socket (`inbox::send`), for an agent whose `CLAUDE_CONFIG_DIR`
+    /// is `config_dir` as written (`~/.claude` when `None`), launched in
+    /// permission class `mode`. `None` when the machine cannot send it that
+    /// way (a `command` machine, no pastor there that has `inbox send`, a
+    /// text too long for a remote command): the caller types it instead.
+    fn inbox_send(
+        &self,
+        _config_dir: Option<&str>,
+        _session: &str,
+        _mode: crate::inbox::Mode,
+        _text: &str,
+    ) -> InboxFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
+    /// Whether `command`, run in the machine's shell, exits 0: an agent's
+    /// login check (`Agents::login_check_command`). `None` when it cannot
+    /// be known.
+    fn command_succeeds(&self, _command: &str) -> DirFuture<'_> {
         Box::pin(async { Ok(None) })
     }
 }
@@ -520,19 +716,74 @@ impl Connector for Endpoint {
         let path = path.to_string();
         Box::pin(async move { unpushed_commits(self, &path).await })
     }
+    fn checkout_dirty(&self, path: &str) -> DirFuture<'_> {
+        let command = remote_dirty_command(path);
+        Box::pin(async move {
+            match probe(self, command).await? {
+                Some(p) => remote_dirty_answer(&p.target, &p.out),
+                None => Ok(None),
+            }
+        })
+    }
+    fn fetch_base(&self, repo: &str) -> FetchFuture<'_> {
+        let command = remote_fetch_command(repo);
+        Box::pin(async move {
+            Ok(match probe(self, command).await? {
+                Some(p) => Some(remote_fetch_answer(&p.target, &p.out)?),
+                None => None,
+            })
+        })
+    }
     fn restore_worktree(&self, repo: &str, path: &str, branch: &str) -> DirFuture<'_> {
         let command = remote_restore_command(repo, path, branch);
         Box::pin(async move { restore_worktree(self, command).await })
     }
-    fn opencode_permission_rules(&self) -> DirFuture<'_> {
+    fn remove_checkout(&self, path: &str) -> DirFuture<'_> {
+        let command = remote_remove_checkout_command(path);
+        Box::pin(async move { remove_checkout(self, command).await })
+    }
+    fn find_processes(&self, spec: &crate::reap::Spec) -> FindFuture<'_> {
+        let command = crate::reap::find_command(spec);
+        Box::pin(async move {
+            Ok(probe(self, command)
+                .await?
+                .map(|p| crate::reap::parse_candidates(&String::from_utf8_lossy(&p.out.stdout))))
+        })
+    }
+    fn end_processes(&self, candidates: &[crate::reap::Candidate]) -> ReapFuture<'_> {
+        let command = crate::reap::end_command(candidates, crate::reap::GRACE);
+        Box::pin(async move {
+            Ok(probe(self, command)
+                .await?
+                .map(|p| crate::reap::parse(&String::from_utf8_lossy(&p.out.stdout))))
+        })
+    }
+    fn opencode_permission_rules(&self) -> ConfigCheckFuture<'_> {
         Box::pin(opencode_permission_rules(self))
     }
     fn agy_settings(&self) -> AgySettingsFuture<'_> {
         Box::pin(agy_settings(self))
     }
+    fn home_file(&self, path: &str) -> AgySettingsFuture<'_> {
+        let command = crate::provision::agy::read_command_of(path);
+        Box::pin(async move { read_settings_file(self, command).await })
+    }
+    fn write_home_file(
+        &self,
+        path: &str,
+        expected: Option<&str>,
+        new: &str,
+        lock: bool,
+    ) -> AgyWriteFuture<'_> {
+        let command = crate::provision::agy::write_command_of(path, expected, new, lock);
+        let path = path.to_string();
+        Box::pin(async move { write_file(self, &path, command).await })
+    }
     fn write_agy_settings(&self, expected: Option<&str>, new: &str) -> AgyWriteFuture<'_> {
         let command = crate::provision::agy::write_command(expected, new);
-        Box::pin(async move { write_agy_settings(self, command).await })
+        Box::pin(
+            async move { write_file(self, crate::provision::agy::SETTINGS_FILE, command).await },
+        )
     }
     fn agy_rules(&self) -> VersionFuture<'_> {
         Box::pin(agy_rules(self))
@@ -543,6 +794,10 @@ impl Connector for Endpoint {
     fn pastor_version(&self) -> VersionFuture<'_> {
         Box::pin(pastor_version(self))
     }
+    fn harness_version(&self, harness: &crate::harness_manifest::Manifest) -> VersionFuture<'_> {
+        let harness = harness.clone();
+        Box::pin(async move { harness_version(self, &harness).await })
+    }
     fn room(&self) -> RoomFuture<'_> {
         Box::pin(room(self))
     }
@@ -550,6 +805,75 @@ impl Connector for Endpoint {
         let command = crate::usage::usage_command(config_dir, session);
         Box::pin(async move { claude_usage(self, command).await })
     }
+    fn inbox_send(
+        &self,
+        config_dir: Option<&str>,
+        session: &str,
+        mode: crate::inbox::Mode,
+        text: &str,
+    ) -> InboxFuture<'_> {
+        let (config_dir, session, text) = (
+            config_dir.map(str::to_string),
+            session.to_string(),
+            text.to_string(),
+        );
+        Box::pin(
+            async move { inbox_send(self, config_dir.as_deref(), &session, mode, &text).await },
+        )
+    }
+
+    fn command_succeeds(&self, command: &str) -> DirFuture<'_> {
+        let command = remote_succeeds_command(command);
+        Box::pin(async move {
+            match probe(self, command).await? {
+                // The same one-word answer as the repo check.
+                Some(p) => remote_dir_answer(&p.target, &p.out),
+                None => Ok(None),
+            }
+        })
+    }
+}
+
+/// A local machine sends in this process, as the head and the session share
+/// the machine; an ssh machine runs its own `pastor inbox send`.
+async fn inbox_send(
+    ep: &Endpoint,
+    config_dir: Option<&str>,
+    session: &str,
+    mode: crate::inbox::Mode,
+    text: &str,
+) -> Result<Option<crate::inbox::Outcome>, ConnectError> {
+    match ep {
+        Endpoint::Local { .. } => {
+            let Some(home) = dirs::home_dir() else {
+                return Ok(None);
+            };
+            let dir = crate::inbox::config_dir_at(config_dir, &home);
+            let out = crate::inbox::send(&dir, session, mode, text, crate::inbox::WAIT).await;
+            Ok(Some(out))
+        }
+        Endpoint::Command { .. } => Ok(None),
+        Endpoint::Ssh { target, .. } => {
+            let command = crate::inbox::send_command(config_dir, session, mode);
+            let Some(argv) = shell_argv(ep, command)? else {
+                return Ok(None);
+            };
+            let out = probe_output_feeding(&argv, text.as_bytes(), PROBE_TIMEOUT).await?;
+            reached(target, &out)?;
+            let result = crate::inbox::parse_result(&String::from_utf8_lossy(&out.stdout));
+            if result.is_none() {
+                tracing::warn!(%target, status = %out.status, stderr = %String::from_utf8_lossy(&out.stderr).trim(), "no answer from pastor inbox send; typing the prompt");
+            }
+            Ok(result)
+        }
+    }
+}
+
+/// `command` in the machine's shell, answered like `remote_dir_command`:
+/// `yes` when it exits 0, `no` otherwise. Its own output is dropped, so
+/// stdout holds only the answer (and rc noise).
+fn remote_succeeds_command(command: &str) -> String {
+    format!("if {{ {command}\n}} >/dev/null 2>&1; then printf yes; else printf no; fi")
 }
 
 async fn home_dir(ep: &Endpoint) -> Result<Option<String>, ConnectError> {
@@ -621,6 +945,96 @@ async fn restore_worktree(ep: &Endpoint, command: String) -> Result<Option<bool>
     }
 }
 
+async fn remove_checkout(ep: &Endpoint, command: String) -> Result<Option<bool>, ConnectError> {
+    match probe(ep, command).await? {
+        Some(p) => remote_remove_checkout_answer(&p.target, &p.out),
+        None => Ok(None),
+    }
+}
+
+/// Removes the worktree at `path` through its repository (found from the
+/// checkout itself, so a bare one works too), answering `removed`,
+/// `refused` when git will not, or `gone` when nothing is at `path`.
+fn remote_remove_checkout_command(path: &str) -> String {
+    let path = shell_quote(path);
+    format!(
+        "if [ ! -e {path} ]; then echo gone; \
+         else common=$(git -C {path} rev-parse --path-format=absolute --git-common-dir) && \
+         if git --git-dir=\"$common\" worktree remove {path} >&2; \
+         then echo removed; else echo refused; fi; fi"
+    )
+}
+
+/// Reads the answer to `remote_remove_checkout_command`, the last line, as
+/// `remote_restore_answer` does.
+fn remote_remove_checkout_answer(
+    target: &str,
+    out: &std::process::Output,
+) -> Result<Option<bool>, ConnectError> {
+    reached(target, out)?;
+    let raw = String::from_utf8_lossy(&out.stdout);
+    match raw.trim_end().lines().last().unwrap_or("").trim() {
+        "removed" | "gone" if out.status.success() => Ok(Some(true)),
+        "refused" if out.status.success() => Ok(Some(false)),
+        _ => {
+            tracing::warn!(%target, status = %out.status, stdout = ?raw, stderr = %String::from_utf8_lossy(&out.stderr).trim(), "git could not tell whether it removed the worktree");
+            Ok(None)
+        }
+    }
+}
+
+/// Fetches the remote `repo`'s current branch tracks, else `origin`, with
+/// git told never to ask a person for anything. Answers `fetched <remote>`,
+/// `none` when the repo has no remote, or `failed <remote>` after git's own
+/// words. Nothing is merged or checked out.
+fn remote_fetch_command(repo: &str) -> String {
+    let repo = shell_quote(repo);
+    format!(
+        "cd {repo} || exit 3; \
+         b=$(git symbolic-ref -q --short HEAD 2>/dev/null); \
+         r=; [ -n \"$b\" ] && r=$(git config --get \"branch.$b.remote\" 2>/dev/null); \
+         case \"$r\" in ''|.) r=; git remote 2>/dev/null | grep -qx origin && r=origin ;; esac; \
+         [ -n \"$r\" ] || {{ echo none; exit 0; }}; \
+         if out=$(GIT_TERMINAL_PROMPT=0 git fetch --quiet \"$r\" 2>&1); \
+         then echo \"fetched $r\"; \
+         else printf '%s\\n' \"$out\" | tail -n 3; echo \"failed $r\"; fi"
+    )
+}
+
+/// Reads the answer to `remote_fetch_command`: its last line, and for a
+/// failure the lines git said before it. Only ssh failing to reach the
+/// machine is an error.
+fn remote_fetch_answer(target: &str, out: &std::process::Output) -> Result<Fetched, ConnectError> {
+    reached(target, out)?;
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let mut lines: Vec<&str> = raw.trim_end().lines().collect();
+    let last = lines.pop().unwrap_or("").trim();
+    if out.status.success() {
+        if last == "none" {
+            return Ok(Fetched::NoRemote);
+        }
+        if let Some(remote) = last.strip_prefix("fetched ") {
+            return Ok(Fetched::Done(remote.to_string()));
+        }
+        if let Some(remote) = last.strip_prefix("failed ") {
+            let said: Vec<&str> = lines
+                .iter()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty())
+                .collect();
+            return Ok(Fetched::Failed(remote.to_string(), said.join(" / ")));
+        }
+    }
+    Ok(Fetched::Failed(
+        "its remote".into(),
+        format!(
+            "git gave no answer ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+    ))
+}
+
 /// Re-adds the worktree at `path` on `branch` in `repo`, answering `added`,
 /// or `no-branch` when the branch no longer exists. `git worktree prune`
 /// first drops what git still remembers of a checkout deleted by hand.
@@ -664,6 +1078,35 @@ fn remote_unpushed_command(path: &str) -> String {
     )
 }
 
+/// Whether the checkout at `path` has uncommitted or untracked files, as
+/// `git status --porcelain` lists them: `dirty`, `clean`, `gone` when
+/// nothing is at `path`, and nothing when git could not say.
+fn remote_dirty_command(path: &str) -> String {
+    let path = shell_quote(path);
+    format!(
+        "if [ ! -e {path} ]; then echo gone; \
+         elif out=$(git -C {path} status --porcelain 2>/dev/null); \
+         then if [ -n \"$out\" ]; then echo dirty; else echo clean; fi; fi"
+    )
+}
+
+/// Reads the answer to `remote_dirty_command`, its last line.
+fn remote_dirty_answer(
+    target: &str,
+    out: &std::process::Output,
+) -> Result<Option<bool>, ConnectError> {
+    reached(target, out)?;
+    let raw = String::from_utf8_lossy(&out.stdout);
+    match raw.trim_end().lines().last().unwrap_or("").trim() {
+        "dirty" if out.status.success() => Ok(Some(true)),
+        "clean" | "gone" if out.status.success() => Ok(Some(false)),
+        _ => {
+            tracing::warn!(%target, status = %out.status, stdout = ?raw, "git could not tell whether the checkout is dirty");
+            Ok(None)
+        }
+    }
+}
+
 /// Reads the answer to `remote_unpushed_command`. As with `remote_home`, only
 /// ssh failing to reach the machine is an error; git failing (no checkout
 /// there, no git on the PATH) is unknown. rc-file noise comes before the
@@ -684,13 +1127,31 @@ fn remote_unpushed_answer(
     }
 }
 
-async fn opencode_permission_rules(ep: &Endpoint) -> Result<Option<bool>, ConnectError> {
+async fn opencode_permission_rules(
+    ep: &Endpoint,
+) -> Result<Option<Vec<crate::config::opencode::ConfigCheckHit>>, ConnectError> {
     let command = crate::config::opencode::CONFIG_CHECK_COMMAND.to_string();
     match probe(ep, command).await? {
-        // The same one-word answer as the repo check.
-        Some(p) => remote_dir_answer(&p.target, &p.out),
+        Some(p) => config_check_answer(&p.target, &p.out),
         None => Ok(None),
     }
+}
+
+/// Reads the answer to `config::opencode::CONFIG_CHECK_COMMAND`: a line per
+/// hit, or none at all when the managed config and preferences are clean.
+/// The command always exits 0, hits or not, so only ssh failing to reach the
+/// machine is an error; a shell that still failed outright is unknown.
+fn config_check_answer(
+    target: &str,
+    out: &std::process::Output,
+) -> Result<Option<Vec<crate::config::opencode::ConfigCheckHit>>, ConnectError> {
+    reached(target, out)?;
+    if !out.status.success() {
+        tracing::warn!(%target, status = %out.status, stderr = %String::from_utf8_lossy(&out.stderr).trim(), "the opencode config check did not exit cleanly");
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    Ok(Some(crate::config::opencode::parse_config_check(&text)))
 }
 
 /// Reads agy's global settings through `probe`, on a local machine too.
@@ -699,7 +1160,16 @@ async fn opencode_permission_rules(ep: &Endpoint) -> Result<Option<bool>, Connec
 async fn agy_settings(
     ep: &Endpoint,
 ) -> Result<Option<crate::provision::agy::AgySettings>, ConnectError> {
-    let Some(p) = probe(ep, crate::provision::agy::read_command()).await? else {
+    read_settings_file(ep, crate::provision::agy::read_command()).await
+}
+
+/// Runs `command` (`provision::agy::read_command_of`) and reads the file it
+/// prints.
+async fn read_settings_file(
+    ep: &Endpoint,
+    command: String,
+) -> Result<Option<crate::provision::agy::AgySettings>, ConnectError> {
+    let Some(p) = probe_with(ep, command, &[], FILE_OUTPUT_LIMIT).await? else {
         return Ok(None);
     };
     reached(&p.target, &p.out)?;
@@ -707,23 +1177,32 @@ async fn agy_settings(
     match crate::provision::agy::parse_read(&raw) {
         Ok(read) if p.out.status.success() => Ok(Some(read)),
         Ok(_) | Err(_) => {
-            tracing::warn!(target = %p.target, status = %p.out.status, stderr = %String::from_utf8_lossy(&p.out.stderr).trim(), "could not read agy's settings");
+            tracing::warn!(target = %p.target, status = %p.out.status, stderr = %String::from_utf8_lossy(&p.out.stderr).trim(), "could not read the file");
             Ok(None)
         }
     }
 }
 
-async fn write_agy_settings(
+/// Runs a write command with its content on stdin, and reads its answer.
+async fn write_file(
     ep: &Endpoint,
-    command: String,
+    path: &str,
+    write: crate::provision::agy::WriteCommand,
 ) -> Result<Option<crate::provision::agy::AgyWrite>, ConnectError> {
-    let Some(p) = probe(ep, command).await? else {
+    let Some(p) = probe_with(
+        ep,
+        write.command,
+        write.input.as_bytes(),
+        PROBE_OUTPUT_LIMIT,
+    )
+    .await?
+    else {
         return Ok(None);
     };
     reached(&p.target, &p.out)?;
     let answer = crate::provision::agy::parse_write(&String::from_utf8_lossy(&p.out.stdout));
     if answer.is_none() || !p.out.status.success() {
-        tracing::warn!(target = %p.target, status = %p.out.status, stderr = %String::from_utf8_lossy(&p.out.stderr).trim(), "could not write agy's settings");
+        tracing::warn!(target = %p.target, %path, status = %p.out.status, stderr = %String::from_utf8_lossy(&p.out.stderr).trim(), "could not write the file");
         return Ok(None);
     }
     Ok(answer)
@@ -762,6 +1241,26 @@ async fn pastor_version(ep: &Endpoint) -> Result<Option<String>, ConnectError> {
     }
     match probe(ep, REMOTE_PASTOR_VERSION_COMMAND.to_string()).await? {
         Some(p) => remote_pastor_version(&p.target, &p.out),
+        None => Ok(None),
+    }
+}
+
+/// Runs the manifest's version command on the machine, a local one under
+/// `sh -c`, and reads the version it prints. A CLI that is not there is an
+/// answer (`None`), as with `pastor_version`; only failing to reach the
+/// machine is an error.
+async fn harness_version(
+    ep: &Endpoint,
+    harness: &crate::harness_manifest::Manifest,
+) -> Result<Option<String>, ConnectError> {
+    let Some(command) = harness.version_command() else {
+        return Ok(None);
+    };
+    match probe(ep, command).await? {
+        Some(p) => {
+            reached(&p.target, &p.out)?;
+            Ok(harness.parse_version(&String::from_utf8_lossy(&p.out.stdout)))
+        }
         None => Ok(None),
     }
 }
@@ -979,6 +1478,10 @@ mod tests {
 
     fn ssh_machine(name: &str) -> MachineConfig {
         MachineConfig {
+            reserved: 0,
+            provisioner: None,
+            bundles: Vec::new(),
+            bundle_apply: None,
             pull: false,
             description: None,
             name: name.into(),
@@ -990,6 +1493,7 @@ mod tests {
             job_slots: 1,
             burst: 1,
             tags: vec![],
+            loads: vec![],
             flock: None,
             agent: None,
             agent_args: None,
@@ -1001,6 +1505,8 @@ mod tests {
             min_disk: None,
             min_memory: None,
             unknown_room: None,
+            pins: Default::default(),
+            env: Default::default(),
         }
     }
 
@@ -1187,6 +1693,10 @@ mod tests {
     #[test]
     fn ssh_endpoint_multiplexes_through_one_master() {
         let m = MachineConfig {
+            reserved: 0,
+            provisioner: None,
+            bundles: Vec::new(),
+            bundle_apply: None,
             pull: false,
             description: None,
             name: "pi-3".into(),
@@ -1198,6 +1708,7 @@ mod tests {
             job_slots: 1,
             burst: 1,
             tags: vec![],
+            loads: vec![],
             flock: None,
             agent: None,
             agent_args: None,
@@ -1209,6 +1720,8 @@ mod tests {
             min_disk: None,
             min_memory: None,
             unknown_room: None,
+            pins: Default::default(),
+            env: Default::default(),
         };
         let paths = Paths::new("/tmp/c", "/tmp/s");
         let ep = Endpoint::from_machine(&m, &paths);
@@ -1242,7 +1755,9 @@ mod tests {
         // The remote command is the only element a shell ever parses.
         assert_eq!(
             argv.last().unwrap(),
-            "sh -c 'herdr --session default remote-api-bridge'"
+            &posix_command(&format!(
+                "{MISE_SHIMS}herdr --session default remote-api-bridge"
+            ))
         );
         assert_eq!(argv[argv.len() - 2], "fleet@pi-3");
         // `--` ends ssh's options, so the target is never read as one.
@@ -1259,7 +1774,10 @@ mod tests {
             Some(Path::new("/tmp/s/ssh/pi-3-%C")),
             REMOTE_HOME_COMMAND.to_string(),
         );
-        assert_eq!(argv.last().unwrap(), "sh -c 'printf %s \"$HOME\"'");
+        assert_eq!(
+            argv.last().unwrap(),
+            &posix_command(&format!("{MISE_SHIMS}printf %s \"$HOME\""))
+        );
         assert_eq!(argv[argv.len() - 2], "fleet@pi-3");
         assert!(
             argv.windows(2)
@@ -1348,9 +1866,7 @@ mod tests {
             REMOTE_PASTOR_VERSION_COMMAND.to_string(),
         );
         assert!(
-            argv.last()
-                .unwrap()
-                .starts_with("sh -c 'PATH=\"$HOME/.cargo/bin:"),
+            argv.last().unwrap().contains("PATH=\"$HOME/.cargo/bin:"),
             "{argv:?}"
         );
         assert!(
@@ -1437,7 +1953,7 @@ mod tests {
             ROOM_COMMAND.to_string(),
         );
         assert!(
-            argv.last().unwrap().starts_with("sh -c 'df -Pk \"$HOME\""),
+            argv.last().unwrap().contains("df -Pk \"$HOME\""),
             "{argv:?}"
         );
         let local = Endpoint::Local {
@@ -1524,6 +2040,86 @@ mod tests {
         assert!(remote_room("t", &killed).is_err());
     }
 
+    /// What pastor runs on an ssh machine sees the directory of mise's shims
+    /// first on its PATH when the machine has one (ssh's shell reads none of
+    /// the files that would put it there), and the PATH as it was when it
+    /// has not; `MISE_DATA_DIR` moves the directory. A local machine runs its
+    /// command as it is, and no shell file of the machine is touched.
+    #[test]
+    fn remote_commands_see_the_mise_shims_when_the_machine_has_them() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let run = |remote: &str, env: &[(&str, &std::path::Path)]| -> String {
+            let argv = ssh_argv_running("fleet@pi-3", None, remote.to_string());
+            let mut cmd = std::process::Command::new("sh");
+            cmd.args(["-c", argv.last().unwrap()])
+                .env_clear()
+                .env("HOME", home.path())
+                .env("PATH", "/usr/bin:/bin");
+            for (k, v) in env {
+                cmd.env(k, v);
+            }
+            let out = cmd.output().unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let shim = |dir: &std::path::Path| {
+            std::fs::create_dir_all(dir).unwrap();
+            let f = dir.join("claude");
+            std::fs::write(&f, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+            f
+        };
+        // No shims directory: the PATH is what ssh gave, and claude is not on it.
+        assert_eq!(run("echo \"$PATH\"", &[]), "/usr/bin:/bin");
+        assert_eq!(run("command -v claude", &[]), "");
+        // The default directory, first on the PATH.
+        let found = shim(&home.path().join(".local/share/mise/shims"));
+        let path = run("echo \"$PATH\"", &[]);
+        assert_eq!(
+            path,
+            format!("{}:/usr/bin:/bin", found.parent().unwrap().display())
+        );
+        assert_eq!(run("command -v claude", &[]), found.display().to_string());
+        // MISE_DATA_DIR moves it.
+        let elsewhere = home.path().join("data");
+        let moved = shim(&elsewhere.join("shims"));
+        assert_eq!(
+            run(
+                "command -v claude",
+                &[("MISE_DATA_DIR", elsewhere.as_path())]
+            ),
+            moved.display().to_string()
+        );
+        // Every way pastor reaches an ssh machine has them: the bridge and
+        // the probes; a local machine's command is its own.
+        let ep = Endpoint::from_machine(&ssh_machine("pi-3"), &Paths::new("/tmp/c", "/tmp/s"));
+        for argv in [
+            shell_argv(&ep, "true".into()).unwrap().unwrap(),
+            ssh_argv("fleet@pi-3", "default", None),
+        ] {
+            assert!(
+                argv.last().unwrap().contains(MISE_SHIMS.trim_end()),
+                "{argv:?}"
+            );
+        }
+        let local = Endpoint::Local {
+            session: "default".into(),
+        };
+        assert_eq!(
+            shell_argv(&local, "true".into()).unwrap().unwrap(),
+            ["sh", "-c", "true"]
+        );
+        // Nothing was written into the machine's home.
+        let files: Vec<_> = std::fs::read_dir(home.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            files.iter().all(|f| f == ".local" || f == "data"),
+            "{files:?}"
+        );
+    }
+
     /// ssh hands its command to the remote user's login shell, which may be
     /// fish or csh. Every remote command is wrapped as `sh -c '<command>'`,
     /// so that shell only parses one word and one single-quoted string, and
@@ -1537,7 +2133,8 @@ mod tests {
         let path = dir.to_str().unwrap();
         let argv = ssh_argv_running("fleet@pi-3", None, remote_dir_command(path));
         let remote = argv.last().unwrap();
-        assert!(remote.starts_with("sh -c 'if test -d "), "{remote}");
+        assert!(remote.starts_with("sh -c '"), "{remote}");
+        assert!(remote.contains("if test -d "), "{remote}");
         let out = std::process::Command::new("sh")
             .args(["-c", remote])
             .output()
@@ -1547,7 +2144,7 @@ mod tests {
             ssh_argv("fleet@pi-3", "default", None)
                 .last()
                 .unwrap()
-                .starts_with("sh -c 'herdr --session default remote-api-bridge'")
+                .contains("herdr --session default remote-api-bridge'")
         );
     }
 
@@ -1604,14 +2201,14 @@ mod tests {
         assert_eq!(command.ensure_dir("/").await.unwrap(), None);
     }
 
-    /// The command itself (every real source of "yes") is
+    /// The command itself (every real source of a hit) is
     /// `config::opencode`'s own to test; this only proves the wiring here
     /// runs it and passes its answer through. The command reads opencode's
     /// config under `$HOME` and `$XDG_CONFIG_HOME`, and the environment is
     /// the whole test binary's, which other tests read, so the local half
     /// runs in a child of this binary with its own empty `HOME` and managed
     /// dir: a real config on the host running the suite cannot turn the
-    /// first answer into a yes.
+    /// first answer into a hit.
     #[tokio::test]
     async fn opencode_permission_rules_per_endpoint() {
         const CHILD: &str = "PASTOR_TEST_OPENCODE_CHILD";
@@ -1624,14 +2221,17 @@ mod tests {
             };
             assert_eq!(
                 local.opencode_permission_rules().await.unwrap(),
-                Some(false)
+                Some(vec![])
             );
-            std::fs::write(
-                managed.join("opencode.json"),
-                r#"{"permission": {"bash": "allow"}}"#,
-            )
-            .unwrap();
-            assert_eq!(local.opencode_permission_rules().await.unwrap(), Some(true));
+            let file = managed.join("opencode.json");
+            std::fs::write(&file, r#"{"permission": {"bash": "allow"}}"#).unwrap();
+            assert_eq!(
+                local.opencode_permission_rules().await.unwrap(),
+                Some(vec![crate::config::opencode::ConfigCheckHit::Key {
+                    file: file.display().to_string(),
+                    key: "permission".into(),
+                }])
+            );
             return;
         }
         let home = tempfile::tempdir().unwrap();
@@ -1974,6 +2574,107 @@ mod tests {
         );
     }
 
+    /// Against a real git and a local bare remote: the remote the current
+    /// branch tracks is fetched (its tracking refs move, nothing is merged
+    /// or checked out), else `origin`; a repo with no remote has nothing to
+    /// fetch; a remote that cannot be reached, or no repo at all, is a
+    /// failure that says so.
+    #[tokio::test]
+    async fn a_local_repo_fetches_the_remote_its_branch_tracks() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |cwd: &std::path::Path, args: &[&str]| -> String {
+            let st = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "init.defaultBranch=main",
+                    "-c",
+                    "protocol.file.allow=always",
+                ])
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(st.status.success(), "{args:?}: {st:?}");
+            String::from_utf8_lossy(&st.stdout).trim().to_string()
+        };
+        let d = dir.path();
+        git(d, &["init", "-q", "--bare", "up.git"]);
+        git(d, &["init", "-q", "work dir"]);
+        let work = d.join("work dir");
+        git(&work, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        git(&work, &["remote", "add", "up", "../up.git"]);
+        git(&work, &["push", "-q", "-u", "up", "HEAD:main"]);
+        // Another clone pushes a commit this one has not seen.
+        git(d, &["clone", "-q", "up.git", "other"]);
+        git(
+            &d.join("other"),
+            &["commit", "-q", "--allow-empty", "-m", "two"],
+        );
+        git(&d.join("other"), &["push", "-q", "origin", "HEAD:main"]);
+        let ahead = git(&d.join("other"), &["rev-parse", "HEAD"]);
+        let mine = git(&work, &["rev-parse", "HEAD"]);
+        assert_ne!(ahead, mine);
+
+        let ep = Endpoint::Local {
+            session: "s".into(),
+        };
+        // A path with a space reaches the shell quoted. The branch tracks
+        // `up`, not `origin`, which this repo has not got.
+        let got = ep.fetch_base(work.to_str().unwrap()).await.unwrap();
+        assert_eq!(got, Some(Fetched::Done("up".into())));
+        assert_eq!(git(&work, &["rev-parse", "up/main"]), ahead);
+        assert_eq!(git(&work, &["rev-parse", "HEAD"]), mine, "nothing merged");
+
+        // No upstream for the branch: `origin` when there is one.
+        git(&work, &["branch", "--unset-upstream"]);
+        git(&work, &["remote", "add", "origin", "../up.git"]);
+        let got = ep.fetch_base(work.to_str().unwrap()).await.unwrap();
+        assert_eq!(got, Some(Fetched::Done("origin".into())));
+        assert_eq!(git(&work, &["rev-parse", "origin/main"]), ahead);
+
+        // No remote at all: nothing to fetch, and nothing wrong.
+        git(d, &["init", "-q", "alone"]);
+        let alone = d.join("alone");
+        assert_eq!(
+            ep.fetch_base(alone.to_str().unwrap()).await.unwrap(),
+            Some(Fetched::NoRemote)
+        );
+
+        // A remote that is gone: the failure says which and why.
+        std::fs::remove_dir_all(d.join("up.git")).unwrap();
+        let Some(Fetched::Failed(remote, why)) =
+            ep.fetch_base(work.to_str().unwrap()).await.unwrap()
+        else {
+            panic!("a gone remote must fail");
+        };
+        assert_eq!(remote, "origin");
+        assert!(!why.is_empty(), "git's own words");
+
+        // Not a repo: the answer is a failure, never a panic or a hang.
+        let missing = d.join("nothing here");
+        assert!(matches!(
+            ep.fetch_base(missing.to_str().unwrap()).await.unwrap(),
+            Some(Fetched::Failed(..))
+        ));
+    }
+
+    /// Everything that reaches the remote shell is quoted.
+    #[test]
+    fn remote_fetch_command_quotes_the_repo() {
+        let c = remote_fetch_command("/r/my repo;rm");
+        assert!(c.starts_with("cd '/r/my repo;rm' || exit 3"), "{c}");
+        assert!(
+            c.contains("GIT_TERMINAL_PROMPT=0"),
+            "git never asks a person"
+        );
+    }
+
     /// Against a real git: an existing branch gets its worktree back, a
     /// gone branch is reported rather than failing.
     #[tokio::test]
@@ -2021,6 +2722,189 @@ mod tests {
             Some(false)
         );
         assert!(!wt2.exists());
+    }
+
+    #[test]
+    fn remote_remove_checkout_answer_reads_the_outcome() {
+        use std::os::unix::process::ExitStatusExt;
+        let out = |code: i32, stdout: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: b"boom".to_vec(),
+        };
+        let answer = |code, stdout| remote_remove_checkout_answer("t", &out(code, stdout));
+        assert_eq!(answer(0, "welcome\nremoved\n").unwrap(), Some(true));
+        assert_eq!(answer(0, "gone\n").unwrap(), Some(true));
+        assert_eq!(answer(0, "refused\n").unwrap(), Some(false));
+        assert_eq!(answer(128, "").unwrap(), None);
+        assert_eq!(answer(1, "removed\n").unwrap(), None);
+        assert!(answer(255, "").is_err());
+        let c = remote_remove_checkout_command("/w/t 1;rm");
+        assert!(c.contains("worktree remove '/w/t 1;rm' >&2"), "{c}");
+        assert!(!c.contains("--force"), "{c}");
+    }
+
+    /// Against a real git: a clean checkout goes and its branch stays, one
+    /// with only ignored files (a build's `target/`) goes too, one with an
+    /// untracked file is refused, and a path with nothing there is gone.
+    #[tokio::test]
+    async fn a_local_checkout_is_removed_unless_it_is_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(st.status.success(), "{args:?}: {st:?}");
+            String::from_utf8_lossy(&st.stdout).into_owned()
+        };
+        git(&["init", "-q", "work"]);
+        std::fs::write(dir.path().join("work/.gitignore"), "target/\n").unwrap();
+        git(&["-C", "work", "add", ".gitignore"]);
+        git(&["-C", "work", "commit", "-q", "-m", "one"]);
+        let ep = Endpoint::Local {
+            session: "s".into(),
+        };
+        for (name, extra) in [("clean", None), ("built", Some("target/x"))] {
+            let wt = dir.path().join(name);
+            git(&[
+                "-C",
+                "work",
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                name,
+                wt.to_str().unwrap(),
+            ]);
+            if let Some(file) = extra {
+                std::fs::create_dir_all(wt.join(file).parent().unwrap()).unwrap();
+                std::fs::write(wt.join(file), "x").unwrap();
+            }
+            assert_eq!(
+                ep.remove_checkout(wt.to_str().unwrap()).await.unwrap(),
+                Some(true),
+                "{name}"
+            );
+            assert!(!wt.exists(), "{name}");
+        }
+        let branches = git(&["-C", "work", "branch", "--list"]);
+        assert!(
+            branches.contains("clean") && branches.contains("built"),
+            "{branches}"
+        );
+        let wt = dir.path().join("dirty");
+        git(&[
+            "-C",
+            "work",
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "dirty",
+            wt.to_str().unwrap(),
+        ]);
+        std::fs::write(wt.join("notes.txt"), "x").unwrap();
+        assert_eq!(
+            ep.remove_checkout(wt.to_str().unwrap()).await.unwrap(),
+            Some(false)
+        );
+        assert!(wt.join("notes.txt").exists());
+        let gone = dir.path().join("never");
+        assert_eq!(
+            ep.remove_checkout(gone.to_str().unwrap()).await.unwrap(),
+            Some(true)
+        );
+    }
+
+    /// `checkout_dirty` against a real git: a clean checkout and one with
+    /// only ignored files (a build's `target/`) are clean, an untracked file
+    /// or a changed tracked file is dirty, a path with nothing there is not,
+    /// and a directory that is no checkout cannot be told.
+    #[tokio::test]
+    async fn a_local_checkout_is_dirty_for_untracked_and_changed_files_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(st.status.success(), "{args:?}: {st:?}");
+        };
+        git(&["init", "-q", "work"]);
+        std::fs::write(dir.path().join("work/.gitignore"), "target/\n").unwrap();
+        std::fs::write(dir.path().join("work/a.txt"), "a").unwrap();
+        git(&["-C", "work", "add", "."]);
+        git(&["-C", "work", "commit", "-q", "-m", "one"]);
+        let ep = Endpoint::Local {
+            session: "s".into(),
+        };
+        let wt = dir.path().join("wt");
+        git(&[
+            "-C",
+            "work",
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "wt",
+            wt.to_str().unwrap(),
+        ]);
+        let path = wt.to_str().unwrap();
+        assert_eq!(ep.checkout_dirty(path).await.unwrap(), Some(false));
+        std::fs::create_dir_all(wt.join("target")).unwrap();
+        std::fs::write(wt.join("target/x"), "built").unwrap();
+        assert_eq!(
+            ep.checkout_dirty(path).await.unwrap(),
+            Some(false),
+            "ignored"
+        );
+        std::fs::write(wt.join("a.txt"), "changed").unwrap();
+        assert_eq!(
+            ep.checkout_dirty(path).await.unwrap(),
+            Some(true),
+            "changed"
+        );
+        std::fs::write(wt.join("a.txt"), "a").unwrap();
+        std::fs::write(wt.join("notes.txt"), "x").unwrap();
+        assert_eq!(
+            ep.checkout_dirty(path).await.unwrap(),
+            Some(true),
+            "untracked"
+        );
+        let nowhere = dir.path().join("never");
+        assert_eq!(
+            ep.checkout_dirty(nowhere.to_str().unwrap()).await.unwrap(),
+            Some(false)
+        );
+        let plain = dir.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        assert_eq!(
+            ep.checkout_dirty(plain.to_str().unwrap()).await.unwrap(),
+            None
+        );
     }
 
     /// Only ssh itself failing (255, or killed) means the machine was not
@@ -2086,6 +2970,22 @@ mod tests {
             .unwrap_err();
         assert!(err.message.contains("timed out"), "{}", err.message);
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// A probe fed a file gets all of it, more than a pipe holds, and one
+    /// that exits without reading it is not waited on.
+    #[tokio::test]
+    async fn a_fed_probe_reads_its_input() {
+        let argv = |script: &str| vec!["sh".to_string(), "-c".into(), script.into()];
+        let input = vec![b'x'; 1024 * 1024];
+        let out = probe_output_feeding(&argv("wc -c"), &input, PROBE_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1048576");
+        let out = probe_output_feeding(&argv("exit 4"), &input, PROBE_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(out.status.code(), Some(4));
     }
 
     /// Every probe goes through `probe`: the command under `sh -c` here,
@@ -2186,6 +3086,10 @@ mod tests {
         // directory and the name, so a deep state dir runs out.
         let deep = format!("/tmp/{}", "d".repeat(80));
         let m = MachineConfig {
+            reserved: 0,
+            provisioner: None,
+            bundles: Vec::new(),
+            bundle_apply: None,
             pull: false,
             description: None,
             name: "pi-3".into(),
@@ -2197,6 +3101,7 @@ mod tests {
             job_slots: 1,
             burst: 1,
             tags: vec![],
+            loads: vec![],
             flock: None,
             agent: None,
             agent_args: None,
@@ -2208,6 +3113,8 @@ mod tests {
             min_disk: None,
             min_memory: None,
             unknown_room: None,
+            pins: Default::default(),
+            env: Default::default(),
         };
         let paths = Paths::new("/tmp/c", &deep);
         let Endpoint::Ssh {
@@ -2232,7 +3139,9 @@ mod tests {
         );
         assert_eq!(
             argv.last().unwrap(),
-            "sh -c 'herdr --session default remote-api-bridge'"
+            &posix_command(&format!(
+                "{MISE_SHIMS}herdr --session default remote-api-bridge"
+            ))
         );
     }
 

@@ -42,6 +42,42 @@ pastor machine list
   head: `pastor setup systemd --herdr --yes` on each machine, then
   `pastor setup systemd --yes` on the head (`setup launchd` on macOS).
 
+## Make a machine ready, and keep it so
+
+pastor can set a machine up and tell you when it drifts, so you don't repeat
+the steps by hand on every Pi. It never installs an OS package or calls
+`sudo`; what only the machine's owner can do (lingering for the user, a
+missing `git` or `curl`) it reports with the fix, and stops. The
+[manual](manual.md#bootstrapping-a-machine) lists what the owner provides first.
+
+- **Set it up from the head.** With `head_address` set in pastor.toml and the
+  head running, `pastor machine add pi-1 user@pi-1 --bootstrap` pins the
+  machine's host key, copies pastor and herdr over and runs `pastor bootstrap`
+  there as its own user. `pastor machine bootstrap pi-1` finishes a setup that
+  stopped, and running it again is the upgrade.
+- **A machine the head can't reach.** A laptop behind NAT joins with a token:
+  `pastor join create --flock personal` on the head, then `pastor join` on the
+  laptop. It becomes a pull machine that asks the head for work, and the head
+  holds it back until its setup reports `ok`.
+- **Pin the harness versions** so every machine of a flock runs the same agent
+  CLI, and bring them there with `pastor machine install`:
+
+  ```toml
+  # fragment of flock.toml
+  [[flock]]
+  name = "personal"
+  pins = { claude = "2.1.310", agy = "1.4" }
+  ```
+
+  `pastor machine list` shows where a machine differs, and `pastor machine
+  check pi-1` runs its provisioner's checks and says what it lacks for the
+  agents that can land on it. Neither changes anything; a task still goes to a
+  machine whose CLI has drifted.
+- **Sign agents in once.** `pastor login pi-1 claude` opens the login in a pane
+  on the machine and shows the URL and code. When an agent runs out of usage,
+  `pastor limit list` shows the account, and no new task starts on it until it
+  resets.
+
 ## Least privilege for agent machines
 
 An agent runs as its machine's user, with every credential that user holds.
@@ -114,9 +150,9 @@ points at its own login, and make it the machine's agent:
 
 ```toml
 # pastor.toml
-[agents.claude-personal]
+[agents.claude-alt]
 kind = "claude"
-env = { CLAUDE_CONFIG_DIR = "~/.claude-personal" }
+env = { CLAUDE_CONFIG_DIR = "~/.claude-alt" }
 ```
 
 ```toml
@@ -124,7 +160,7 @@ env = { CLAUDE_CONFIG_DIR = "~/.claude-personal" }
 [[machine]]
 name = "desk"
 local = true
-agent = "claude-personal"
+agent = "claude-alt"
 ```
 
 Never put tokens in `pastor.toml`: every agent's pane can read it.
@@ -156,14 +192,36 @@ system asks before a command, the task sits `blocked` until someone answers.
   with `"bash": {"*": "ask"}` stops every task at its first shell command.
   On a machine that runs opencode tasks, allow what those tasks run, or give
   review tasks everything they need in the prompt so they don't need a shell.
-- Keep `agents_change_fleet` off (the default), so an agent can't start
-  tasks or change the fleet.
 - Don't pass a "skip all permissions" flag through `agent_args` except on a
   machine you would wipe without a second thought.
 - Accept a repository's folder-trust prompt once per machine with
   `pastor task send t-3 --trust`; later tasks there go through on their own.
   Or save it ahead of time, with no blocked task:
   `pastor trust add pi-1 '~/work/api'`.
+
+## The same files on every machine
+
+Skills, hook scripts and instructions you want every agent to have belong in a
+[bundle](manual.md#bundles) kept on the head, not copied by hand:
+
+```bash
+pastor bundle add ./team-rules      # validated, checked for secrets, kept by version
+pastor bundle apply pi-1            # places it in the homes of pi-1's agents
+```
+
+Name it in the flock (`bundles = ["team-rules"]`). With `bundle_apply =
+"auto"` the head keeps the homes of its ssh and local machines in line by
+itself, and applies a stale machine before a task starts on it; with the
+default `manual`, the `bundles` row of `pastor machine check pi-1` says `stale`
+and you run `bundle apply`. Keep tokens out of bundles: `bundle add` refuses them.
+
+What belongs in one repository's working folder, rather than in every home, is
+a workdir bundle (`target = "workdir"`), named in `workdir_bundles` on a flock
+or a job. The head places it in the folder of each task before its agent
+starts. `pastor workdir check pi-1 /home/pi/work/api` says later whether the
+files are still as pastor placed them (`ok`, `drift`, `conflict`, ...), and
+`pastor workdir list` shows every folder the head placed a set in. The
+[manual](manual.md#workdir-bundles) has the rules.
 
 ## Fresh code for every task
 
