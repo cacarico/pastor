@@ -1,7 +1,8 @@
 # pastor
 
 **An agent orchestrator for a flock of machines.** Queue tasks, schedule
-jobs, and let pastor spread coding agents across your flock over ssh.
+jobs, spread coding agents across your flock over ssh, and keep the machines
+ready for them.
 
 [![CI](https://github.com/cacarico/pastor/actions/workflows/ci.yml/badge.svg)](https://github.com/cacarico/pastor/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/cacarico/pastor)](https://github.com/cacarico/pastor/releases)
@@ -14,6 +15,11 @@ such as new GitHub issues or cards on a board. pastor picks a free machine,
 opens a terminal there, starts the agent (Claude Code, opencode, ...), sends
 the prompt and keeps track of it. When I come back, I read what it did, answer
 it if it asked something, or sit in its terminal and carry on.
+
+pastor also looks after the machines the agents run on: it can set a machine
+up, install the agent CLIs at the versions you pin, put your team's skills and
+instructions in the agents' homes, and place the files an agent starts with in
+its working folder, then check later that they are still as it left them.
 
 There are bigger and more general projects in this space. pastor is not trying
 to be one of them. It is a small tool I am building to improve how I use AI in
@@ -56,13 +62,19 @@ someone else's cloud. The longer story is in [the blog post](https://cacari.co/p
 - **The head** is the machine whose `pastor serve` holds the queue, the
   schedule and the history.
 - **Machines** take the tasks. The head can be one of them. Others are
-  reached over ssh, and each runs herdr.
+  reached over ssh, and each runs herdr. A machine the head cannot reach (a
+  laptop behind NAT) is a **pull machine**: it runs its own `pastor serve`,
+  joins with a one-time token and asks the head for work.
 - **A task** is one agent, one prompt, in a repo or, with `--worktree`, in a
   fresh git worktree of it, so two agents never edit the same checkout.
 - **A job** is a schedule plus a **connector** that finds work, and a prompt
   template that turns each piece of work into a task.
 - **A flock** is a named group of machines, for example `work` and
   `personal`, so work and personal agents never mix accounts.
+- **A bundle** is a directory of what your team wants in its agents' homes on
+  every machine of a flock: skills, hooks, instructions, settings, MCP
+  servers. A **workdir set** is the same kind of thing for one working
+  folder, placed before an agent starts there.
 
 ## Install
 
@@ -83,10 +95,14 @@ cargo install pastor-cli --locked  # build from source: Rust 1.88+ and a C compi
 
 You also need:
 
-- [herdr](https://herdr.dev) 0.9 or newer on every machine, with its server running;
+- [herdr](https://herdr.dev) 0.9 or newer on every machine, with its server running
+  (`pastor machine add NAME user@host --bootstrap` fetches and starts it on
+  a new machine);
 - ssh from the head to the other machines, without a passphrase prompt;
 - git on the head, for `pastor connector install`;
-- the agents themselves (`claude`, `opencode`, ...), installed as usual on each machine.
+- the agents themselves (`claude`, `opencode`, ...) on each machine. Install them as
+  usual, or pin the versions of `claude` and `agy` in `flock.toml` and let
+  `pastor machine install` bring each machine to them.
 
 Each connector says what else it needs: `github-issues`, for example, uses an
 authenticated `gh`, `jq` and `sh` on the head.
@@ -104,6 +120,11 @@ pastor machine add here --local        # this machine
 pastor machine add pi-1 user@pi-1      # a machine you can ssh to
 pastor serve                           # start the head in the background
 ```
+
+For a machine you reach over ssh, `pastor machine add pi-1 user@pi-1
+--bootstrap` also sets it up from the head (with the head running and `head_address` set in pastor.toml): it pins the host key, copies pastor
+and herdr over and runs `pastor bootstrap` there, as the machine's own user,
+with no root and no `sudo` (see [Keeping machines ready](#keeping-machines-ready)).
 
 `pastor serve status` shows it and `pastor serve stop` stops it; its log is
 `~/.local/state/pastor/serve.log`. To keep it up after a reboot, run it as a
@@ -219,6 +240,12 @@ notification. Writing one takes a manifest and a script in any language. See
 | run orchestrators | `pastor orchestrator list`, `pastor orchestrator describe NAME`, `pastor orchestrator run NAME`, `pastor orchestrator start NAME`, `pastor orchestrator stop NAME` (files in `~/.config/pastor/orchestrators/`, see [the manual](docs/manual.md#orchestrators)) |
 | manage flocks | `pastor flock list`, `pastor flock describe NAME`, `pastor flock edit` |
 | change settings | `pastor config edit` |
+| see why a task waits | `pastor queue` |
+| set a machine up, check it, bring it to its pins | `pastor machine add NAME user@host --bootstrap`, `pastor machine check NAME`, `pastor machine install NAME` |
+| sign an agent in | `pastor login MACHINE AGENT`, `pastor agent signed-in --machine MACHINE AGENT` |
+| keep agents' homes in line | `pastor bundle add DIR`, `pastor bundle apply MACHINE` |
+| place files in a working folder | `pastor workdir place MACHINE DIR --set FILE`, `pastor workdir check MACHINE DIR` |
+| see a permission profile | `pastor profile list`, `pastor profile render --kind claude NAME` |
 | use connectors | `pastor connector list`, `pastor connector describe ID`, `pastor connector install OWNER/REPO/DIR` |
 
 Every list and describe takes `--json`. `make install` also installs fish
@@ -243,7 +270,7 @@ machines = { pi-1 = 2 }
 [[machine]]
 name = "laptop"
 local = true
-agent = "claude-personal"   # this machine's plain `claude` is a work login
+agent = "claude-alt"   # this machine's plain `claude` is a work login
 
 [[machine]]
 name = "pi-1"
@@ -252,20 +279,99 @@ ssh = "pi-1"
 
 ```toml
 # ~/.config/pastor/pastor.toml
-[agents.claude-personal]
+[agents.claude-alt]
 kind = "claude"
-env = { CLAUDE_CONFIG_DIR = "~/.claude-personal" }
+env = { CLAUDE_CONFIG_DIR = "~/.claude-alt" }
 ```
 
 A task only ever runs on a machine in its own flock, with the agent that
 machine names.
+
+## Keeping machines ready
+
+pastor makes a machine ready for the agents that land on it and tells you when
+it drifts. It never installs an OS package or calls `sudo`: what only the
+machine's owner can do, it reports, and stops.
+
+- **Set up.** `pastor machine add NAME user@host --bootstrap` (or `pastor
+  machine bootstrap NAME`) sets an ssh machine up from the head; `pastor join`
+  does it from the new machine, with a token from `pastor join create`, and
+  makes it a pull machine. Both end in a report the head keeps.
+- **Checked.** `pastor machine check NAME` runs the machine's provisioner's
+  checks and says what it lacks for the agents that can land on it; it changes
+  nothing. Built-in provisioners cover arch, debian, macos and raspberry-pi-os.
+- **Harness versions.** A flock names the version of each harness it expects,
+  and `pastor machine list` shows where a machine differs:
+
+  ```toml
+  # fragment of flock.toml
+  [[flock]]
+  name = "work"
+  machines = { pi-1 = 2 }
+  pins = { claude = "2.1.310", agy = "1.4" }
+  ```
+
+  `pastor machine install pi-1` brings it to the pins. Nothing installs on
+  its own.
+- **Logins, trust and limits.** `pastor login pi-1 claude` opens an agent's
+  login in a pane there and shows the URL and code; `pastor agent signed-in`
+  checks one (`--machine pi-1 claude`); `pastor trust add pi-1 /home/pi/work/api` saves a repo for folder-trust
+  prompts to be answered; `pastor limit list` shows the accounts that ran out
+  of usage, which no new task starts on until they reset.
+- **Agent homes.** A bundle is kept on the head with `pastor bundle add DIR`
+  and named in `flock.toml` (`bundles = ["team-rules"]`); `pastor bundle apply
+  pi-1` places its skills, hooks and instructions in the homes of that
+  machine's agents and merges its settings, and takes out what it no longer
+  gets. `pastor bundle adopt` takes over a home that already has files. With
+  `bundle_apply = "auto"` the head keeps the homes of its ssh and local
+  machines in line by itself.
+- **Permission profiles.** A profile is a named allow and deny list.
+  `pastor profile render --kind claude NAME` shows what it becomes for a
+  harness (`claude` or `agy`): its flags, env and settings, and what that
+  harness cannot carry.
+- **Updating pastor.** `pastor fleet update VERSION` puts a version from the
+  head's artifact cache on every machine it reaches, the head last.
+
+[The manual](docs/manual.md#bootstrapping-a-machine) has each part in full.
+
+## Files for an agent's working folder
+
+A workdir set is what one agent starts with in its folder: skills, hook
+scripts, agent files, settings and instructions, in a JSON or TOML document
+that names its harness (`claude` or `agy`). pastor places it, writes a ledger
+of what it put there, keeps those files out of git, and later takes out what a
+newer, smaller set no longer has, or everything it placed.
+
+```sh
+pastor workdir place pi-1 /home/pi/work/api --set agent-set.json    # through the head
+pastor workdir place --local ~/work/api --set agent-set.json # on the machine itself
+pastor workdir check pi-1 /home/pi/work/api    # still as placed? ok, drift, conflict, ...
+pastor workdir remove pi-1 /home/pi/work/api
+pastor workdir list                     # every directory the head placed sets in
+```
+
+Three ways in:
+
+- **By hand, or by whatever starts the agent.** Anything that launches an
+  agent can hand pastor the set before the start. On a pull machine it runs
+  `pastor workdir place --local` there, and the machine reports what it did
+  to the head.
+- **With a task.** `pastor task run --workdir-set agent-set.json ...`, or
+  `workdir_set` in a job's `[dispatch]`, places the set in the task's folder
+  before every start.
+- **From a bundle.** A bundle whose manifest says `target = "workdir"` is a set
+  kept on the head by version. Name it in `workdir_bundles` on a flock or a
+  job, and the head places it before each start of the task.
+
+[The manual](docs/manual.md#workdir-bundles) has the set format, what `check`
+says and the rules for a task.
 
 ## Safety
 
 - **Agents can't take over your flocks.** Every agent pastor starts is
   marked. It can read tasks and end its own with `pastor task done`, but
   can't start tasks, stop other tasks, edit machines, jobs or settings, or
-  start its own head, unless you set `agents_change_fleet = true`.
+  start its own head.
 - **Orchestrators get a little more.** An orchestrator task (`task run
   --role orchestrator`, or one an orchestrator file starts) and its scripts
   may also run, retry, send to and close tasks, enable or disable a job and
@@ -308,6 +414,12 @@ every Raspberry Pi OS release.
   your machines can run, one task after another, with nobody watching.
 - [Connector skill](skills/connector/SKILL.md): `/pastor:connector`
   scaffolds a poll or stream connector and tests it before you install it.
+- [Dispatch skill](skills/dispatch/SKILL.md): `/pastor:dispatch` runs a
+  `pastor:spec` plan's next task and handles `blocked`, `done`, `failed`
+  and `stale` by fixed rules, with nobody else watching the branch.
+- [Review skill](skills/review/SKILL.md): `/pastor:review` checks a
+  finished plan branch, sends back one fix task for what it finds, and
+  opens the pull request.
 - [Changelog](CHANGELOG.md).
 
 ## Contributing

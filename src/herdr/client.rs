@@ -11,8 +11,8 @@ use tokio::io::{
 use super::transport::{ConnectError, Connector};
 use super::{
     AgentInfo, AgentList, AgentResult, Created, Event, HerdrError, Incoming, PaneInfoResult,
-    PaneList, PaneRead, PaneRef, Pong, Request, Response, WorkspaceInfo, WorkspaceList,
-    WorktreeInfo, WorktreeList, WorktreeRemoved,
+    PaneList, PaneProcessInfo, PaneRead, PaneRef, Pong, Request, Response, WorkspaceInfo,
+    WorkspaceList, WorktreeInfo, WorktreeList, WorktreeRemoved,
 };
 
 pub type BoxRead = Box<dyn AsyncRead + Unpin + Send>;
@@ -589,6 +589,20 @@ pub trait ConnectorExt: Connector {
         )
         .await
         .map(drop)
+    }
+
+    /// `pane.process_info` (herdr 0.9.5): the pid of the pane's shell, which
+    /// is where `reap` starts. `pane_not_found` for a pane it does not have;
+    /// an older herdr answers `unknown_method`.
+    async fn pane_shell_pid(&self, pane_id: &str) -> Result<Option<u32>, CallError> {
+        Ok(self
+            .call_as::<PaneProcessInfo>(
+                "pane.process_info",
+                serde_json::json!({"pane_id": pane_id}),
+            )
+            .await?
+            .process_info
+            .shell_pid)
     }
 
     /// `pane.close` (herdr 0.9.1): closes the pane and, with it, the agent in

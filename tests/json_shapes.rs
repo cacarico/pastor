@@ -16,7 +16,7 @@ use pastor::cli::{HeadRow, MachineRow, machine_list_json};
 use pastor::config::flock::Flock;
 use pastor::describe::{MachineDescription, flock_description};
 use pastor::ipc::{IpcResponse, parse_request_line};
-use pastor::machine::FlockSeat;
+use pastor::machine::{FlockSeat, Room};
 use pastor::queue::QueueEntry;
 use pastor::scheduler::JobStatus;
 use pastor::store::{NewTask, Store};
@@ -203,7 +203,15 @@ fn spec() -> DispatchSpec {
         cwd: None,
         keep_pane: None,
         keep_pane_from: None,
+        remove_worktree: None,
+        remove_worktree_from: None,
+        load: None,
+        load_from: None,
+        fetch: Default::default(),
         rounds: Default::default(),
+        start_prompt: None,
+        workdir: None,
+        workdir_bundles: Vec::new(),
     }
 }
 
@@ -355,6 +363,43 @@ fn task_list_json_is_an_array_of_tasks() {
     assert_sparse_keys("task list", sparse, TASK, TASK_MAY_BE_ABSENT);
 }
 
+/// With env in the config, `task describe --json` adds an `env` object, a
+/// secret-looking key's value hidden; with none the key is absent (the shape
+/// above).
+#[test]
+fn task_describe_json_has_the_env_the_config_sets() {
+    let d = dirs();
+    store_with_tasks(&d);
+    std::fs::write(
+        d.config.join("pastor.toml"),
+        "[defaults]\nenv = { NOTES_URL = \"http://notes.example:8790\", API_KEY = \"short\" }\n",
+    )
+    .unwrap();
+    let v = json_of(&d, &["task", "describe", "t-2", "--json"]);
+    assert_eq!(
+        v["env"]["NOTES_URL"],
+        json!({"value": "http://notes.example:8790", "from": "defaults"}),
+        "{v}"
+    );
+    assert_eq!(
+        v["env"]["API_KEY"],
+        json!({"value": "(hidden)", "from": "defaults"}),
+        "{v}"
+    );
+    let text = pastor(&d.config, &d.state)
+        .args(["task", "describe", "t-2"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        text.contains(
+            "API_KEY=(hidden) (defaults), NOTES_URL=http://notes.example:8790 (defaults)"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("short"), "{text}");
+}
+
 #[test]
 fn task_describe_json_is_a_task_and_its_summaries() {
     full_task_json_has_the_task_shape("task describe", &full_task().to_json());
@@ -429,32 +474,51 @@ fn queue_json_is_entries_with_their_task() {
 const MACHINE: &[(&str, &str)] = &[
     ("burst", "number"),
     ("channel", "string"),
+    ("cordon", "object"),
     ("description", "string|null"),
     ("endpoint", "string"),
     ("error", "string|null"),
     ("flock", "string"),
     ("flocks", "array"),
+    ("harness", "array"),
     ("herdr_version", "string|null"),
     ("host", "string"),
     ("job_slots", "number"),
     ("live", "number|null"),
     ("max_agents", "number"),
     ("name", "string"),
+    ("no_head_address", "bool"),
     ("now", "array"),
     ("orphans", "array"),
     ("pastor_read_at", "string|null"),
     ("pastor_version", "string|null"),
     ("profile", "string|null"),
     ("protocol", "number|null"),
+    ("reserved", "number"),
+    ("room", "object|null"),
     ("tags", "array"),
 ];
 
-/// Left out of a machine's JSON when it is in no named flock, or starts
-/// no `--now` task.
-const MACHINE_MAY_BE_ABSENT: &[&str] = &["flocks", "now"];
+/// `Room`, inside a machine's `room`: what it had free, last read.
+const ROOM: &[(&str, &str)] = &[
+    ("asked_at", "string|null"),
+    ("error", "string|null"),
+    ("home_free", "number|null"),
+    ("mem_free", "number|null"),
+    ("tmp_free", "number|null"),
+];
+
+/// Left out of a machine's JSON when it is in no named flock, starts no
+/// `--now` task, has no harness pins, or is not cordoned.
+const MACHINE_MAY_BE_ABSENT: &[&str] = &["cordon", "flocks", "harness", "now"];
 
 fn machine_row() -> MachineRow {
     MachineRow {
+        cordon: Some(pastor::store::Cordon {
+            machine: "pi-1".into(),
+            reason: Some("kernel update".into()),
+            since: chrono::Utc::now(),
+        }),
         now: vec!["t-9".into()],
         name: "pi-1".into(),
         host: "user@pi-1".into(),
@@ -476,16 +540,31 @@ fn machine_row() -> MachineRow {
         max_agents: 2,
         job_slots: 1,
         burst: 1,
+        reserved: 1,
         tags: vec!["arm".into()],
         orphans: vec!["t-9".into()],
         profile: Some("safe".into()),
         description: Some("the one by the window".into()),
+        no_head_address: true,
+        harness: vec![pastor::harness::HarnessStatus::new(
+            "claude",
+            "2.1.310",
+            Some("2.1.309".into()),
+        )],
+        room: Some(Room {
+            home_free: Some(2_097_152),
+            tmp_free: Some(1_048_576),
+            mem_free: Some(4_194_304),
+            asked_at: Some(chrono::Utc::now()),
+            error: None,
+        }),
     }
 }
 
 /// A machine never reached, in no named flock, with nothing optional set.
 fn bare_machine_row() -> MachineRow {
     MachineRow {
+        cordon: None,
         now: Vec::new(),
         name: "pi-1".into(),
         host: "user@pi-1".into(),
@@ -502,10 +581,14 @@ fn bare_machine_row() -> MachineRow {
         max_agents: 1,
         job_slots: 1,
         burst: 0,
+        reserved: 0,
         tags: vec![],
         orphans: vec![],
         profile: None,
         description: None,
+        no_head_address: false,
+        harness: vec![],
+        room: None,
     }
 }
 
@@ -521,6 +604,33 @@ fn assert_machine_row(what: &str, v: &Value) {
                 ("max", "number|null"),
                 ("name", "string"),
                 ("share", "number|null"),
+            ],
+            &[],
+        );
+    }
+    assert_shape(
+        &format!("{what} cordon"),
+        &v["cordon"],
+        &[
+            ("machine", "string"),
+            ("reason", "string|null"),
+            ("since", "string"),
+        ],
+        &[],
+    );
+    if !v["room"].is_null() {
+        assert_shape(&format!("{what} room"), &v["room"], ROOM, &[]);
+        assert_filled(&format!("{what} room"), &v["room"], &["error"]);
+    }
+    for pin in v["harness"].as_array().unwrap() {
+        assert_shape(
+            &format!("{what} harness"),
+            pin,
+            &[
+                ("drift", "bool"),
+                ("kind", "string"),
+                ("pin", "string"),
+                ("version", "string|null"),
             ],
             &[],
         );
@@ -671,6 +781,84 @@ fn flock_describe_json_is_the_flock_and_its_tasks() {
     assert_emptied("flock describe", &v, &want, &[]);
 }
 
+/// A machine's bundles with every field set, and its shape.
+fn full_config() -> pastor::bundle::keep::ConfigDescription {
+    use pastor::bundle::keep::{ConfigDescription, HomeConfig, HomeState, LastApply, WantedBundle};
+    let at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    ConfigDescription {
+        apply_mode: pastor::bundle::Apply::Auto,
+        bundles: vec![WantedBundle {
+            id: "team-rules".into(),
+            version: "2026.10.27.1".into(),
+            hash: "ab".repeat(32),
+            applied_hash: Some("cd".repeat(32)),
+        }],
+        stale: true,
+        last_apply: Some(LastApply {
+            at,
+            ok: false,
+            error: Some("boom".into()),
+        }),
+        homes: vec![HomeConfig {
+            path: "~/.claude-main".into(),
+            kind: "claude".into(),
+            agents: vec!["claude-main".into()],
+            state: Some(HomeState::Drift),
+            adopted: Some(true),
+        }],
+        checked_at: Some(at),
+    }
+}
+
+#[test]
+fn machine_describe_config_json_has_its_shape() {
+    let v = serde_json::to_value(full_config()).unwrap();
+    assert_shape(
+        "machine describe config",
+        &v,
+        &[
+            ("apply_mode", "string"),
+            ("bundles", "array"),
+            ("checked_at", "string|null"),
+            ("homes", "array"),
+            ("last_apply", "object|null"),
+            ("stale", "bool"),
+        ],
+        &[],
+    );
+    assert_eq!(v["apply_mode"], "auto");
+    assert_shape(
+        "machine describe config bundle",
+        &v["bundles"][0],
+        &[
+            ("applied_hash", "string|null"),
+            ("hash", "string"),
+            ("id", "string"),
+            ("version", "string"),
+        ],
+        &[],
+    );
+    assert_shape(
+        "machine describe config home",
+        &v["homes"][0],
+        &[
+            ("adopted", "bool|null"),
+            ("agents", "array"),
+            ("kind", "string"),
+            ("path", "string"),
+            ("state", "string|null"),
+        ],
+        &[],
+    );
+    assert_eq!(v["homes"][0]["state"], "drift");
+    assert_shape(
+        "machine describe config last_apply",
+        &v["last_apply"],
+        &[("at", "string"), ("error", "string|null"), ("ok", "bool")],
+        &[],
+    );
+}
+
 #[test]
 fn machine_describe_json_is_the_row_its_tasks_and_errors() {
     let d = MachineDescription {
@@ -681,20 +869,93 @@ fn machine_describe_json_is_the_row_its_tasks_and_errors() {
         agents_by_kind: Default::default(),
         tasks: vec![full_task()],
         recent_errors: vec![],
+        config: Some(full_config()),
+        workdirs: Some(pastor::bundle::workdir_keep::WorkdirsDescription {
+            count: 2,
+            states: [("ok".to_string(), 1), ("drift".to_string(), 1)].into(),
+            read_at: Some("2026-11-02T10:00:00Z".into()),
+            ledgers: Some(3),
+            worst: vec![pastor::bundle::workdir_keep::Worst {
+                dir: "/home/user/src/app".into(),
+                id: "reviewer".into(),
+                state: pastor::bundle::workdir_keep::State::Drift,
+            }],
+        }),
+        signed_out: vec![pastor::limit::AccountLimit {
+            account: "pi-1/claude".into(),
+            model: None,
+            hard: true,
+            no_credit: false,
+            signed_out: true,
+            until: None,
+            retry_at: pastor::limit::signed_out_until(),
+            line: "Select login method:".into(),
+            task_id: Some(7),
+            machine: Some("pi-1".into()),
+            agent: Some("claude".into()),
+            seen_at: chrono::Utc::now(),
+        }],
+        bootstrap: Some(pastor::store::MachineState {
+            machine: "pi-1".into(),
+            bootstrap: pastor::store::BootstrapState::Failed,
+            isolation: Some("none".into()),
+            failed_step: Some("herdr".into()),
+            why: Some("herdr is not on the PATH".into()),
+            host_key: Some("ssh-ed25519 AAAA".into()),
+            herdr_version: Some("0.9.5".into()),
+            pastor_version: Some("0.10.0".into()),
+            generation: 1,
+            updated_at: chrono::Utc::now(),
+        }),
     };
     let v = serde_json::to_value(&d).unwrap();
     let mut want: Vec<(&str, &str)> = MACHINE.to_vec();
     want.extend([
         ("agents_by_kind", "object"),
+        ("bootstrap", "object|null"),
+        ("config", "object|null"),
         ("fallback", "array|null"),
         ("model", "string|null"),
         ("recent_errors", "array"),
         ("session", "string"),
+        ("signed_out", "array"),
         ("tasks", "array"),
+        ("workdirs", "object|null"),
     ]);
     assert_shape("machine describe", &v, &want, &[]);
     assert_filled("machine describe", &v, &[]);
+    assert_shape(
+        "machine describe workdirs",
+        &v["workdirs"],
+        &[
+            ("count", "number"),
+            ("ledgers", "number"),
+            ("read_at", "string"),
+            ("states", "object"),
+            ("worst", "array"),
+        ],
+        &[],
+    );
+    assert_eq!(v["workdirs"]["worst"][0]["state"], "drift", "{v}");
     assert!(v["tasks"][0]["id"].is_number(), "{v}");
+    assert_shape(
+        "machine describe bootstrap",
+        &v["bootstrap"],
+        &[
+            ("bootstrap", "string"),
+            ("failed_step", "string|null"),
+            ("generation", "number"),
+            ("herdr_version", "string|null"),
+            ("host_key", "string|null"),
+            ("isolation", "string|null"),
+            ("machine", "string"),
+            ("pastor_version", "string|null"),
+            ("updated_at", "string"),
+            ("why", "string|null"),
+        ],
+        &[],
+    );
+    assert_eq!(v["bootstrap"]["bootstrap"], "failed");
 
     // A machine never reached, with no model and no tasks.
     let d = MachineDescription {
@@ -705,6 +966,10 @@ fn machine_describe_json_is_the_row_its_tasks_and_errors() {
         agents_by_kind: Default::default(),
         tasks: vec![],
         recent_errors: vec![],
+        config: None,
+        workdirs: None,
+        signed_out: vec![],
+        bootstrap: None,
     };
     let v = serde_json::to_value(&d).unwrap();
     assert_shape("machine describe", &v, &want, MACHINE_MAY_BE_ABSENT);

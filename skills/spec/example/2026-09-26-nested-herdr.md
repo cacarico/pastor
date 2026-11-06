@@ -1,6 +1,6 @@
 # pastor machine open refuses inside herdr: Implementation Plan
 
-> **For agentic workers:** this plan runs on a pastor flock, one task at a time. Each task's prompt file is under `docs/superpowers/plans/2026-09-26-nested-herdr/`. Do only the task your prompt names.
+> **For agentic workers:** this plan runs on a pastor flock, one task at a time. Each task's prompt file is under `docs/plans/2026-09-26-nested-herdr/`. Do only the task your prompt names.
 
 **Goal:** `pastor machine open <machine>` run inside a herdr pane fails at once with the code `nested_herdr` and a message that says to use a plain terminal, instead of exec'ing herdr and letting herdr refuse.
 
@@ -20,12 +20,12 @@
 ## Pastor
 
 - Plan branch: `pastor/nested-herdr` (the plan, the ledger and the prompt files live here)
-- Ledger: `docs/superpowers/plans/2026-09-26-nested-herdr.ledger.md`
+- Ledger: `docs/plans/2026-09-26-nested-herdr.ledger.md`
 - Repo on the machines: `~/work/pastor`
 - Check: `make check`
 - Order: series. Start task N+1 only when the ledger has `Task N: complete`.
 - Dispatch: do not push the plan branch while a task may push it. Record `Task N: ran as t-M on <machine>` after the task's own ledger line, before starting the next.
-- Before merging: drop `docs/superpowers/plans/2026-09-26-nested-herdr*` from the branch; this repo keeps its plans on the `docs` branch.
+- Before merging: drop `docs/plans/2026-09-26-nested-herdr*` from the branch; this repo keeps its plans on the `docs` branch.
 
 ---
 
@@ -107,7 +107,7 @@ with a body saying herdr would refuse anyway, after taking the terminal.
 - depends on: nothing
 
 ```bash
-pastor task run --prompt-file docs/superpowers/plans/2026-09-26-nested-herdr/task-1.md \
+pastor task run --prompt-file docs/plans/2026-09-26-nested-herdr/task-1.md \
   --flock default --repo '~/work/pastor' --worktree --branch pastor/nested-herdr-1 \
   --model sonnet --timeout 45m --json
 ```
@@ -159,7 +159,7 @@ with a body saying the known gap is closed.
 - depends on: Task 1
 
 ```bash
-pastor task run --prompt-file docs/superpowers/plans/2026-09-26-nested-herdr/task-2.md \
+pastor task run --prompt-file docs/plans/2026-09-26-nested-herdr/task-2.md \
   --flock default --repo '~/work/pastor' --worktree --branch pastor/nested-herdr-2 \
   --model sonnet --timeout 30m --json
 ```

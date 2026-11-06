@@ -68,6 +68,18 @@ pub struct RemoteHead {
     /// than `sun_path` (104 bytes on macOS) fails every request. `None` when
     /// even a bare `-%C` does not fit; ssh then runs without multiplexing.
     control_path: Option<PathBuf>,
+    /// The machine key and pastor's own `known_hosts`, on a machine that
+    /// joined a head with a token: `pastor join` made the one and pinned the
+    /// head in the other, and the head's line for that key is the only way in.
+    /// `None` on any other machine, whose ssh keeps the user's own keys and
+    /// known hosts.
+    joined: Option<Joined>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Joined {
+    key: PathBuf,
+    known_hosts: PathBuf,
 }
 
 pub fn client_file(paths: &Paths) -> PathBuf {
@@ -158,11 +170,20 @@ pub fn resolve(
 
 impl RemoteHead {
     pub fn new(paths: &Paths, ssh: &str, pastor: Option<String>, source: HeadSource) -> Self {
+        // Both or neither: a machine key beside no pinned head is a pushed
+        // machine's, which its head reaches, and a known_hosts beside no key
+        // is the head's own pins.
+        let joined = Some(Joined {
+            key: paths.machine_key(),
+            known_hosts: paths.known_hosts_file(),
+        })
+        .filter(|j| j.key.exists() && j.known_hosts.exists());
         RemoteHead {
             ssh: ssh.to_string(),
             pastor: pastor.unwrap_or_else(|| DEFAULT_PASTOR.to_string()),
             source,
             control_path: crate::ssh::fitting_control_path(paths, "head"),
+            joined,
         }
     }
 
@@ -170,12 +191,23 @@ impl RemoteHead {
     /// transport's is, with the remote command quoted for the login shell
     /// that parses it.
     pub fn ssh_args(&self) -> Vec<String> {
+        self.ssh_args_with(None, self.control_path.as_deref())
+    }
+
+    /// `ssh_args`, reading `config` as the ssh configuration (`-F`) and
+    /// multiplexing over `control_path`.
+    fn ssh_args_with(&self, config: Option<&Path>, control_path: Option<&Path>) -> Vec<String> {
         crate::ssh::Ssh {
             target: &self.ssh,
-            control_path: self.control_path.as_deref(),
+            control_path,
             control_persist: "60s",
             keepalive: false,
             no_tty: false,
+            identity: self.joined.as_ref().map(|j| j.key.as_path()),
+            extra_identity: None,
+            known_hosts: self.joined.as_ref().map(|j| j.known_hosts.as_path()),
+            accept_new: false,
+            config_file: config,
         }
         .args(&format!("{} bridge", self.pastor))
     }
@@ -184,15 +216,61 @@ impl RemoteHead {
     /// ssh that exits with no reply is `RequestError::Unreachable` with its
     /// stderr; an error the bridge itself writes (`no_head`) is
     /// `RequestError::Refused` with the bridge's code.
+    ///
+    /// ssh refuses a system configuration file it finds owned by someone
+    /// else (`Bad owner or permissions on /etc/ssh/ssh_config.d/...`), which
+    /// is how every root-owned file looks inside a sandbox that maps file
+    /// owners, such as Codex's. Such a failure is tried once more with the
+    /// user's own `~/.ssh/config` as the whole configuration (`-F`), which
+    /// leaves the system's out and keeps the user's host aliases, and without
+    /// the shared master: such a sandbox keeps the state dir read-only. When
+    /// `~/.ssh/config` is refused too (a symlink into a root-owned store),
+    /// the last try reads `/dev/null`, which still reaches a `user@host`.
     pub async fn request(
         &self,
         line: &str,
         timeout: Duration,
     ) -> Result<IpcResponse, RequestError> {
-        crate::ssh::ensure_control_dir(self.control_path.as_deref())
-            .map_err(|e| RequestError::Unreachable(format!("{e:#}")))?;
+        let refused = |r: &Result<IpcResponse, RequestError>| matches!(r, Err(RequestError::Unreachable(why)) if bad_ssh_config_owner(why));
+        let first = self.request_with(line, timeout, None).await;
+        if !refused(&first) {
+            return first;
+        }
+        let own = user_ssh_config();
+        let second = self.request_with(line, timeout, Some(&own)).await;
+        if own.as_os_str() != NO_CONFIG && refused(&second) {
+            return self
+                .request_with(line, timeout, Some(Path::new(NO_CONFIG)))
+                .await;
+        }
+        second
+    }
+
+    /// The `ControlPath` a request multiplexes over, its directory made. A
+    /// request with `-F` is the sandbox's retry, where the state dir is
+    /// read-only: none. So is one whose directory cannot be made and is not
+    /// there (the same sandbox on a first try); a directory that is there and
+    /// is refused (not private, not ours) stays an error.
+    fn control_for(&self, config: Option<&Path>) -> Result<Option<PathBuf>, RequestError> {
+        let Some(path) = self.control_path.as_deref().filter(|_| config.is_none()) else {
+            return Ok(None);
+        };
+        match crate::ssh::ensure_control_dir(Some(path)) {
+            Ok(()) => Ok(Some(path.to_path_buf())),
+            Err(_) if !crate::ssh::control_dir_exists(path) => Ok(None),
+            Err(e) => Err(RequestError::Unreachable(format!("{e:#}"))),
+        }
+    }
+
+    async fn request_with(
+        &self,
+        line: &str,
+        timeout: Duration,
+        config: Option<&Path>,
+    ) -> Result<IpcResponse, RequestError> {
+        let control = self.control_for(config)?;
         let mut child = tokio::process::Command::new("ssh")
-            .args(self.ssh_args())
+            .args(self.ssh_args_with(config, control.as_deref()))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -275,6 +353,24 @@ impl RemoteHead {
             self.ssh, self.pastor
         )))
     }
+}
+
+/// Did ssh stop on a configuration file it will not read for its owner
+/// (`Bad owner or permissions on /etc/ssh/ssh_config.d/20-x.conf`)?
+fn bad_ssh_config_owner(stderr: &str) -> bool {
+    stderr.contains("Bad owner or permissions on")
+}
+
+/// An empty ssh configuration, for `-F`.
+const NO_CONFIG: &str = "/dev/null";
+
+/// The user's own ssh configuration, or an empty one when there is none:
+/// `-F` wants a file, and ssh reads a missing one as an error.
+fn user_ssh_config() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".ssh/config"))
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from(NO_CONFIG))
 }
 
 /// What a failed request to a remote head tells the user.
@@ -417,6 +513,39 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
         (tmp, p)
+    }
+
+    /// A machine that joined a head has its machine key and the head pinned
+    /// in pastor's known_hosts: its ssh uses both, and checks the host
+    /// strictly. Either alone changes nothing, so a pushed machine and a head
+    /// with pins of its own keep the user's ssh.
+    #[test]
+    fn a_joined_machine_uses_its_key_and_the_pinned_head() {
+        let (_t, p) = paths();
+        std::fs::create_dir_all(&p.state_dir).unwrap();
+        let plain = |a: &[String]| !a.iter().any(|a| a == "-i" || a.contains("KnownHosts"));
+        std::fs::write(p.machine_key(), "k").unwrap();
+        std::fs::write(p.agent_key(), "k").unwrap();
+        let args = RemoteHead::new(&p, "me@head", None, HeadSource::File).ssh_args();
+        assert!(plain(&args), "{args:?}");
+        std::fs::remove_file(p.machine_key()).unwrap();
+        std::fs::write(p.known_hosts_file(), "head ssh-ed25519 AAAAHEAD\n").unwrap();
+        let args = RemoteHead::new(&p, "me@head", None, HeadSource::File).ssh_args();
+        assert!(plain(&args), "{args:?}");
+        std::fs::write(p.machine_key(), "k").unwrap();
+        let args = RemoteHead::new(&p, "me@head", None, HeadSource::File).ssh_args();
+        let machine = p.machine_key().display().to_string();
+        let known = format!("UserKnownHostsFile={}", p.known_hosts_file().display());
+        assert!(
+            args.windows(2).any(|w| w == ["-i", machine.as_str()]),
+            "{args:?}"
+        );
+        assert!(args.contains(&known), "{args:?}");
+        assert!(args.contains(&"IdentitiesOnly=yes".to_string()), "{args:?}");
+        assert!(
+            args.contains(&"StrictHostKeyChecking=yes".to_string()),
+            "{args:?}"
+        );
     }
 
     /// A misspelt key under `[head]` fails the load, naming the file and
@@ -588,6 +717,51 @@ mod tests {
             &args[args.len() - 3..],
             ["--", "user@pi-1", "sh -c 'pastor bridge'"]
         );
+    }
+
+    #[test]
+    fn a_config_file_is_read_by_ssh_instead_of_the_system_s() {
+        let (_tmp, p) = paths();
+        let h = RemoteHead::new(&p, "user@pi-1", None, HeadSource::File);
+        assert!(!h.ssh_args().iter().any(|a| a == "-F"));
+        let args = h.ssh_args_with(Some(Path::new("/home/me/.ssh/config")), None);
+        assert_eq!(&args[..2], ["-F", "/home/me/.ssh/config"], "{args:?}");
+        for opt in ["ControlMaster=no", "ControlPath=none"] {
+            assert!(args.windows(2).any(|w| w == ["-o", opt]), "{opt}: {args:?}");
+        }
+        assert_eq!(
+            &args[args.len() - 3..],
+            ["--", "user@pi-1", "sh -c 'pastor bridge'"]
+        );
+    }
+
+    /// The sandbox keeps the state dir read-only: a control directory that
+    /// cannot be made, and is not there, means no multiplexing for the
+    /// request, not an unreachable head; a `-F` retry never multiplexes.
+    #[test]
+    fn a_control_dir_that_cannot_be_made_means_no_multiplexing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("not-a-dir");
+        std::fs::write(&blocker, "").unwrap();
+        let p = Paths::new(tmp.path().join("c"), blocker.join("state"));
+        let h = RemoteHead::new(&p, "user@pi-1", None, HeadSource::File);
+        assert_eq!(h.control_for(None).unwrap(), None);
+
+        let (_tmp, p) = paths();
+        let h = RemoteHead::new(&p, "user@pi-1", None, HeadSource::File);
+        let path = h.control_for(None).unwrap().expect("made");
+        assert!(path.parent().unwrap().is_dir());
+        assert_eq!(h.control_for(Some(Path::new("/dev/null"))).unwrap(), None);
+    }
+
+    #[test]
+    fn only_a_refused_system_config_is_retried() {
+        assert!(bad_ssh_config_owner(
+            "Bad owner or permissions on /etc/ssh/ssh_config.d/20-systemd-ssh-proxy.conf"
+        ));
+        assert!(!bad_ssh_config_owner(
+            "ssh: connect to host pi-1: Connection refused"
+        ));
     }
 
     #[test]

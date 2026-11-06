@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -26,6 +26,16 @@ use crate::task::{Observed, Task, TaskState, TaskSummary, next_state};
 #[derive(Debug, thiserror::Error)]
 #[error("{0} timed out after {1:?}")]
 struct TimedOut(&'static str, Duration);
+
+/// What `Actor::prompt_by_socket` did with a pending prompt.
+enum BySocket {
+    /// The session took it; the agent as `agent.list` showed it just before.
+    Sent(Box<AgentInfo>),
+    /// The agent is launching or blocked: send nothing yet.
+    Wait,
+    /// Type it, as for an agent with no socket.
+    Type,
+}
 
 /// Auto-close found the agent of a done task no longer idle: not a failure,
 /// the task is simply not done any more.
@@ -93,6 +103,17 @@ fn manual_worktree_cleanup(display_id: &str) -> String {
 /// The note on a task whose worktree auto-close kept, and why. The branch is
 /// the one the checkout was recorded on: a retry reopens an older checkout
 /// and drops `spec.branch`, so the requested one may not be where the work is.
+/// Whether `path`, as a task row recorded it, may be handed to `git worktree
+/// remove` at all: absolute, with no `.` or `..` part and at least three
+/// parts, so a damaged row never names `/` or a home directory.
+fn sweepable_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix('/') else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('/').filter(|p| !p.is_empty()).collect();
+    parts.len() >= 3 && parts.iter().all(|p| *p != "." && *p != "..")
+}
+
 fn worktree_kept_note(t: &Task, name: &str, why: &str) -> String {
     let branch = t
         .spec
@@ -203,6 +224,11 @@ impl FlockSeat {
         self.max.is_none_or(|n| self.live < n as usize)
     }
 
+    /// Is the flock at 0 here: in it, but starting nothing, to drain it?
+    pub fn drained(&self) -> bool {
+        self.max == Some(0)
+    }
+
     /// Is the flock under its share here, so it takes a free slot without
     /// looking at who else waits? A seat with no number is.
     pub fn under_share(&self) -> bool {
@@ -243,6 +269,19 @@ pub struct Room {
     pub error: Option<String>,
 }
 
+/// Whether the machine's agents last reached the head, as the `reach` row of
+/// a `machine check` the head ran said: `ok` when the row passed, not when
+/// it failed. Nothing but a later check changes it, so a machine the head
+/// never checked has none and is placed as ever.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reach {
+    pub ok: bool,
+    pub at: DateTime<Utc>,
+    /// What ssh said, when it failed.
+    #[serde(default)]
+    pub why: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MachineStatus {
     pub name: String,
@@ -265,6 +304,12 @@ pub struct MachineStatus {
     /// it answers, and from a head that predates the field.
     #[serde(default)]
     pub pastor_read_at: Option<DateTime<Utc>>,
+    /// The harness versions the machine's pins name (`harness`), as last
+    /// read, with whether each drifts from its pin; read at each connect and
+    /// every `version_every` with the pastor version. Empty with no pins,
+    /// and from a head that predates it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub harness: Vec<crate::harness::HarnessStatus>,
     /// What the machine has free (`Connector::room`), read at each connect
     /// and again every `MachineSettings::room_every` while connected or
     /// polling. `None` until the first probe, and for a machine that cannot
@@ -272,6 +317,10 @@ pub struct MachineStatus {
     /// that predates the field.
     #[serde(default)]
     pub room: Option<Room>,
+    /// The last `reach` result of a `machine check` of it. Defaulted so a
+    /// CLI can still read a head that predates the field.
+    #[serde(default)]
+    pub reach: Option<Reach>,
     pub protocol: Option<u32>,
     pub error: Option<String>,
     pub live: usize,
@@ -287,6 +336,11 @@ pub struct MachineStatus {
     #[serde(default)]
     pub burst: u32,
     pub tags: Vec<String>,
+    /// The machine is cordoned (`pastor machine cordon`): it takes no new
+    /// task. Filled in by `Fleet::statuses` from the store; `None` from an
+    /// actor, and from a head that predates cordons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cordon: Option<crate::store::Cordon>,
     /// Agents named like a task (`t-<id>`) that no open task on this machine
     /// owns: the row is failed, closed or gone (a dispatch that failed after
     /// `agent.start`, a daemon killed mid-dispatch, a pruned row). Counted in
@@ -333,6 +387,17 @@ pub struct MachineStatus {
     /// head that predates it.
     #[serde(default)]
     pub description: Option<String>,
+    /// `MachineConfig::reserved`: the slots dispatch keeps free of its own
+    /// tasks; `Fleet::statuses` fills it in. 0 from an actor, and from a
+    /// head that predates it.
+    #[serde(default)]
+    pub reserved: u32,
+    /// The head reaches the machine over `ssh` and has no `head_address`,
+    /// so its agents cannot run `pastor task done` (`daemon::is_cut_off`).
+    /// `Fleet::statuses` fills it in; `false` from an actor, and from a
+    /// head that predates it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_head_address: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -381,18 +446,43 @@ pub struct MachineSettings {
     /// `head_address` in `pastor.toml`, for a machine other than the head's
     /// own (`daemon::actor_settings`): its agents get it as `ipc::HEAD_ENV`.
     pub head_address: Option<String>,
+    /// The machine is reached over `ssh` and the head has no `head_address`
+    /// (`daemon::actor_settings`): its agents get no `ipc::HEAD_ENV`, so
+    /// their `pastor task done` cannot reach the head, and a round here that
+    /// ends with no summary is `Outcome::NoHead`.
+    pub cut_off_from_head: bool,
     /// `[limits]` in `pastor.toml`, on the head: a task whose agent stops
     /// on a usage limit goes `waiting` and its limit goes in the table.
     /// `None` on a headless serve, which keeps no table: its tasks settle as
     /// if no limit were read.
     pub limits: Option<crate::config::LimitsConfig>,
-    /// The deny list of the machine's own permission profile (its
-    /// `[[machine]]` profile, else its flock's, else `[defaults]`), in
-    /// Claude Code's patterns: what the agy provisioner makes agy's settings
-    /// there deny before a profiled agy launch (`provision::agy`). Set per
-    /// machine by `Fleet::own_deny`, so a change of profile replaces only
-    /// that machine's actor.
-    pub own_deny: Vec<String>,
+    /// The machine's own permission profile (its `[[machine]]` profile, else
+    /// its flock's, else `[defaults]`), its lists in Claude Code's patterns:
+    /// what the agy provisioner makes agy's settings there say before a
+    /// profiled agy launch (`provision::agy`). `None` with no profile. Set
+    /// per machine by `Fleet::own_policy`, so a change of profile replaces
+    /// only that machine's actor.
+    pub own_policy: Option<crate::config::agy::Policy>,
+    /// The harness versions the machine's flock (or the machine) pins,
+    /// per kind (`Flock::pins_for`): the actor reads the version of each
+    /// and reports the drift (`MachineStatus::harness`). Empty with no pins.
+    /// Set per machine by `Fleet::settings_of`, so a change of pins replaces
+    /// only that machine's actor.
+    pub harness_pins: crate::harness::Pins,
+    /// The harness manifests: how to ask a machine for each pinned kind's
+    /// version.
+    pub harnesses: std::sync::Arc<crate::harness_manifest::Harnesses>,
+    /// Asked before a task starts: whether the machine's bundles allow it.
+    /// Set by `Fleet::settings_of` from the head's keeper; none elsewhere.
+    pub bundle_gate: crate::bundle::keep::GateHandle,
+    /// Places a task's workdir set before its agent starts, and takes it out
+    /// when its worktree goes. Set by `Fleet::settings_of` from the head on
+    /// a machine it can place sets on; none elsewhere.
+    pub workdir_gate: crate::bundle::workdir_task::GateHandle,
+    /// The env layers under an agent's own that reach this machine
+    /// (`EnvLayers::of`). Set per machine by `Fleet::settings_of`, so a
+    /// change replaces only the actors of the machines it reaches.
+    pub env: crate::config::EnvLayers,
 }
 
 impl Default for MachineSettings {
@@ -411,8 +501,14 @@ impl Default for MachineSettings {
             room_every: Duration::from_secs(60),
             agents: crate::config::Agents::default(),
             head_address: None,
+            cut_off_from_head: false,
             limits: None,
-            own_deny: vec![],
+            own_policy: None,
+            harness_pins: Default::default(),
+            harnesses: Default::default(),
+            bundle_gate: Default::default(),
+            workdir_gate: Default::default(),
+            env: Default::default(),
         }
     }
 }
@@ -487,6 +583,22 @@ pub enum MachineCommand {
         for_task: i64,
         reply: oneshot::Sender<anyhow::Result<Task>>,
     },
+    /// Before a task leaves this machine: tell its agent to commit and push
+    /// its work (`task::MOVE_SAVE_PROMPT`), through its Claude session's
+    /// inbox socket when that takes it and typed otherwise, then reply once
+    /// it has finished that prompt and gone idle. Refused (`SendRefused`)
+    /// with `task_not_live` for a task with no pane here, `agent_busy` for
+    /// an agent still working and `save_blocked` for one waiting on a
+    /// question; `save_timeout` when preflight, the prompt, or the wait does
+    /// not clear within `timeout`; `save_blocked` too for an agent that
+    /// stopped to ask a question instead of finishing. The row and the
+    /// pane are left as they are either way, and the task is excluded from
+    /// `auto_close_done` until the save resolves, however it resolves.
+    SaveWork {
+        task_id: i64,
+        timeout: Duration,
+        reply: oneshot::Sender<anyhow::Result<Task>>,
+    },
     /// Start a paused task again on its own session (`dispatch::resume`).
     Resume {
         task_id: i64,
@@ -498,6 +610,36 @@ pub enum MachineCommand {
     AutoTrust {
         reply: oneshot::Sender<anyhow::Result<()>>,
     },
+    /// `pastor task sweep`: the worktrees pastor kept on this machine for
+    /// tasks that ended, listed, and with `apply` removed when nothing
+    /// forbids it (`Actor::run_sweep`).
+    Sweep {
+        apply: bool,
+        reply: oneshot::Sender<anyhow::Result<Vec<SweepEntry>>>,
+    },
+}
+
+/// One worktree `pastor task sweep` looked at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SweepEntry {
+    pub machine: String,
+    pub path: String,
+    pub branch: String,
+    /// The tasks whose rows record the worktree.
+    pub tasks: Vec<String>,
+    pub action: SweepAction,
+    /// Why it is kept; none otherwise.
+    #[serde(default)]
+    pub why: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SweepAction {
+    Removed,
+    /// A dry run found nothing that forbids removing it.
+    WouldRemove,
+    Kept,
 }
 
 /// A `task run --now` dispatch, sent on the actor's urgent channel
@@ -569,9 +711,9 @@ impl SendInput {
     }
 }
 
-/// `Send` refused before it typed anything, or `End` before it wrote
-/// anything, for a reason the CLI reports under its own code
-/// (`task_not_live`, ...).
+/// `Send` refused before it typed anything, `End` before it wrote
+/// anything, or `SaveWork` refused or timed out, for a reason the CLI
+/// reports under its own code (`task_not_live`, ...).
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub struct SendRefused {
@@ -587,6 +729,22 @@ pub struct SendRefused {
 pub struct OrphanClosed {
     pub agent: String,
     pub machine: String,
+}
+
+/// What was running under a pane about to close, listed before the close
+/// (`Actor::find_leftovers`).
+struct Leftovers {
+    task_id: Option<i64>,
+    pane: String,
+    name: String,
+    found: Vec<crate::reap::Candidate>,
+    /// The pane is closed already, whatever else the close does: the agent
+    /// is gone and what it left may be ended even if the close fails later.
+    pane_closed: bool,
+    /// The checkout is gone: only then are the processes found by working in
+    /// it ended. A checkout that stays is somebody's, and what works in it
+    /// with it.
+    checkout_gone: bool,
 }
 
 /// The machine's actor was stopped (a flock reload removed or replaced the
@@ -792,6 +950,17 @@ impl MachineHandle {
         self.request(cmd, rx).await
     }
 
+    /// See `MachineCommand::SaveWork`.
+    pub async fn save_work(&self, task_id: i64, timeout: Duration) -> anyhow::Result<Task> {
+        let (reply, rx) = oneshot::channel();
+        let cmd = MachineCommand::SaveWork {
+            task_id,
+            timeout,
+            reply,
+        };
+        self.request(cmd, rx).await
+    }
+
     /// See `MachineCommand::Resume`.
     pub async fn resume(&self, task_id: i64) -> anyhow::Result<Task> {
         let (reply, rx) = oneshot::channel();
@@ -803,6 +972,13 @@ impl MachineHandle {
     pub async fn auto_trust(&self) -> anyhow::Result<()> {
         let (reply, rx) = oneshot::channel();
         self.request(MachineCommand::AutoTrust { reply }, rx).await
+    }
+
+    /// See `MachineCommand::Sweep`.
+    pub async fn sweep(&self, apply: bool) -> anyhow::Result<Vec<SweepEntry>> {
+        let (reply, rx) = oneshot::channel();
+        self.request(MachineCommand::Sweep { apply, reply }, rx)
+            .await
     }
 
     /// Send `cmd` and wait for its reply, or fail with `ActorStopped` once
@@ -882,8 +1058,11 @@ pub fn pull_machine(name: String, max_agents: u32, tags: Vec<String>) -> Machine
     let (tx, _) = mpsc::channel(1);
     let (now_tx, _) = mpsc::channel(1);
     let status = Arc::new(RwLock::new(MachineStatus {
+        cordon: None,
+        reserved: 0,
         now: Vec::new(),
         description: None,
+        no_head_address: false,
         name: name.clone(),
         host: "pull".into(),
         endpoint: PULL_ENDPOINT.into(),
@@ -891,7 +1070,9 @@ pub fn pull_machine(name: String, max_agents: u32, tags: Vec<String>) -> Machine
         herdr_version: None,
         pastor_version: None,
         pastor_read_at: None,
+        harness: vec![],
         room: None,
+        reach: None,
         protocol: None,
         error: None,
         live: 0,
@@ -932,8 +1113,11 @@ pub fn spawn_machine(
     let (tx, rx) = mpsc::channel(32);
     let (now_tx, now_rx) = mpsc::channel(8);
     let status = Arc::new(RwLock::new(MachineStatus {
+        cordon: None,
+        reserved: 0,
         now: Vec::new(),
         description: None,
+        no_head_address: false,
         name: name.clone(),
         host: connector.host(),
         endpoint: connector.describe(),
@@ -941,7 +1125,9 @@ pub fn spawn_machine(
         herdr_version: None,
         pastor_version: None,
         pastor_read_at: None,
+        harness: vec![],
         room: None,
+        reach: None,
         protocol: None,
         error: None,
         live: 0,
@@ -967,6 +1153,7 @@ pub fn spawn_machine(
         rx,
         now_rx: Some(now_rx),
         pending_done: HashMap::new(),
+        leftovers: None,
         dialog_answered: HashMap::new(),
         unseen_prompt: HashMap::new(),
         idle_agents: HashSet::new(),
@@ -975,6 +1162,7 @@ pub fn spawn_machine(
         was_connected: false,
         failures: 0,
         lost_announced: false,
+        saving: Arc::new(Mutex::new(HashMap::new())),
         orphans: vec![],
         stopped_since: HashMap::new(),
         version_asked_at: Instant::now(),
@@ -1055,6 +1243,9 @@ struct Actor {
     /// agent is still idle at that same sequence; with no sequence, the first
     /// check records one and starts the window over.
     pending_done: HashMap<i64, (Option<u64>, Instant)>,
+    /// What a close under way found running (`find_leftovers`), ended by
+    /// `run_close` if the close goes through.
+    leftovers: Option<Leftovers>,
     /// task id -> when its startup prompt was answered: its trust keys went
     /// in, or, answered by a person at the pane, when the agent was first
     /// seen out of `blocked`. Claude redraws for a moment after its trust
@@ -1065,11 +1256,13 @@ struct Actor {
     dialog_answered: HashMap<i64, Instant>,
     /// task id -> how often its prompt was sent again, for a task whose
     /// agent this actor gave its prompt (dispatch or a pending delivery) and
-    /// has not seen `working` or `blocked` since. An agent still idle a
-    /// settle window later at the sequence the prompt went in at never took
-    /// it: `confirm_pending_done` sends it again, up to `MAX_PROMPT_RESENDS`
-    /// times, then marks the task `blocked`. Kept in memory only, like the
-    /// activity flag was: after a restart such a task stays `running`.
+    /// has not seen `working` since. An agent still idle a settle window
+    /// later at the sequence the prompt went in at never took it:
+    /// `confirm_pending_done` sends it again, up to `MAX_PROMPT_RESENDS`
+    /// times, then marks the task `blocked`. `blocked` alone does not prove
+    /// the prompt was taken: it may be a startup dialog the prompt went into
+    /// (`prompt_in_dialog`, `prompt_on_screen`). Kept in memory only, like
+    /// the activity flag was: after a restart such a task stays `running`.
     unseen_prompt: HashMap<i64, u8>,
     /// Tasks whose agent this actor last saw `idle` or `done` (`unknown`
     /// changes nothing). Decides what an exit means: an agent that ends
@@ -1109,6 +1302,14 @@ struct Actor {
     version_asked_at: Instant,
     /// When the machine was last asked for its room; see `refresh_room`.
     room_asked_at: Instant,
+    /// Tasks `start_save` has a save prompt out for right now, shared with
+    /// the detached future it hands back (`SavingGuard`), each with whether
+    /// the actor has seen its agent working since the prompt. What such an
+    /// agent does is the save turn, not the task's work: its status is not
+    /// applied to the row (`saving_saw`), and `auto_close_done` skips it.
+    /// The flag is for the save's wait, which polls and could miss a short
+    /// turn. Removed on every exit from that future, however it ends.
+    saving: Arc<Mutex<HashMap<i64, bool>>>,
 }
 
 /// The pane of `task` if it is live on `machine`: starting with a pane
@@ -1131,6 +1332,101 @@ fn live_pane(task: &Task, machine: &str) -> Result<String, SendRefused> {
             ),
         }),
     }
+}
+
+/// How often `SaveWork` looks at the agent while it saves. Short, since the
+/// rule it waits by needs to see the agent working at least once, and a
+/// commit and push can take only a few seconds.
+const SAVE_POLL: Duration = Duration::from_millis(500);
+
+/// What is left of `deadline`, or `None` once it has passed: the one clock
+/// `start_save` checks preflight, prompt delivery and the detached wait
+/// against, so none of them can together run longer than the `timeout` a
+/// save was asked to keep inside.
+fn time_left(deadline: Instant) -> Option<Duration> {
+    let now = Instant::now();
+    (now < deadline).then(|| deadline - now)
+}
+
+/// `start_save`'s refusal for a `deadline` that passed before the agent's
+/// work was confirmed saved, whichever step of it ran out the clock.
+fn save_timeout_err(display: &str, timeout: Duration) -> anyhow::Error {
+    SendRefused {
+        code: "save_timeout",
+        message: format!(
+            "the agent of {display} did not finish saving its work within {timeout:?}"
+        ),
+    }
+    .into()
+}
+
+/// `err` from a step `start_save` bounded by what was left of `deadline`:
+/// `save_timeout` once that deadline has passed, since a step cut short by
+/// its own share of the budget is the save timing out, not a herdr that
+/// stopped answering; `err` unchanged with the deadline still ahead, a
+/// genuine failure within it (an outage, say) that the caller should still
+/// see as one.
+fn or_save_timeout(
+    err: anyhow::Error,
+    deadline: Instant,
+    display: &str,
+    timeout: Duration,
+) -> anyhow::Error {
+    if time_left(deadline).is_none() {
+        save_timeout_err(display, timeout)
+    } else {
+        err
+    }
+}
+
+/// Keeps a task's id in `saving` from the moment its save prompt is sent
+/// until the future `start_save` hands back for it ends, however it ends:
+/// success, a refusal, or an error. `auto_close_done` reads the set this
+/// guards to leave such a task's row and pane alone, since the row still
+/// reads `Done` the whole time its agent commits and pushes.
+struct SavingGuard {
+    id: i64,
+    saving: Arc<Mutex<HashMap<i64, bool>>>,
+}
+
+impl SavingGuard {
+    fn new(saving: Arc<Mutex<HashMap<i64, bool>>>, id: i64) -> Self {
+        saving.lock().unwrap().insert(id, false);
+        Self { id, saving }
+    }
+}
+
+impl Drop for SavingGuard {
+    fn drop(&mut self) {
+        self.saving.lock().unwrap().remove(&self.id);
+    }
+}
+
+impl SavingGuard {
+    /// Whether the actor has seen the agent working since the save prompt.
+    fn seen_working(&self) -> bool {
+        self.saving
+            .lock()
+            .unwrap()
+            .get(&self.id)
+            .copied()
+            .unwrap_or(false)
+    }
+}
+
+/// The agent in `pane`, by a fresh `agent.list`.
+async fn agent_in(
+    connector: &dyn Connector,
+    pane: &str,
+    timeout: Duration,
+) -> anyhow::Result<AgentInfo> {
+    let agents = tokio::time::timeout(timeout, connector.agent_list())
+        .await
+        .map_err(|_| TimedOut("agent.list", timeout))??;
+    agents
+        .into_iter()
+        .find(|a| a.pane_id == pane)
+        .with_context(|| format!("no agent in pane {pane}"))
 }
 
 /// Who holds a pane at one look: the agent's name (`Some(None)` for an
@@ -1243,12 +1539,25 @@ pub enum EndBy {
 /// settled `done` (`Actor::pane_end`).
 enum PaneEnd {
     Finished,
+    /// Claude or agy printed `DONE` alone as its last line
+    /// (`task::trailing_done`) without running `pastor task done`: the task
+    /// ends as if it had, with this message as its summary.
+    Said(String),
     Question(String),
     /// Not Claude, idle with no `pastor task done` (`Actor::not_ended`):
     /// the pane's last lines. herdr cannot tell such an agent's pause
     /// (agy thinking, waiting on a process of its own) from its end.
     NotEnded(String),
     ShellRunning,
+    /// Claude stopped under a dialog pastor answers (its autocompact
+    /// offer): the keys that answer it, pressed by the caller. The turn has
+    /// not ended for sure, so the window starts over.
+    Dialog(crate::config::Dialog, Vec<String>),
+    /// Claude stopped under a dialog that shows still but that pastor will
+    /// not press: it was answered for this task already (and the pane did
+    /// not clear), or the option it picks is not there. The task is
+    /// `blocked` for a person, not closed under it.
+    DialogUp(String),
     /// It stopped on a usage limit (`limit::limit_in`): not done, it waits
     /// for the reset or moves to its next model (`Actor::wait_on_limit`).
     /// With the pane's text, for an agent it hands the task to.
@@ -1283,10 +1592,35 @@ struct RateRetry {
 /// Who asked for a close. `pastor task close` refuses what herdr refuses;
 /// auto-close of a done task closes the pane anyway when the worktree cannot
 /// go without force, and writes the row only while it is still `Done`.
+/// `Stopped` is `auto_close_stopped` removing the worktree of a failed task
+/// that asked for it (`DispatchSpec::removes_worktree`): it keeps what it
+/// cannot remove as auto-close does, and the row stays failed, with no pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CloseBy {
     Command,
     AutoClose,
+    Stopped,
+}
+
+impl CloseBy {
+    /// Pastor's own close, not a person's: it keeps, with a note, what a
+    /// `task close` would refuse.
+    fn is_auto(self) -> bool {
+        self != CloseBy::Command
+    }
+}
+
+/// What became of a worktree task's checkout removed with no herdr
+/// workspace of the task's left to remove it by
+/// (`Actor::remove_checkout_left`).
+enum Removal {
+    Gone,
+    /// Kept, with the note saying why.
+    Kept(String),
+    /// Another agent works in it, named.
+    Busy(String),
+    /// git could not tell, or no checkout was recorded.
+    Unknown,
 }
 
 /// What the inner loop should do after a command: nothing, reopen the event
@@ -1315,6 +1649,41 @@ enum PollExit {
 }
 
 impl Actor {
+    /// The version of each pinned harness on the machine (`harness_pins`),
+    /// or `None` when a probe got no answer, so the last reading stays.
+    async fn ask_harness(&self) -> Option<Vec<crate::harness::HarnessStatus>> {
+        let mut out = Vec::new();
+        for (kind, pin) in &self.settings.harness_pins {
+            // A pin on a kind whose manifest is gone or reads no version has
+            // nothing to ask.
+            let Some(harness) = self
+                .settings
+                .harnesses
+                .get(kind)
+                .filter(|m| m.version.is_some())
+            else {
+                continue;
+            };
+            let asked = tokio::time::timeout(
+                self.settings.request_timeout,
+                self.connector.harness_version(harness),
+            )
+            .await;
+            match asked {
+                Ok(Ok(v)) => out.push(crate::harness::HarnessStatus::new(kind, pin, v)),
+                Ok(Err(err)) => {
+                    tracing::warn!(machine = %self.name, %kind, %err, "could not ask for the harness version");
+                    return None;
+                }
+                Err(_) => {
+                    tracing::warn!(machine = %self.name, %kind, "harness version check timed out");
+                    return None;
+                }
+            }
+        }
+        Some(out)
+    }
+
     /// The machine's pastor version, for `machine list` only; `None` when
     /// the question got no answer. The ping or reconcile before it just proved
     /// the machine reachable, so a failure here, even an ssh one, is logged
@@ -1414,9 +1783,13 @@ impl Actor {
                     }
                 };
             let asked = self.ask_pastor_version().await;
+            let harness = self.ask_harness().await;
             self.version_asked_at = Instant::now();
             {
                 let mut s = self.status.write().recover();
+                if let Some(h) = harness {
+                    s.harness = h;
+                }
                 s.herdr_version = Some(pong.version.clone());
                 // An ask that got no answer keeps the version last read and
                 // its time, as the periodic refresh does: a blank here would
@@ -1636,10 +2009,14 @@ impl Actor {
             return;
         }
         self.version_asked_at = Instant::now();
+        let harness = self.ask_harness().await;
         if let Some(v) = self.ask_pastor_version().await {
             let mut s = self.status.write().recover();
             s.pastor_version = v;
             s.pastor_read_at = Some(Utc::now());
+        }
+        if let Some(h) = harness {
+            self.status.write().recover().harness = h;
         }
     }
 
@@ -1692,8 +2069,10 @@ impl Actor {
                     Some(MachineCommand::Send { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
                     Some(MachineCommand::End { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
                     Some(MachineCommand::Pause { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
+                    Some(MachineCommand::SaveWork { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
                     Some(MachineCommand::Resume { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
                     Some(MachineCommand::AutoTrust { reply }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
+                    Some(MachineCommand::Sweep { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
                 },
             }
         }
@@ -1735,13 +2114,15 @@ impl Actor {
     /// `emit` with a `PastorEvent::detail`. A task that turns `done` or
     /// `failed` here ends a round with no summary from its agent, so the
     /// round keeps the pane's last lines (`Store::end_round`); `end_task`
-    /// ends its own with what the agent said.
+    /// ends its own with what the agent said. On a machine cut off from the
+    /// head the round is `no head` (`Store::end_round_unreached`) unless the
+    /// task asked for no summary.
     fn emit_with(&self, kind: &str, task_id: Option<i64>, detail: Option<serde_json::Value>) {
         let summary = task_id.filter(|_| matches!(kind, "task.done" | "task.failed"));
         if let Some(id) = summary {
             self.read_usage(id);
         }
-        let summary = summary.and_then(|id| match self.store.end_round(id, None) {
+        let summary = summary.and_then(|id| match self.end_round(id) {
             Ok(summary) => Some(summary),
             Err(err) => {
                 tracing::error!(machine = %self.name, %err, id, "save the task's summary");
@@ -1749,6 +2130,24 @@ impl Actor {
             }
         });
         self.send_event(kind, task_id, detail, summary);
+    }
+
+    /// `Store::end_round` with no summary, or `end_round_unreached` when the
+    /// task's agent could not have sent one: this machine is cut off from
+    /// the head and the task asked for a summary. A row that cannot be read
+    /// counts as asking.
+    fn end_round(&self, id: i64) -> anyhow::Result<crate::task::TaskSummary> {
+        let asked = || {
+            !matches!(
+                self.store.get_task(id),
+                Ok(Some(t)) if t.spec.summary == crate::task::SummaryMode::Off
+            )
+        };
+        if self.settings.cut_off_from_head && asked() {
+            self.store.end_round_unreached(id)
+        } else {
+            self.store.end_round(id, None)
+        }
     }
 
     /// Read what task `id`'s Claude session has used so far from its files
@@ -1766,6 +2165,9 @@ impl Actor {
                 return;
             }
         };
+        if self.settings.agents.kind(&task.spec.agent) != "claude" {
+            return;
+        }
         let Some(session) = task
             .spec
             .session_id
@@ -2059,10 +2461,36 @@ impl Actor {
                     CommandOutcome::Nothing
                 }
             }
+            MachineCommand::SaveWork {
+                task_id,
+                timeout,
+                reply,
+            } => {
+                // The wait runs beside the actor: an agent committing and
+                // pushing takes minutes, and the actor has the rest of the
+                // machine to serve meanwhile.
+                match self.start_save(task_id, timeout).await {
+                    Ok(wait) => {
+                        tokio::spawn(async move {
+                            let _ = reply.send(wait.await);
+                        });
+                        CommandOutcome::Nothing
+                    }
+                    Err(err) => {
+                        let dead = is_outage(&err);
+                        let _ = reply.send(Err(err));
+                        if dead {
+                            CommandOutcome::Reconnect
+                        } else {
+                            CommandOutcome::Nothing
+                        }
+                    }
+                }
+            }
             MachineCommand::Resume { task_id, reply } => {
                 let (result, mut dead, nows) = self.run_dispatch(task_id, true).await;
                 dead |= nows.dead;
-                if nows.blocked
+                if (matches!(&result, Ok(t) if t.state == TaskState::Blocked) || nows.blocked)
                     && let Err(err) = self.auto_answer().await
                 {
                     tracing::warn!(machine = %self.name, "auto trust after dispatch: {err:#}");
@@ -2075,6 +2503,16 @@ impl Actor {
                     (true, _) => CommandOutcome::Reconnect,
                     (false, true) => CommandOutcome::Resubscribe,
                     (false, false) => CommandOutcome::Nothing,
+                }
+            }
+            MachineCommand::Sweep { apply, reply } => {
+                let result = self.run_sweep(apply).await;
+                let dead = matches!(&result, Err(err) if is_outage(err));
+                let _ = reply.send(result);
+                if dead {
+                    CommandOutcome::Reconnect
+                } else {
+                    CommandOutcome::Nothing
                 }
             }
             MachineCommand::AutoTrust { reply } => {
@@ -2163,34 +2601,10 @@ impl Actor {
             };
             return (Err(err.into()), false);
         }
-        let (text, keys, detail) = if input.trust {
-            // Only the startup prompt: keys sent while the agent starts can
-            // land before the dialog, and would claim the task and save the
-            // repo; keys sent to a working agent go into its own UI.
-            if task.state != TaskState::Blocked || !task.prompt_pending {
-                let err = SendRefused {
-                    code: "not_at_trust_prompt",
-                    message: format!(
-                        "{} is {} and not waiting on its startup prompt; --trust answers only a task blocked while it starts",
-                        task.display_id(),
-                        task.state
-                    ),
-                };
-                return (Err(err.into()), false);
-            }
-            let Some(keys) = self.settings.agents.trust_keys(&task.spec.agent) else {
-                let err = SendRefused {
-                    code: "no_trust_keys",
-                    message: format!(
-                        "agent {} has no trust_keys; set [agents.{}] trust_keys in pastor.toml",
-                        task.spec.agent, task.spec.agent
-                    ),
-                };
-                return (Err(err.into()), false);
-            };
-            let detail = serde_json::json!({"keys": keys, "trust": true});
-            (None, keys, detail)
-        } else if let Some(want) = &input.pick {
+        if input.trust {
+            return self.run_trust_send(task, pane).await;
+        }
+        let (text, keys, detail) = if let Some(want) = &input.pick {
             let timeout = self.settings.request_timeout;
             let target = task.agent_name.as_deref().unwrap_or(&pane);
             let screen =
@@ -2244,8 +2658,24 @@ impl Actor {
                 });
             (text, input.key_sequence(), input.detail())
         };
+        // Text and its Enter go to a Claude session's inbox socket when it
+        // takes them; keys of their own, a line left without Enter and a
+        // pick stay keystrokes, as does whatever the socket does not take.
+        let mut detail = detail;
+        let by_socket = match &text {
+            Some(text) if input.pick.is_none() && keys == ["Enter"] => {
+                self.text_by_socket(&task, text).await
+            }
+            _ => false,
+        };
+        if by_socket {
+            detail["socket"] = true.into();
+        }
         let timeout = self.settings.request_timeout;
         let sent = tokio::time::timeout(timeout, async {
+            if by_socket {
+                return Ok(());
+            }
             if let Some(text) = &text {
                 self.connector.pane_send_text(&pane, text).await?;
             }
@@ -2275,22 +2705,179 @@ impl Actor {
         if task.state == TaskState::Blocked && task.prompt_pending {
             self.dialog_answered.insert(task.id, Instant::now());
         }
-        if input.trust {
-            // The prompt is answered: saved trust must not answer it again.
-            if let Err(err) = self
-                .store
-                .claim_trust_sent(task.id, &keys)
-                .and_then(|_| self.store.claim_answered(task.id, "trust", &keys))
-            {
-                return (Err(err), false);
+        (Ok(task), false)
+    }
+
+    /// Send `text` to `task`'s Claude session through its inbox socket, when
+    /// its agent delivers that way (`dispatch::Inbox`); whether the session
+    /// took it. The `agent.list` read just before gates it as a pending
+    /// prompt is gated (`prompt_by_socket`): an agent herdr lists blocked or
+    /// still launching gets nothing, and the caller types the text, which a
+    /// dialog may be waiting for. Any other answer is typed too.
+    async fn text_by_socket(&self, task: &Task, text: &str) -> bool {
+        let Some(inbox) = crate::dispatch::Inbox::of(&self.settings.agents, &task.spec) else {
+            return false;
+        };
+        let name = task
+            .agent_name
+            .clone()
+            .unwrap_or_else(|| Task::agent_name_for(task.id));
+        let timeout = self.settings.request_timeout;
+        let Ok(Ok(agents)) = tokio::time::timeout(timeout, self.connector.agent_list()).await
+        else {
+            return false;
+        };
+        let Some(agent) = agents.iter().find(|a| a.name.as_deref() == Some(&name)) else {
+            return false;
+        };
+        if agent.agent_status == AgentStatus::Blocked || agent.launch_pending {
+            return false;
+        }
+        let shown = task.display_id();
+        let send = inbox.send(self.connector.as_ref(), &shown, text);
+        matches!(tokio::time::timeout(timeout, send).await, Ok(true))
+    }
+
+    /// `MachineCommand::Send` with `--trust`: only the startup prompt (keys
+    /// sent while the agent starts can land before the dialog, and would
+    /// claim the task and save the repo; keys sent to a working agent go
+    /// into its own UI), its agent's trust keys.
+    ///
+    /// Claude's dialog opens on "No, exit"; `Down` moves to "Yes, I trust
+    /// this folder", which `Enter` then takes. A `Down` lost between pastor
+    /// and the pane once left the dialog on "No, exit", so `Enter` quit
+    /// Claude while pastor still marked the repo trusted. So when
+    /// there is a marker to read the dialog by and more than one key, every
+    /// key but the last goes first; the pane is read, and the last key goes
+    /// only once the marker is the dialog's *selected* option, not merely
+    /// shown (`trust_option_selected`, unlike `shows_trust_marker`, which
+    /// `auto_answer` uses only to confirm the dialog is up before pressing
+    /// every key in one go, since nothing there has pressed a key yet to
+    /// lose). That stricter check only holds for the built-in Claude
+    /// marker, known to be its correct option's own label
+    /// (`Agents::trust_marker_is_option_text`); a configured one may name a
+    /// heading instead, so it falls back to `shows_trust_marker`, the
+    /// dialog merely being up, as every marker did before this check
+    /// existed. A dialog that lands elsewhere is refused and saves no
+    /// trust, the same as a send that fails outright. An agent with a
+    /// single trust key, or none set as a marker, is answered in one press
+    /// as before.
+    async fn run_trust_send(&mut self, task: Task, pane: String) -> (anyhow::Result<Task>, bool) {
+        if task.state != TaskState::Blocked || !task.prompt_pending {
+            let err = SendRefused {
+                code: "not_at_trust_prompt",
+                message: format!(
+                    "{} is {} and not waiting on its startup prompt; --trust answers only a task blocked while it starts",
+                    task.display_id(),
+                    task.state
+                ),
+            };
+            return (Err(err.into()), false);
+        }
+        let Some(keys) = self.settings.agents.trust_keys(&task.spec.agent) else {
+            let err = SendRefused {
+                code: "no_trust_keys",
+                message: format!(
+                    "agent {} has no trust_keys; set [agents.{}] trust_keys in pastor.toml",
+                    task.spec.agent, task.spec.agent
+                ),
+            };
+            return (Err(err.into()), false);
+        };
+        let marker = self.settings.agents.trust_marker(&task.spec.agent);
+        let marker_is_option = self
+            .settings
+            .agents
+            .trust_marker_is_option_text(&task.spec.agent);
+        let timeout = self.settings.request_timeout;
+        // A built-in marker, the right option's own label, is checked even
+        // before a lone key: agy's dialog takes Enter on whatever is selected.
+        let (lead, confirm) = match (marker, keys.split_last()) {
+            (Some(marker), Some((confirm, lead))) if !lead.is_empty() || marker_is_option => {
+                (lead, Some((confirm.clone(), marker)))
             }
-            if let Some(repo) = &task.spec.repo
-                && let Err(err) = self.store.trust_repo(&self.name, repo)
+            _ => (keys.as_slice(), None),
+        };
+        if !lead.is_empty()
+            && let Err((err, dead)) = self.send_keys_timed(&pane, lead, timeout).await
+        {
+            return (Err(err), dead);
+        }
+        if let Some((confirm, marker)) = confirm {
+            let target = task.agent_name.as_deref().unwrap_or(&pane).to_string();
+            let screen = match tokio::time::timeout(
+                timeout,
+                self.connector.agent_read(&target, 100),
+            )
+            .await
             {
-                return (Err(err), false);
+                Ok(Ok(screen)) => screen,
+                Ok(Err(err)) => {
+                    let dead = err.is_transport();
+                    return (Err(err.into()), dead);
+                }
+                Err(_) => return (Err(TimedOut("agent.read", timeout).into()), true),
+            };
+            let selected = if marker_is_option {
+                crate::config::trust_option_selected(&screen, &marker)
+            } else {
+                crate::config::shows_trust_marker(&screen, &marker)
+            };
+            if !selected {
+                let err = SendRefused {
+                    code: "trust_not_selected",
+                    message: format!(
+                        "{} answered its folder-trust dialog with {lead:?}, but it is not on \"{marker}\"; \
+                         not sending the key that confirms it, so it is not left to exit on another option",
+                        task.display_id()
+                    ),
+                };
+                return (Err(err.into()), false);
+            }
+            if let Err((err, dead)) = self
+                .send_keys_timed(&pane, std::slice::from_ref(&confirm), timeout)
+                .await
+            {
+                return (Err(err), dead);
             }
         }
+        let detail = serde_json::json!({"keys": keys, "trust": true});
+        self.emit_with("task.input", Some(task.id), Some(detail));
+        self.unseen_prompt.remove(&task.id);
+        self.dialog_answered.insert(task.id, Instant::now());
+        // The prompt is answered: saved trust must not answer it again.
+        if let Err(err) = self
+            .store
+            .claim_trust_sent(task.id, &keys)
+            .and_then(|_| self.store.claim_answered(task.id, "trust", &keys))
+        {
+            return (Err(err), false);
+        }
+        if let Some(dir) = task.spec.trust_dir()
+            && let Err(err) = self.store.trust_repo(&self.name, dir)
+        {
+            return (Err(err), false);
+        }
         (Ok(task), false)
+    }
+
+    /// `keys` into `pane` within `timeout`: `Err((err, dead))` on failure,
+    /// `dead` for a timeout or a transport failure, same as `run_send`'s own
+    /// send.
+    async fn send_keys_timed(
+        &self,
+        pane: &str,
+        keys: &[String],
+        timeout: Duration,
+    ) -> Result<(), (anyhow::Error, bool)> {
+        match tokio::time::timeout(timeout, self.connector.pane_send_keys(pane, keys)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => {
+                let dead = err.is_transport();
+                Err((err.into(), dead))
+            }
+            Err(_) => Err((TimedOut("pane input", timeout).into(), true)),
+        }
     }
 
     /// `MachineCommand::End`: the row alone, no herdr request. A task with a
@@ -2335,7 +2922,7 @@ impl Actor {
             let err = SendRefused {
                 code: crate::task::SUMMARY_REQUIRED,
                 message: format!(
-                    "{} needs a summary: pastor task done --summary-file - <<'EOF', then a first line done, partial, blocked or nothing to do, up to five short lines, and EOF",
+                    "{} needs a summary: pastor task done --current --summary '<summary>', a text in single quotes (a single quote inside it is written '\\'') whose first line is done, partial, blocked or nothing to do, then up to five short lines",
                     task.display_id()
                 ),
             };
@@ -2437,7 +3024,20 @@ impl Actor {
         remove_worktree: bool,
         by: CloseBy,
     ) -> (anyhow::Result<Task>, bool) {
-        match self.close_inner(task_id, remove_worktree, by).await {
+        self.leftovers = None;
+        let closed = self.close_inner(task_id, remove_worktree, by).await;
+        // Only a close that went through ends what the agent left running: a
+        // refused one leaves the task and its agent as they were. A pane
+        // closed before the refusal is the exception, the agent being gone.
+        if let Some(mut left) = self.leftovers.take()
+            && (closed.is_ok() || left.pane_closed)
+        {
+            if !left.checkout_gone {
+                left.found.retain(|c| c.found != crate::reap::Found::Cwd);
+            }
+            self.end_leftovers(left).await;
+        }
+        match closed {
             Ok(t) => (Ok(t), false),
             Err(err) => {
                 let dead = is_outage(&err);
@@ -2460,6 +3060,13 @@ impl Actor {
             })
         {
             anyhow::bail!("task {name} is no longer done on {}", self.name);
+        }
+        if by == CloseBy::Stopped
+            && !row.as_ref().is_some_and(|t| {
+                t.state == TaskState::Failed && t.machine.as_deref() == Some(&self.name)
+            })
+        {
+            anyhow::bail!("task {name} is no longer failed on {}", self.name);
         }
         // What auto-close leaves behind and says so on the row.
         let mut note = None;
@@ -2524,7 +3131,7 @@ impl Actor {
                 agent: agent.name.clone(),
                 expected,
             };
-            if by == CloseBy::AutoClose {
+            if by.is_auto() {
                 return Err(reused.into());
             }
             tracing::debug!(machine = %self.name, task = %name, %reused, "not closing a reused pane");
@@ -2539,7 +3146,7 @@ impl Actor {
         // The reconcile that found the task done listed a moment ago; the agent
         // may have gone back to work since. Closing it now would kill running
         // work: leave the row `Done` and let the status path move it on.
-        if by == CloseBy::AutoClose
+        if by.is_auto()
             && let Some((pane, _)) = &target
             && let Some(agent) = agents.iter().find(|a| &a.pane_id == pane)
             && !matches!(agent.agent_status, AgentStatus::Idle | AgentStatus::Done)
@@ -2590,14 +3197,36 @@ impl Actor {
         }
         let Some((pane, workspace)) = target else {
             return match row {
+                // No pane, so no workspace of the task's to remove the
+                // checkout by: git removes it on the machine instead.
                 Some(t) if remove_worktree => {
-                    anyhow::bail!(manual_worktree_cleanup(&t.display_id()))
+                    match self.remove_checkout_left(&t, &agents, None).await? {
+                        Removal::Gone => self.finish_removal(t, by, None, true, None),
+                        Removal::Kept(note) => self.finish_removal(t, by, None, false, Some(note)),
+                        Removal::Busy(who) if by.is_auto() => {
+                            let note = worktree_kept_note(&t, &name, &format!("{who} works in it"));
+                            self.finish_removal(t, by, None, false, Some(note))
+                        }
+                        Removal::Busy(who) => anyhow::bail!(
+                            "the worktree of {name} has another agent in it, {who}; close that first"
+                        ),
+                        Removal::Unknown => anyhow::bail!(manual_worktree_cleanup(&t.display_id())),
+                    }
                 }
                 Some(t) if by == CloseBy::AutoClose => self.finish_auto_close(t, None),
                 Some(t) => self.finish_close(t),
                 None => anyhow::bail!("task {name} not found"),
             };
         };
+        // The pane's agent is about to be closed below, taking with it any
+        // conversation id it has not yet reported through a reconcile
+        // (`capture_agent_session` otherwise only runs there): read it from
+        // this same `agent.list` reply first, so a hook's report is not lost
+        // to a close that outruns the next reconcile.
+        let row = row.map(|t| match agents.iter().find(|a| a.pane_id == pane) {
+            Some(agent) => self.capture_agent_session(t, agent),
+            None => t,
+        });
         let mut close_pane = !remove_worktree;
         let mut worktree_gone = false;
         let mut keep_worktree = false;
@@ -2605,9 +3234,14 @@ impl Actor {
         // remote: a push that failed leaves the work only there. Auto-close
         // keeps it, as it keeps a dirty one. Unknown (no checkout recorded,
         // git could not tell) removes as before; herdr keeps the branch.
+        // A task that asked for its worktree to go whatever it ends in
+        // (`remove_worktree`) is not asked: its commits stay on the branch.
         if by == CloseBy::AutoClose
             && remove_worktree
-            && let Some(checkout) = row.as_ref().and_then(|t| t.spec.checkout.as_deref())
+            && let Some(checkout) = row
+                .as_ref()
+                .filter(|t| !t.spec.removes_worktree())
+                .and_then(|t| t.spec.checkout.as_deref())
         {
             let unpushed =
                 tokio::time::timeout(timeout, self.connector.unpushed_commits(&checkout.path))
@@ -2648,7 +3282,7 @@ impl Actor {
                 .checkout_occupant(&agents, task_id, &pane, checkout, own)
                 .await?
             {
-                if by != CloseBy::AutoClose {
+                if !by.is_auto() {
                     anyhow::bail!(
                         "the worktree of {name} has another agent in it, {who}; close that first"
                     );
@@ -2676,6 +3310,20 @@ impl Actor {
             keep_worktree = true;
             close_pane = t.state != TaskState::Closed;
         }
+        // What runs under the pane is listed before it goes, while herdr can
+        // still say where its shell is, and for a checkout that goes too,
+        // what works in it. Ended once the close went through (`run_close`).
+        // Not a closed row's pane: pastor closed that one, and herdr may have
+        // handed its id out again.
+        if row.as_ref().is_none_or(|t| t.state != TaskState::Closed) {
+            let cwd = row
+                .as_ref()
+                .filter(|_| remove_worktree && !keep_worktree)
+                .and_then(|t| t.spec.checkout.as_ref())
+                .filter(|c| !c.already_open)
+                .map(|c| c.path.as_str());
+            self.leftovers = Some(self.find_leftovers(row.as_ref(), &pane, &name, cwd).await);
+        }
         // The task's pane goes first (not a closed row's: pastor closed that
         // one, and herdr may have handed its id out again), then the checkout
         // goes through a workspace `worktree.open` makes on it.
@@ -2685,6 +3333,9 @@ impl Actor {
         {
             if t.state != TaskState::Closed {
                 self.close_pane_of(&pane, &name).await?;
+                if let Some(left) = self.leftovers.as_mut() {
+                    left.pane_closed = true;
+                }
             }
             close_pane = false;
             match self.open_checkout(t, &name).await? {
@@ -2704,7 +3355,11 @@ impl Actor {
                     reopened = Some(created.root_pane.pane_id);
                 }
                 // The checkout is gone already: nothing left to remove.
-                None => worktree_gone = true,
+                None => {
+                    worktree_gone = true;
+                    self.checkout_went();
+                    self.forget_workdir(row.as_ref());
+                }
             }
         }
         if remove_worktree && !keep_worktree && !worktree_gone {
@@ -2715,28 +3370,50 @@ impl Actor {
                 .await
                 .map_err(|_| TimedOut("worktree.remove", timeout))?;
             match removed {
-                Ok(()) => worktree_gone = true,
-                // Already gone, pane and all: nothing left for herdr to remove.
-                Err(err)
-                    if by == CloseBy::AutoClose && err.code() == Some("workspace_not_found") =>
-                {
+                Ok(()) => {
                     worktree_gone = true;
+                    self.checkout_went();
+                    self.forget_workdir(row.as_ref());
                 }
-                // The recorded workspace is gone from herdr too: some other
-                // way it may have already been closed, or its checkout
-                // never existed to begin with. Either way there is no pane
-                // left to worry about here either, so this is the no-target
-                // outcome in disguise -- close the row and hand back the
-                // same manual-cleanup note rather than failing the close.
+                // The recorded workspace is gone from herdr, pane and all:
+                // closed some other way, or its checkout never existed.
+                // The checkout may still be on disk, so git removes it on
+                // the machine; when git cannot tell, auto-close takes it as
+                // gone, and `task close` closes the row with the
+                // manual-cleanup note rather than failing.
                 Err(err) if err.code() == Some("workspace_not_found") => {
                     self.forget_orphan(&pane);
                     self.pending_done.remove(&task_id);
+                    let removal = match row.as_ref() {
+                        Some(t) => Some(self.remove_checkout_left(t, &agents, Some(&pane)).await?),
+                        None => None,
+                    };
+                    // Only a checkout that is gone is searched.
+                    if matches!(removal, Some(Removal::Gone)) {
+                        self.checkout_went();
+                    }
                     return match row {
-                        Some(mut t) => {
-                            let note = manual_worktree_cleanup(&t.display_id());
-                            t.workspace_id = None;
-                            self.finish_close_with_note(t, note)
-                        }
+                        Some(t) => match removal.expect("a row was looked at") {
+                            Removal::Gone => self.finish_removal(t, by, Some(&pane), true, None),
+                            Removal::Kept(note) => {
+                                self.finish_removal(t, by, Some(&pane), true, Some(note))
+                            }
+                            Removal::Busy(who) if by.is_auto() => {
+                                let why = format!("{who} works in it");
+                                let note = worktree_kept_note(&t, &name, &why);
+                                self.finish_removal(t, by, Some(&pane), true, Some(note))
+                            }
+                            Removal::Busy(who) => anyhow::bail!(
+                                "the worktree of {name} has another agent in it, {who}; close that first"
+                            ),
+                            Removal::Unknown if by.is_auto() => {
+                                self.finish_removal(t, by, Some(&pane), true, None)
+                            }
+                            Removal::Unknown => {
+                                let note = manual_worktree_cleanup(&t.display_id());
+                                self.finish_removal(t, by, Some(&pane), true, Some(note))
+                            }
+                        },
                         None => {
                             self.refresh_live();
                             Err(OrphanClosed {
@@ -2752,7 +3429,7 @@ impl Actor {
                 // for an API refusal, where herdr actually answered with a
                 // code: a protocol or decoding error is not herdr saying no,
                 // so it falls to the branch below and is retried whole.
-                Err(err) if by == CloseBy::AutoClose && err.code().is_some() => {
+                Err(err) if by.is_auto() && err.code().is_some() => {
                     self.close_reopened(reopened.as_deref()).await;
                     let t = row.as_ref().expect("auto-close has a row");
                     let why = match err.code() {
@@ -2776,6 +3453,9 @@ impl Actor {
         self.forget_orphan(&pane);
         self.pending_done.remove(&task_id);
         match row {
+            Some(t) if by == CloseBy::Stopped => {
+                self.finish_stopped(t, Some(&pane), worktree_gone, note)
+            }
             // The workspace is gone with the worktree. Clearing it is how
             // the row says so: prune keeps a worktree row that still
             // records one, since a plain close leaves the checkout on disk.
@@ -2805,6 +3485,122 @@ impl Actor {
                 }
                 .into())
             }
+        }
+    }
+
+    /// List what runs under the shell of `pane`, and in `cwd` (the checkout
+    /// that is about to go), before the pane closes (`reap`): closing a pane
+    /// takes its shell, not a build the agent started under `flock` or
+    /// `setsid`. It has to be asked while herdr can still say where the
+    /// shell is, and nothing is signalled yet, since the close can still be
+    /// refused: `end_leftovers` does that once it went through. Best effort:
+    /// a pane herdr cannot describe, or a machine that cannot be reached,
+    /// finds nothing and the close goes on.
+    async fn find_leftovers(
+        &self,
+        task: Option<&Task>,
+        pane: &str,
+        name: &str,
+        cwd: Option<&str>,
+    ) -> Leftovers {
+        let mut left = Leftovers {
+            task_id: task.map(|t| t.id),
+            pane: pane.to_string(),
+            name: name.to_string(),
+            found: vec![],
+            pane_closed: false,
+            checkout_gone: false,
+        };
+        let timeout = self.settings.request_timeout;
+        let root = match tokio::time::timeout(timeout, self.connector.pane_shell_pid(pane)).await {
+            Ok(Ok(pid)) => pid,
+            Ok(Err(err)) => {
+                tracing::debug!(machine = %self.name, task = %name, %err, "no process info for a pane about to close");
+                None
+            }
+            Err(_) => None,
+        };
+        let spec = crate::reap::Spec {
+            root,
+            // Never the root of a disk, or a path that is not one.
+            cwd: cwd
+                .filter(|c| c.starts_with('/') && c.len() > 1)
+                .map(str::to_string),
+        };
+        if spec.is_empty() {
+            return left;
+        }
+        match tokio::time::timeout(timeout, self.connector.find_processes(&spec)).await {
+            Ok(Ok(Some(found))) => left.found = found,
+            Ok(Ok(None)) => {}
+            Ok(Err(err)) => {
+                tracing::warn!(machine = %self.name, task = %name, %err, "look for what a closing task left running");
+            }
+            Err(_) => {
+                tracing::warn!(machine = %self.name, task = %name, "looking for what a closing task left running took too long");
+            }
+        }
+        left
+    }
+
+    /// End what `find_leftovers` listed that still runs, now that the close
+    /// went through: the agent and its tools went with the pane and are not
+    /// among them. What was ended goes in `task.processes_killed`.
+    async fn end_leftovers(&self, left: Leftovers) {
+        if left.found.is_empty() {
+            return;
+        }
+        let within = self.settings.request_timeout + crate::reap::GRACE + Duration::from_secs(5);
+        let killed = match tokio::time::timeout(within, self.connector.end_processes(&left.found))
+            .await
+        {
+            Ok(Ok(Some(killed))) => killed,
+            Ok(Ok(None)) => return,
+            Ok(Err(err)) => {
+                tracing::warn!(machine = %self.name, task = %left.name, %err, "end what a closed task left running");
+                return;
+            }
+            Err(_) => {
+                tracing::warn!(machine = %self.name, task = %left.name, "ending what a closed task left running took too long");
+                return;
+            }
+        };
+        if killed.is_empty() {
+            return;
+        }
+        let ended = killed.iter().filter(|k| k.ended).count();
+        tracing::info!(machine = %self.name, task = %left.name, ended, listed = killed.len(), "ended what a closed task left running");
+        self.emit_with(
+            "task.processes_killed",
+            left.task_id,
+            Some(serde_json::json!({
+                "pane": left.pane,
+                "count": ended,
+                "processes": killed,
+            })),
+        );
+    }
+
+    /// The checkout of the close under way is gone: what works in it is
+    /// ended too.
+    /// The workdir sets the head placed in `t`'s worktree leave with it
+    /// (`workdir_task::Gate::forget`): its ledger and the repo's exclude
+    /// lines for it would otherwise stay until a read finds it gone.
+    fn forget_workdir(&self, t: Option<&Task>) {
+        if let Some(c) = t.and_then(|t| t.spec.checkout.as_deref()) {
+            self.forget_workdir_in(&c.path);
+        }
+    }
+
+    fn forget_workdir_in(&self, dir: &str) {
+        if let Some(gate) = &self.settings.workdir_gate.0 {
+            gate.forget(&self.name, dir);
+        }
+    }
+
+    fn checkout_went(&mut self) {
+        if let Some(left) = self.leftovers.as_mut() {
+            left.checkout_gone = true;
         }
     }
 
@@ -2966,6 +3762,7 @@ impl Actor {
         let name = t.display_id();
         let Some(created) = self.open_checkout(&t, &name).await? else {
             // Gone already: nothing left to remove.
+            self.forget_workdir(Some(&t));
             return self.finish_close(t);
         };
         if created.already_open {
@@ -2982,7 +3779,10 @@ impl Actor {
             .await
             .map_err(|_| TimedOut("worktree.remove", timeout))?;
         match removed {
-            Ok(()) => self.finish_close(t),
+            Ok(()) => {
+                self.forget_workdir(Some(&t));
+                self.finish_close(t)
+            }
             Err(err) => {
                 self.close_reopened(Some(&created.root_pane.pane_id)).await;
                 Err(anyhow::Error::from(err).context(format!("remove the worktree of {name}")))
@@ -3016,6 +3816,331 @@ impl Actor {
         Ok(t)
     }
 
+    /// The row half of a close whose checkout `remove_checkout_left` dealt
+    /// with, for whoever asked: `workspace_gone` clears the row's workspace,
+    /// and `note` says what was kept.
+    fn finish_removal(
+        &mut self,
+        mut t: Task,
+        by: CloseBy,
+        pane: Option<&str>,
+        workspace_gone: bool,
+        note: Option<String>,
+    ) -> anyhow::Result<Task> {
+        if workspace_gone || note.is_none() {
+            t.workspace_id = None;
+        }
+        match (by, note) {
+            (CloseBy::Stopped, note) => self.finish_stopped(t, pane, workspace_gone, note),
+            (CloseBy::AutoClose, note) => self.finish_auto_close(t, note),
+            (CloseBy::Command, Some(note)) => self.finish_close_with_note(t, note),
+            (CloseBy::Command, None) => {
+                self.store.update_task(&mut t)?;
+                self.finish_close(t)
+            }
+        }
+    }
+
+    /// The row half of removing a failed task's worktree
+    /// (`CloseBy::Stopped`): it stays failed, so `task retry` still takes
+    /// it and makes a new worktree from its branch, and records no pane any
+    /// more, nor a workspace once the checkout is gone. A note on a kept
+    /// checkout follows the error the task failed with.
+    fn finish_stopped(
+        &mut self,
+        t: Task,
+        pane: Option<&str>,
+        workspace_gone: bool,
+        note: Option<String>,
+    ) -> anyhow::Result<Task> {
+        let written = write_task(&self.store, t.clone(), |t| {
+            let ours = t.state == TaskState::Failed && t.pane_id.as_deref() == pane;
+            if ours {
+                t.pane_id = None;
+                if workspace_gone {
+                    t.workspace_id = None;
+                }
+                if let Some(note) = &note {
+                    t.error = Some(match t.error.take() {
+                        Some(e) => format!("{e}; {note}"),
+                        None => note.clone(),
+                    });
+                }
+            }
+            ours
+        })?;
+        self.refresh_live();
+        Ok(written.unwrap_or(t))
+    }
+
+    /// Remove the checkout of worktree task `t` when herdr has no
+    /// workspace of the task's left on it (closed with its last pane, or
+    /// gone some other way): `git worktree remove` on the machine, never
+    /// forced, so uncommitted or untracked files keep it. The same checks
+    /// as through herdr come first: a checkout another agent works in, one
+    /// a workspace pastor did not open showed when the task started, or one
+    /// a workspace still shows, stays. `pane` is the task's own, if any.
+    async fn remove_checkout_left(
+        &self,
+        t: &Task,
+        agents: &[AgentInfo],
+        pane: Option<&str>,
+    ) -> anyhow::Result<Removal> {
+        let name = t.display_id();
+        let Some(checkout) = t.spec.checkout.as_deref() else {
+            return Ok(Removal::Unknown);
+        };
+        if let Some(kept) = self.checkout_held(t, agents, pane).await? {
+            return Ok(kept);
+        }
+        let timeout = self.settings.request_timeout;
+        let removed = tokio::time::timeout(timeout, self.connector.remove_checkout(&checkout.path))
+            .await
+            .map_err(|_| TimedOut("git worktree remove", timeout))?
+            .map_err(CallError::from)
+            .with_context(|| format!("remove the worktree of {name}"))?;
+        Ok(match removed {
+            Some(true) => {
+                self.forget_workdir(Some(t));
+                Removal::Gone
+            }
+            Some(false) => Removal::Kept(worktree_kept_note(
+                t,
+                &name,
+                "uncommitted or untracked files",
+            )),
+            None => Removal::Unknown,
+        })
+    }
+
+    /// What keeps the checkout of `t` from being removed that is not in the
+    /// checkout itself: a workspace pastor did not open showed it when the
+    /// task started, another agent works in it, or a workspace still shows
+    /// it. None when nothing does (or no checkout is recorded).
+    async fn checkout_held(
+        &self,
+        t: &Task,
+        agents: &[AgentInfo],
+        pane: Option<&str>,
+    ) -> anyhow::Result<Option<Removal>> {
+        let name = t.display_id();
+        let Some(checkout) = t.spec.checkout.as_deref() else {
+            return Ok(None);
+        };
+        if checkout.already_open {
+            let why = "a workspace pastor did not open showed it when the task started";
+            return Ok(Some(Removal::Kept(worktree_kept_note(t, &name, why))));
+        }
+        if let Some(who) = self
+            .checkout_occupant(agents, t.id, pane.unwrap_or(""), Some(&checkout.path), None)
+            .await?
+        {
+            return Ok(Some(Removal::Busy(who)));
+        }
+        let timeout = self.settings.request_timeout;
+        let workspaces = tokio::time::timeout(timeout, self.connector.workspace_list())
+            .await
+            .map_err(|_| TimedOut("workspace.list", timeout))??;
+        if let Some(w) = workspaces.iter().find(|w| {
+            w.worktree
+                .as_ref()
+                .is_some_and(|c| crate::dispatch::same_dir(&c.checkout_path, &checkout.path))
+        }) {
+            let why = format!("workspace {} shows it", w.workspace_id);
+            return Ok(Some(Removal::Kept(worktree_kept_note(t, &name, &why))));
+        }
+        Ok(None)
+    }
+
+    /// `pastor task sweep` on this machine: the worktrees pastor made for
+    /// tasks that have ended (closed or failed) and that are still on
+    /// disk, each either removed (with `apply`; or listed as `would_remove`
+    /// without) or kept with the reason. A worktree is removed only when all
+    /// of these hold, and each is asked of the machine itself:
+    ///
+    /// - the path is one a task row recorded for pastor's own checkout, looks
+    ///   like a path (absolute, no `..`) and is not a repo a task works in;
+    /// - no live task uses it: every row that records it, or has it as
+    ///   `--repo`, has ended;
+    /// - pastor opened it, no workspace shows it, no agent works in it
+    ///   (`checkout_held`);
+    /// - git finds no commit on no remote and no uncommitted or untracked
+    ///   file (ignored files, a build's `target/`, go with the worktree);
+    /// - and then `git worktree remove` is asked, never forced, which
+    ///   refuses what the checks above missed.
+    ///
+    /// Anything that cannot be told is kept. The branch stays, and so do the
+    /// task rows: a retry puts the checkout back.
+    async fn run_sweep(&self, apply: bool) -> anyhow::Result<Vec<SweepEntry>> {
+        let timeout = self.settings.request_timeout;
+        let mut rows = self.store.list_tasks(&TaskFilter {
+            machine: Some(self.name.clone()),
+            ..Default::default()
+        })?;
+        // Oldest first, so a worktree's branch and its tasks read in order.
+        rows.sort_by_key(|t| t.id);
+        // A stale task's agent may still be at work (it turns failed once it
+        // stops), so a stale task counts as live here.
+        let ended = |t: &Task| matches!(t.state, TaskState::Closed | TaskState::Failed);
+        // Worktrees by path, in the order the rows are first seen.
+        let mut paths: Vec<String> = Vec::new();
+        for t in &rows {
+            if let Some(c) = t.spec.checkout.as_ref()
+                && !paths.contains(&c.path)
+            {
+                paths.push(c.path.clone());
+            }
+        }
+        let agents = tokio::time::timeout(timeout, self.connector.agent_list())
+            .await
+            .map_err(|_| TimedOut("agent.list", timeout))??;
+        let mut out = Vec::new();
+        for path in paths {
+            let here: Vec<&Task> = rows
+                .iter()
+                .filter(|t| {
+                    t.spec
+                        .checkout
+                        .as_ref()
+                        .is_some_and(|c| crate::dispatch::same_dir(&c.path, &path))
+                })
+                .collect();
+            // Only what a task that ended left: a running task's own
+            // worktree is not the sweep's business.
+            if !here.iter().any(|t| ended(t)) {
+                continue;
+            }
+            let first = here[0];
+            let entry = |action, why: Option<String>| SweepEntry {
+                machine: self.name.clone(),
+                path: path.clone(),
+                branch: first
+                    .spec
+                    .checkout
+                    .as_ref()
+                    .map(|c| c.branch.clone())
+                    .unwrap_or_default(),
+                tasks: here.iter().map(|t| t.display_id()).collect(),
+                action,
+                why,
+            };
+            let kept = |why: String| entry(SweepAction::Kept, Some(why));
+            if !sweepable_path(&path) {
+                out.push(kept(
+                    "the recorded path does not look like a worktree".into(),
+                ));
+                continue;
+            }
+            // A live task: one that records the worktree, or works in it as
+            // its `--repo` (a fix round).
+            if let Some(live) = rows.iter().find(|t| {
+                !ended(t)
+                    && (t
+                        .spec
+                        .checkout
+                        .as_ref()
+                        .is_some_and(|c| crate::dispatch::same_dir(&c.path, &path))
+                        || t.spec
+                            .repo
+                            .as_deref()
+                            .is_some_and(|r| crate::dispatch::same_dir(r, &path)))
+            }) {
+                out.push(kept(format!(
+                    "{} is live ({})",
+                    live.display_id(),
+                    live.state
+                )));
+                continue;
+            }
+            // A repo a task works in is not a worktree to sweep.
+            if rows.iter().any(|t| {
+                t.spec
+                    .repo
+                    .as_deref()
+                    .is_some_and(|r| crate::dispatch::same_dir(r, &path))
+            }) {
+                out.push(kept("it is the repo a task works in".into()));
+                continue;
+            }
+            if here
+                .iter()
+                .any(|t| t.spec.checkout.as_ref().is_some_and(|c| c.already_open))
+            {
+                out.push(kept(
+                    "a workspace pastor did not open showed it when the task started".into(),
+                ));
+                continue;
+            }
+            let ask = async |what: &'static str, f: crate::herdr::transport::DirFuture<'_>| {
+                tokio::time::timeout(timeout, f)
+                    .await
+                    .map_err(|_| TimedOut(what, timeout))?
+                    .map_err(CallError::from)
+                    .map_err(anyhow::Error::from)
+            };
+            match ask("test -e", self.connector.dir_exists(&path)).await? {
+                Some(false) => continue,
+                Some(true) => {}
+                None => {
+                    out.push(kept("could not tell whether it is still there".into()));
+                    continue;
+                }
+            }
+            match ask("git rev-list", self.connector.unpushed_commits(&path)).await? {
+                Some(false) => {}
+                Some(true) => {
+                    out.push(kept("commits on no remote".into()));
+                    continue;
+                }
+                None => {
+                    out.push(kept("could not tell whether its commits are pushed".into()));
+                    continue;
+                }
+            }
+            match ask("git status", self.connector.checkout_dirty(&path)).await? {
+                Some(false) => {}
+                Some(true) => {
+                    out.push(kept("uncommitted or untracked files".into()));
+                    continue;
+                }
+                None => {
+                    out.push(kept(
+                        "could not tell whether it has uncommitted files".into(),
+                    ));
+                    continue;
+                }
+            }
+            match self.checkout_held(first, &agents, None).await? {
+                None => {}
+                Some(Removal::Busy(who)) => {
+                    out.push(kept(format!("{who} works in it")));
+                    continue;
+                }
+                Some(Removal::Kept(_)) => {
+                    out.push(kept("a workspace shows it".into()));
+                    continue;
+                }
+                Some(_) => {
+                    out.push(kept("something holds it".into()));
+                    continue;
+                }
+            }
+            if !apply {
+                out.push(entry(SweepAction::WouldRemove, None));
+                continue;
+            }
+            match ask("git worktree remove", self.connector.remove_checkout(&path)).await? {
+                Some(true) => {
+                    self.forget_workdir_in(&path);
+                    out.push(entry(SweepAction::Removed, None));
+                }
+                Some(false) => out.push(kept("uncommitted or untracked files".into())),
+                None => out.push(kept("git could not tell whether it removed it".into())),
+            }
+        }
+        Ok(out)
+    }
+
     /// Both auto-closes: done tasks (`auto_close_done`), then the panes of
     /// stopped agents no task is waiting on (`auto_close_stopped`).
     async fn auto_close(&mut self) -> anyhow::Result<()> {
@@ -3036,13 +4161,20 @@ impl Actor {
         };
         let grace = chrono::Duration::from_std(after).unwrap_or(chrono::Duration::MAX);
         let now = Utc::now();
-        let due: Vec<Task> = self
-            .store
-            .tasks_on_machine(&self.name)?
+        let tasks = self.store.tasks_on_machine(&self.name)?;
+        // A done task with a save out for it is not idle in the sense this
+        // check means: its agent is mid-commit or mid-push, and closing its
+        // pane now would strand that work. `start_save` clears it here the
+        // moment the save resolves, one way or another. Cloned out of the
+        // lock, not held across it: a `std::sync::MutexGuard` is never
+        // `Send`, and the loop below awaits.
+        let saving: HashSet<i64> = self.saving.lock().unwrap().keys().copied().collect();
+        let due: Vec<Task> = tasks
             .into_iter()
             .filter(|t| {
                 t.state == TaskState::Done
                     && !t.spec.keeps_pane()
+                    && !saving.contains(&t.id)
                     && now - t.finished_at.unwrap_or(t.updated_at) >= grace
             })
             .collect();
@@ -3103,6 +4235,20 @@ impl Actor {
     /// `Starting` task with no pane. A pane herdr will not close is logged
     /// and tried again at the next check; only a failure below the API is
     /// returned.
+    /// Whether the checkout of `t` holds uncommitted or untracked files,
+    /// or pastor cannot tell; false for a task with no checkout.
+    async fn holds_unsaved_work(&self, t: &Task) -> anyhow::Result<bool> {
+        let Some(checkout) = t.spec.checkout.as_deref() else {
+            return Ok(false);
+        };
+        let timeout = self.settings.request_timeout;
+        let dirty = tokio::time::timeout(timeout, self.connector.checkout_dirty(&checkout.path))
+            .await
+            .map_err(|_| TimedOut("git status", timeout))?
+            .map_err(CallError::from)?;
+        Ok(dirty != Some(false))
+    }
+
     async fn auto_close_stopped(&mut self) -> anyhow::Result<()> {
         let Some(after) = self.settings.close_failed_after else {
             return Ok(());
@@ -3261,6 +4407,25 @@ impl Actor {
                 self.pending_done.remove(&t.id);
                 self.emit("task.failed", Some(t.id));
             }
+            // Asked for its worktree to go whatever it ends in: removing it
+            // through herdr closes the pane with it, and what cannot go is
+            // kept with a note, as auto-close of a done task does.
+            if t.spec.removes_worktree() {
+                let (result, dead) = self.run_close(t.id, true, CloseBy::Stopped).await;
+                listed = false;
+                match result {
+                    Ok(row) => {
+                        tracing::info!(machine = %self.name, task = %name, ?after, note = ?row.error, "removed a stopped agent's worktree after close_failed_after");
+                        closed.insert(pane);
+                    }
+                    Err(err) if dead => return Err(err),
+                    Err(err) => {
+                        tracing::warn!(machine = %self.name, task = %name, err = format!("{err:#}"), "removing a failed task's worktree failed; trying again at the next check");
+                    }
+                }
+                continue;
+            }
+            let left = self.find_leftovers(Some(&t), &pane, &name, None).await;
             let close = self.close_pane_of(&pane, &name).await;
             listed = false;
             match close {
@@ -3271,6 +4436,7 @@ impl Actor {
                     continue;
                 }
             }
+            self.end_leftovers(left).await;
             write_task(&self.store, t, |t| {
                 let ours = t.pane_id.as_deref() == Some(pane.as_str());
                 if ours {
@@ -3303,6 +4469,7 @@ impl Actor {
                 self.stopped_since.remove(&pane);
                 continue;
             }
+            let left = self.find_leftovers(None, &pane, &agent, None).await;
             let close = self.close_pane_of(&pane, &agent).await;
             listed = false;
             match close {
@@ -3313,6 +4480,7 @@ impl Actor {
                     continue;
                 }
             }
+            self.end_leftovers(left).await;
             tracing::info!(machine = %self.name, %agent, %pane, ?after, "closed an orphaned agent's pane after close_failed_after");
             self.forget_orphan(&pane);
         }
@@ -3352,12 +4520,12 @@ impl Actor {
         }
     }
 
-    /// `MachineCommand::Pause`. The agent is interrupted first (`esc`, so
-    /// Claude ends its turn and saves the conversation as it stands), then
-    /// its pane closes, which ends the agent; a worktree stays on disk, since
-    /// only `worktree.remove` deletes one. The row goes `paused` last, with
-    /// no pane or workspace: the pane is gone, and the workspace closed with
-    /// its last pane or is someone else's.
+    /// `MachineCommand::Pause`. The agent is interrupted first (`esc`, so it
+    /// ends its turn and saves the conversation as it stands, Claude's and
+    /// agy's alike), then its pane closes, which ends the agent; a worktree
+    /// stays on disk, since only `worktree.remove` deletes one. The row goes
+    /// `paused` last, with no pane or workspace: the pane is gone, and the
+    /// workspace closed with its last pane or is someone else's.
     async fn pause_task(&mut self, task_id: i64, for_task: i64) -> anyhow::Result<Task> {
         let task = self
             .store
@@ -3395,6 +4563,235 @@ impl Actor {
         .with_context(|| format!("{name} moved on while it was paused"))?;
         self.emit("task.paused", Some(task_id));
         Ok(paused)
+    }
+
+    /// Whether task `id` has a save out: then `status` is the save turn's,
+    /// and is not applied to its row. A `working` is kept for the save's
+    /// wait (`SavingGuard::seen_working`), and any window the task had
+    /// open toward `done` is dropped, since the idle that would close it
+    /// is the save's.
+    fn saving_saw(&mut self, id: i64, status: AgentStatus) -> bool {
+        {
+            let mut saving = self.saving.lock().unwrap();
+            let Some(seen) = saving.get_mut(&id) else {
+                return false;
+            };
+            *seen |= status == AgentStatus::Working;
+        }
+        self.pending_done.remove(&id);
+        true
+    }
+
+    /// The part of `MachineCommand::SaveWork` the actor does itself: check
+    /// the task and its agent, and give it the prompt. What it returns waits
+    /// for the agent to finish that prompt, off the actor.
+    async fn start_save(
+        &mut self,
+        task_id: i64,
+        timeout: Duration,
+    ) -> anyhow::Result<Pin<Box<dyn Future<Output = anyhow::Result<Task>> + Send>>> {
+        let deadline = Instant::now() + timeout;
+        let Some(task) = self.store.get_task(task_id)? else {
+            let err = SendRefused {
+                code: "task_not_found",
+                message: format!("t-{task_id} not found"),
+            };
+            return Err(err.into());
+        };
+        let pane = match (&task.pane_id, task.machine.as_deref()) {
+            (Some(pane), Some(m)) if task.state.occupies_pane() && m == self.name => pane.clone(),
+            _ => {
+                let err = SendRefused {
+                    code: "task_not_live",
+                    message: format!(
+                        "{} is {} with no pane on {}; there is no agent to save its work",
+                        task.display_id(),
+                        task.state,
+                        self.name
+                    ),
+                };
+                return Err(err.into());
+            }
+        };
+        let display = task.display_id();
+        let request_timeout = self.settings.request_timeout;
+        let Some(budget) = time_left(deadline).map(|d| d.min(request_timeout)) else {
+            return Err(save_timeout_err(&display, timeout));
+        };
+        let agent = agent_in(&*self.connector, &pane, budget)
+            .await
+            .map_err(|e| or_save_timeout(e, deadline, &display, timeout))?;
+        if agent.agent_status == AgentStatus::Working {
+            let err = SendRefused {
+                code: "agent_busy",
+                message: format!(
+                    "the agent of {display} is working; save its work once it is idle"
+                ),
+            };
+            return Err(err.into());
+        }
+        // Waiting for a person, or still launching: the prompt would land in
+        // a dialog, or wait in a queue the save cannot see the end of.
+        if agent.agent_status == AgentStatus::Blocked || agent.launch_pending {
+            let err = SendRefused {
+                code: "save_blocked",
+                message: format!(
+                    "the agent of {display} is waiting on a question; answer it, then save its work"
+                ),
+            };
+            return Err(err.into());
+        }
+        let name = task
+            .agent_name
+            .clone()
+            .unwrap_or_else(|| Task::agent_name_for(task.id));
+        let prompt = crate::task::MOVE_SAVE_PROMPT;
+        let Some(budget) = time_left(deadline).map(|d| d.min(request_timeout)) else {
+            return Err(save_timeout_err(&display, timeout));
+        };
+        // Through the session's inbox socket when it takes it, as a task's
+        // own prompt goes; typed otherwise. A socket send has no reply from
+        // the agent, so the save counts from the `agent.list` read above,
+        // with no work seen since, as `prompt_by_socket` does.
+        let by_socket = match crate::dispatch::Inbox::of(&self.settings.agents, &task.spec) {
+            Some(inbox) => matches!(
+                tokio::time::timeout(
+                    budget,
+                    inbox.send(self.connector.as_ref(), &display, prompt)
+                )
+                .await,
+                Ok(true)
+            ),
+            None => false,
+        };
+        let sent = if by_socket {
+            agent
+        } else {
+            let Some(budget) = time_left(deadline).map(|d| d.min(request_timeout)) else {
+                return Err(save_timeout_err(&display, timeout));
+            };
+            tokio::time::timeout(budget, self.connector.agent_prompt(&name, prompt))
+                .await
+                .map_err(|_| save_timeout_err(&display, timeout))??
+        };
+        // Tracked from the prompt landing, not from when the wait below
+        // starts: a save is in flight the moment its prompt is sent, even
+        // while this result sits between `handle_command` and the
+        // `tokio::spawn` that awaits it. Dropped on every exit from the
+        // future this hands back.
+        let guard = SavingGuard::new(self.saving.clone(), task_id);
+        let connector = self.connector.clone();
+        let claude = self.settings.agents.kind(&task.spec.agent) == "claude";
+        let store = self.store.clone();
+        Ok(Box::pin(async move {
+            // Counted from the prompt, as `deliver_pending_prompt` does: what
+            // the agent did before it is not this prompt's work.
+            let baseline = sent.state_change_seq;
+            let mut active = sent.agent_status.is_activity();
+            let mut last_seq = baseline;
+            let saved: anyhow::Result<()> = async {
+                loop {
+                    let Some(sleep_for) = time_left(deadline) else {
+                        return Err(save_timeout_err(&display, timeout));
+                    };
+                    tokio::time::sleep(SAVE_POLL.min(sleep_for)).await;
+                    // The sleep can land right on the deadline: recheck before
+                    // spending any more of it on a request, so a slow read never
+                    // turns an overrun into a late success.
+                    let Some(budget) = time_left(deadline).map(|d| d.min(request_timeout)) else {
+                        return Err(save_timeout_err(&display, timeout));
+                    };
+                    let agent = agent_in(&*connector, &pane, budget)
+                        .await
+                        .map_err(|e| or_save_timeout(e, deadline, &display, timeout))?;
+                    last_seq = last_seq.max(agent.state_change_seq);
+                    // Stopped on a question mid-save (a permission prompt on
+                    // the push, say): nobody is there to answer it in time.
+                    if agent.agent_status == AgentStatus::Blocked {
+                        let err = SendRefused {
+                            code: "save_blocked",
+                            message: format!(
+                                "the agent of {display} stopped on a question instead of finishing the save"
+                            ),
+                        };
+                        return Err(err.into());
+                    }
+                    if agent.agent_status == AgentStatus::Working {
+                        active = true;
+                        continue;
+                    }
+                    // A turn shorter than a poll is seen working only by the
+                    // actor's events.
+                    active |= guard.seen_working();
+                    if !matches!(agent.agent_status, AgentStatus::Idle | AgentStatus::Done)
+                        || !crate::task::completed_past(
+                            baseline,
+                            active,
+                            Some(agent.state_change_seq),
+                            agent.completion_seq,
+                        )
+                    {
+                        continue;
+                    }
+                    // Idle past the prompt's own sequence is not proof by
+                    // itself: herdr reads an agent idle while it waits on a
+                    // shell of its own, or while agy is still thinking, the same
+                    // way it reads one that is really done. Read the pane, as
+                    // `pane_end` does for a real completion, before trusting it.
+                    let Some(budget) = time_left(deadline).map(|d| d.min(request_timeout)) else {
+                        return Err(save_timeout_err(&display, timeout));
+                    };
+                    let text = tokio::time::timeout(budget, connector.agent_read(&name, 100))
+                        .await
+                        .map_err(|_| save_timeout_err(&display, timeout))??;
+                    if (claude && crate::task::background_shell_running(&text))
+                        || (!claude && crate::task::tasks_running(&text))
+                    {
+                        // Still at work: keep polling at this sequence rather
+                        // than call it done on an idle reading that is really
+                        // the agent waiting on a shell or thinking.
+                        continue;
+                    }
+                    let question = crate::task::trailing_question(&text)
+                        .or_else(|| (!claude).then(|| crate::task::permission_question(&text))?);
+                    if let Some(question) = question {
+                        let err = SendRefused {
+                            code: "save_blocked",
+                            message: format!(
+                                "the agent of {display} is asking instead of finishing the save: {question}"
+                            ),
+                        };
+                        return Err(err.into());
+                    }
+                    if time_left(deadline).is_none() {
+                        return Err(save_timeout_err(&display, timeout));
+                    }
+                    return Ok(());
+                }
+            }
+            .await;
+            // The save turn is not the task's work, however the save ended:
+            // a later idle at its sequence completes nothing, so a move that
+            // does not go ahead leaves the row as it was.
+            if let Ok(Some(row)) = store.get_task(task_id) {
+                let moved = write_task(&store, row, |t| {
+                    let behind = t.last_completion_seq.is_none_or(|seq| seq < last_seq);
+                    if behind {
+                        t.last_completion_seq = Some(last_seq);
+                    }
+                    behind
+                });
+                if let Err(err) = moved {
+                    let shown: &str = &display;
+                    tracing::warn!(task = shown, %err, "record the save turn's sequence");
+                }
+            }
+            drop(guard);
+            saved?;
+            store
+                .get_task(task_id)?
+                .with_context(|| format!("{display} vanished while it saved"))
+        }))
     }
 
     /// Start task `task_id` (a paused one with `resume`), taking any
@@ -3496,13 +4893,68 @@ impl Actor {
         // Whether the agent goes back to a conversation it had: one that dies
         // at the start of a new one never got its prompt there.
         let resumes_session = resume && task.spec.session_id.is_some();
+        // The machine's bundles first: `auto` applies a stale machine and
+        // launches, `manual` launches with what is there, and a failed apply
+        // stops the task in both. It has its own time, not the dispatch's.
+        if let Some(gate) = &self.settings.bundle_gate.0
+            && let Err(why) = gate.before_launch(&self.name).await
+        {
+            let message = format!("{}: {why}", crate::bundle::keep::BUNDLE_STALE);
+            task.state = TaskState::Failed;
+            task.error = Some(message.clone());
+            task.finished_at = Some(Utc::now());
+            if let Err(err) = self.store.update_task(&mut task) {
+                return (Err(err), false);
+            }
+            self.emit("task.failed", Some(task.id));
+            return (
+                Err(anyhow::anyhow!("dispatch {}: {message}", task.display_id())),
+                false,
+            );
+        }
         let timeout = self.settings.request_timeout;
+        // A task's workdir set is placed inside the start, under its own
+        // bound, which the start's own bound leaves room for: the herdr
+        // requests keep the whole of `request_timeout`.
+        let place_wait = timeout / 2;
+        let start_wait = if task.spec.workdir.is_some() || !task.spec.workdir_bundles.is_empty() {
+            timeout + place_wait
+        } else {
+            timeout
+        };
+        // Each start says afresh why it left a stored bundle out.
+        for b in &mut task.spec.workdir_bundles {
+            b.skipped = None;
+        }
+        // The trust pastor holds for this machine, for the folder of a task
+        // it is about to start (`trust_write`).
+        let trusted: Vec<String> = self
+            .store
+            .trusted_repos()
+            .map(|all| {
+                all.into_iter()
+                    .filter(|t| t.machine == self.name)
+                    .map(|t| t.repo)
+                    .collect()
+            })
+            .unwrap_or_default();
+        // A store that cannot be read holds the prompt for every row: at
+        // worst a person answers a dialog again.
+        let answered = self.answered_dialogs(&task).unwrap_or_default();
         let start = async {
             let (conn, agents) = (self.connector.as_ref(), &self.settings.agents);
             let head = self.settings.head_address.as_deref();
             let ready = self.settings.agent_ready_timeout;
             let provision = crate::dispatch::Provision {
-                own_deny: &self.settings.own_deny,
+                own: self.settings.own_policy.as_ref(),
+                trusted: &trusted,
+                trust_recheck: crate::trust_write::RECHECK,
+                pins: Some(&self.settings.harness_pins),
+                harnesses: Some(self.settings.harnesses.as_ref()),
+                env: Some(&self.settings.env),
+                answered: &answered,
+                workdirs: Some(&self.settings.workdir_gate),
+                workdir_wait: Some(place_wait),
             };
             if resume {
                 crate::dispatch::resume_with(conn, &mut task, agents, head, ready, provision).await
@@ -3510,13 +4962,13 @@ impl Actor {
                 dispatch_with(conn, &mut task, agents, head, ready, provision).await
             }
         };
-        let outcome = match tokio::time::timeout(timeout, start).await {
+        let outcome = match tokio::time::timeout(start_wait, start).await {
             Ok(outcome) => outcome,
             // `dispatch()` itself never got to resolve, so its own Failed-recording
             // never ran; do the same bookkeeping it would have done on an error, and
             // force a reconnect: a herdr that stops answering is a machine that is gone.
             Err(_) => {
-                let message = format!("request timed out after {timeout:?}");
+                let message = format!("request timed out after {start_wait:?}");
                 task.state = TaskState::Failed;
                 task.error = Some(message.clone());
                 task.finished_at = Some(Utc::now());
@@ -3545,6 +4997,16 @@ impl Actor {
         if let Err(err) = self.store.update_task(&mut task) {
             return (Err(err), dead);
         }
+        if let Some(why) = task.spec.fetch.warning.clone() {
+            self.emit_with(
+                "task.fetch_failed",
+                Some(task.id),
+                Some(serde_json::json!({"repo": task.spec.repo, "why": why})),
+            );
+        }
+        if let Some(detail) = workdir_skipped(&task) {
+            self.emit_with("workdir.skipped", Some(task.id), Some(detail));
+        }
         match outcome {
             Ok(_) => {
                 self.emit(&format!("task.{}", task.state), Some(task.id));
@@ -3559,6 +5021,20 @@ impl Actor {
             }
         }
     }
+}
+
+/// The detail of `workdir.skipped` for a task whose start left its stored
+/// workdir bundles out: their ids and why. `None` when it left none out.
+pub(crate) fn workdir_skipped(task: &Task) -> Option<serde_json::Value> {
+    let skipped: Vec<&crate::task::WorkdirBundle> = task
+        .spec
+        .workdir_bundles
+        .iter()
+        .filter(|b| b.skipped.is_some())
+        .collect();
+    let why = skipped.first()?.skipped.clone();
+    let ids: Vec<&str> = skipped.iter().map(|b| b.id.as_str()).collect();
+    Some(serde_json::json!({"ids": ids, "why": why}))
 }
 
 impl Actor {
@@ -3644,7 +5120,7 @@ impl Actor {
                 agent_idle: self.idle_agents.contains(&task.id),
             }
         } else if let Some(status) = ev.agent_status() {
-            self.note_status(task.id, status);
+            self.note_status(task.id, status, task.prompt_pending);
             // Subscription events carry no sequence; treat idle as a candidate and let
             // the settle check read the real one from agent.list.
             Observed::Status {
@@ -3656,9 +5132,23 @@ impl Actor {
             return Ok(());
         };
         if let Observed::Status { status, .. } = &observed
+            && self.saving_saw(task.id, *status)
+        {
+            return Ok(());
+        }
+        if let Observed::Status { status, .. } = &observed
             && task.prompt_pending
             && self.deliver_pending_prompt(task.clone(), *status).await?
         {
+            return Ok(());
+        }
+        if let Observed::Status {
+            status: AgentStatus::Blocked,
+            ..
+        } = &observed
+            && self.prompt_in_dialog(&task).await?
+        {
+            self.auto_answer().await?;
             return Ok(());
         }
         match &observed {
@@ -3666,9 +5156,18 @@ impl Actor {
                 status: crate::herdr::AgentStatus::Idle | crate::herdr::AgentStatus::Done,
                 ..
             } => {
-                // A fresh window on every idle event: an agent that went back to
-                // work in between sent a working event, which cleared the old one.
-                self.pending_done.insert(task.id, (None, Instant::now()));
+                // A fresh window, unless one is already open: an agent that
+                // went back to work in between sent a working event, which
+                // cleared the old one, so normally there is nothing here yet.
+                // But `reconcile`'s own agent.list poll can also open this
+                // task's window, with the real sequence already read off the
+                // agent (`Some`, not this event's placeholder `None`); a
+                // subscription event for the very idle that poll already
+                // caught must not throw that reading away and restart the
+                // window from scratch.
+                self.pending_done
+                    .entry(task.id)
+                    .or_insert((None, Instant::now()));
             }
             _ => {
                 self.pending_done.remove(&task.id);
@@ -3686,6 +5185,17 @@ impl Actor {
             self.auto_answer().await?;
         }
         Ok(())
+    }
+
+    /// The startup dialogs pastor has answered for `task` (`Store::answered`).
+    fn answered_dialogs(&self, task: &Task) -> anyhow::Result<Vec<String>> {
+        let mut out = Vec::new();
+        for d in self.settings.agents.dialogs(&task.spec.agent) {
+            if self.store.answered(task.id, &d.name)? {
+                out.push(d.name);
+            }
+        }
+        Ok(out)
     }
 
     /// Send the prompt the agent has not seen yet (see `Task::prompt_pending`)
@@ -3727,9 +5237,14 @@ impl Actor {
             .unwrap_or_else(|| Task::agent_name_for(task.id));
         let timeout = self.settings.request_timeout;
         // Still at a startup question herdr reads idle (Codex's folder
-        // trust): the prompt would answer it and be lost. The next status
-        // or reconcile looks again, and waits out the redraw once it is gone.
-        let hold = self.settings.agents.startup_markers(&task.spec.agent);
+        // trust, any of agy's): the prompt would answer it and be lost. The
+        // next status or reconcile looks again (and answers a dialog pastor
+        // knows), and waits out the redraw once it is gone.
+        let answered = self.answered_dialogs(&task)?;
+        let hold = self
+            .settings
+            .agents
+            .startup_markers(&task.spec.agent, &answered);
         if !hold.is_empty() {
             match tokio::time::timeout(timeout, self.connector.agent_read(&name, 100))
                 .await
@@ -3746,16 +5261,37 @@ impl Actor {
                 }
             }
         }
-        let prompt = crate::task::prompt_to_send(&task);
-        let result = tokio::time::timeout(timeout, self.connector.agent_prompt(&name, &prompt))
-            .await
-            .map_err(|_| TimedOut("agent.prompt", timeout))?;
+        let prompt = crate::task::pending_prompt(&task);
+        let by_socket = match crate::dispatch::Inbox::of(&self.settings.agents, &task.spec) {
+            Some(inbox) => self.prompt_by_socket(&inbox, &task, &name, &prompt).await?,
+            None => BySocket::Type,
+        };
+        // The agent as the prompt went in, and whether it was at work by
+        // then (see `dispatch::Prompted`).
+        let result = match by_socket {
+            BySocket::Wait => return Ok(true),
+            BySocket::Sent(agent) => Ok((*agent, false)),
+            BySocket::Type => {
+                tokio::time::timeout(timeout, self.connector.agent_prompt(&name, &prompt))
+                    .await
+                    .map_err(|_| TimedOut("agent.prompt", timeout))?
+                    .map(|agent| {
+                        let activity = agent.agent_status.is_activity();
+                        (agent, activity)
+                    })
+            }
+        };
         let id = task.id;
+        // The reply reports the agent's session as well as `agent.list` does.
+        let session = result.as_ref().ok().and_then(|(agent, _)| {
+            crate::task::reported_session(self.settings.agents.kind(&task.spec.agent), agent)
+                .map(String::from)
+        });
         // Only a row still waiting for this prompt, on a live pane, takes the
         // outcome. A row closed or failed meanwhile is left as it is.
         let still_pending = |t: &Task| t.prompt_pending && t.state.occupies_pane();
         let written = match result {
-            Ok(agent) => {
+            Ok((agent, activity)) => {
                 let written = write_task(&self.store, task, |t| {
                     if !still_pending(t) {
                         return false;
@@ -3773,15 +5309,18 @@ impl Actor {
                     // State changes before the agent had our prompt (its launch,
                     // its startup question) are not this task's work: count from here.
                     t.last_completion_seq = Some(agent.state_change_seq);
+                    if let Some(session) = &session {
+                        t.spec.session_id = Some(session.clone());
+                    }
                     // Set on the fresh row too: a re-read row never carries it.
-                    t.activity_seen = agent.agent_status.is_activity();
+                    t.activity_seen = activity;
                     true
                 })?;
                 // `status` was what the prompt went in on, typically idle; the
                 // reply is newer. Without it, an exit before the next event (or
                 // any time while polling) would read as between turns.
                 if written.is_some() {
-                    self.note_status(id, agent.agent_status);
+                    self.note_status(id, agent.agent_status, false);
                 }
                 written
             }
@@ -3822,6 +5361,47 @@ impl Actor {
         Ok(true)
     }
 
+    /// Send `task`'s pending `prompt` through its Claude session's inbox
+    /// socket. The `agent.list` read just before gates it as herdr gates a
+    /// typed prompt: a launching or blocked agent waits for the next status
+    /// or reconcile. A resend says which attempt it is, since Claude drops
+    /// the same text from the same sender within 30 seconds.
+    async fn prompt_by_socket(
+        &self,
+        inbox: &crate::dispatch::Inbox,
+        task: &Task,
+        name: &str,
+        prompt: &str,
+    ) -> anyhow::Result<BySocket> {
+        let timeout = self.settings.request_timeout;
+        let agents = tokio::time::timeout(timeout, self.connector.agent_list())
+            .await
+            .map_err(|_| TimedOut("agent.list", timeout))??;
+        let Some(agent) = agents.into_iter().find(|a| a.name.as_deref() == Some(name)) else {
+            // Gone: typing it fails the task as before.
+            return Ok(BySocket::Type);
+        };
+        if agent.agent_status == AgentStatus::Blocked || agent.launch_pending {
+            return Ok(BySocket::Wait);
+        }
+        let text = match self.unseen_prompt.get(&task.id) {
+            Some(&resent) if resent > 0 => {
+                format!(
+                    "{prompt}\n\n(Sent again, attempt {}.)",
+                    u16::from(resent) + 1
+                )
+            }
+            _ => prompt.to_string(),
+        };
+        let shown = task.display_id();
+        let send = inbox.send(self.connector.as_ref(), &shown, &text);
+        // A send that does not finish in time is typed, like any other.
+        Ok(match tokio::time::timeout(timeout, send).await {
+            Ok(true) => BySocket::Sent(Box::new(agent)),
+            _ => BySocket::Type,
+        })
+    }
+
     /// Send the pending prompts held after a trust answer once `settle` has
     /// passed. No status event may come in between: the agent sits idle at
     /// an empty input until it gets its prompt.
@@ -3860,6 +5440,12 @@ impl Actor {
                 // Its entry is still there and due, so the prompt goes in now
                 // rather than being held again as a fresh answer.
                 self.deliver_pending_prompt(task, status).await?;
+                // Held at the next dialog, which herdr read idle (agy's
+                // banner after its trust): read like one herdr reads blocked.
+                blocked_again |= self
+                    .store
+                    .get_task(id)?
+                    .is_some_and(|t| t.prompt_pending && t.state == TaskState::Blocked);
             }
             // Sent, or blocked again: leaving the block next starts a new hold.
             self.dialog_answered.remove(&id);
@@ -3900,6 +5486,10 @@ impl Actor {
             let Some((seen_seq, _)) = self.pending_done.remove(&id) else {
                 continue;
             };
+            // Its idle is the save turn's end, not the task's.
+            if self.saving.lock().unwrap().contains_key(&id) {
+                continue;
+            }
             let Ok(Some(task)) = self.store.get_task(id) else {
                 continue;
             };
@@ -3914,7 +5504,12 @@ impl Actor {
             if task.state == TaskState::Stale && holds_other_agent(&task, &agents, &agent.pane_id) {
                 continue;
             }
-            self.note_status(id, agent.agent_status);
+            self.note_status(id, agent.agent_status, task.prompt_pending);
+            // As in `reconcile`: a hard limit below closes the pane before
+            // the next reconcile would otherwise capture a reported
+            // conversation id, so take it from this same `agent.list` reply
+            // first.
+            let task = self.capture_agent_session(task, agent);
             let idle_like = matches!(agent.agent_status, AgentStatus::Idle | AgentStatus::Done);
             // No sequence yet (the candidate came from an event) is as good as a
             // moved one: the agent may have worked again inside the window.
@@ -3932,9 +5527,39 @@ impl Actor {
                 && task.last_completion_seq == Some(agent.state_change_seq)
                 && let Some(&resent) = self.unseen_prompt.get(&id)
             {
-                self.prompt_not_taken(task, agent.agent_status, resent)
-                    .await?;
+                // Codex typed it as a paste and did not submit it: press
+                // Enter, as a person would, instead of pasting it again.
+                if resent < MAX_PROMPT_RESENDS && self.submit_unsent_prompt(&task).await? {
+                    self.unseen_prompt.insert(id, resent.saturating_add(1));
+                    self.pending_done.insert(id, (seen_seq, Instant::now()));
+                    continue;
+                }
+                self.prompt_not_taken(task, agent, resent, false).await?;
                 continue;
+            }
+            // Seen blocked since its prompt, never at work: the blocked
+            // spell may have been a startup dialog the prompt went into, its
+            // Enter the answer. The prompt on screen shows it was taken.
+            if idle_like
+                && matches!(task.state, TaskState::Running | TaskState::Blocked)
+                && !task.prompt_pending
+                && task.activity_seen
+                && let Some(&resent) = self.unseen_prompt.get(&id)
+            {
+                match self.prompt_on_screen(&task).await {
+                    Ok(true) => {
+                        self.unseen_prompt.remove(&id);
+                    }
+                    Ok(false) => {
+                        self.prompt_not_taken(task, agent, resent, true).await?;
+                        continue;
+                    }
+                    Err(err) => {
+                        // Out of reach: look again next window.
+                        self.pending_done.insert(id, (seen_seq, Instant::now()));
+                        return Err(err);
+                    }
+                }
             }
             let observed = observed_from(agent);
             // Only a turn whose end was read says anything about the short
@@ -3955,7 +5580,7 @@ impl Actor {
                 PaneEnd::Finished
             };
             let short = matches!(&end, PaneEnd::Limit(l, _) if !l.hard);
-            if read && !short && !matches!(end, PaneEnd::ShellRunning) {
+            if read && !short && !matches!(end, PaneEnd::ShellRunning | PaneEnd::Dialog(..)) {
                 // A turn that ends on anything else than a short limit (one
                 // waiting on a shell has not ended): the count starts over.
                 self.rate_retries.remove(&id);
@@ -3970,6 +5595,14 @@ impl Actor {
                         // The pane could not be closed: look again next window.
                         self.pending_done.insert(id, (seen_seq, Instant::now()));
                         return Err(err);
+                    }
+                }
+                PaneEnd::Said(said) => {
+                    // As if the agent had run `pastor task done` with the
+                    // message: the same row, round and event.
+                    self.pending_done.remove(&id);
+                    if let Err(err) = self.end_task(id, Some(said), EndBy::Agent) {
+                        tracing::warn!(machine = %self.name, task = %task.display_id(), "end a task whose agent said DONE: {err:#}");
                     }
                 }
                 PaneEnd::Question(question) => {
@@ -3993,6 +5626,47 @@ impl Actor {
                     // settle check looks again.
                     tracing::debug!(machine = %self.name, task = %task.display_id(), "background shell still running");
                     self.pending_done.insert(id, (seen_seq, Instant::now()));
+                }
+                PaneEnd::Dialog(dialog, keys) => {
+                    // Answer it and look again after the window: the agent
+                    // takes its turn up again, or ends it for good.
+                    self.pending_done.insert(id, (seen_seq, Instant::now()));
+                    let pane = task.pane_id.clone().unwrap_or_default();
+                    self.press_dialog(&task, &pane, &dialog, keys).await?;
+                }
+                PaneEnd::DialogUp(name) => {
+                    let error = format!("stopped under the {name} dialog");
+                    let detail = serde_json::json!({ "why": "dialog_up", "dialog": name });
+                    self.block_idle(task, &observed, error, detail)
+                }
+                // A task that must end with a summary and stops without one
+                // fails, unless its worktree holds work not committed yet:
+                // the idle may have been read too early, the agent cut off
+                // before it committed. Then it is blocked, its pane and
+                // session kept, so the agent can still finish with `task
+                // done` and a person can still reach it.
+                PaneEnd::Finished
+                    if read
+                        && !task.ended
+                        && task.spec.summary == crate::task::SummaryMode::Require =>
+                {
+                    match self.holds_unsaved_work(&task).await {
+                        Ok(true) => {
+                            let error = format!(
+                                "{}, with uncommitted files in its worktree",
+                                crate::task::STOPPED_WITHOUT_SUMMARY
+                            );
+                            let detail =
+                                serde_json::json!({ "why": "uncommitted_without_summary" });
+                            self.block_idle(task, &observed, error, detail)
+                        }
+                        Ok(false) => self.apply(task, &observed),
+                        Err(err) => {
+                            // Out of reach: look again next window.
+                            self.pending_done.insert(id, (seen_seq, Instant::now()));
+                            return Err(err);
+                        }
+                    }
                 }
                 PaneEnd::Finished => self.apply(task, &observed),
             }
@@ -4090,14 +5764,30 @@ impl Actor {
                 continue;
             };
             let text = crate::task::RATE_RETRY_PROMPT;
-            let keys = ["Enter".to_string()];
-            let timeout = self.settings.request_timeout;
-            tokio::time::timeout(timeout, async {
-                self.connector.pane_send_text(&pane, text).await?;
-                self.connector.pane_send_keys(&pane, &keys).await
-            })
-            .await
-            .map_err(|_| TimedOut("pane input", timeout))??;
+            // By socket, each attempt says which it is: Claude drops the same
+            // text from the same sender within 30 seconds, and the waits
+            // between attempts can be shorter.
+            let attempt = self.rate_retries.get(&id).map_or(1, |r| r.attempts);
+            let socket_text = if attempt > 1 {
+                format!("{text} (Attempt {attempt}.)")
+            } else {
+                text.to_string()
+            };
+            let by_socket = self.text_by_socket(&task, &socket_text).await;
+            let keys = if by_socket {
+                vec![]
+            } else {
+                vec!["Enter".to_string()]
+            };
+            if !by_socket {
+                let timeout = self.settings.request_timeout;
+                tokio::time::timeout(timeout, async {
+                    self.connector.pane_send_text(&pane, text).await?;
+                    self.connector.pane_send_keys(&pane, &keys).await
+                })
+                .await
+                .map_err(|_| TimedOut("pane input", timeout))??;
+            }
             if let Some(r) = self.rate_retries.get_mut(&id) {
                 r.due = None;
             }
@@ -4106,34 +5796,104 @@ impl Actor {
                 "task.input",
                 Some(id),
                 Some(serde_json::json!({
-                    "text_len": text.chars().count(),
+                    "text_len": if by_socket { socket_text.chars().count() } else { text.chars().count() },
                     "keys": keys,
                     "rate_retry": true,
+                    "socket": by_socket,
                 })),
             );
         }
         Ok(())
     }
 
+    /// Codex idle at the sequence its prompt went in, never at work: if the
+    /// prompt sits in its input box (`task::prompt_unsent_in_input`), press
+    /// Enter to submit it, and say so with `task.input`. Returns whether it
+    /// did. A pane that cannot be read, or another kind of agent, leaves the
+    /// prompt to be sent again as before.
+    async fn submit_unsent_prompt(&mut self, task: &Task) -> anyhow::Result<bool> {
+        if self.settings.agents.kind(&task.spec.agent) != "codex" {
+            return Ok(false);
+        }
+        let (Some(pane), Some(name)) = (
+            task.pane_id.clone(),
+            task.agent_name
+                .clone()
+                .or_else(|| Some(Task::agent_name_for(task.id))),
+        ) else {
+            return Ok(false);
+        };
+        let timeout = self.settings.request_timeout;
+        let screen = match tokio::time::timeout(timeout, self.connector.agent_read(&name, 100))
+            .await
+            .map_err(|_| TimedOut("agent.read", timeout))?
+        {
+            Ok(screen) => screen,
+            Err(err) if err.is_transport() => return Err(err.into()),
+            Err(err) => {
+                tracing::warn!(machine = %self.name, task = %task.display_id(), %err, "read pane for an unsubmitted prompt");
+                return Ok(false);
+            }
+        };
+        // Codex's folder-trust dialog reads idle, and Enter there would trust
+        // the folder: a dialog pastor holds the prompt for is not an input.
+        let answered = self.answered_dialogs(task)?;
+        let hold = self
+            .settings
+            .agents
+            .startup_markers(&task.spec.agent, &answered);
+        if crate::config::shows_startup_question(&screen, &hold) {
+            return Ok(false);
+        }
+        if !crate::task::prompt_unsent_in_input(&screen, &crate::task::pending_prompt(task)) {
+            return Ok(false);
+        }
+        let keys = vec!["Enter".to_string()];
+        tokio::time::timeout(timeout, self.connector.pane_send_keys(&pane, &keys))
+            .await
+            .map_err(|_| TimedOut("pane.send_keys", timeout))??;
+        tracing::info!(machine = %self.name, task = %task.display_id(), "the prompt sat in the agent's input; pressed Enter to submit it");
+        self.emit_with(
+            "task.input",
+            Some(task.id),
+            Some(serde_json::json!({"keys": keys, "submit": true})),
+        );
+        Ok(true)
+    }
+
     /// The agent of `task` sits at an empty input with the prompt it was
     /// given nowhere (see `unseen_prompt`): send it again, or, after
     /// `MAX_PROMPT_RESENDS`, mark the task `blocked` so it does not read as
     /// `running` with nothing pending. The baseline stays at the idle it sits
-    /// at, so `next_state` holds it there until the agent moves.
+    /// at, so `next_state` holds it there until the agent moves. With
+    /// `blocked_seen`, the agent was seen `blocked` since the prompt but the
+    /// prompt is not on its screen (`prompt_on_screen`): that spell was no
+    /// work on it, so the task is `running` again with no activity; and once
+    /// the resends are spent, `blocked` with no activity and its baseline at
+    /// the idle `agent` sits at, so `next_state` holds it there.
     async fn prompt_not_taken(
         &mut self,
         task: Task,
-        status: AgentStatus,
+        agent: &AgentInfo,
         resent: u8,
+        blocked_seen: bool,
     ) -> anyhow::Result<()> {
         let id = task.id;
-        let unchanged =
-            |t: &Task| t.state == TaskState::Running && !t.prompt_pending && !t.activity_seen;
+        let status = agent.agent_status;
+        let idle_seq = agent.completion_seq.or(Some(agent.state_change_seq));
+        let unchanged = |t: &Task| {
+            !t.prompt_pending
+                && if blocked_seen {
+                    matches!(t.state, TaskState::Running | TaskState::Blocked)
+                } else {
+                    t.state == TaskState::Running && !t.activity_seen
+                }
+        };
         if resent >= MAX_PROMPT_RESENDS {
             self.unseen_prompt.remove(&id);
             let message = format!(
                 "agent did not take its prompt ({} sent); send it with `pastor task send`",
-                resent + 1
+                u16::from(resent) + 1
             );
             tracing::warn!(machine = %self.name, task = %task.display_id(), "{message}");
             let written = write_task(&self.store, task, |t| {
@@ -4142,6 +5902,10 @@ impl Actor {
                 }
                 t.state = TaskState::Blocked;
                 t.error = Some(message.clone());
+                // A blocked spell before this counted as activity: neither it
+                // nor the sequence it moved may read as the task done.
+                t.activity_seen = false;
+                t.last_completion_seq = idle_seq;
                 true
             })?;
             if let Some(t) = written {
@@ -4151,10 +5915,14 @@ impl Actor {
             return Ok(());
         }
         tracing::warn!(machine = %self.name, task = %task.display_id(), "agent did not take its prompt; sending it again");
-        self.unseen_prompt.insert(id, resent + 1);
+        self.unseen_prompt.insert(id, resent.saturating_add(1));
         let pending = write_task(&self.store, task, |t| {
             let resend = unchanged(t);
-            t.prompt_pending |= resend;
+            if resend {
+                t.prompt_pending = true;
+                t.state = TaskState::Running;
+                t.activity_seen = false;
+            }
             resend
         })?;
         if let Some(task) = pending {
@@ -4163,20 +5931,115 @@ impl Actor {
         Ok(())
     }
 
+    /// The agent of `task` went `blocked` after its prompt went in, before
+    /// it was seen at work. If its screen shows one of its startup dialogs
+    /// (`Agents::startup_markers`), herdr read it ready before it read the
+    /// dialog, and the prompt went into the dialog, not to the agent. Then
+    /// the prompt is pending again and the task `blocked`, with no activity:
+    /// the dialog is answered as any startup block is (`auto_answer`, or a
+    /// person), and the prompt goes in after it. Returns whether it did so;
+    /// `false` leaves the status to the usual state machine.
+    async fn prompt_in_dialog(&mut self, task: &Task) -> anyhow::Result<bool> {
+        if task.prompt_pending || task.state != TaskState::Running || task.activity_seen {
+            return Ok(false);
+        }
+        let Some(&resent) = self.unseen_prompt.get(&task.id) else {
+            return Ok(false);
+        };
+        let answered = self.answered_dialogs(task)?;
+        let hold = self
+            .settings
+            .agents
+            .startup_markers(&task.spec.agent, &answered);
+        if hold.is_empty() {
+            return Ok(false);
+        }
+        let name = task
+            .agent_name
+            .clone()
+            .unwrap_or_else(|| Task::agent_name_for(task.id));
+        let timeout = self.settings.request_timeout;
+        let screen = match tokio::time::timeout(timeout, self.connector.agent_read(&name, 100))
+            .await
+            .map_err(|_| TimedOut("agent.read", timeout))?
+        {
+            Ok(screen) => screen,
+            Err(err) if err.is_transport() => return Err(err.into()),
+            Err(err) => {
+                tracing::warn!(machine = %self.name, task = %task.display_id(), %err, "read pane for a startup question");
+                return Ok(false);
+            }
+        };
+        if !crate::config::shows_startup_question(&screen, &hold) {
+            return Ok(false);
+        }
+        let written = write_task(&self.store, task.clone(), |t| {
+            if t.prompt_pending || t.state != TaskState::Running || t.activity_seen {
+                return false;
+            }
+            t.prompt_pending = true;
+            t.state = TaskState::Blocked;
+            true
+        })?;
+        let Some(t) = written else {
+            return Ok(false);
+        };
+        tracing::warn!(machine = %self.name, task = %t.display_id(), "the prompt went into a startup dialog; it waits until the dialog is answered");
+        // The resend says which attempt it is (`prompt_by_socket`).
+        self.unseen_prompt.insert(t.id, resent.saturating_add(1));
+        self.pending_done.remove(&t.id);
+        self.emit("task.blocked", Some(t.id));
+        self.refresh_live();
+        Ok(true)
+    }
+
+    /// Does the screen of `task`'s agent show the prompt it was given? An
+    /// agent that took it shows it as its first message. Only the start of
+    /// the prompt is looked for, whitespace aside, since the pane wraps it.
+    /// A pane that cannot be read for any other reason than the transport
+    /// counts as showing it: the task ends as it did before this check.
+    async fn prompt_on_screen(&self, task: &Task) -> anyhow::Result<bool> {
+        let name = task
+            .agent_name
+            .clone()
+            .unwrap_or_else(|| Task::agent_name_for(task.id));
+        let timeout = self.settings.request_timeout;
+        let screen = match tokio::time::timeout(timeout, self.connector.agent_read(&name, 100))
+            .await
+            .map_err(|_| TimedOut("agent.read", timeout))?
+        {
+            Ok(screen) => screen,
+            Err(err) if err.is_transport() => return Err(err.into()),
+            Err(err) => {
+                tracing::warn!(machine = %self.name, task = %task.display_id(), %err, "read pane for the prompt");
+                return Ok(true);
+            }
+        };
+        Ok(crate::task::shows_prompt(
+            &screen,
+            &crate::task::prompt_to_send(task),
+        ))
+    }
+
     /// The usage limit `task`'s agent stopped on, if `text`, the end of its
-    /// pane, ends on one. None on a task its agent ended (`task done`), and
-    /// none where no table is kept (`MachineSettings::limits`).
+    /// pane, ends on one; a login screen or a lost login reads as a limit
+    /// that is signed out (`limit::signed_out_in`). None on a task its agent
+    /// ended (`task done`), and none where no table is kept
+    /// (`MachineSettings::limits`).
     fn limit_in(&self, task: &Task, text: &str) -> Option<crate::limit::Limit> {
         if task.ended || self.settings.limits.is_none() {
             return None;
         }
-        let kind = self.settings.agents.kind(&task.spec.agent);
-        crate::limit::limit_in(kind, text, Utc::now())
+        let agents = &self.settings.agents;
+        let kind = agents.kind(&task.spec.agent);
+        crate::limit::signed_out_in(kind, text, &agents.login_markers(&task.spec.agent))
+            .or_else(|| crate::limit::limit_in(kind, text, Utc::now()))
     }
 
     /// Keep `limit`, which `task`'s agent stopped on, in the table under the
     /// account its agent names here (`Agents::limit_key`), with
-    /// `agent.exhausted` and `task.limited`, and answer the row. A limit
+    /// `agent.exhausted` (`agent.signed_out` for a signed-out agent) and
+    /// `task.limited`, and answer the row. A limit
     /// that is not hard (a 429 or 529 past the agent's own retries) is kept as
     /// one with no reset named. The row is answered even when the store
     /// refuses it: the task waits all the same.
@@ -4186,7 +6049,12 @@ impl Actor {
         if !limit.hard {
             limit.until = None;
         }
-        let key = self.settings.agents.limit_key(&self.name, &task.spec.agent);
+        let agents = &self.settings.agents;
+        let key = if limit.signed_out {
+            agents.signed_out_key(&self.name, &task.spec.agent)
+        } else {
+            agents.limit_key(&self.name, &task.spec.agent)
+        };
         let config = self.settings.limits.clone().unwrap_or_default();
         let row = crate::limit::AccountLimit::of(
             &key,
@@ -4200,9 +6068,13 @@ impl Actor {
         );
         match self.store.record_limit(&row) {
             Ok(()) => {
-                tracing::warn!(machine = %self.name, task = %task.display_id(), account = %row.account, model = ?row.model, retry_at = %row.retry_at, "account exhausted");
+                if row.signed_out {
+                    tracing::warn!(machine = %self.name, task = %task.display_id(), account = %row.account, agent = %task.spec.agent, "agent signed out");
+                } else {
+                    tracing::warn!(machine = %self.name, task = %task.display_id(), account = %row.account, model = ?row.model, retry_at = %row.retry_at, "account exhausted");
+                }
                 self.emit_with(
-                    "agent.exhausted",
+                    row.kept_event(),
                     Some(task.id),
                     Some(row.event_detail(None)),
                 );
@@ -4274,7 +6146,14 @@ impl Actor {
         t.spec.rounds.stop = Some(Box::new(crate::task::LimitStop {
             agent: t.spec.agent.clone(),
             model: t.model().map(str::to_string),
-            why: if limit.hard { "limit" } else { "rate_limit" }.into(),
+            why: if limit.signed_out {
+                "signed_out"
+            } else if limit.hard {
+                "limit"
+            } else {
+                "rate_limit"
+            }
+            .into(),
             line: row.line.clone(),
             until: row.retry_at,
             tail: crate::task::pane_tail(text, lines).join("\n"),
@@ -4298,6 +6177,11 @@ impl Actor {
         } else {
             "no_fallback"
         };
+        let shown = if row.signed_out {
+            format!("waiting: {}", row.short_note(now))
+        } else {
+            format!("waiting {}", crate::limit::local_time(row.retry_at, now))
+        };
         tracing::info!(machine = %self.name, task = %t.display_id(), until = %row.retry_at, why, "waiting for a usage limit to reset");
         self.emit_with(
             "task.waiting",
@@ -4308,7 +6192,8 @@ impl Actor {
                 "account": row.account,
                 "model": row.model,
                 "until": row.retry_at,
-                "shown": format!("waiting {}", crate::limit::local_time(row.retry_at, now)),
+                "signed_out": row.signed_out,
+                "shown": shown,
             })),
         );
     }
@@ -4337,7 +6222,10 @@ impl Actor {
                 );
             }
         }
-        self.close_pane_of(pane, &name).await
+        let left = self.find_leftovers(Some(task), pane, &name, None).await;
+        self.close_pane_of(pane, &name).await?;
+        self.end_leftovers(left).await;
+        Ok(())
     }
 
     /// How the task's agent ended its turn, read from the tail of its pane:
@@ -4359,15 +6247,37 @@ impl Actor {
         match tokio::time::timeout(timeout, self.connector.agent_read(target, 100)).await {
             Ok(Ok(text)) => {
                 let claude = self.settings.agents.kind(&task.spec.agent) == "claude";
-                if crate::task::background_shell_running(&text)
+                // Under a dialog Claude drew in place of its input box, the
+                // agent does not go on until it is answered, whatever else
+                // the pane says.
+                if claude && let Some((dialog, keys)) = self.pick_dialog(task, &text, true)? {
+                    return Ok(PaneEnd::Dialog(dialog, keys));
+                }
+                if (claude && crate::task::background_shell_running(&text))
                     || (!claude && crate::task::tasks_running(&text))
                 {
                     return Ok(PaneEnd::ShellRunning);
+                }
+                if claude && let Some(name) = self.dialog_up(task, &text) {
+                    return Ok(PaneEnd::DialogUp(name));
                 }
                 // A task its agent ended (`task done`) is done whatever its
                 // pane says.
                 if let Some(limit) = self.limit_in(task, &text) {
                     return Ok(PaneEnd::Limit(limit, text));
+                }
+                // Its last line is DONE: it said it is finished, in Claude's
+                // words or agy's, and `pastor task done` is left to it.
+                if matches!(
+                    self.settings.agents.kind(&task.spec.agent),
+                    "claude" | "agy"
+                ) && let Some(said) = crate::task::trailing_done(&text, claude)
+                    // A task that must say what it did is not finished by the
+                    // word alone.
+                    && (said != crate::task::DONE_WORD
+                        || task.spec.summary != crate::task::SummaryMode::Require)
+                {
+                    return Ok(PaneEnd::Said(said));
                 }
                 // Kept only when the task really is done: a tail left by a
                 // question would reach a later failed task's finish command.
@@ -4428,8 +6338,9 @@ impl Actor {
     }
 
     /// Remember whether the agent of task `id` is between turns; see
-    /// `Actor::idle_agents`.
-    fn note_status(&mut self, id: i64, status: AgentStatus) {
+    /// `Actor::idle_agents`. `prompt_pending`: the task's prompt has not gone
+    /// in yet, so work seen now is not work on it.
+    fn note_status(&mut self, id: i64, status: AgentStatus, prompt_pending: bool) {
         match status {
             AgentStatus::Idle | AgentStatus::Done => {
                 self.idle_agents.insert(id);
@@ -4440,10 +6351,51 @@ impl Actor {
                     self.picker_read.remove(&id);
                 }
                 self.idle_agents.remove(&id);
-                // It took its prompt, or stopped on something a person answers.
-                self.unseen_prompt.remove(&id);
+                // At work, it took its prompt (one already given: a pending
+                // one keeps its resend count for the attempt it goes in as).
+                // Blocked, it may sit at a startup dialog the prompt went
+                // into: that is checked (`prompt_in_dialog`,
+                // `prompt_on_screen`), not assumed.
+                if status == AgentStatus::Working && !prompt_pending {
+                    self.unseen_prompt.remove(&id);
+                }
             }
             AgentStatus::Unknown => {}
+        }
+    }
+
+    /// Record `task`'s agent's own session, the first time an `agent.list`
+    /// entry pastor reads for it (reconcile, the settle check, a close)
+    /// reports one it can use (`task::reported_session`); anything else, or
+    /// no report at all
+    /// (a machine with no such hook installed, or one that has not run yet),
+    /// leaves the task with none: a later pause is then refused
+    /// (`task::why_not_pausable`) and `task attach` fails with `no_agent`,
+    /// as before this; only a usage-limit wait still starts the task fresh
+    /// from its prompt, as it always has.
+    fn capture_agent_session(&self, task: Task, agent: &AgentInfo) -> Task {
+        let kind = self.settings.agents.kind(&task.spec.agent);
+        let Some(value) = crate::task::reported_session(kind, agent) else {
+            return task;
+        };
+        if task.spec.session_id.as_deref() == Some(value) {
+            return task;
+        }
+        let value = value.to_string();
+        let name = task.display_id();
+        match write_task(&self.store, task.clone(), |t| {
+            if t.spec.session_id.as_deref() == Some(value.as_str()) {
+                return false;
+            }
+            t.spec.session_id = Some(value.clone());
+            true
+        }) {
+            Ok(Some(written)) => written,
+            Ok(None) => task,
+            Err(err) => {
+                tracing::error!(%err, task = %name, "record agent session");
+                task
+            }
         }
     }
 
@@ -4501,7 +6453,7 @@ impl Actor {
         if !to.is_open() {
             self.idle_agents.remove(&task.id);
         }
-        if to != TaskState::Running {
+        if !matches!(to, TaskState::Running | TaskState::Blocked) {
             self.unseen_prompt.remove(&task.id);
         }
         if let Observed::Status {
@@ -4684,7 +6636,11 @@ impl Actor {
                     self.pending_done.remove(&task.id);
                 }
                 Some(agent) => {
-                    self.note_status(task.id, agent.agent_status);
+                    self.note_status(task.id, agent.agent_status, task.prompt_pending);
+                    let task = self.capture_agent_session(task, agent);
+                    if self.saving_saw(task.id, agent.agent_status) {
+                        continue;
+                    }
                     if agent.agent_status == AgentStatus::Blocked {
                         blocked.push(task.id);
                     }
@@ -4694,6 +6650,11 @@ impl Actor {
                         && self
                             .deliver_pending_prompt(task.clone(), agent.agent_status)
                             .await?
+                    {
+                        continue;
+                    }
+                    if agent.agent_status == AgentStatus::Blocked
+                        && self.prompt_in_dialog(&task).await?
                     {
                         continue;
                     }
@@ -4794,6 +6755,12 @@ impl Actor {
         };
         self.picker_read.insert(id);
         let kind = self.settings.agents.kind(&task.spec.agent);
+        // A login screen, which some agents show blocked: the agent is
+        // signed out, not asking.
+        let markers = self.settings.agents.login_markers(&task.spec.agent);
+        if let Some(out) = crate::limit::signed_out_in(kind, &text, &markers) {
+            return self.wait_on_limit(task, &out, false, &text).await;
+        }
         let Some(picker) = crate::limit::limit_picker(kind, &text, Utc::now()) else {
             return Ok(());
         };
@@ -4869,70 +6836,120 @@ impl Actor {
             let screen = tokio::time::timeout(timeout, self.connector.agent_read(target, 100))
                 .await
                 .map_err(|_| TimedOut("agent.read", timeout))??;
-            // The first row that shows, was not answered for this task, and
-            // applies: a row with no marker (trust without one) shows on
-            // every screen, and an earlier dialog's text can linger in the
-            // read, so a row that is done or does not apply must not hide
-            // the ones after it.
-            let repo = task.spec.repo.as_deref();
-            let mut dialog = None;
-            for d in &dialogs {
-                let shows = d
-                    .marker
-                    .as_deref()
-                    .is_none_or(|m| crate::config::shows_trust_marker(&screen, m));
-                if !shows || self.store.answered(task.id, &d.name)? {
-                    continue;
-                }
-                let trusted = match repo {
-                    Some(r) => self.store.is_trusted(&self.name, r)?,
-                    None => false,
+            let Some((dialog, keys)) = self.pick_dialog(&task, &screen, false)? else {
+                continue;
+            };
+            self.press_dialog(&task, pane, &dialog, keys).await?;
+        }
+        Ok(())
+    }
+
+    /// The first of `task`'s agent's dialogs that shows in `screen`, was
+    /// not answered for the task, and applies, with the keys that answer
+    /// it. A row with no marker (trust without one) shows on every screen,
+    /// and an earlier dialog's text can linger in the read, so a row that
+    /// is done or does not apply must not hide the ones after it. A `pick`
+    /// not on screen gives nothing: the dialog is left for a person.
+    /// `idle` is a screen read from an agent that stopped (`pane_end`), not
+    /// one blocked while starting: the trust dialog and rows with no marker
+    /// are not looked for there.
+    fn pick_dialog(
+        &self,
+        task: &Task,
+        screen: &str,
+        idle: bool,
+    ) -> anyhow::Result<Option<(crate::config::Dialog, Vec<String>)>> {
+        let repo = task.spec.trust_dir();
+        let mut dialog = None;
+        for d in self.settings.agents.dialogs(&task.spec.agent) {
+            if idle && (d.needs_trust || d.marker.is_none()) {
+                continue;
+            }
+            let shows = d
+                .marker
+                .as_deref()
+                .is_none_or(|m| crate::config::shows_trust_marker(screen, m));
+            if !shows || self.store.answered(task.id, &d.name)? {
+                continue;
+            }
+            let trusted = match repo {
+                Some(r) => self.store.is_trusted(&self.name, r)?,
+                None => false,
+            };
+            if d.needs_trust && !trusted {
+                continue;
+            }
+            dialog = Some(d);
+            break;
+        }
+        let Some(dialog) = dialog else {
+            tracing::debug!(machine = %self.name, task = %task.display_id(), "no dialog to answer on this screen: one pastor does not know, or one that waits for a person");
+            return Ok(None);
+        };
+        let keys = match &dialog.answer {
+            crate::config::Answer::Keys(keys) => keys.clone(),
+            crate::config::Answer::Pick(want) => {
+                let found = crate::picker::at_bottom(screen).and_then(|f| f.picker.keys_to(want));
+                let Some(keys) = found else {
+                    tracing::warn!(machine = %self.name, task = %task.display_id(), dialog = %dialog.name, pick = %want, "the dialog shows no such option; left for a person");
+                    return Ok(None);
                 };
-                if d.needs_trust && !trusted {
-                    continue;
-                }
-                dialog = Some(d);
-                break;
+                keys
             }
-            let Some(dialog) = dialog else {
-                tracing::debug!(machine = %self.name, task = %task.display_id(), "blocked on a dialog pastor does not know, or one that waits for a person");
-                continue;
-            };
-            let keys = match &dialog.answer {
-                crate::config::Answer::Keys(keys) => keys.clone(),
-                crate::config::Answer::Pick(want) => {
-                    let found =
-                        crate::picker::at_bottom(&screen).and_then(|f| f.picker.keys_to(want));
-                    let Some(keys) = found else {
-                        tracing::warn!(machine = %self.name, task = %task.display_id(), dialog = %dialog.name, pick = %want, "the dialog shows no such option; left for a person");
-                        continue;
-                    };
-                    keys
-                }
-            };
-            tokio::time::timeout(timeout, self.connector.pane_send_keys(pane, &keys))
-                .await
-                .map_err(|_| TimedOut("pane.send_keys", timeout))??;
-            self.dialog_answered.insert(task.id, Instant::now());
-            if !self.store.claim_answered(task.id, &dialog.name, &keys)? {
-                continue;
-            }
-            if dialog.needs_trust {
-                self.store.claim_trust_sent(task.id, &keys)?;
-                tracing::info!(machine = %self.name, task = %task.display_id(), repo = repo.unwrap_or(""), "answered the trust prompt of a trusted repo");
-                self.emit_with(
-                    "task.trusted",
-                    Some(task.id),
-                    Some(serde_json::json!({"keys": keys})),
-                );
-            } else {
-                tracing::info!(machine = %self.name, task = %task.display_id(), dialog = %dialog.name, "answered a startup dialog");
-                self.emit_with(
-                    "task.answered",
-                    Some(task.id),
-                    Some(serde_json::json!({"dialog": dialog.name, "keys": keys})),
-                );
-            }
+        };
+        Ok(Some((dialog, keys)))
+    }
+
+    /// The name of a dialog of `task`'s agent (not the trust one) whose
+    /// marker shows in the bottom prompt of `screen`, answered or not.
+    fn dialog_up(&self, task: &Task, screen: &str) -> Option<String> {
+        self.settings
+            .agents
+            .dialogs(&task.spec.agent)
+            .into_iter()
+            .filter(|d| !d.needs_trust)
+            .find(|d| {
+                d.marker
+                    .as_deref()
+                    .is_some_and(|m| crate::config::shows_trust_marker(screen, m))
+            })
+            .map(|d| d.name)
+    }
+
+    /// Press `keys` in `pane` to answer `dialog` for `task`, and record the
+    /// answer (`claim_answered`, once per task and dialog across restarts).
+    /// The trust row also claims `trust_sent` and emits `task.trusted`;
+    /// every other row emits `task.answered`.
+    async fn press_dialog(
+        &mut self,
+        task: &Task,
+        pane: &str,
+        dialog: &crate::config::Dialog,
+        keys: Vec<String>,
+    ) -> anyhow::Result<()> {
+        let timeout = self.settings.request_timeout;
+        tokio::time::timeout(timeout, self.connector.pane_send_keys(pane, &keys))
+            .await
+            .map_err(|_| TimedOut("pane.send_keys", timeout))??;
+        self.dialog_answered.insert(task.id, Instant::now());
+        if !self.store.claim_answered(task.id, &dialog.name, &keys)? {
+            return Ok(());
+        }
+        if dialog.needs_trust {
+            self.store.claim_trust_sent(task.id, &keys)?;
+            tracing::info!(machine = %self.name, task = %task.display_id(), repo = task.spec.trust_dir().unwrap_or(""), "answered the trust prompt of a trusted repo");
+            self.emit_with(
+                "task.trusted",
+                Some(task.id),
+                Some(serde_json::json!({"keys": keys})),
+            );
+        } else {
+            tracing::info!(machine = %self.name, task = %task.display_id(), dialog = %dialog.name, "answered a startup dialog");
+            self.emit_with(
+                "task.answered",
+                Some(task.id),
+                Some(serde_json::json!({"dialog": dialog.name, "keys": keys})),
+            );
         }
         Ok(())
     }
@@ -5134,8 +7151,14 @@ mod tests {
             room_every: Duration::from_millis(200),
             agents: Default::default(),
             head_address: None,
+            cut_off_from_head: false,
             limits: None,
-            own_deny: vec![],
+            own_policy: None,
+            harness_pins: Default::default(),
+            harnesses: Default::default(),
+            bundle_gate: Default::default(),
+            workdir_gate: Default::default(),
+            env: Default::default(),
         }
     }
 
@@ -5187,6 +7210,14 @@ mod tests {
             cwd: None,
             keep_pane: None,
             keep_pane_from: None,
+            remove_worktree: None,
+            remove_worktree_from: None,
+            load: None,
+            load_from: None,
+            fetch: Default::default(),
+            start_prompt: None,
+            workdir: None,
+            workdir_bundles: Vec::new(),
             rounds: Default::default(),
         }
     }
@@ -5293,8 +7324,8 @@ mod tests {
         wait_for("live count", || h.snapshot().live == 1).await;
     }
 
-    /// The actor hands its machine's own deny list (`own_deny`) to dispatch,
-    /// so a profiled agy task there writes those rules into agy's settings.
+    /// The actor hands its machine's own profile (`own_policy`) to dispatch,
+    /// so a profiled agy task there writes its rules into agy's settings.
     #[tokio::test]
     async fn the_actor_provisions_agy_with_its_own_profile() {
         let fake = FakeHerdr::new();
@@ -5307,7 +7338,10 @@ mod tests {
             &fake,
             &store,
             MachineSettings {
-                own_deny: vec!["Bash(sudo:*)".into()],
+                own_policy: Some(crate::config::agy::Policy {
+                    deny: vec!["Bash(sudo:*)".into()],
+                    ..Default::default()
+                }),
                 ..settings()
             },
         );
@@ -5331,6 +7365,98 @@ mod tests {
         let _ = h.dispatch(t.id).await;
         let content = fake.agy_settings_now().unwrap().content.unwrap_or_default();
         assert!(content.contains("command(sudo)"), "{content}");
+    }
+
+    /// The actor hands its machine's env layers (`env`) to dispatch: the
+    /// pane of a task gets `[defaults]`'s, the task's flock's and the
+    /// machine's, each key over the one before.
+    #[tokio::test]
+    async fn the_actor_gives_its_agents_the_env_layers() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let layer = |kv: &[(&str, &str)]| -> std::collections::BTreeMap<String, String> {
+            kv.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let (h, _events) = spawn_with_settings(
+            &fake,
+            &store,
+            MachineSettings {
+                env: crate::config::EnvLayers {
+                    defaults: layer(&[("A", "defaults"), ("B", "defaults")]),
+                    flocks: [(
+                        "default".to_string(),
+                        layer(&[("B", "flock"), ("C", "flock")]),
+                    )]
+                    .into(),
+                    machine: layer(&[("C", "machine")]),
+                },
+                ..settings()
+            },
+        );
+        let t = new_task(&store);
+        let t = h.dispatch(t.id).await.unwrap();
+        let env = fake.pane_env(t.pane_id.as_deref().unwrap());
+        assert_eq!(env["A"], "defaults");
+        assert_eq!(env["B"], "flock");
+        assert_eq!(env["C"], "machine");
+    }
+
+    /// A worktree task whose base could not be fetched starts anyway: the
+    /// row carries the reason and a `task.fetch_failed` event says it; one
+    /// whose fetch went fine says nothing.
+    #[tokio::test]
+    async fn a_failed_fetch_before_a_worktree_is_a_warning_and_an_event() {
+        let task_for = |store: &Store| {
+            store
+                .insert_task(NewTask {
+                    description: None,
+                    job: "run".into(),
+                    item: serde_json::Value::Null,
+                    prompt: "hi".into(),
+                    spec: DispatchSpec {
+                        worktree: true,
+                        repo: Some("/r/app".into()),
+                        ..spec()
+                    },
+                    flock: "default".into(),
+                })
+                .unwrap()
+        };
+        for fails in [true, false] {
+            let fake = FakeHerdr::new();
+            if fails {
+                fake.set_fetch(crate::herdr::Fetched::Failed(
+                    "origin".into(),
+                    "fatal: no route to host".into(),
+                ));
+            }
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let (h, mut events) = spawn(&fake, &store);
+            let t = task_for(&store);
+            let t = h.dispatch(t.id).await.unwrap();
+            assert_eq!(t.state, TaskState::Running, "{fails}");
+            let mut found = Vec::new();
+            while let Ok(ev) = events.try_recv() {
+                if ev.kind == "task.fetch_failed" {
+                    found.push(ev);
+                }
+            }
+            if fails {
+                let why = t.spec.fetch.warning.clone().unwrap();
+                assert!(why.contains("no route to host"), "{why}");
+                assert_eq!(found.len(), 1, "{found:?}");
+                let detail = found[0].detail.clone().unwrap();
+                assert_eq!(detail["repo"], "/r/app");
+                assert_eq!(detail["why"], why);
+                let row = store.get_task(t.id).unwrap().unwrap();
+                assert_eq!(row.spec.fetch.warning.as_deref(), Some(why.as_str()));
+            } else {
+                assert!(found.is_empty(), "{found:?}");
+                assert_eq!(t.spec.fetch.warning, None);
+            }
+        }
     }
 
     /// A flock reload stops a removed or replaced machine's actor. Afterwards
@@ -5698,6 +7824,168 @@ mod tests {
         wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
     }
 
+    /// A task whose agent goes idle with `DONE` alone as its last line is
+    /// ended as if it had run `pastor task done`: done, `ended`, one
+    /// `task.done`, and the message is the round's summary (the agent's, not
+    /// the pane's tail). The same for agy, whose message is what sits above
+    /// its input. A `DONE` that is not the last line ends nothing: a Claude
+    /// task is done on the idle as before but its summary is the pane, and an
+    /// agy task is blocked until it ends itself.
+    #[tokio::test(start_paused = true)]
+    async fn a_last_line_done_ends_the_task_with_that_message() {
+        use crate::task::SummarySource;
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let settle = Duration::from_millis(200);
+        let (h, mut events) = spawn_with_settings(&fake, &store, settings_with_settle(settle));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let go = |agent: &'static str| {
+            let (h, store) = (h.clone(), store.clone());
+            async move {
+                let t = h.dispatch(new_task_of(&store, agent).id).await.unwrap();
+                (t.id, t.pane_id.clone().unwrap())
+            }
+        };
+
+        // Claude: the last line of its last message.
+        let (id, pane) = go("claude").await;
+        fake.set_status(&pane, AgentStatus::Working);
+        fake.set_pane_text(
+            &pane,
+            "● Pushed the branch and opened the PR.\n\n  DONE\n\n✻ Baked for 1m\n\n❯\n",
+        );
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("done", || state_of(&store, id) == TaskState::Done).await;
+        let row = store.get_task(id).unwrap().unwrap();
+        assert!(row.ended, "ended as by `task done`");
+        let round = row.summary.unwrap();
+        assert_eq!(round.source, SummarySource::Agent);
+        assert_eq!(round.text, "Pushed the branch and opened the PR.\nDONE");
+        assert_eq!(count(&mut events, "task.done", id).len(), 1);
+
+        // agy: above its input, and with no `task done` the pane waits for.
+        let (id, pane) = go("agy").await;
+        fake.set_status(&pane, AgentStatus::Working);
+        fake.set_pane_text(
+            &pane,
+            "  Opened the PR.\n  DONE\n\n╭──────╮\n│ >    │\n╰──────╯\n ~/src/repo  gemini-3-pro\n",
+        );
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("done", || state_of(&store, id) == TaskState::Done).await;
+        let row = store.get_task(id).unwrap().unwrap();
+        assert!(row.ended);
+        assert_eq!(row.summary.unwrap().text, "Opened the PR.\nDONE");
+
+        // Not the last line: a Claude task is done on the idle as it always
+        // was, with the pane for its summary; an agy task has not ended.
+        let (id, pane) = go("claude").await;
+        fake.set_status(&pane, AgentStatus::Working);
+        fake.set_pane_text(&pane, "● DONE\n\n  but the lint still fails.\n\n❯\n");
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("done", || state_of(&store, id) == TaskState::Done).await;
+        let row = store.get_task(id).unwrap().unwrap();
+        assert!(!row.ended);
+        assert_eq!(row.summary.unwrap().source, SummarySource::Pane);
+
+        let (id, pane) = go("agy").await;
+        fake.set_status(&pane, AgentStatus::Working);
+        fake.set_pane_text(&pane, "  DONE, almost.\n\n  > \n");
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("blocked", || state_of(&store, id) == TaskState::Blocked).await;
+        assert!(!store.get_task(id).unwrap().unwrap().ended);
+    }
+
+    /// On a task that must say what it did, a bare `DONE` is no summary, and
+    /// a `DONE` from the round before does not end a reopened task whose new
+    /// turn drew no message (interrupted, or ended by an API error): the task
+    /// fails as one that stopped without a summary.
+    #[tokio::test(start_paused = true)]
+    async fn a_required_task_is_not_ended_by_a_bare_or_an_old_done() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let settle = Duration::from_millis(150);
+        let (h, _events) = spawn_with_settings(&fake, &store, settings_with_settle(settle));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        // A bare DONE: nothing above it says what was done.
+        let t = h.dispatch(new_required_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        fake.set_pane_text(&pane, "● DONE\n\n❯\n");
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("failed", || state_of(&store, t.id) == TaskState::Failed).await;
+        assert!(!store.get_task(t.id).unwrap().unwrap().ended);
+
+        // A message and DONE ends it; a later turn that draws no message
+        // does not end it again with the round before's words.
+        let t = h.dispatch(new_required_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        fake.set_pane_text(&pane, "● Opened the PR.\n\n  DONE\n\n❯\n");
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+        assert!(store.get_task(t.id).unwrap().unwrap().ended);
+        tokio::time::sleep(settle * 3).await;
+        let input = SendInput {
+            text: Some("commit and push".into()),
+            enter: true,
+            ..Default::default()
+        };
+        h.send(t.id, input).await.unwrap();
+        fake.set_pane_text(
+            &pane,
+            "● Opened the PR.\n\n  DONE\n\n❯ commit and push\n  ⎿  API Error: 500\n\n❯\n",
+        );
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("activity recorded", || {
+            store.get_task(t.id).unwrap().unwrap().activity_seen
+        })
+        .await;
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("failed", || state_of(&store, t.id) == TaskState::Failed).await;
+        let row = store.get_task(t.id).unwrap().unwrap();
+        assert!(!row.ended);
+        assert_eq!(
+            row.error.as_deref(),
+            Some(crate::task::STOPPED_WITHOUT_SUMMARY)
+        );
+    }
+
+    /// An agent that stops to ask or to wait is not ended by a `DONE` that is
+    /// not the end of its message; one that ends on a question is blocked as
+    /// before, even if an earlier message said `DONE`.
+    #[tokio::test(start_paused = true)]
+    async fn a_question_or_a_wait_is_not_closed_by_an_earlier_done() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let settle = Duration::from_millis(200);
+        let (h, _events) = spawn_with_settings(&fake, &store, settings_with_settle(settle));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        fake.set_pane_text(
+            &pane,
+            "● DONE\n\n❯ one more thing\n\n● Two ways to do it.\n\n  Should I keep the old flag?\n\n❯\n",
+        );
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("blocked", || state_of(&store, t.id) == TaskState::Blocked).await;
+        let row = store.get_task(t.id).unwrap().unwrap();
+        assert!(!row.ended);
+        assert_eq!(
+            row.error.as_deref(),
+            Some("agent asked: Should I keep the old flag?")
+        );
+    }
+
     /// `settings_with_settle` on a head, which keeps the limits.
     fn limits_kept(settle: Duration) -> MachineSettings {
         MachineSettings {
@@ -5717,7 +8005,7 @@ mod tests {
         agents.0.insert(
             "claude".into(),
             crate::config::AgentDef {
-                env: [("CLAUDE_CONFIG_DIR".into(), "~/.claude-personal".into())].into(),
+                env: [("CLAUDE_CONFIG_DIR".into(), "~/.claude-alt".into())].into(),
                 ..Default::default()
             },
         );
@@ -5742,7 +8030,7 @@ mod tests {
             output: 700,
             read_at: Utc::now(),
         };
-        fake.set_usage(Some("~/.claude-personal"), &session, usage.clone());
+        fake.set_usage(Some("~/.claude-alt"), &session, usage.clone());
         fake.set_status(&pane, AgentStatus::Working);
         wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
         assert_eq!(store.get_task(t.id).unwrap().unwrap().usage, None);
@@ -5903,6 +8191,59 @@ mod tests {
         let text = prompt["text"].as_str().unwrap();
         assert!(text.starts_with("hi"), "{text}");
         assert!(text.ends_with(crate::task::LIMIT_HANDOVER), "{text}");
+    }
+
+    /// `confirm_pending_done` sees the same `agent.list` reply
+    /// `capture_agent_session` reads a conversation id from: a hard quota
+    /// closes the pane in the very same pass, before a reconcile (due only
+    /// every `reconcile_every`) would otherwise have had a chance to record
+    /// it. The id must not be lost to that race.
+    #[tokio::test(start_paused = true)]
+    async fn an_agy_session_is_captured_before_a_hard_quota_closes_its_pane() {
+        use crate::herdr::{AgentSessionInfo, AgentSessionRefKind};
+
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        // No reconcile inside the test, so only the settle check can record it.
+        let settings = MachineSettings {
+            reconcile_every: Duration::from_secs(3600),
+            ..limits_kept(Duration::from_millis(100))
+        };
+        let (h, _events) = spawn_with_settings(&fake, &store, settings);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task_of(&store, "agy").id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+        const CONVERSATION: &str = "9f1e2d3c-4b5a-6978-8f90-123456789abc";
+        fake.set_agent_session(
+            &pane,
+            Some(AgentSessionInfo {
+                agent: "agy".into(),
+                kind: AgentSessionRefKind::Id,
+                source: "agy-hook".into(),
+                value: CONVERSATION.into(),
+            }),
+        );
+        fake.set_pane_text(
+            &pane,
+            "  Half of the review is written.\n\n\
+             \u{20} RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your\n\
+             \u{20} subscription to increase your limits. Resets in 4h21m30s.\n\n\
+             ╭────────╮\n│ >      │\n╰────────╯\n ~/src/repo  gemini-3-pro\n",
+        );
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("waiting", || state_of(&store, t.id) == TaskState::Waiting).await;
+        let row = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(row.pane_id, None, "its pane closed on the hard quota");
+        assert_eq!(
+            row.spec.session_id.as_deref(),
+            Some(CONVERSATION),
+            "the conversation id is kept despite the pane closing before any reconcile ran"
+        );
     }
 
     /// An opencode task that fell back to GPT and ran out there is not
@@ -6156,6 +8497,63 @@ mod tests {
         assert_eq!(retries_sent(&fake, &pane), 3);
     }
 
+    /// The rate retry line goes through a Claude session's inbox socket,
+    /// each attempt after the first saying which it is so Claude never drops
+    /// it as the same text from the same sender. The task stays running at
+    /// the idle `retry_later` took as its baseline until it works again.
+    #[tokio::test(start_paused = true)]
+    async fn a_rate_retry_goes_through_the_inbox_socket() {
+        let fake = FakeHerdr::new();
+        fake.set_inbox_result(Some("accepted"));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = spawn_with_settings(&fake, &store, short_limits(3));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        let retries = |fake: &FakeHerdr| -> Vec<String> {
+            fake.inbox_sends()
+                .into_iter()
+                .map(|s| s.text)
+                .filter(|t| t.starts_with(crate::task::RATE_RETRY_PROMPT))
+                .collect()
+        };
+        for (attempt, wait) in [(1, 1), (2, 2)] {
+            turn_ends_on(&fake, &pane, OVERLOADED).await;
+            next_rate_limited(&mut events, t.id).await;
+            tokio::time::sleep(Duration::from_millis(wait * 1000 + 300)).await;
+            assert_eq!(retries(&fake).len(), attempt, "after the wait");
+            assert_eq!(state_of(&store, t.id), TaskState::Running);
+        }
+        let sent = retries(&fake);
+        assert_eq!(sent[0], crate::task::RATE_RETRY_PROMPT);
+        assert!(sent[1].contains("Attempt 2"), "{sent:?}");
+        assert_eq!(retries_sent(&fake, &pane), 0, "nothing typed");
+    }
+
+    /// A rate retry the socket does not take is typed.
+    #[tokio::test(start_paused = true)]
+    async fn a_rate_retry_the_socket_does_not_take_is_typed() {
+        let fake = FakeHerdr::new();
+        fake.set_inbox_result(Some("accepted"));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = spawn_with_settings(&fake, &store, short_limits(3));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_inbox_result(Some("held"));
+        turn_ends_on(&fake, &pane, OVERLOADED).await;
+        next_rate_limited(&mut events, t.id).await;
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        assert_eq!(retries_sent(&fake, &pane), 1);
+        assert_eq!(fake.inbox_sends().len(), 2, "the socket was tried");
+    }
+
     /// A message that names a wait (`try again in 20s`) is waited at least
     /// that long, past a shorter `rate_backoff`.
     #[tokio::test(start_paused = true)]
@@ -6331,8 +8729,11 @@ mod tests {
             assert_eq!(row.state, TaskState::Blocked, "{screen}");
             assert!(keys_in(&fake, &pane).is_empty(), "{screen}");
             assert!(store.limits().unwrap().is_empty(), "{screen}");
+            // One read at its start, for its login screen, one for a
+            // startup dialog its prompt may have gone into
+            // (`prompt_in_dialog`), and one for the picker.
             let reads = calls(&fake, "agent.read").len();
-            assert_eq!(reads, 1, "{screen}: read once");
+            assert_eq!(reads, 3, "{screen}: read once");
         }
     }
 
@@ -6432,6 +8833,184 @@ mod tests {
         assert_eq!(state_of(&store, t.id), TaskState::Failed);
     }
 
+    /// `new_task` with its agent `agent`.
+    fn task_of(store: &Store, agent: &str) -> Task {
+        let mut spec = spec();
+        spec.agent = agent.into();
+        store
+            .insert_task(NewTask {
+                description: None,
+                job: "run".into(),
+                item: serde_json::Value::Null,
+                prompt: "hi".into(),
+                spec,
+                flock: "default".into(),
+            })
+            .unwrap()
+    }
+
+    /// The kinds of the events about task `id` received so far, with their
+    /// details.
+    fn kinds_of(
+        events: &mut broadcast::Receiver<PastorEvent>,
+        id: i64,
+    ) -> Vec<(String, Option<serde_json::Value>)> {
+        let mut kinds = Vec::new();
+        while let Ok(ev) = events.try_recv() {
+            if ev.task_id == Some(id) {
+                kinds.push((ev.kind, ev.detail));
+            }
+        }
+        kinds
+    }
+
+    /// An agent that starts at its login screen is signed out: the task
+    /// waits, held, not failed, with the agent marked signed out
+    /// (`agent.signed_out`) and nothing typed into the screen. Claude's
+    /// screen reads `blocked`; agy's reads idle and ready.
+    #[tokio::test(start_paused = true)]
+    async fn an_agent_at_its_login_screen_at_start_is_signed_out() {
+        let screens = [
+            (
+                "claude",
+                false,
+                "Welcome to Claude Code\n\n Select login method:\n\n \u{276f} 1. Claude account with subscription\n   2. Anthropic Console account\n",
+            ),
+            (
+                "agy",
+                true,
+                "Welcome back! You are currently not signed in.\n\n> Sign in with Google\n",
+            ),
+        ];
+        for (agent, idle, screen) in screens {
+            let fake = FakeHerdr::new();
+            fake.set_trust_prompt(Some(vec!["Enter".into()]));
+            fake.set_trust_idle(idle);
+            fake.set_trust_screen(screen);
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let (h, mut events) =
+                spawn_with_settings(&fake, &store, limits_kept(Duration::from_millis(100)));
+            wait_for("connected", || {
+                h.snapshot().channel == ChannelState::Connected
+            })
+            .await;
+            let t = h.dispatch(task_of(&store, agent).id).await.unwrap();
+            assert_eq!(t.state, TaskState::Waiting, "{agent}: {:?}", t.error);
+            let row = store.get_task(t.id).unwrap().unwrap();
+            assert_eq!(row.pane_id, None, "{agent}");
+            assert_eq!(row.waiting_until, Some(crate::limit::signed_out_until()));
+            assert_eq!(
+                row.error.as_deref(),
+                Some(format!("m/{agent} signed out (seen by t-{})", t.id).as_str())
+            );
+            let limits = store.limits().unwrap();
+            assert_eq!(limits.len(), 1, "{agent}: {limits:?}");
+            assert!(limits[0].signed_out, "{agent}");
+            assert_eq!(limits[0].account, format!("m/{agent}"));
+            assert!(calls(&fake, "agent.prompt").is_empty(), "{agent}");
+            let kinds = kinds_of(&mut events, t.id);
+            let (_, detail) = kinds
+                .iter()
+                .find(|(k, _)| k == "agent.signed_out")
+                .unwrap_or_else(|| panic!("{agent}: {kinds:?}"));
+            assert_eq!(detail.as_ref().unwrap()["agent"], agent);
+            assert!(!kinds.iter().any(|(k, _)| k == "agent.exhausted"));
+            assert!(!kinds.iter().any(|(k, _)| k == "task.failed"));
+            let (_, waiting) = kinds.iter().find(|(k, _)| k == "task.waiting").unwrap();
+            assert_eq!(
+                waiting.as_ref().unwrap()["shown"],
+                format!("waiting: m/{agent} signed out")
+            );
+        }
+    }
+
+    /// A running Claude task whose login goes while it works ends its turn
+    /// on `Not logged in · Please run /login`: it is held, waiting, not
+    /// done or failed, and the agent is marked signed out. The same words
+    /// in a tool call's output are not a sign-out.
+    #[tokio::test(start_paused = true)]
+    async fn a_running_task_whose_login_goes_is_held() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let settle = Duration::from_millis(100);
+        let (h, mut events) = spawn_with_settings(&fake, &store, limits_kept(settle));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+        fake.set_pane_text(
+            &pane,
+            "❯ hi\n\n● Half of it is done.\n\n  ⎿  Not logged in · Please run /login\n\n────────\n❯ \n────────\n",
+        );
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("waiting", || state_of(&store, t.id) == TaskState::Waiting).await;
+        let row = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(row.pane_id, None);
+        assert_eq!(row.machine.as_deref(), Some("m"));
+        let limits = store.limits().unwrap();
+        assert_eq!(limits.len(), 1, "{limits:?}");
+        assert!(limits[0].signed_out);
+        assert_eq!(limits[0].line, "Not logged in · Please run /login");
+        assert_eq!(
+            row.spec.rounds.stop.as_ref().map(|s| s.why.as_str()),
+            Some("signed_out")
+        );
+        let kinds = kinds_of(&mut events, t.id);
+        let has = |k: &str| kinds.iter().any(|(kind, _)| kind == k);
+        assert!(has("agent.signed_out") && has("task.waiting"), "{kinds:?}");
+        assert!(!has("task.done") && !has("task.failed"), "{kinds:?}");
+
+        // A grep that prints the message, then a reply: done, no mark.
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let fake = FakeHerdr::new();
+        let (h, _events) = spawn_with_settings(&fake, &store, limits_kept(settle));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+        fake.set_pane_text(
+            &pane,
+            "❯ hi\n\n● Bash(grep -rn login src)\n  ⎿  Not logged in · Please run /login\n\n────────\n❯ \n────────\n",
+        );
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+        assert!(store.limits().unwrap().is_empty());
+    }
+
+    /// A running task whose agent stops at its login screen, which herdr
+    /// reads `blocked`, is held as signed out, not left blocked.
+    #[tokio::test(start_paused = true)]
+    async fn a_blocked_agent_at_its_login_screen_is_held() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let settle = Duration::from_millis(100);
+        let (h, mut events) = spawn_with_settings(&fake, &store, limits_kept(settle));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+        fake.set_pane_text(
+            &pane,
+            "● Half of it is done.\n\n Select login method:\n\n \u{276f} 1. Claude account with subscription\n   2. Anthropic Console account\n",
+        );
+        fake.set_status(&pane, AgentStatus::Blocked);
+        wait_for("waiting", || state_of(&store, t.id) == TaskState::Waiting).await;
+        assert!(store.limits().unwrap()[0].signed_out);
+        assert!(saw(&mut events, "agent.signed_out", t.id));
+    }
+
     /// Claude can end its turn with a command left running in the
     /// background; its footer says "1 shell still running" and it takes the
     /// turn up again when the shell ends. herdr reads it idle all the while,
@@ -6470,6 +9049,76 @@ mod tests {
         fake.set_pane_text(&pane, "● make check passed. Pushed the branch.\n\n❯\n");
         fake.set_status(&pane, AgentStatus::Idle);
         wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+    }
+
+    /// Claude 2.1.3xx draws the shell as a bare count in its footer
+    /// (`· 1 shell ·`), with no "still running": the task stays running
+    /// all the same, and is done once the shell ended and the agent's next
+    /// turn did.
+    #[tokio::test(start_paused = true)]
+    async fn a_bare_shell_count_in_the_footer_is_not_done() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let settle = Duration::from_millis(100);
+        let (h, _events) = spawn_with_settings(&fake, &store, settings_with_settle(settle));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+        let screen: String = include_str!("../tests/fixtures/panes/one-shell-idle-footer.txt")
+            .lines()
+            .filter(|l| !l.starts_with("#! "))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        fake.set_pane_text(&pane, &screen);
+        fake.set_status(&pane, AgentStatus::Idle);
+        tokio::time::sleep(settle * 6).await;
+        assert_eq!(
+            state_of(&store, t.id),
+            TaskState::Running,
+            "a background shell keeps the task running"
+        );
+        fake.set_status(&pane, AgentStatus::Working);
+        fake.set_pane_text(&pane, "● make check passed. Committed and pushed.\n\n❯\n");
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+    }
+
+    /// The same with a dialog Claude drew under its turn summary, in place
+    /// of the input box: the shell is still running, so the task is not
+    /// closed as finished with no summary while the agent waits on it.
+    #[tokio::test(start_paused = true)]
+    async fn an_agent_waiting_on_a_shell_under_a_dialog_is_not_done() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let settle = Duration::from_millis(100);
+        let (h, _events) = spawn_with_settings(&fake, &store, settings_with_settle(settle));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+        let screen: String =
+            include_str!("../tests/fixtures/panes/shell-running-under-a-dialog.txt")
+                .lines()
+                .filter(|l| !l.starts_with("#! "))
+                .map(|l| format!("{l}\n"))
+                .collect();
+        fake.set_pane_text(&pane, &screen);
+        fake.set_status(&pane, AgentStatus::Idle);
+        tokio::time::sleep(settle * 6).await;
+        assert_eq!(
+            state_of(&store, t.id),
+            TaskState::Running,
+            "a background shell keeps the task running"
+        );
     }
 
     /// A task of `agent` (no `[agents]` entry, so its kind is its name).
@@ -7086,7 +9735,7 @@ mod tests {
     /// `Task::agent_name_for` makes count.
     #[test]
     fn only_canonical_task_names_are_orphans() {
-        for name in ["t-01", "t-007", "t-0", "t-00"] {
+        for name in ["t-01", "t-07", "t-0", "t-00"] {
             assert_eq!(task_id_of_agent(name), None, "{name:?}");
         }
         let agent = |name: &str, pane: &str| -> AgentInfo {
@@ -7171,6 +9820,216 @@ mod tests {
         })
         .await;
         assert_eq!(h.snapshot().live, 1);
+    }
+
+    /// herdr's agy hook reports the conversation id through `agent_session`
+    /// once it has one; the next reconcile that lists it records it on the
+    /// task, the same place Claude's own `--session-id` goes, so a later
+    /// pause or `task attach` can resume it on `agy --conversation <id>`.
+    #[tokio::test(start_paused = true)]
+    async fn an_agy_conversation_id_herdr_reports_is_recorded_on_the_task() {
+        use crate::herdr::{AgentSessionInfo, AgentSessionRefKind};
+
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let mut t = new_task(&store);
+        t.spec.agent = "agy".into();
+        store.update_task(&mut t).unwrap();
+        let running = h.dispatch(t.id).await.unwrap();
+        assert_eq!(running.spec.session_id, None, "agy picks none at start");
+        let pane = running.pane_id.clone().unwrap();
+        const CONVERSATION: &str = "9f1e2d3c-4b5a-6978-8f90-123456789abc";
+        fake.set_agent_session(
+            &pane,
+            Some(AgentSessionInfo {
+                agent: "agy".into(),
+                kind: AgentSessionRefKind::Id,
+                source: "agy-hook".into(),
+                value: CONVERSATION.into(),
+            }),
+        );
+        wait_for("its conversation id is recorded", || {
+            store
+                .get_task(t.id)
+                .unwrap()
+                .unwrap()
+                .spec
+                .session_id
+                .as_deref()
+                == Some(CONVERSATION)
+        })
+        .await;
+    }
+
+    /// A machine with no agy hook installed (or one that has not reported
+    /// anything yet) never sets `agent_session`, so the task simply keeps no
+    /// session, as before: a plain `agent.list` report of a kind pastor
+    /// does not resume, or one that does not match the task's own kind, is
+    /// never recorded either.
+    #[tokio::test(start_paused = true)]
+    async fn an_agy_task_with_no_reported_conversation_keeps_none() {
+        use crate::herdr::{AgentSessionInfo, AgentSessionRefKind};
+
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let mut t = new_task(&store);
+        t.spec.agent = "agy".into();
+        store.update_task(&mut t).unwrap();
+        let running = h.dispatch(t.id).await.unwrap();
+        let pane = running.pane_id.clone().unwrap();
+        // A report for another agent kind is never trusted for this task.
+        fake.set_agent_session(
+            &pane,
+            Some(AgentSessionInfo {
+                agent: "codex".into(),
+                kind: AgentSessionRefKind::Id,
+                source: "codex-hook".into(),
+                value: "9f1e2d3c-4b5a-6978-8f90-123456789abc".into(),
+            }),
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(store.get_task(t.id).unwrap().unwrap().spec.session_id, None);
+    }
+
+    /// An agy task's conversation id can be shaped like a Claude session,
+    /// but its usage is never looked for in Claude's files.
+    #[tokio::test(start_paused = true)]
+    async fn an_agy_task_that_ends_reads_no_claude_usage() {
+        use crate::herdr::{AgentSessionInfo, AgentSessionRefKind};
+
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task_of(&store, "agy").id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        const CONVERSATION: &str = "9f1e2d3c-4b5a-4978-8f90-123456789abc";
+        // What a Claude session of that id would have used, were it read.
+        fake.set_usage(
+            None,
+            CONVERSATION,
+            crate::usage::TaskUsage {
+                model: None,
+                api_calls: 1,
+                input: 1,
+                cache_write: 0,
+                cache_read: 0,
+                output: 1,
+                read_at: Utc::now(),
+            },
+        );
+        fake.set_agent_session(
+            &pane,
+            Some(AgentSessionInfo {
+                agent: "agy".into(),
+                kind: AgentSessionRefKind::Id,
+                source: "agy-hook".into(),
+                value: CONVERSATION.into(),
+            }),
+        );
+        wait_for("its conversation id is recorded", || {
+            store
+                .get_task(t.id)
+                .unwrap()
+                .unwrap()
+                .spec
+                .session_id
+                .as_deref()
+                == Some(CONVERSATION)
+        })
+        .await;
+        h.end(t.id, Some("done".into())).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(store.get_task(t.id).unwrap().unwrap().usage, None);
+    }
+
+    /// An agy task that recorded its conversation id can be paused and
+    /// resumed exactly as a Claude one, on `--conversation` in place of
+    /// `--resume`: `why_not_pausable` took only Claude before this.
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_agy_task_resumes_its_own_conversation() {
+        use crate::herdr::{AgentSessionInfo, AgentSessionRefKind};
+        use crate::task::Priority;
+
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = store
+            .insert_task_at(
+                NewTask {
+                    description: None,
+                    job: "run".into(),
+                    item: serde_json::Value::Null,
+                    prompt: "hi".into(),
+                    spec: DispatchSpec {
+                        agent: "agy".into(),
+                        ..spec()
+                    },
+                    flock: "default".into(),
+                },
+                Priority::Low,
+                None,
+                crate::task::TaskRole::Agent,
+            )
+            .unwrap();
+        let running = h.dispatch(t.id).await.unwrap();
+        let pane = running.pane_id.clone().unwrap();
+        const CONVERSATION: &str = "9f1e2d3c-4b5a-6978-8f90-123456789abc";
+        fake.set_agent_session(
+            &pane,
+            Some(AgentSessionInfo {
+                agent: "agy".into(),
+                kind: AgentSessionRefKind::Id,
+                source: "agy-hook".into(),
+                value: CONVERSATION.into(),
+            }),
+        );
+        wait_for("its conversation id is recorded", || {
+            store
+                .get_task(t.id)
+                .unwrap()
+                .unwrap()
+                .spec
+                .session_id
+                .as_deref()
+                == Some(CONVERSATION)
+        })
+        .await;
+
+        let other = new_task(&store);
+        let paused = h.pause(t.id, other.id).await.unwrap();
+        assert_eq!(paused.state, TaskState::Paused);
+
+        h.resume(t.id).await.unwrap();
+        wait_for("resumed", || state_of(&store, t.id) == TaskState::Running).await;
+        let reqs = fake.requests();
+        let start = reqs
+            .iter()
+            .rev()
+            .find(|r| r.method == "agent.start")
+            .unwrap();
+        assert_eq!(start.params["kind"], "agy");
+        assert_eq!(
+            start.params["args"],
+            serde_json::json!(["--conversation", CONVERSATION])
+        );
     }
 
     async fn connected(
@@ -7591,6 +10450,60 @@ mod tests {
         assert_eq!(calls(&fake, "pane.close").len(), 1);
     }
 
+    /// `pastor task close` (and so `task done`'s auto-close) stops a task
+    /// before any reconcile ever ran: the only `agent.list` reply it will
+    /// ever see is the one it reads to find the pane to close. A reported
+    /// conversation id must be captured from that same reply, or the closed
+    /// task cannot be reopened on it (`task attach`) despite the hook having
+    /// reported one.
+    #[tokio::test(start_paused = true)]
+    async fn close_captures_a_reported_session_before_closing_the_pane() {
+        use crate::herdr::{AgentSessionInfo, AgentSessionRefKind};
+
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        // No reconcile inside the test, so only the close can record it.
+        let settings = MachineSettings {
+            reconcile_every: Duration::from_secs(3600),
+            ..settings()
+        };
+        let (h, _events) = spawn_with_settings(&fake, &store, settings);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task_of(&store, "agy").id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        assert_eq!(t.spec.session_id, None);
+        const CONVERSATION: &str = "9f1e2d3c-4b5a-6978-8f90-123456789abc";
+        fake.set_agent_session(
+            &pane,
+            Some(AgentSessionInfo {
+                agent: "agy".into(),
+                kind: AgentSessionRefKind::Id,
+                source: "agy-hook".into(),
+                value: CONVERSATION.into(),
+            }),
+        );
+        let closed = h.close(t.id, false).await.unwrap();
+        assert_eq!(closed.state, TaskState::Closed);
+        assert_eq!(
+            closed.spec.session_id.as_deref(),
+            Some(CONVERSATION),
+            "the conversation id is kept even though reconcile never ran"
+        );
+        assert_eq!(
+            store
+                .get_task(t.id)
+                .unwrap()
+                .unwrap()
+                .spec
+                .session_id
+                .as_deref(),
+            Some(CONVERSATION)
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn close_with_remove_worktree_removes_it_and_a_dirty_one_is_refused() {
         let fake = FakeHerdr::new();
@@ -7631,6 +10544,563 @@ mod tests {
             "an API error is not an outage"
         );
         assert_eq!(fake.agents().len(), 1);
+    }
+
+    /// A workdir gate that records each `forget`, and places anything.
+    #[derive(Default)]
+    struct Forgot(std::sync::Mutex<Vec<(String, String)>>);
+
+    impl crate::bundle::workdir_task::Gate for Forgot {
+        fn place<'a>(
+            &'a self,
+            _machine: &'a str,
+            _dir: &'a str,
+            _what: &'a crate::bundle::workdir_task::Placing,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(true) })
+        }
+
+        fn forget(&self, machine: &str, dir: &str) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((machine.to_string(), dir.to_string()));
+        }
+    }
+
+    impl Forgot {
+        fn dirs(&self) -> Vec<String> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, d)| d.clone())
+                .collect()
+        }
+    }
+
+    /// `settings` with a `Forgot` gate, and the gate.
+    fn forgetting(settings: MachineSettings) -> (MachineSettings, Arc<Forgot>) {
+        let gate = Arc::new(Forgot::default());
+        let settings = MachineSettings {
+            workdir_gate: crate::bundle::workdir_task::GateHandle(Some(gate.clone())),
+            ..settings
+        };
+        (settings, gate)
+    }
+
+    /// A task's worktree that goes takes the workdir sets placed in it out
+    /// with it; a close that keeps the worktree leaves them.
+    #[tokio::test]
+    async fn a_removed_worktree_takes_its_workdir_sets_with_it() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (settings, gate) = forgetting(MachineSettings::default());
+        let (h, _events) = spawn_with_settings(&fake, &store, settings);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let kept = h.dispatch(worktree_task(&store).id).await.unwrap();
+        h.close(kept.id, false).await.unwrap();
+        assert!(gate.dirs().is_empty(), "the worktree stays");
+        let gone = h.dispatch(worktree_task(&store).id).await.unwrap();
+        let path = gone.spec.checkout.clone().unwrap().path;
+        h.close(gone.id, true).await.unwrap();
+        assert_eq!(*gate.0.lock().unwrap(), [("m".to_string(), path)]);
+    }
+
+    /// The other ways a close takes a worktree, each taking its sets out:
+    /// a shared workspace's task whose checkout is gone already, a workspace
+    /// herdr lost (git removes the checkout on the machine), and a paused
+    /// task whose kept checkout is opened and removed.
+    #[tokio::test(start_paused = true)]
+    async fn every_close_that_takes_a_worktree_takes_its_workdir_sets() {
+        use crate::herdr::Connector as _;
+        let start = async |fake: &FakeHerdr, store: &Arc<Store>| {
+            let (settings, gate) = forgetting(MachineSettings::default());
+            let (h, events) = spawn_with_settings(fake, store, settings);
+            wait_for("connected", || {
+                h.snapshot().channel == ChannelState::Connected
+            })
+            .await;
+            (h, events, gate)
+        };
+
+        // Shared workspace, checkout gone before the close.
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events, gate) = start(&fake, &store).await;
+        let t = h
+            .dispatch(placed_task(&store, Place::Pastor, true).id)
+            .await
+            .unwrap();
+        let path = t.spec.checkout.clone().unwrap().path;
+        fake.remove_checkout(&path).await.unwrap();
+        h.close(t.id, true).await.unwrap();
+        assert_eq!(gate.dirs(), [path], "shared, gone already");
+
+        // The workspace is lost to herdr: git removes the checkout.
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events, gate) = start(&fake, &store).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        let path = t.spec.checkout.clone().unwrap().path;
+        fake.close_pane(&t.pane_id.clone().unwrap());
+        store.close_task(t.id).unwrap();
+        h.close(t.id, true).await.unwrap();
+        assert_eq!(fake.removed_checkouts(), std::slice::from_ref(&path));
+        assert_eq!(gate.dirs(), [path], "lost workspace");
+
+        // A paused task whose checkout is still on disk.
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events, gate) = start(&fake, &store).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        let path = t.spec.checkout.clone().unwrap().path;
+        fake.close_pane(&t.pane_id.clone().unwrap());
+        let mut row = store.get_task(t.id).unwrap().unwrap();
+        row.state = TaskState::Paused;
+        store.update_task(&mut row).unwrap();
+        let closed = h.close(t.id, true).await.unwrap();
+        assert_eq!(closed.state, TaskState::Closed);
+        assert_eq!(gate.dirs(), [path], "paused, removed through a workspace");
+    }
+
+    /// Auto-close's removal of a done task's clean worktree takes its sets
+    /// out too.
+    #[tokio::test(start_paused = true)]
+    async fn auto_close_takes_the_workdir_sets_out_with_the_worktree() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (settings, gate) = forgetting(auto_close_settings());
+        let (h, _events) = spawn_with_settings(&fake, &store, settings);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = run_to_done(&h, &fake, &store, worktree_task(&store)).await;
+        auto_closed(&store, t.id).await;
+        assert_eq!(gate.dirs(), [t.spec.checkout.clone().unwrap().path]);
+    }
+
+    /// A paused task's close that removes its kept worktree takes the sets
+    /// out with it; a plain close leaves them.
+    #[tokio::test(start_paused = true)]
+    async fn closing_a_paused_task_s_worktree_takes_its_workdir_sets_out() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (settings, gate) = forgetting(MachineSettings::default());
+        let (h, _events) = spawn_with_settings(&fake, &store, settings);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let paused = |store: &Store| {
+            let mut t = worktree_task(store);
+            t.state = TaskState::Paused;
+            t.machine = Some("m".into());
+            t.spec.checkout = Some(Box::new(crate::task::Checkout {
+                branch: format!("pastor/t-{}", t.id),
+                path: format!("/srv/worktrees/app/t-{}", t.id),
+                already_open: false,
+            }));
+            store.update_task(&mut t).unwrap();
+            t
+        };
+        let kept = paused(&store);
+        h.close(kept.id, false).await.unwrap();
+        assert!(gate.dirs().is_empty(), "the worktree stays");
+        let gone = paused(&store);
+        h.close(gone.id, true).await.unwrap();
+        assert_eq!(gate.dirs(), [gone.spec.checkout.clone().unwrap().path]);
+    }
+
+    /// A pane's shell that has left a build running: `sh` with a background
+    /// `sleep`, standing for a `flock cargo test`. Returns the shell and the
+    /// pid of the child.
+    async fn pane_shell_with_a_build(dir: &std::path::Path) -> (tokio::process::Child, u32) {
+        let file = dir.join("child");
+        let shell = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("sleep 300 & echo $! > {}; wait", file.display()))
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        for _ in 0..100 {
+            if let Some(pid) = std::fs::read_to_string(&file)
+                .ok()
+                .and_then(|t| t.trim().parse().ok())
+            {
+                return (shell, pid);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the shell did not start its child");
+    }
+
+    fn alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// Closing a task used to close its pane and leave a build its agent
+    /// had started running. Now what runs under the pane's shell ends
+    /// before the pane closes, and the task's events say what.
+    #[tokio::test]
+    async fn closing_a_task_ends_what_its_agent_left_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut shell, build) = pane_shell_with_a_build(tmp.path()).await;
+        let fake = FakeHerdr::new();
+        fake.run_reaps();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        fake.set_shell_pid(t.pane_id.as_deref().unwrap(), shell.id().unwrap());
+        assert!(alive(build));
+
+        let closed = h.close(t.id, false).await.unwrap();
+        assert_eq!(closed.state, TaskState::Closed);
+        let mut gone = false;
+        for _ in 0..50 {
+            if !alive(build) {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(gone, "the build outlived its task");
+        let _ = shell.kill().await;
+
+        // Asked before the pane closed, and told.
+        let order: Vec<String> = fake.requests().into_iter().map(|r| r.method).collect();
+        let asked = order.iter().position(|m| m == "pane.process_info").unwrap();
+        let closed_at = order.iter().rposition(|m| m == "pane.close").unwrap();
+        assert!(asked < closed_at, "{order:?}");
+        let mut told = None;
+        while let Ok(ev) = events.try_recv() {
+            if ev.kind == "task.processes_killed" {
+                told = Some(ev);
+            }
+        }
+        let ev = told.expect("a task.processes_killed event");
+        assert_eq!(ev.task_id, Some(t.id));
+        let detail = ev.detail.unwrap();
+        assert_eq!(detail["count"], 1, "{detail}");
+        assert_eq!(detail["processes"][0]["pid"], build, "{detail}");
+        assert_eq!(detail["processes"][0]["found"], "tree", "{detail}");
+        assert_eq!(detail["processes"][0]["forced"], false, "{detail}");
+    }
+
+    /// A close that removes the checkout also asks for whatever works in
+    /// it, which a build that left the pane's tree is found by; a close that
+    /// keeps it asks only for the pane's tree. A pane herdr gives no shell
+    /// for and a checkout that stays: nothing is asked.
+    #[tokio::test(start_paused = true)]
+    async fn the_checkout_is_searched_only_when_it_goes() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let removed = h.dispatch(worktree_task(&store).id).await.unwrap();
+        let kept = h.dispatch(worktree_task(&store).id).await.unwrap();
+        let plain = h.dispatch(new_task(&store).id).await.unwrap();
+        fake.set_shell_pid(removed.pane_id.as_deref().unwrap(), 4001);
+        fake.set_shell_pid(kept.pane_id.as_deref().unwrap(), 4002);
+
+        h.close(removed.id, true).await.unwrap();
+        let path = removed.spec.checkout.clone().map(|c| c.path);
+        let got = fake.reaps();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].root, Some(4001));
+        assert!(got[0].cwd.is_some(), "{got:?}");
+        assert!(path.is_none() || got[0].cwd == path, "{got:?}");
+
+        h.close(kept.id, false).await.unwrap();
+        let got = fake.reaps();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[1].root, Some(4002));
+        assert_eq!(got[1].cwd, None, "the checkout stays: only the tree");
+
+        h.close(plain.id, false).await.unwrap();
+        assert_eq!(fake.reaps().len(), 2, "no shell and no checkout: no ask");
+    }
+
+    fn candidate(pid: u32, found: crate::reap::Found) -> crate::reap::Candidate {
+        crate::reap::Candidate {
+            pid,
+            found,
+            start: "Wed Oct 28 04:45:28 2026".into(),
+            name: "cargo".into(),
+        }
+    }
+
+    /// The pids `fake` was asked to end, in order.
+    fn ended_pids(fake: &FakeHerdr) -> Vec<u32> {
+        fake.ended().iter().flatten().map(|c| c.pid).collect()
+    }
+
+    /// A close that herdr refuses (a dirty checkout) changes nothing: the
+    /// agent and what it started are left running, since the task is.
+    #[tokio::test]
+    async fn a_refused_close_ends_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut shell, build) = pane_shell_with_a_build(tmp.path()).await;
+        let fake = FakeHerdr::new();
+        fake.run_reaps();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_shell_pid(&pane, shell.id().unwrap());
+        fake.set_dirty(t.workspace_id.as_deref().unwrap());
+
+        let err = h.close(t.id, true).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("dirty_worktree_requires_force"),
+            "{err:#}"
+        );
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+        assert!(alive(build), "the build is still running");
+        assert!(fake.ended().is_empty(), "{:?}", fake.ended());
+        let _ = shell.kill().await;
+        let _ = std::process::Command::new("kill")
+            .arg(build.to_string())
+            .status();
+    }
+
+    /// Auto-close keeps a dirty checkout and closes the pane anyway: what
+    /// runs under the pane is ended, what works in the checkout is not.
+    #[tokio::test(start_paused = true)]
+    async fn auto_close_keeping_a_checkout_does_not_end_what_works_in_it() {
+        use crate::reap::Found;
+        let fake = FakeHerdr::new();
+        fake.set_leftovers(vec![
+            candidate(4001, Found::Tree),
+            candidate(4002, Found::Cwd),
+            candidate(4003, Found::Group),
+        ]);
+        fake.dirty_worktrees(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn_with_settings(&fake, &store, auto_close_settings());
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = run_to_done(&h, &fake, &store, worktree_task(&store)).await;
+        auto_closed(&store, t.id).await;
+        assert_eq!(ended_pids(&fake), [4001, 4003]);
+    }
+
+    /// What works in the checkout is ended only when the checkout went with
+    /// the close, in every placement: a dirty one that herdr refuses, or one
+    /// a workspace pastor did not open shows, stays, and so does what works
+    /// in it; a clean one that is removed takes it all.
+    #[tokio::test(start_paused = true)]
+    async fn what_works_in_a_checkout_is_ended_only_if_the_checkout_goes() {
+        use crate::reap::Found;
+        let leftovers = |n: u32| {
+            vec![
+                candidate(n, Found::Tree),
+                candidate(n + 1, Found::Cwd),
+                candidate(n + 2, Found::Group),
+            ]
+        };
+        for place in [Place::Repo, Place::Pastor] {
+            // Dirty: refused, the pane (shared) may already be closed.
+            let fake = FakeHerdr::new();
+            fake.set_leftovers(leftovers(6001));
+            fake.dirty_worktrees(true);
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let (h, _events) = connected(&fake, &store).await;
+            let t = h
+                .dispatch(placed_task(&store, place.clone(), true).id)
+                .await
+                .unwrap();
+            let err = h.close(t.id, true).await.unwrap_err();
+            assert!(
+                format!("{err:#}").contains("dirty_worktree_requires_force"),
+                "{place:?}: {err:#}"
+            );
+            let ended = ended_pids(&fake);
+            assert!(!ended.contains(&6002), "{place:?} dirty: {ended:?}");
+            assert_eq!(
+                ended,
+                if place == Place::Pastor {
+                    vec![6001, 6003]
+                } else {
+                    vec![]
+                },
+                "{place:?} dirty: only a pane already closed ends the rest"
+            );
+
+            // A workspace pastor did not open shows it (a task in a shared
+            // workspace): kept, with a note.
+            if place == Place::Pastor {
+                let fake = FakeHerdr::new();
+                fake.set_leftovers(leftovers(7001));
+                let store = Arc::new(Store::open_in_memory().unwrap());
+                let (h, _events) = connected(&fake, &store).await;
+                let t = h
+                    .dispatch(placed_task(&store, place.clone(), true).id)
+                    .await
+                    .unwrap();
+                let checkout = t.spec.checkout.clone().unwrap();
+                fake.worktree_open("/r", &checkout.branch, "mine")
+                    .await
+                    .unwrap();
+                let closed = h.close(t.id, true).await.unwrap();
+                let note = closed.error.as_deref().unwrap_or_default();
+                assert!(note.contains("worktree kept"), "{closed:?}");
+                assert_eq!(ended_pids(&fake), [7001, 7003], "kept: only the pane's");
+            }
+
+            // Clean: removed, and what works in it goes with it.
+            let fake = FakeHerdr::new();
+            fake.set_leftovers(leftovers(8001));
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let (h, _events) = connected(&fake, &store).await;
+            let t = h
+                .dispatch(placed_task(&store, place.clone(), true).id)
+                .await
+                .unwrap();
+            h.close(t.id, true).await.unwrap();
+            assert_eq!(ended_pids(&fake), [8001, 8002, 8003], "{place:?} removed");
+        }
+
+        // herdr no longer knows the recorded workspace, whose checkout git
+        // removes on the machine: it is gone, and what works in it goes.
+        let fake = FakeHerdr::new();
+        fake.set_leftovers(leftovers(9001));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        fake.forget_workspace(t.workspace_id.as_deref().unwrap());
+        h.close(t.id, true).await.unwrap();
+        assert_eq!(
+            fake.removed_checkouts(),
+            vec![t.spec.checkout.clone().unwrap().path],
+            "git removed it"
+        );
+        assert_eq!(
+            ended_pids(&fake),
+            [9001, 9002, 9003],
+            "recorded workspace lost"
+        );
+
+        // A task in a shared workspace whose checkout is gone already:
+        // nothing is left to remove, and what works there goes.
+        let fake = FakeHerdr::new();
+        fake.set_leftovers(leftovers(9101));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h
+            .dispatch(placed_task(&store, Place::Pastor, true).id)
+            .await
+            .unwrap();
+        fake.remove_checkout(&t.spec.checkout.clone().unwrap().path)
+            .await
+            .unwrap();
+        h.close(t.id, true).await.unwrap();
+        assert_eq!(
+            ended_pids(&fake),
+            [9101, 9102, 9103],
+            "checkout already gone"
+        );
+    }
+
+    /// Every place that closes a task's pane lists what runs under it
+    /// first and ends it after: a failed task's pane closing after
+    /// `close_failed_after`, an orphan's, and the pane of a task that is
+    /// paused.
+    #[tokio::test(start_paused = true)]
+    async fn the_other_ways_a_pane_closes_end_what_it_left_too() {
+        use crate::reap::Found;
+        // A failed task's pane.
+        let fake = FakeHerdr::new();
+        fake.set_leftovers(vec![candidate(5001, Found::Tree)]);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let t = stopped_task(&fake, &store, TaskState::Failed).await;
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_shell_pid(&pane, 777);
+        let (_h, _events) = spawn_with_settings(&fake, &store, close_failed_settings());
+        wait_for("pane closed", || !pane_open(&fake, &pane)).await;
+        assert_eq!(
+            fake.reaps(),
+            [crate::reap::Spec {
+                root: Some(777),
+                cwd: None
+            }]
+        );
+        assert_eq!(ended_pids(&fake), [5001]);
+        let order: Vec<String> = fake.requests().into_iter().map(|r| r.method).collect();
+        let asked = order.iter().position(|m| m == "pane.process_info").unwrap();
+        assert!(asked < order.iter().position(|m| m == "pane.close").unwrap());
+
+        // An orphan's pane.
+        let fake = FakeHerdr::new();
+        fake.set_leftovers(vec![candidate(5002, Found::Tree)]);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let ghost = start_agent(&fake, "t-99").await;
+        fake.set_shell_pid(&ghost, 778);
+        let (_h, _events) = spawn_with_settings(&fake, &store, close_failed_settings());
+        wait_for("orphan closed", || !pane_open(&fake, &ghost)).await;
+        assert_eq!(ended_pids(&fake), [5002]);
+
+        // A paused task's pane.
+        let fake = FakeHerdr::new();
+        fake.set_leftovers(vec![candidate(5003, Found::Tree)]);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let low = store
+            .insert_task_at(
+                NewTask {
+                    description: None,
+                    job: "run".into(),
+                    item: serde_json::Value::Null,
+                    prompt: "hi".into(),
+                    spec: spec(),
+                    flock: "default".into(),
+                },
+                crate::task::Priority::Low,
+                None,
+                crate::task::TaskRole::Agent,
+            )
+            .unwrap();
+        let t = h.dispatch(low.id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_shell_pid(&pane, 779);
+        fake.set_agent_session(
+            &pane,
+            Some(crate::herdr::AgentSessionInfo {
+                agent: "claude".into(),
+                kind: crate::herdr::AgentSessionRefKind::Id,
+                source: "claude-hook".into(),
+                value: "9f1e2d3c-4b5a-6978-8f90-123456789abc".into(),
+            }),
+        );
+        let other = new_task(&store);
+        h.pause(t.id, other.id).await.unwrap();
+        assert_eq!(ended_pids(&fake), [5003]);
+    }
+
+    /// A row pastor closed already names a pane herdr may have handed to
+    /// another agent: closing it again, to remove the checkout, asks for
+    /// nothing under that pane.
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_rows_pane_is_not_searched() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        fake.set_shell_pid(t.pane_id.as_deref().unwrap(), 4001);
+        h.close(t.id, false).await.unwrap();
+        assert_eq!(fake.reaps().len(), 1);
+        h.close(t.id, true).await.unwrap();
+        assert_eq!(fake.reaps().len(), 1, "{:?}", fake.reaps());
     }
 
     fn placed_task(store: &Store, place: Place, worktree: bool) -> Task {
@@ -8189,42 +11659,54 @@ mod tests {
     }
 
     /// The recorded workspace can be gone from herdr entirely by the time
-    /// `--remove-worktree` reaches it -- closed some other way, say. That is
-    /// the no-target outcome in disguise: the close still succeeds, closing
-    /// the row (the pane is gone with the workspace), and reports the same
-    /// manual-cleanup note the no-target path gives instead of failing with
-    /// `close_failed`.
+    /// `--remove-worktree` reaches it -- closed some other way, say. herdr
+    /// has nothing to remove the checkout by, so git removes it on the
+    /// machine, and the close succeeds with no note; a dirty checkout stays,
+    /// noted, and the row closes all the same.
     #[tokio::test(start_paused = true)]
     async fn close_remove_worktree_handles_a_recorded_workspace_herdr_has_lost() {
-        let fake = FakeHerdr::new();
-        let store = Arc::new(Store::open_in_memory().unwrap());
-        let (h, _events) = connected(&fake, &store).await;
-        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
-        let pane = t.pane_id.clone().unwrap();
-        // herdr has lost the workspace and its pane both, without going
-        // through pastor's close, and the row is marked closed without
-        // reaching herdr: the workspace id is still recorded, but herdr no
-        // longer has it, so `worktree.remove` answers `workspace_not_found`.
-        fake.close_pane(&pane);
-        store.close_task(t.id).unwrap();
-        assert_eq!(state_of(&store, t.id), TaskState::Closed);
+        for dirty in [false, true] {
+            let fake = FakeHerdr::new();
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let (h, _events) = connected(&fake, &store).await;
+            let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+            let pane = t.pane_id.clone().unwrap();
+            let path = t.spec.checkout.clone().unwrap().path;
+            if dirty {
+                fake.set_dirty_checkout(&path);
+            }
+            // herdr has lost the workspace and its pane both, without going
+            // through pastor's close, and the row is marked closed without
+            // reaching herdr: the workspace id is still recorded, but herdr no
+            // longer has it, so `worktree.remove` answers `workspace_not_found`.
+            fake.close_pane(&pane);
+            store.close_task(t.id).unwrap();
+            assert_eq!(state_of(&store, t.id), TaskState::Closed);
 
-        let closed = h.close(t.id, true).await.unwrap();
-        assert_eq!(closed.state, TaskState::Closed);
-        assert_eq!(
-            closed.error.as_deref(),
-            Some(manual_worktree_cleanup(&closed.display_id()).as_str())
-        );
-        assert_eq!(
-            closed.workspace_id, None,
-            "herdr has nothing left to remove; the note carries the rest"
-        );
+            let closed = h.close(t.id, true).await.unwrap();
+            assert_eq!(closed.state, TaskState::Closed);
+            assert_eq!(
+                fake.removed_checkouts(),
+                vec![path.clone()],
+                "dirty {dirty}"
+            );
+            let note = closed.error.clone().unwrap_or_default();
+            assert_eq!(
+                note.contains("worktree kept: uncommitted or untracked files"),
+                dirty,
+                "{note}"
+            );
+            assert_eq!(
+                closed.workspace_id, None,
+                "herdr has nothing left to remove; git or the note carries the rest"
+            );
+        }
     }
 
     /// A plain close only closes the pane (herdr closes the workspace with
     /// its last pane) and leaves the checkout on disk, so the row keeps its
     /// workspace and prune will not take it. `--remove-worktree` afterwards
-    /// finds the workspace gone, gives the manual-cleanup note and clears
+    /// finds the workspace gone, removes the checkout with git and clears
     /// the workspace; running it again has nothing left to do.
     #[tokio::test(start_paused = true)]
     async fn close_keeps_the_workspace_until_the_worktree_is_dealt_with() {
@@ -8240,9 +11722,10 @@ mod tests {
         let removed = h.close(t.id, true).await.unwrap();
         assert_eq!(removed.state, TaskState::Closed);
         assert_eq!(removed.workspace_id, None);
+        assert_eq!(removed.error, None);
         assert_eq!(
-            removed.error.as_deref(),
-            Some(manual_worktree_cleanup(&removed.display_id()).as_str())
+            fake.removed_checkouts(),
+            vec![t.spec.checkout.clone().unwrap().path]
         );
 
         let again = h.close(t.id, true).await.unwrap();
@@ -8391,9 +11874,14 @@ mod tests {
             .unwrap();
         assert_eq!(t.state, TaskState::Blocked);
         h.send(t.id, trust()).await.unwrap();
+        // `Down` goes on its own, the pane is read to confirm it landed,
+        // and only then does `Enter` confirm the selection.
         assert_eq!(
             fake.pane_input(t.pane_id.as_deref().unwrap()),
-            [PaneInput::Keys(vec!["Down".into(), "Enter".into()])]
+            [
+                PaneInput::Keys(vec!["Down".into()]),
+                PaneInput::Keys(vec!["Enter".into()]),
+            ]
         );
         assert!(store.is_trusted("m", "~/src/app").unwrap());
         wait_for("the pending prompt delivered", || {
@@ -8405,6 +11893,40 @@ mod tests {
             evs[0].detail,
             Some(serde_json::json!({"keys": ["Down", "Enter"], "trust": true}))
         );
+    }
+
+    /// The bug `--trust` exists to fix: a `Down` lost on the way to
+    /// a real pane leaves Claude's dialog on "No, exit". `--trust` reads the
+    /// pane after `Down` and refuses to press `Enter` while it is not on
+    /// "Yes, I trust this folder", so it fails instead of quitting Claude
+    /// while still marking the repo trusted.
+    #[tokio::test(start_paused = true)]
+    async fn send_trust_refuses_to_confirm_a_lost_down_key() {
+        let fake = FakeHerdr::new();
+        fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = connected(&fake, &store).await;
+        let t = h
+            .dispatch(repo_task(&store, "claude", Some("~/src/app")).id)
+            .await
+            .unwrap();
+        assert_eq!(t.state, TaskState::Blocked);
+        fake.lose_next_trust_keys(t.pane_id.as_deref().unwrap(), 1);
+        let err = h.send(t.id, trust()).await.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<SendRefused>().map(|r| r.code),
+            Some("trust_not_selected"),
+            "{err:#}"
+        );
+        // `Down` went, and was lost; `Enter` never did, so Claude was never
+        // left to exit on "No, exit".
+        assert_eq!(
+            fake.pane_input(t.pane_id.as_deref().unwrap()),
+            [PaneInput::Keys(vec!["Down".into()])]
+        );
+        assert!(!store.is_trusted("m", "~/src/app").unwrap());
+        assert_eq!(state_of(&store, t.id), TaskState::Blocked);
+        assert!(input_events(&mut events).is_empty());
     }
 
     /// Claude redraws for a moment after its trust dialog, and loses a prompt
@@ -8505,6 +12027,136 @@ mod tests {
         assert_eq!(state_of(&store, t.id), TaskState::Running);
     }
 
+    /// agy's folder-trust dialog in a new folder, as agy 1.4.12 draws it
+    /// (captured, the folder replaced). herdr reads it idle and ready.
+    const AGY_TRUST_SCREEN: &str = "Accessing workspace:\n\n/home/fake/src/app\n\nDo you trust the contents of this project?\n\nAntigravity CLI requires permission to read, edit, and execute files here.\n\n> Yes, I trust this folder\n  No, exit\n\n  \u{2191}/\u{2193} Navigate \u{b7} enter Confirm\n                                                                                  accept-edits \u{b7} Gemini 4 Argon \u{b7} medium\n";
+
+    /// agy's input once trusted, under a new-model banner. The input is as
+    /// agy 1.4.12 draws it (captured, the account and folder replaced); the
+    /// banner's line is not a capture, only the text a `dialogs` row for
+    /// it names.
+    const AGY_BANNER_SCREEN: &str = "\n      \u{2584}\u{2580}\u{2580}\u{2584}        Antigravity CLI 1.4.12\n     \u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}       someone@example.com\n    \u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}      Gemini 4 Argon (Medium)\n   \u{2584}\u{2580}\u{2580}    \u{2580}\u{2580}\u{2584}     ~/src/app\n  \u{2584}\u{2580}\u{2580}      \u{2580}\u{2580}\u{2584}\n\n  Meet Gemini 4 Argon \u{b7} esc to dismiss\n\n────────────────────────────────────────────────────────────\n> Accept-edits mode: file edits auto-approved (shift+tab to cycle)\n────────────────────────────────────────────────────────────\n                                                                                  accept-edits \u{b7} Gemini 4 Argon \u{b7} medium\n";
+
+    /// A bare `agy` agent in a new folder. herdr reads its trust dialog idle
+    /// and ready, so a prompt typed then is lost, and the Enter after it
+    /// takes the option the dialog opens on, "Yes, I trust this folder":
+    /// the folder trusted with nobody asked. pastor knows the dialog: the
+    /// prompt waits with the task blocked, and goes in after `--trust`.
+    #[tokio::test(start_paused = true)]
+    async fn a_bare_agy_task_in_a_new_folder_waits_at_its_trust_dialog() {
+        let fake = FakeHerdr::new();
+        fake.set_startup_dialogs(vec![(AGY_TRUST_SCREEN.into(), keys(&["Enter"]))]);
+        fake.set_trust_idle(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h
+            .dispatch(repo_task(&store, "agy", Some("~/src/app")).id)
+            .await
+            .unwrap();
+        assert_eq!(t.state, TaskState::Blocked);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(calls(&fake, "agent.prompt").is_empty());
+        let pane = t.pane_id.clone().unwrap();
+        assert!(fake.pane_input(&pane).is_empty(), "nothing pressed for it");
+
+        h.send(t.id, trust()).await.unwrap();
+        wait_for("the agent working on its prompt", || agent_working(&fake)).await;
+        assert_eq!(calls(&fake, "agent.prompt").len(), 1);
+        assert_eq!(fake.pane_input(&pane), [PaneInput::Keys(keys(&["Enter"]))]);
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+    }
+
+    /// agy's lone trust key takes whatever option is selected, so `--trust`
+    /// reads the dialog first and presses nothing when it is not on "Yes,
+    /// I trust this folder".
+    #[tokio::test(start_paused = true)]
+    async fn agy_trust_is_not_pressed_on_another_option() {
+        let fake = FakeHerdr::new();
+        let on_no = AGY_TRUST_SCREEN
+            .replace("> Yes, I trust", "  Yes, I trust")
+            .replace("  No, exit", "> No, exit");
+        fake.set_startup_dialogs(vec![(on_no, keys(&["Enter"]))]);
+        fake.set_trust_idle(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h
+            .dispatch(repo_task(&store, "agy", Some("~/src/app")).id)
+            .await
+            .unwrap();
+        assert_eq!(t.state, TaskState::Blocked);
+        let err = h.send(t.id, trust()).await.unwrap_err();
+        assert!(err.to_string().contains("not on"), "{err}");
+        assert!(fake.pane_input(t.pane_id.as_deref().unwrap()).is_empty());
+        assert_eq!(state_of(&store, t.id), TaskState::Blocked);
+    }
+
+    /// An agy agent with its trust dialog and a banner row of its own.
+    fn agy_with_a_banner() -> MachineSettings {
+        let mut settings = settings();
+        settings.agents = toml::from_str(
+            "[agy-work]\nkind = \"agy\"\ntrust_keys = [\"Enter\"]\ntrust_marker = \"Do you trust the contents of this project\"\n[[agy-work.dialogs]]\nname = \"model-banner\"\nmarker = \"esc to dismiss\"\nkeys = [\"esc\"]\n",
+        )
+        .unwrap();
+        settings
+    }
+
+    /// agy in a new folder: its trust dialog, then a banner, both read idle
+    /// and ready by herdr, so a prompt typed at either is lost. `--trust`
+    /// answers the first; the prompt then waits while the banner shows,
+    /// pastor answers the banner's row, and the prompt goes in once.
+    #[tokio::test(start_paused = true)]
+    async fn an_agy_prompt_waits_for_its_banner_after_the_trust_answer() {
+        let fake = FakeHerdr::new();
+        fake.set_startup_dialogs(vec![
+            (AGY_TRUST_SCREEN.into(), keys(&["Enter"])),
+            (AGY_BANNER_SCREEN.into(), keys(&["esc"])),
+        ]);
+        fake.set_trust_idle(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected_with(&fake, &store, agy_with_a_banner()).await;
+        let t = h
+            .dispatch(repo_task(&store, "agy-work", Some("~/src/app")).id)
+            .await
+            .unwrap();
+        assert_eq!(t.state, TaskState::Blocked);
+        assert!(calls(&fake, "agent.prompt").is_empty());
+
+        h.send(t.id, trust()).await.unwrap();
+        wait_for("the agent working on its prompt", || agent_working(&fake)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(calls(&fake, "agent.prompt").len(), 1);
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+        assert_eq!(
+            fake.pane_input(t.pane_id.as_deref().unwrap()),
+            [
+                PaneInput::Keys(keys(&["Enter"])),
+                PaneInput::Keys(keys(&["esc"])),
+            ]
+        );
+        assert!(store.answered(t.id, "model-banner").unwrap());
+    }
+
+    /// The banner without a trust dialog before it, in a folder agy
+    /// already trusts: the first prompt waits for it too, at dispatch.
+    #[tokio::test(start_paused = true)]
+    async fn an_agy_prompt_waits_for_its_banner_at_dispatch() {
+        let fake = FakeHerdr::new();
+        fake.set_startup_dialogs(vec![(AGY_BANNER_SCREEN.into(), keys(&["esc"]))]);
+        fake.set_trust_idle(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected_with(&fake, &store, agy_with_a_banner()).await;
+        let t = h
+            .dispatch(new_task_of(&store, "agy-work").id)
+            .await
+            .unwrap();
+        assert_eq!(t.state, TaskState::Blocked);
+        assert!(calls(&fake, "agent.prompt").is_empty());
+        wait_for("the agent working on its prompt", || agent_working(&fake)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(calls(&fake, "agent.prompt").len(), 1);
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+    }
+
     /// An agent that sits at an empty input after its prompt went in (herdr
     /// accepted it, the agent lost it) gets the prompt again once it has
     /// sat idle a settle window at the sequence the prompt went in at.
@@ -8523,6 +12175,335 @@ mod tests {
         let t = store.get_task(t.id).unwrap().unwrap();
         assert_eq!(t.state, TaskState::Running);
         assert!(!t.prompt_pending);
+    }
+
+    /// Blocks `fake`'s first agent as soon as it is started, so dispatch
+    /// leaves the prompt pending.
+    fn block_on_start(fake: &FakeHerdr) {
+        fake.set_ready_after(Duration::from_millis(150));
+        let watcher = fake.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Some(a) = watcher.agents().first() {
+                    watcher.set_status(&a.pane_id, AgentStatus::Blocked);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+    }
+
+    /// A resumed task whose start hits a dialog holds the prompt that start
+    /// meant: once the dialog clears, a paused task gets `RESUME_PROMPT`
+    /// and one back from a usage limit `LIMIT_RESUME_PROMPT`, once, never
+    /// the task's own prompt, which its session already ran.
+    #[tokio::test(start_paused = true)]
+    async fn a_resume_held_at_a_dialog_sends_the_resume_prompt() {
+        for (state, want) in [
+            (TaskState::Paused, crate::task::RESUME_PROMPT),
+            (TaskState::Waiting, crate::task::LIMIT_RESUME_PROMPT),
+        ] {
+            let fake = FakeHerdr::new();
+            block_on_start(&fake);
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let (h, _events) = connected(&fake, &store).await;
+            let mut t = new_task(&store);
+            t.state = state;
+            t.machine = Some("m".into());
+            t.spec.session_id = crate::task::new_session_id();
+            if state == TaskState::Waiting {
+                t.waiting_until = Some(Utc::now() - chrono::Duration::minutes(1));
+            }
+            store.update_task(&mut t).unwrap();
+            let t = h.resume(t.id).await.unwrap();
+            assert_eq!(t.state, TaskState::Blocked, "{state:?}");
+            assert!(calls(&fake, "agent.prompt").is_empty(), "{state:?}");
+
+            fake.set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Idle);
+            wait_for("the held prompt sent", || {
+                let t = store.get_task(t.id).unwrap().unwrap();
+                t.state == TaskState::Running && !t.prompt_pending
+            })
+            .await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let typed: Vec<String> = calls(&fake, "agent.prompt")
+                .iter()
+                .map(|p| p["text"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(typed, [want], "{state:?}");
+        }
+    }
+
+    /// A prompt held for a blocked Claude agent goes through its session's
+    /// inbox socket once the block clears, and is not typed. The baseline
+    /// is the `agent.list` read before the send; the agent's own move to
+    /// working is the activity, and its idle after that is done.
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_prompt_goes_through_the_inbox_socket() {
+        let fake = FakeHerdr::new();
+        fake.set_inbox_result(Some("accepted"));
+        block_on_start(&fake);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        assert_eq!(t.state, TaskState::Blocked);
+        assert!(fake.inbox_sends().is_empty(), "nothing sent while blocked");
+
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Idle);
+        let idle_seq = fake.agents()[0].state_change_seq;
+        wait_for("running with the prompt sent", || {
+            let t = store.get_task(t.id).unwrap().unwrap();
+            t.state == TaskState::Running && !t.prompt_pending
+        })
+        .await;
+        assert!(calls(&fake, "agent.prompt").is_empty(), "not typed");
+        let sends = fake.inbox_sends();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(
+            Some(sends[0].session.as_str()),
+            t.spec.session_id.as_deref()
+        );
+        assert_eq!(sends[0].text, crate::task::prompt_to_send(&t));
+        let got = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(got.last_completion_seq, Some(idle_seq));
+        assert!(agent_working(&fake));
+
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+        assert!(saw(&mut events, "task.done", t.id));
+        assert_eq!(fake.inbox_sends().len(), 1, "sent once");
+    }
+
+    /// A socket send the agent did not act on is sent again, marked with
+    /// its attempt, so Claude's guard never drops it as the same text from
+    /// the same sender.
+    #[tokio::test(start_paused = true)]
+    async fn a_socket_prompt_the_agent_did_not_take_is_sent_again_marked() {
+        let fake = FakeHerdr::new();
+        fake.set_inbox_result(Some("accepted"));
+        fake.ignore_prompts(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        assert_eq!(t.state, TaskState::Running);
+        assert_eq!(fake.inbox_sends().len(), 1);
+        fake.ignore_prompts(false);
+        wait_for("the agent working on its prompt", || agent_working(&fake)).await;
+        let sends = fake.inbox_sends();
+        assert_eq!(sends.len(), 2);
+        assert!(calls(&fake, "agent.prompt").is_empty(), "not typed");
+        assert_ne!(sends[0].text, sends[1].text);
+        assert!(
+            sends[1].text.starts_with(&sends[0].text),
+            "{:?}",
+            sends[1].text
+        );
+        assert!(sends[1].text.contains("attempt 2"), "{:?}", sends[1].text);
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+    }
+
+    /// A pending prompt the socket does not take is typed, as before.
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_prompt_the_socket_does_not_take_is_typed() {
+        let fake = FakeHerdr::new();
+        fake.set_inbox_result(Some("held"));
+        block_on_start(&fake);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        fake.set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Idle);
+        wait_for("running with the prompt sent", || {
+            let t = store.get_task(t.id).unwrap().unwrap();
+            t.state == TaskState::Running && !t.prompt_pending
+        })
+        .await;
+        assert_eq!(fake.inbox_sends().len(), 1);
+        assert_eq!(calls(&fake, "agent.prompt").len(), 1);
+        assert!(agent_working(&fake));
+    }
+
+    /// The `agent.list` read before a socket send gates it as herdr gates
+    /// a typed prompt: an agent still launching gets nothing, and the
+    /// prompt stays pending until it is up.
+    #[tokio::test(start_paused = true)]
+    async fn a_launching_agent_gets_no_socket_send() {
+        let fake = FakeHerdr::new();
+        fake.set_inbox_result(Some("accepted"));
+        let ready_after = Duration::from_millis(600);
+        fake.set_ready_after(ready_after);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut t = new_task(&store);
+        let name = Task::agent_name_for(t.id);
+        let created = fake
+            .workspace_create(None, &name, &Default::default())
+            .await
+            .unwrap();
+        let pane = created.root_pane.pane_id.clone();
+        let session = crate::task::new_session_id().unwrap();
+        let args = ["--session-id".to_string(), session.clone()];
+        fake.agent_start(&name, "claude", &pane, &args)
+            .await
+            .unwrap();
+        let launched = Instant::now();
+        fake.set_status_silently(&pane, AgentStatus::Unknown);
+        t.state = TaskState::Starting;
+        t.machine = Some("m".into());
+        t.spec.session_id = Some(session.clone());
+        store.update_task(&mut t).unwrap();
+        let (_h, _events) = spawn(&fake, &store);
+        wait_for("adopted", || {
+            store.get_task(t.id).unwrap().unwrap().pane_id.is_some()
+        })
+        .await;
+        // An idle event while herdr still lists it launching.
+        fake.set_status(&pane, AgentStatus::Idle);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(launched.elapsed() < ready_after);
+        assert!(
+            fake.inbox_sends().is_empty(),
+            "nothing sent while launching"
+        );
+        assert!(store.get_task(t.id).unwrap().unwrap().prompt_pending);
+
+        wait_for("running with the prompt sent", || {
+            let t = store.get_task(t.id).unwrap().unwrap();
+            t.state == TaskState::Running && !t.prompt_pending
+        })
+        .await;
+        assert_eq!(fake.inbox_sends().len(), 1);
+        assert_eq!(fake.inbox_sends()[0].session, session);
+        assert!(calls(&fake, "agent.prompt").is_empty());
+    }
+
+    /// `task send` text and its Enter go through a Claude session's inbox
+    /// socket and are not typed; `task.input` says so. Keys of their own,
+    /// and a line sent without Enter, stay keystrokes. The orchestrator's
+    /// last message is such a send (text and Enter), so it goes the same
+    /// way.
+    #[tokio::test(start_paused = true)]
+    async fn send_text_goes_through_the_inbox_socket() {
+        let fake = FakeHerdr::new();
+        fake.set_inbox_result(Some("accepted"));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        assert_eq!(fake.inbox_sends().len(), 1, "the first prompt");
+        while events.try_recv().is_ok() {}
+        let text = |text: &str, enter| SendInput {
+            text: Some(text.into()),
+            enter,
+            ..Default::default()
+        };
+        h.send(t.id, text("next step", true)).await.unwrap();
+        let sends = fake.inbox_sends();
+        assert_eq!(sends.len(), 2);
+        assert_eq!(sends[1].text, "next step");
+        assert_eq!(
+            Some(sends[1].session.as_str()),
+            t.spec.session_id.as_deref()
+        );
+        assert!(fake.pane_input(&pane).is_empty(), "nothing typed");
+        let input = loop {
+            let ev = events.try_recv().expect("a task.input");
+            if ev.kind == "task.input" {
+                break ev.detail.unwrap();
+            }
+        };
+        assert_eq!(input["socket"], true, "{input}");
+        assert_eq!(input["text_len"], 9, "{input}");
+
+        h.send(
+            t.id,
+            SendInput {
+                keys: vec!["esc".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        h.send(t.id, text("half", false)).await.unwrap();
+        assert_eq!(
+            fake.pane_input(&pane),
+            [
+                PaneInput::Keys(vec!["esc".into()]),
+                PaneInput::Text("half".into()),
+            ]
+        );
+        assert_eq!(fake.inbox_sends().len(), 2);
+    }
+
+    /// Text the socket does not take is typed, as is text for an agent
+    /// herdr lists as blocked, whose dialog may be what it answers.
+    #[tokio::test(start_paused = true)]
+    async fn send_text_the_socket_does_not_take_is_typed() {
+        let fake = FakeHerdr::new();
+        fake.set_inbox_result(Some("accepted"));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_inbox_result(Some("held"));
+        while events.try_recv().is_ok() {}
+        let send = |text: &str| SendInput {
+            text: Some(text.into()),
+            enter: true,
+            ..Default::default()
+        };
+        h.send(t.id, send("next step")).await.unwrap();
+        assert_eq!(fake.inbox_sends().len(), 2, "tried the socket");
+        let input = loop {
+            let ev = events.try_recv().expect("a task.input");
+            if ev.kind == "task.input" {
+                break ev.detail.unwrap();
+            }
+        };
+        assert!(input.get("socket").is_none(), "{input}");
+
+        fake.set_inbox_result(Some("accepted"));
+        fake.set_status(&pane, AgentStatus::Blocked);
+        h.send(t.id, send("2")).await.unwrap();
+        assert_eq!(fake.inbox_sends().len(), 2, "no socket send while blocked");
+        assert_eq!(
+            fake.pane_input(&pane),
+            [
+                PaneInput::Text("next step".into()),
+                PaneInput::Keys(vec!["Enter".into()]),
+                PaneInput::Text("2".into()),
+                PaneInput::Keys(vec!["Enter".into()]),
+            ]
+        );
+    }
+
+    /// Text that reopens a done task goes through the socket with the
+    /// summary ask on its line, and the task runs again.
+    #[tokio::test(start_paused = true)]
+    async fn send_to_a_done_task_goes_through_the_socket_and_runs_it_again() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = run_to_done(&h, &fake, &store, new_task(&store)).await;
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_inbox_result(Some("accepted"));
+        let sent = h
+            .send(
+                t.id,
+                SendInput {
+                    text: Some("commit and push".into()),
+                    enter: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(sent.state, TaskState::Running);
+        assert_eq!(
+            fake.inbox_sends().last().unwrap().text,
+            format!("commit and push {}", crate::task::SUMMARY_ASK)
+        );
+        assert!(fake.pane_input(&pane).is_empty(), "nothing typed");
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
     }
 
     /// A resumed task's prompt is watched the same way: an agent that lost
@@ -8577,6 +12558,113 @@ mod tests {
         assert_eq!(state_of(&store, t.id), TaskState::Blocked);
     }
 
+    /// Codex takes a prompt as a bracketed paste and reads the Enter that
+    /// follows as a newline, so it sits in the input box, short as it is or
+    /// as a placeholder when long. The agent stays idle: pastor presses Enter
+    /// once, as a person would, instead of pasting the prompt again.
+    #[tokio::test(start_paused = true)]
+    async fn a_codex_prompt_left_in_its_input_is_submitted_not_pasted_again() {
+        let codex_input = |text: &str| {
+            format!("  gpt-5 default · ~/src/app\n\n› {text}\n\n  ⏎ send · ctrl+j newline\n")
+        };
+        let long = codex_input("[Pasted Content 4096 chars]");
+        let probe = new_task_of(&Store::open_in_memory().unwrap(), "codex");
+        let short = codex_input(&crate::task::prompt_to_send(&probe));
+        for screen in [long, short] {
+            let fake = FakeHerdr::new();
+            fake.ignore_prompts(true);
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let (h, mut events) = connected(&fake, &store).await;
+            let t = h.dispatch(new_task_of(&store, "codex").id).await.unwrap();
+            let pane = t.pane_id.clone().unwrap();
+            fake.set_pane_text(&pane, &screen);
+            wait_for("Enter pressed", || {
+                fake.pane_input(&pane) == [PaneInput::Keys(keys(&["Enter"]))]
+            })
+            .await;
+            assert_eq!(
+                calls(&fake, "agent.prompt").len(),
+                1,
+                "not pasted again: {screen}"
+            );
+            assert!(saw(&mut events, "task.input", t.id));
+            // It took the Enter and is at work.
+            fake.set_status(&pane, AgentStatus::Working);
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            assert_eq!(state_of(&store, t.id), TaskState::Running);
+            assert_eq!(fake.pane_input(&pane).len(), 1, "Enter once: {screen}");
+        }
+    }
+
+    /// An Enter that does not start work is pressed no more often than a
+    /// prompt would be sent again, then the task is blocked for a person,
+    /// the prompt having gone in once.
+    #[tokio::test(start_paused = true)]
+    async fn an_enter_codex_ignores_is_pressed_twice_then_the_task_blocks() {
+        let fake = FakeHerdr::new();
+        fake.ignore_prompts(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task_of(&store, "codex").id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_pane_text(&pane, "  gpt-5 default\n\n› [Pasted Content 4096 chars]\n");
+        wait_for("blocked", || state_of(&store, t.id) == TaskState::Blocked).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            fake.pane_input(&pane),
+            [
+                PaneInput::Keys(keys(&["Enter"])),
+                PaneInput::Keys(keys(&["Enter"]))
+            ],
+            "MAX_PROMPT_RESENDS presses"
+        );
+        assert_eq!(calls(&fake, "agent.prompt").len(), 1, "pasted once");
+        let error = store.get_task(t.id).unwrap().unwrap().error.unwrap();
+        assert!(error.contains("did not take"), "{error}");
+    }
+
+    /// Codex's folder-trust dialog reads idle, and Enter on it would trust the
+    /// folder: with the dialog on the screen nothing is pressed, however
+    /// much of a paste the pane shows.
+    #[tokio::test(start_paused = true)]
+    async fn enter_is_not_pressed_on_codex_s_trust_dialog() {
+        let fake = FakeHerdr::new();
+        fake.ignore_prompts(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task_of(&store, "codex").id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_pane_text(
+            &pane,
+            "[Pasted Content 4096 chars]\n\n  Do you trust the contents of this directory?\n  /srv/repo\n\n› 1. Yes, continue\n  2. No, quit\n\n  Press enter to continue\n",
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            fake.pane_input(&pane).is_empty(),
+            "{:?}",
+            fake.pane_input(&pane)
+        );
+    }
+
+    /// A codex prompt that is nowhere on its screen is sent again, as any
+    /// agent's is, and no Enter is pressed into an empty input.
+    #[tokio::test(start_paused = true)]
+    async fn a_codex_prompt_that_is_not_in_its_input_is_sent_again() {
+        let fake = FakeHerdr::new();
+        fake.ignore_prompts(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task_of(&store, "codex").id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_pane_text(&pane, "  gpt-5 default\n\n› \n");
+        wait_for("blocked", || state_of(&store, t.id) == TaskState::Blocked).await;
+        assert_eq!(
+            calls(&fake, "agent.prompt").len(),
+            1 + MAX_PROMPT_RESENDS as usize
+        );
+        assert!(fake.pane_input(&pane).is_empty(), "no Enter into nothing");
+    }
+
     /// The same for an agent that took its trust answer: a prompt lost
     /// anyway (a redraw longer than `settle`) is sent again.
     #[tokio::test(start_paused = true)]
@@ -8599,6 +12687,201 @@ mod tests {
         wait_for("the agent working on its prompt", || agent_working(&fake)).await;
         assert!(calls(&fake, "agent.prompt").len() >= 2);
         assert_eq!(state_of(&store, t.id), TaskState::Running);
+    }
+
+    /// herdr can read Claude's folder-trust dialog idle and ready (late,
+    /// or not at all). A prompt typed then goes into the dialog and is
+    /// lost, so the first prompt waits while the dialog shows: pastor
+    /// answers it for a trusted repo, and the prompt goes in once, after.
+    #[tokio::test(start_paused = true)]
+    async fn a_claude_prompt_waits_for_a_trust_dialog_read_idle() {
+        let fake = FakeHerdr::new();
+        fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
+        fake.set_trust_idle(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store.trust_repo("m", "/r").unwrap();
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        assert_eq!(t.state, TaskState::Blocked);
+        assert!(calls(&fake, "agent.prompt").is_empty());
+        wait_for("the agent working on its prompt", || agent_working(&fake)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(calls(&fake, "agent.prompt").len(), 1);
+        assert!(store.answered(t.id, "trust").unwrap());
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+    }
+
+    /// The same dialog in a folder pastor does not trust waits for a
+    /// person; once they answer it at the pane, the prompt goes in once.
+    #[tokio::test(start_paused = true)]
+    async fn a_claude_prompt_held_at_a_trust_dialog_goes_in_once_answered() {
+        let fake = FakeHerdr::new();
+        fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
+        fake.set_trust_idle(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h
+            .dispatch(repo_task(&store, "claude", Some("~/src/app")).id)
+            .await
+            .unwrap();
+        assert_eq!(t.state, TaskState::Blocked);
+        let pane = t.pane_id.clone().unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(calls(&fake, "agent.prompt").is_empty());
+        assert!(fake.pane_input(&pane).is_empty(), "nothing pressed for it");
+
+        fake.answer_trust_by_hand(&pane);
+        wait_for("the agent working on its prompt", || agent_working(&fake)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(calls(&fake, "agent.prompt").len(), 1);
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+    }
+
+    /// herdr read the agent ready before Claude drew its trust dialog, so
+    /// the prompt went into the dialog. Once herdr reads it blocked with
+    /// the dialog on screen, that is not work: the prompt is pending again
+    /// and the task blocked, and the prompt goes in again once the dialog
+    /// is answered.
+    #[tokio::test(start_paused = true)]
+    async fn a_prompt_typed_into_a_trust_dialog_is_held_and_sent_again() {
+        let fake = FakeHerdr::new();
+        fake.ignore_prompts(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        assert_eq!(t.state, TaskState::Running);
+        assert_eq!(calls(&fake, "agent.prompt").len(), 1);
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_pane_text(&pane, crate::herdr::fake::CLAUDE_TRUST_SCREEN);
+        fake.set_status(&pane, AgentStatus::Blocked);
+        wait_for("the prompt held again", || {
+            let t = store.get_task(t.id).unwrap().unwrap();
+            t.state == TaskState::Blocked && t.prompt_pending
+        })
+        .await;
+        assert!(!store.get_task(t.id).unwrap().unwrap().activity_seen);
+
+        // A person answers the dialog; the agent is idle at an empty input.
+        fake.set_pane_text(&pane, "fake output");
+        fake.ignore_prompts(false);
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("the agent working on its prompt", || agent_working(&fake)).await;
+        assert_eq!(calls(&fake, "agent.prompt").len(), 2);
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+    }
+
+    /// A prompt held after it went into a dialog keeps its resend count
+    /// through a moment of `working` while the agent redraws, so the socket
+    /// send after the answer is marked as a resend and Claude does not drop
+    /// it as the same text from the same sender.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_prompt_keeps_its_attempt_through_a_redraw() {
+        let fake = FakeHerdr::new();
+        fake.set_inbox_result(Some("accepted"));
+        fake.ignore_prompts(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        assert_eq!(fake.inbox_sends().len(), 1);
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_pane_text(&pane, crate::herdr::fake::CLAUDE_TRUST_SCREEN);
+        fake.set_status(&pane, AgentStatus::Blocked);
+        wait_for("the prompt held again", || {
+            store.get_task(t.id).unwrap().unwrap().prompt_pending
+        })
+        .await;
+        fake.set_pane_text(&pane, "fake output");
+        fake.set_status(&pane, AgentStatus::Working);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        fake.ignore_prompts(false);
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("sent again", || fake.inbox_sends().len() == 2).await;
+        let sends = fake.inbox_sends();
+        assert!(sends[1].text.contains("attempt 2"), "{:?}", sends[1].text);
+    }
+
+    /// The prompt's own Enter answered a dialog herdr read blocked for a
+    /// moment: the agent sits idle with the prompt nowhere on its screen.
+    /// That blocked spell was no work on the prompt, so the task is not
+    /// done: the prompt is sent again.
+    #[tokio::test(start_paused = true)]
+    async fn a_prompt_lost_in_a_dialog_it_answered_is_sent_again() {
+        let fake = FakeHerdr::new();
+        fake.ignore_prompts(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Blocked);
+        wait_for("blocked", || state_of(&store, t.id) == TaskState::Blocked).await;
+        fake.ignore_prompts(false);
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("the agent working on its prompt", || agent_working(&fake)).await;
+        assert_eq!(calls(&fake, "agent.prompt").len(), 2);
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+    }
+
+    /// Every attempt lost the same way, blocked for a moment and idle with
+    /// the prompt nowhere on screen: after the resends the task is
+    /// `blocked` for a person, and stays so while the agent sits idle,
+    /// rather than ending at the next settle.
+    #[tokio::test(start_paused = true)]
+    async fn a_prompt_lost_in_a_dialog_every_time_ends_blocked_and_stays() {
+        let fake = FakeHerdr::new();
+        fake.ignore_prompts(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        let did_not_take = || {
+            store
+                .get_task(t.id)
+                .unwrap()
+                .unwrap()
+                .error
+                .is_some_and(|e| e.contains("did not take"))
+        };
+        for sent in 1..=1 + MAX_PROMPT_RESENDS as usize {
+            wait_for("the prompt sent", || {
+                calls(&fake, "agent.prompt").len() == sent
+            })
+            .await;
+            fake.set_status(&pane, AgentStatus::Blocked);
+            wait_for("blocked", || state_of(&store, t.id) == TaskState::Blocked).await;
+            fake.set_status(&pane, AgentStatus::Idle);
+        }
+        wait_for("blocked for a person", did_not_take).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Blocked);
+        assert!(did_not_take());
+        assert_eq!(
+            calls(&fake, "agent.prompt").len(),
+            1 + MAX_PROMPT_RESENDS as usize
+        );
+    }
+
+    /// A blocked spell before any work, with the prompt on the screen
+    /// after it, did reach the agent: its idle after that ends the task as
+    /// before, with no prompt sent again.
+    #[tokio::test(start_paused = true)]
+    async fn a_prompt_on_screen_after_a_blocked_spell_was_taken() {
+        let fake = FakeHerdr::new();
+        fake.ignore_prompts(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        // The prompt alone, no message after it: the prompt is what shows.
+        let shown = format!("> {}\n", crate::task::prompt_to_send(&t));
+        fake.set_pane_text(&pane, &shown);
+        fake.set_status(&pane, AgentStatus::Blocked);
+        wait_for("blocked", || state_of(&store, t.id) == TaskState::Blocked).await;
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("ended", || {
+            matches!(state_of(&store, t.id), TaskState::Done | TaskState::Failed)
+        })
+        .await;
+        assert_eq!(calls(&fake, "agent.prompt").len(), 1);
     }
 
     /// The same for the actor's own answer to a trusted repo's dialog.
@@ -8660,7 +12943,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn send_trust_needs_trust_keys_and_saves_nothing_without_a_repo() {
+    async fn send_trust_needs_trust_keys() {
         let fake = FakeHerdr::new();
         fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -8676,14 +12959,64 @@ mod tests {
             "{err:#}"
         );
         assert!(calls(&fake, "pane.send_keys").is_empty());
+    }
 
+    /// A task with no repo starts in the folder dispatch picked for it
+    /// (`~/pastor-tasks`, made absolute), and that folder is what `--trust`
+    /// saves: the next task with no repo on the machine, blocked on the same
+    /// dialog, is answered by the actor and runs, with no one at the pane.
+    /// Another machine's trust does not count, nor does another folder.
+    #[tokio::test(start_paused = true)]
+    async fn trust_for_a_task_with_no_repo_is_saved_for_its_folder() {
+        let fake = FakeHerdr::new();
+        fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = connected(&fake, &store).await;
         let bare = h
             .dispatch(repo_task(&store, "claude", None).id)
             .await
             .unwrap();
-        h.send(bare.id, trust()).await.unwrap();
-        assert_eq!(calls(&fake, "pane.send_keys").len(), 1);
+        assert_eq!(bare.state, TaskState::Blocked);
+        let dir = bare
+            .spec
+            .cwd
+            .clone()
+            .expect("a task with no repo records its folder");
+        assert!(dir.ends_with("/pastor-tasks"), "{dir}");
         assert!(store.trusted_repos().unwrap().is_empty());
+        h.send(bare.id, trust()).await.unwrap();
+        // `Down`, then `Enter` once the pane confirms it landed.
+        assert_eq!(calls(&fake, "pane.send_keys").len(), 2);
+        assert!(store.is_trusted("m", &dir).unwrap());
+        assert_eq!(store.trusted_repos().unwrap().len(), 1);
+        trusted_events(&mut events);
+
+        // The next one needs no one.
+        let next = h
+            .dispatch(repo_task(&store, "claude", None).id)
+            .await
+            .unwrap();
+        assert_eq!(next.spec.cwd.as_deref(), Some(dir.as_str()));
+        wait_for("the second task answered and running", || {
+            state_of(&store, next.id) == TaskState::Running
+        })
+        .await;
+        assert_eq!(trusted_events(&mut events).len(), 1);
+        // The two sends of `--trust`, then the actor's one for the second.
+        assert_eq!(calls(&fake, "pane.send_keys").len(), 3);
+
+        // A task from before the folder was recorded has nothing to save,
+        // and one in a folder nobody trusted is left to a person.
+        let mut old = repo_task(&store, "claude", None);
+        old.spec.cwd = None;
+        assert_eq!(old.spec.trust_dir(), None);
+        store.untrust("m", &dir).unwrap();
+        let again = h
+            .dispatch(repo_task(&store, "claude", None).id)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(state_of(&store, again.id), TaskState::Blocked);
     }
 
     fn answered_events(events: &mut broadcast::Receiver<PastorEvent>) -> Vec<PastorEvent> {
@@ -8770,6 +13103,164 @@ mod tests {
         );
         assert!(store.answered(t.id, "auto-mode-default").unwrap());
         assert!(store.answered(t.id, "trust").unwrap());
+    }
+
+    /// The same chain read idle and ready, as herdr can read Claude's
+    /// dialogs before it notices them: the prompt waits for the built-in
+    /// auto-mode dialog too, not only the trust one, and goes in once after.
+    #[tokio::test(start_paused = true)]
+    async fn a_claude_prompt_waits_for_its_builtin_dialogs_read_idle() {
+        let fake = FakeHerdr::new();
+        fake.set_startup_dialogs(vec![
+            (
+                crate::herdr::fake::CLAUDE_TRUST_SCREEN.into(),
+                keys(&DOWN_ENTER),
+            ),
+            (AUTO_SCREEN.into(), keys(&DOWN_ENTER)),
+        ]);
+        fake.set_trust_idle(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store.trust_repo("m", "/r").unwrap();
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        wait_for("the agent working on its prompt", || agent_working(&fake)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(calls(&fake, "agent.prompt").len(), 1);
+        assert!(store.answered(t.id, "auto-mode-default").unwrap());
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+    }
+
+    /// Claude's autocompact offer, as it draws it under a finished turn.
+    const AUTOCOMPACT_SCREEN: &str = "✻ Sautéed for 14m 37s\n\n─────────\n We recommend compacting earlier\n\n   Want to autocompact at 400k tokens instead?\n\n   ❯ Autocompact at ‹ 400k › tokens\n     Keep 600k tokens\n\n   ↑/↓ choose · ←/→ change size · enter confirm · esc not now\n";
+
+    /// At a task's start herdr reads the offer idle and ready, so a prompt
+    /// typed then is lost in it: the prompt waits, the offer is answered
+    /// with "Keep", and the prompt goes in once it is gone.
+    #[tokio::test(start_paused = true)]
+    async fn the_autocompact_offer_at_a_start_is_kept_and_the_prompt_goes_in() {
+        let fake = FakeHerdr::new();
+        fake.set_startup_dialogs(vec![(AUTOCOMPACT_SCREEN.into(), keys(&DOWN_ENTER))]);
+        fake.set_trust_idle(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        assert_eq!(t.state, TaskState::Blocked);
+        let pane = t.pane_id.clone().unwrap();
+        wait_for("the task to run", || {
+            state_of(&store, t.id) == TaskState::Running
+        })
+        .await;
+        assert_eq!(fake.pane_input(&pane), [PaneInput::Keys(keys(&DOWN_ENTER))]);
+        assert_eq!(calls(&fake, "agent.prompt").len(), 1);
+        assert!(store.answered(t.id, "autocompact").unwrap());
+        let mut answered = vec![];
+        while let Ok(ev) = events.try_recv() {
+            if ev.kind == "task.answered" {
+                answered.push(ev.detail);
+            }
+        }
+        assert_eq!(
+            answered,
+            [Some(
+                serde_json::json!({"dialog": "autocompact", "keys": ["Down", "Enter"]})
+            )]
+        );
+    }
+
+    /// Under a finished turn the offer replaces the input box. The agent
+    /// is idle, so the task would close as finished with no summary while
+    /// Claude waits for an answer; pastor keeps the setting instead, and
+    /// the task ends once the pane is back to its input box.
+    #[tokio::test(start_paused = true)]
+    async fn the_autocompact_offer_under_an_idle_agent_is_answered_not_closed() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let settle = Duration::from_millis(100);
+        let (h, _events) = spawn_with_settings(&fake, &store, settings_with_settle(settle));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+        fake.set_pane_text(&pane, AUTOCOMPACT_SCREEN);
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("the offer answered", || {
+            fake.pane_input(&pane) == [PaneInput::Keys(keys(&DOWN_ENTER))]
+        })
+        .await;
+        assert_eq!(
+            state_of(&store, t.id),
+            TaskState::Running,
+            "not closed under the offer"
+        );
+        // Claude is back at its input box: the turn is over.
+        fake.set_pane_text(&pane, "✻ Sautéed for 14m 37s\n\n❯ \n");
+        tokio::time::sleep(settle * 6).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Done);
+        assert_eq!(
+            fake.pane_input(&pane),
+            [PaneInput::Keys(keys(&DOWN_ENTER))],
+            "pressed once"
+        );
+    }
+
+    /// The offer is still up after its answer (Claude redrew slowly, or a
+    /// key was lost), or comes up a second time, or its "Keep" option is not
+    /// there: nothing is pressed twice, and the task waits for a person
+    /// blocked, not closed under it.
+    #[tokio::test(start_paused = true)]
+    async fn the_autocompact_offer_that_stays_up_blocks_the_task_not_closes_it() {
+        for (screen, presses) in [
+            (AUTOCOMPACT_SCREEN.to_string(), 1),
+            (AUTOCOMPACT_SCREEN.replace("Keep 600k", "Stay at 600k"), 0),
+        ] {
+            let fake = FakeHerdr::new();
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let settle = Duration::from_millis(100);
+            let (h, _events) = spawn_with_settings(&fake, &store, settings_with_settle(settle));
+            wait_for("connected", || {
+                h.snapshot().channel == ChannelState::Connected
+            })
+            .await;
+            let t = h.dispatch(new_task(&store).id).await.unwrap();
+            let pane = t.pane_id.clone().unwrap();
+            fake.set_status(&pane, AgentStatus::Working);
+            wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+            fake.set_pane_text(&pane, &screen);
+            fake.set_status(&pane, AgentStatus::Idle);
+            wait_for("blocked", || state_of(&store, t.id) == TaskState::Blocked).await;
+            tokio::time::sleep(settle * 6).await;
+            assert_eq!(state_of(&store, t.id), TaskState::Blocked, "{screen}");
+            assert_eq!(fake.pane_input(&pane).len(), presses, "{screen}");
+            let error = store.get_task(t.id).unwrap().unwrap().error.unwrap();
+            assert!(error.contains("autocompact"), "{error}");
+        }
+    }
+
+    /// A resumed task that comes back blocked on a startup dialog pastor
+    /// knows has it answered before `resume` replies, as a dispatched one
+    /// does, not only at the next reconcile.
+    #[tokio::test(start_paused = true)]
+    async fn a_resumed_task_at_a_dialog_has_it_answered() {
+        let fake = FakeHerdr::new();
+        fake.set_startup_dialogs(vec![(RENDERER_SCREEN.into(), keys(&DOWN_ENTER))]);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let mut t = new_task(&store);
+        t.state = TaskState::Paused;
+        t.machine = Some("m".into());
+        t.spec.session_id = crate::task::new_session_id();
+        store.update_task(&mut t).unwrap();
+        let t = h.resume(t.id).await.unwrap();
+        assert_eq!(t.state, TaskState::Blocked);
+        assert_eq!(
+            fake.pane_input(t.pane_id.as_deref().unwrap()),
+            [PaneInput::Keys(keys(&DOWN_ENTER))]
+        );
+        assert!(store.answered(t.id, "fullscreen").unwrap());
     }
 
     /// A dialog after trust whose row the user removed is left for a
@@ -9541,6 +14032,294 @@ mod tests {
         store.insert_retry(t.id).expect("still retryable");
     }
 
+    /// A task that must end with a summary and goes idle without one, its
+    /// worktree holding uncommitted files, may have been read idle too
+    /// early: it is blocked, not failed, its pane kept past
+    /// `close_failed_after`, and the agent can still finish it with `task
+    /// done` and a summary. With a clean worktree the same stop fails.
+    #[tokio::test(start_paused = true)]
+    async fn a_required_summary_with_uncommitted_work_blocks_instead_of_failing() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let settle = Duration::from_millis(100);
+        let settings = MachineSettings {
+            close_failed_after: Some(Duration::from_millis(150)),
+            ..settings_with_settle(settle)
+        };
+        let (h, _events) = spawn_with_settings(&fake, &store, settings);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let required = |store: &Store| {
+            let mut t = worktree_task(store);
+            t.spec.summary = crate::task::SummaryMode::Require;
+            store.update_task(&mut t).unwrap();
+            t
+        };
+        let t = h.dispatch(required(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        let path = t.spec.checkout.clone().expect("a checkout").path;
+        fake.set_dirty_checkout(&path);
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+        fake.set_pane_text(&pane, "● Tests pass; committing next.\n\n❯\n");
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("blocked", || state_of(&store, t.id) == TaskState::Blocked).await;
+        let row = store.get_task(t.id).unwrap().unwrap();
+        assert!(
+            row.error
+                .as_deref()
+                .is_some_and(|e| e.starts_with(crate::task::STOPPED_WITHOUT_SUMMARY)),
+            "{row:?}"
+        );
+        tokio::time::sleep(settle * 6).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Blocked);
+        assert!(fake.agents().iter().any(|a| a.pane_id == pane), "pane kept");
+
+        // The agent comes back, commits and ends the task itself.
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+        fake.set_clean_checkout(&path);
+        let done = h
+            .end_by(t.id, Some("done\ncommitted".into()), EndBy::Agent)
+            .await
+            .unwrap();
+        assert_eq!(done.state, TaskState::Done);
+        assert_eq!(done.summary.unwrap().outcome, crate::task::Outcome::Done);
+
+        // A clean worktree: the same stop fails, as without a worktree.
+        let t = h.dispatch(required(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+        fake.set_pane_text(&pane, "● All finished\n\n❯\n");
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("failed", || state_of(&store, t.id) == TaskState::Failed).await;
+    }
+
+    /// A worktree task that asked for its worktree to go whatever it ends in
+    /// (`remove_worktree`), in `place`.
+    fn removing_task(store: &Store, place: Place) -> Task {
+        let mut t = placed_task(store, place, true);
+        t.spec.remove_worktree = Some(true);
+        store.update_task(&mut t).unwrap();
+        t
+    }
+
+    /// A machine actor with `close_failed_after` short, connected.
+    async fn connected_closing_failed(
+        fake: &FakeHerdr,
+        store: &Arc<Store>,
+    ) -> (MachineHandle, broadcast::Receiver<PastorEvent>) {
+        let (h, events) = spawn_with_settings(fake, store, close_failed_settings());
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        (h, events)
+    }
+
+    /// Dispatch `t`, then let its agent exit: the task fails.
+    async fn run_to_failed(h: &MachineHandle, fake: &FakeHerdr, store: &Store, t: &Task) -> Task {
+        let t = h.dispatch(t.id).await.unwrap();
+        assert_eq!(t.state, TaskState::Running, "{:?}", t.error);
+        fake.exit_pane(t.pane_id.as_deref().unwrap());
+        wait_for("failed", || state_of(store, t.id) == TaskState::Failed).await;
+        store.get_task(t.id).unwrap().unwrap()
+    }
+
+    /// The pane of task `id` is closed (or its worktree removed with it).
+    async fn pane_gone(store: &Store, id: i64) -> Task {
+        wait_for("pane gone", || {
+            store.get_task(id).unwrap().unwrap().pane_id.is_none()
+        })
+        .await;
+        store.get_task(id).unwrap().unwrap()
+    }
+
+    /// A failed task that asked for it loses its worktree after
+    /// `close_failed_after`, through herdr and never forced, which takes
+    /// the pane with it. The row stays failed with its error, so `task
+    /// retry` still takes it, and the retry puts the checkout back on the
+    /// same branch rather than starting a fresh `pastor/t-<id>`.
+    #[tokio::test]
+    async fn a_failed_task_that_asked_loses_its_worktree_and_its_retry_keeps_the_branch() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected_closing_failed(&fake, &store).await;
+        let failed = run_to_failed(&h, &fake, &store, &removing_task(&store, Place::Repo)).await;
+        let checkout = failed.spec.checkout.clone().unwrap();
+        let ws = failed.workspace_id.clone().unwrap();
+
+        let row = pane_gone(&store, failed.id).await;
+        assert_eq!(row.state, TaskState::Failed);
+        assert_eq!(row.workspace_id, None);
+        assert_eq!(row.error, failed.error);
+        assert_eq!(
+            calls(&fake, "worktree.remove"),
+            vec![serde_json::json!({"workspace_id": ws, "force": false})]
+        );
+        let own = serde_json::json!({"pane_id": failed.pane_id.clone().unwrap()});
+        assert!(!calls(&fake, "pane.close").contains(&own));
+        assert!(fake.worktree_list("/r").await.unwrap().is_empty());
+        assert!(fake.workspaces().is_empty());
+
+        let retry = store.insert_retry(failed.id).unwrap();
+        assert!(retry.spec.removes_worktree());
+        let t = h.dispatch(retry.id).await.unwrap();
+        assert_eq!(t.state, TaskState::Running, "{:?}", t.error);
+        assert_eq!(
+            fake.restored(),
+            vec![("/r".into(), checkout.path.clone(), checkout.branch.clone())]
+        );
+        assert_eq!(calls(&fake, "worktree.create").len(), 1);
+        assert_eq!(calls(&fake, "worktree.open")[0]["branch"], checkout.branch);
+        assert_eq!(t.spec.checkout.unwrap().branch, checkout.branch);
+    }
+
+    /// A failed task that did not ask keeps its worktree, as before: only
+    /// its pane goes.
+    #[tokio::test]
+    async fn a_failed_task_that_did_not_ask_keeps_its_worktree() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected_closing_failed(&fake, &store).await;
+        let failed =
+            run_to_failed(&h, &fake, &store, &placed_task(&store, Place::Repo, true)).await;
+        let row = pane_gone(&store, failed.id).await;
+        assert_eq!(row.state, TaskState::Failed);
+        assert!(calls(&fake, "worktree.remove").is_empty());
+        let own = serde_json::json!({"pane_id": failed.pane_id.clone().unwrap()});
+        assert!(calls(&fake, "pane.close").contains(&own));
+        assert_eq!(fake.worktree_list("/r").await.unwrap().len(), 1);
+    }
+
+    /// The guards of `task close --remove-worktree` hold for a failed task
+    /// too: a dirty checkout, one another agent works in and one a
+    /// workspace pastor did not open showed all stay, each with a note
+    /// after the task's own error. Its pane goes all the same, and the row
+    /// stays failed.
+    #[tokio::test]
+    async fn a_failed_task_s_worktree_is_kept_by_the_same_guards() {
+        for guard in ["dirty", "occupied", "foreign"] {
+            let fake = FakeHerdr::new();
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let (h, _events) = connected_closing_failed(&fake, &store).await;
+            let place = if guard == "occupied" {
+                Place::Pastor
+            } else {
+                Place::Repo
+            };
+            if guard == "dirty" {
+                fake.dirty_worktrees(true);
+            }
+            let t = h.dispatch(removing_task(&store, place).id).await.unwrap();
+            let checkout = t.spec.checkout.clone().unwrap();
+            let why = match guard {
+                "dirty" => "worktree kept: uncommitted changes".to_string(),
+                "occupied" => {
+                    // A fix round working in the checkout from the shared
+                    // workspace.
+                    let mut fix = placed_task(&store, Place::Pastor, false);
+                    fix.spec.repo = Some(checkout.path.clone());
+                    store.update_task(&mut fix).unwrap();
+                    let fix = h.dispatch(fix.id).await.unwrap();
+                    format!("{} works in it", fix.display_id())
+                }
+                _ => {
+                    let mut row = store.get_task(t.id).unwrap().unwrap();
+                    row.spec.checkout.as_mut().unwrap().already_open = true;
+                    store.update_task(&mut row).unwrap();
+                    "a workspace pastor did not open showed it".to_string()
+                }
+            };
+            fake.exit_pane(t.pane_id.as_deref().unwrap());
+            wait_for("failed", || state_of(&store, t.id) == TaskState::Failed).await;
+            let error = store.get_task(t.id).unwrap().unwrap().error.unwrap();
+
+            let row = pane_gone(&store, t.id).await;
+            assert_eq!(row.state, TaskState::Failed, "{guard}");
+            let note = row.error.clone().unwrap();
+            assert!(note.starts_with(&format!("{error}; ")), "{guard}: {note}");
+            assert!(note.contains(&why), "{guard}: {note}");
+            assert!(note.contains(&checkout.branch), "{guard}: {note}");
+            assert!(fake.removed_checkouts().is_empty(), "{guard}");
+            assert_eq!(fake.worktree_list("/r").await.unwrap().len(), 1, "{guard}");
+            store.insert_retry(t.id).expect("still retryable");
+        }
+    }
+
+    /// A stale task's agent may still be at work: its worktree stays while
+    /// it works, and goes once it stops and `close_failed_after` has passed,
+    /// the task failed first.
+    #[tokio::test]
+    async fn a_stale_task_s_worktree_goes_only_once_its_agent_stops() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected_closing_failed(&fake, &store).await;
+        let t = h
+            .dispatch(removing_task(&store, Place::Repo).id)
+            .await
+            .unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        let mut row = store.get_task(t.id).unwrap().unwrap();
+        row.state = TaskState::Stale;
+        row.finished_at = Some(Utc::now());
+        // A baseline no idle reaches: a stale task's agent has not finished.
+        row.last_completion_seq = Some(1_000);
+        store.update_task(&mut row).unwrap();
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(calls(&fake, "worktree.remove").is_empty());
+        assert_eq!(state_of(&store, t.id), TaskState::Stale);
+
+        fake.set_status(&pane, AgentStatus::Idle);
+        let row = pane_gone(&store, t.id).await;
+        assert_eq!(row.state, TaskState::Failed);
+        assert_eq!(row.workspace_id, None);
+        assert_eq!(calls(&fake, "worktree.remove").len(), 1);
+        assert!(fake.worktree_list("/r").await.unwrap().is_empty());
+    }
+
+    /// A done task that asked for its worktree to go loses it even with
+    /// commits on no remote: they stay on its branch, which is kept.
+    #[tokio::test(start_paused = true)]
+    async fn a_done_task_that_asked_loses_its_worktree_with_unpushed_commits() {
+        for asked in [false, true] {
+            let fake = FakeHerdr::new();
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let (h, _events) = spawn_with_settings(&fake, &store, auto_close_settings());
+            wait_for("connected", || {
+                h.snapshot().channel == ChannelState::Connected
+            })
+            .await;
+            let task = if asked {
+                removing_task(&store, Place::Repo)
+            } else {
+                placed_task(&store, Place::Repo, true)
+            };
+            let t = h.dispatch(task.id).await.unwrap();
+            fake.set_unpushed(&t.spec.checkout.clone().unwrap().path);
+            fake.set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Idle);
+            auto_closed(&store, t.id).await;
+            let row = store.get_task(t.id).unwrap().unwrap();
+            assert_eq!(
+                calls(&fake, "worktree.remove").len(),
+                usize::from(asked),
+                "asked {asked}"
+            );
+            assert_eq!(
+                row.error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("commits on no remote")),
+                !asked,
+                "{row:?}"
+            );
+        }
+    }
+
     /// `close_failed_after = "never"` keeps a failed task's pane, as before.
     #[tokio::test]
     async fn never_keeps_a_failed_tasks_pane() {
@@ -10168,6 +14947,114 @@ mod tests {
         assert_eq!(late.source, SummarySource::Agent);
     }
 
+    /// On an `ssh` machine of a head with no `head_address`, an agent's
+    /// `pastor task done` cannot reach the head, so a round there ends with
+    /// no summary whatever the agent did. It says `no head`, not `no
+    /// summary`, so an orchestrator does not read it as unfinished work. A
+    /// task that asked for no summary still ends as `no summary`.
+    #[tokio::test(start_paused = true)]
+    async fn a_round_on_a_machine_cut_off_from_the_head_is_no_head() {
+        use crate::task::{Outcome, SummaryMode, SummarySource};
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn_with_settings(
+            &fake,
+            &store,
+            MachineSettings {
+                cut_off_from_head: true,
+                ..settings_with_settle(Duration::from_millis(100))
+            },
+        );
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let off = store
+            .insert_task(NewTask {
+                description: None,
+                job: "run".into(),
+                item: serde_json::Value::Null,
+                prompt: "hi".into(),
+                spec: DispatchSpec {
+                    summary: SummaryMode::Off,
+                    ..spec()
+                },
+                flock: "default".into(),
+            })
+            .unwrap();
+        for (task, want) in [
+            (new_task(&store), Outcome::NoHead),
+            (off, Outcome::NoSummary),
+        ] {
+            let t = h.dispatch(task.id).await.unwrap();
+            let pane = t.pane_id.clone().unwrap();
+            fake.set_status(&pane, AgentStatus::Working);
+            fake.set_pane_text(&pane, "● Opened https://example.org/pr/7\n\n❯\n");
+            fake.set_status(&pane, AgentStatus::Idle);
+            wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+            let summary = store.get_task(t.id).unwrap().unwrap().summary.unwrap();
+            assert_eq!(summary.outcome, want, "{:?}", task.spec.summary);
+            assert_eq!(summary.source, SummarySource::Pane);
+            assert!(summary.text.contains("example.org/pr/7"), "{summary:?}");
+        }
+    }
+
+    /// The bundle gate on an actor: a task whose machine's bundles will not
+    /// let it start fails with `bundle_stale` and the reason, and starts
+    /// nothing; one the gate lets through starts.
+    #[tokio::test(start_paused = true)]
+    async fn a_task_the_bundle_gate_refuses_fails_with_bundle_stale() {
+        use crate::bundle::keep::{Gate, GateHandle};
+        use std::future::Future;
+        use std::pin::Pin;
+        struct Said(Result<(), String>);
+        impl Gate for Said {
+            fn before_launch<'a>(
+                &'a self,
+                _machine: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+                let answer = self.0.clone();
+                Box::pin(async move { answer })
+            }
+        }
+        for (answer, starts) in [
+            (
+                Err("the last bundle apply to m failed: boom".to_string()),
+                false,
+            ),
+            (Ok(()), true),
+        ] {
+            let fake = FakeHerdr::new();
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let settings = MachineSettings {
+                bundle_gate: GateHandle(Some(Arc::new(Said(answer)))),
+                ..MachineSettings::default()
+            };
+            let (h, _events) = spawn_with_settings(&fake, &store, settings);
+            wait_for("connected", || {
+                h.snapshot().channel == ChannelState::Connected
+            })
+            .await;
+            let task = new_task(&store);
+            let started = h.dispatch(task.id).await;
+            let row = store.get_task(task.id).unwrap().unwrap();
+            let started_one = fake.requests().iter().any(|r| r.method == "agent.start");
+            assert_eq!(started_one, starts);
+            if starts {
+                started.unwrap();
+                assert_eq!(row.state, TaskState::Running);
+            } else {
+                let err = started.unwrap_err();
+                assert!(err.to_string().contains("bundle_stale"), "{err}");
+                assert_eq!(row.state, TaskState::Failed);
+                let error = row.error.unwrap();
+                assert!(error.starts_with("bundle_stale: "), "{error}");
+                assert!(error.contains("boom"), "{error}");
+                assert!(row.finished_at.is_some());
+            }
+        }
+    }
+
     /// A task whose `summary` is `require`.
     fn new_required_task(store: &Store) -> Task {
         store
@@ -10202,7 +15089,7 @@ mod tests {
             err.downcast_ref::<SendRefused>().map(|r| r.code),
             Some(crate::task::SUMMARY_REQUIRED)
         );
-        assert!(err.to_string().contains("--summary-file -"), "{err}");
+        assert!(err.to_string().contains("--summary '<summary>'"), "{err}");
         assert_eq!(state_of(&store, t.id), TaskState::Running);
         assert!(store.summaries(t.id).unwrap().is_empty());
         let done = h
@@ -11422,6 +16309,8 @@ mod tests {
         .await;
         let t = h.dispatch(new_task(&store).id).await.unwrap();
         let pane = t.pane_id.clone().unwrap();
+        // Its screen shows it answered the prompt (`prompt_on_screen`).
+        fake.set_pane_text(&pane, "\u{25cf} Done, after your answer.\n");
         fake.set_status_silently(&pane, AgentStatus::Blocked);
         wait_for("blocked", || state_of(&store, t.id) == TaskState::Blocked).await;
         fake.set_status(&pane, AgentStatus::Idle);
@@ -11882,6 +16771,61 @@ mod tests {
             .count();
         assert_eq!(pings, 1, "picked up without a reconnect");
         assert!(h.snapshot().pastor_read_at.expect("read again") > old);
+    }
+
+    /// A machine with pins reports the version of each pinned harness and
+    /// whether it drifts; the reading follows an upgrade without a reconnect,
+    /// a CLI that is not there is not drift, and a machine with no pins
+    /// reports nothing.
+    #[tokio::test(start_paused = true)]
+    async fn status_carries_harness_drift_against_the_pins() {
+        let fake = FakeHerdr::new();
+        fake.set_harness_version("claude", Some("2.1.309"));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let pins = |kv: &[(&str, &str)]| -> MachineSettings {
+            MachineSettings {
+                harness_pins: kv
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                ..settings()
+            }
+        };
+        let (h, _events) = spawn_with_settings(
+            &fake,
+            &store,
+            pins(&[("claude", "2.1.310"), ("agy", "1.4")]),
+        );
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let got = |h: &MachineHandle| -> Vec<(String, Option<String>, bool)> {
+            h.snapshot()
+                .harness
+                .iter()
+                .map(|s| (s.kind.clone(), s.version.clone(), s.drift))
+                .collect()
+        };
+        // Sorted by kind; agy is not installed, which is not drift.
+        assert_eq!(
+            got(&h),
+            [
+                ("agy".to_string(), None, false),
+                ("claude".to_string(), Some("2.1.309".into()), true)
+            ]
+        );
+        // An upgrade to the pin clears it at the next refresh.
+        fake.set_harness_version("claude", Some("2.1.310"));
+        wait_for("no drift", || h.snapshot().harness.iter().all(|s| !s.drift)).await;
+        assert_eq!(h.snapshot().harness[1].version.as_deref(), Some("2.1.310"));
+
+        let (plain, _e) = spawn(&fake, &store);
+        wait_for("connected", || {
+            plain.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        assert!(plain.snapshot().harness.is_empty());
     }
 
     /// A reconnect whose version ask fails (the ping worked, the extra ssh
@@ -13029,5 +17973,662 @@ mod tests {
             h.snapshot().channel == ChannelState::Connected
         })
         .await;
+    }
+
+    /// `pastor task sweep` on one machine: a worktree of an ended task is
+    /// removed only when every check passes, a dry run removes nothing, and
+    /// whatever cannot be told is kept.
+    mod sweep {
+        use super::*;
+
+        /// A task row on machine `m` in `state` recording `path` as its
+        /// checkout.
+        fn task_at(store: &Store, state: TaskState, path: &str) -> Task {
+            let mut t = new_task(store);
+            t.machine = Some("m".into());
+            t.state = state;
+            t.spec.worktree = true;
+            t.spec.repo = Some("/srv/repo".into());
+            t.spec.checkout = Some(Box::new(crate::task::Checkout {
+                branch: format!("pastor/t-{}", t.id),
+                path: path.into(),
+                already_open: false,
+            }));
+            store.update_task(&mut t).unwrap();
+            t
+        }
+
+        const PATH: &str = "/srv/worktrees/repo/t-1";
+
+        fn kept_why(entries: &[SweepEntry]) -> Vec<(SweepAction, Option<String>)> {
+            entries.iter().map(|e| (e.action, e.why.clone())).collect()
+        }
+
+        /// A clean worktree of a failed or closed task is removed,
+        /// once, whatever the rows that record it say of each other.
+        #[tokio::test(start_paused = true)]
+        async fn a_clean_kept_worktree_is_removed() {
+            for state in [TaskState::Failed, TaskState::Closed] {
+                let fake = FakeHerdr::new();
+                let store = Arc::new(Store::open_in_memory().unwrap());
+                let (h, _events) = connected(&fake, &store).await;
+                let t = task_at(&store, state, PATH);
+                // A retry that has ended too records the same worktree.
+                let retry = task_at(&store, TaskState::Closed, PATH);
+                let got = h.sweep(true).await.unwrap();
+                assert_eq!(got.len(), 1, "{state:?}: {got:?}");
+                assert_eq!(got[0].action, SweepAction::Removed, "{got:?}");
+                assert_eq!(got[0].path, PATH);
+                assert_eq!(got[0].branch, format!("pastor/t-{}", t.id));
+                assert_eq!(got[0].tasks, [t.display_id(), retry.display_id()]);
+                assert_eq!(fake.removed_checkouts(), [PATH], "{state:?}");
+            }
+        }
+
+        /// A worktree the sweep removes takes the workdir sets placed in it
+        /// out with it; a dry run takes nothing out.
+        #[tokio::test(start_paused = true)]
+        async fn a_swept_worktree_takes_its_workdir_sets_out() {
+            let fake = FakeHerdr::new();
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let (settings, gate) = forgetting(MachineSettings::default());
+            let (h, _events) = spawn_with_settings(&fake, &store, settings);
+            wait_for("connected", || {
+                h.snapshot().channel == ChannelState::Connected
+            })
+            .await;
+            task_at(&store, TaskState::Failed, PATH);
+            h.sweep(false).await.unwrap();
+            assert!(gate.dirs().is_empty(), "a dry run");
+            let got = h.sweep(true).await.unwrap();
+            assert_eq!(got[0].action, SweepAction::Removed, "{got:?}");
+            assert_eq!(gate.dirs(), [PATH]);
+        }
+
+        /// Without `apply` the same worktree is only listed.
+        #[tokio::test(start_paused = true)]
+        async fn a_dry_run_removes_nothing() {
+            let fake = FakeHerdr::new();
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let (h, _events) = connected(&fake, &store).await;
+            task_at(&store, TaskState::Failed, PATH);
+            let got = h.sweep(false).await.unwrap();
+            assert_eq!(kept_why(&got), [(SweepAction::WouldRemove, None)]);
+            assert!(fake.removed_checkouts().is_empty());
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_worktree_with_uncommitted_changes_is_kept() {
+            let fake = FakeHerdr::new();
+            fake.set_dirty_checkout(PATH);
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let (h, _events) = connected(&fake, &store).await;
+            task_at(&store, TaskState::Failed, PATH);
+            for apply in [false, true] {
+                let got = h.sweep(apply).await.unwrap();
+                assert_eq!(
+                    kept_why(&got),
+                    [(
+                        SweepAction::Kept,
+                        Some("uncommitted or untracked files".into())
+                    )]
+                );
+            }
+            assert!(
+                fake.removed_checkouts().is_empty(),
+                "never asked to remove it"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_worktree_with_unpushed_commits_is_kept() {
+            let fake = FakeHerdr::new();
+            fake.set_unpushed(PATH);
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let (h, _events) = connected(&fake, &store).await;
+            task_at(&store, TaskState::Closed, PATH);
+            let got = h.sweep(true).await.unwrap();
+            assert_eq!(
+                kept_why(&got),
+                [(SweepAction::Kept, Some("commits on no remote".into()))]
+            );
+            assert!(fake.removed_checkouts().is_empty());
+        }
+
+        /// A live task that records the worktree (a retry), or works in it as
+        /// its repo (a fix round), keeps it; a running task's own worktree is
+        /// not listed at all.
+        #[tokio::test(start_paused = true)]
+        async fn the_worktree_of_a_live_task_is_kept() {
+            for state in [
+                TaskState::Running,
+                TaskState::Queued,
+                TaskState::Paused,
+                TaskState::Waiting,
+                TaskState::Stale,
+                TaskState::Done,
+            ] {
+                let fake = FakeHerdr::new();
+                let store = Arc::new(Store::open_in_memory().unwrap());
+                let (h, _events) = connected(&fake, &store).await;
+                task_at(&store, TaskState::Failed, PATH);
+                let live = task_at(&store, state, PATH);
+                let got = h.sweep(true).await.unwrap();
+                assert_eq!(got.len(), 1, "{state:?}: {got:?}");
+                assert_eq!(got[0].action, SweepAction::Kept, "{state:?}");
+                assert!(
+                    got[0]
+                        .why
+                        .as_deref()
+                        .is_some_and(|w| w.contains(&live.display_id())),
+                    "{got:?}"
+                );
+                assert!(fake.removed_checkouts().is_empty(), "{state:?}");
+            }
+            // A fix round whose --repo is the worktree.
+            let fake = FakeHerdr::new();
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let (h, _events) = connected(&fake, &store).await;
+            task_at(&store, TaskState::Failed, PATH);
+            let mut round = new_task(&store);
+            round.machine = Some("m".into());
+            round.state = TaskState::Running;
+            round.spec.repo = Some(PATH.into());
+            store.update_task(&mut round).unwrap();
+            let got = h.sweep(true).await.unwrap();
+            assert_eq!(got[0].action, SweepAction::Kept, "{got:?}");
+            assert!(fake.removed_checkouts().is_empty());
+            // Alone, a running task's worktree is not the sweep's business.
+            let fake = FakeHerdr::new();
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let (h, _events) = connected(&fake, &store).await;
+            task_at(&store, TaskState::Running, PATH);
+            assert!(h.sweep(true).await.unwrap().is_empty());
+        }
+
+        /// What pastor did not make, what is not a path and what is not
+        /// there is never removed.
+        #[tokio::test(start_paused = true)]
+        async fn what_pastor_did_not_make_or_cannot_name_is_kept_or_skipped() {
+            let fake = FakeHerdr::new();
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let (h, _events) = connected(&fake, &store).await;
+            let mut shown = task_at(&store, TaskState::Closed, "/srv/worktrees/repo/shown");
+            shown.spec.checkout.as_mut().unwrap().already_open = true;
+            store.update_task(&mut shown).unwrap();
+            for bad in [
+                "/",
+                "/home",
+                "/srv/x",
+                "relative/dir/here",
+                "/srv/../etc/passwd",
+            ] {
+                task_at(&store, TaskState::Closed, bad);
+            }
+            let gone = "/srv/worktrees/repo/gone";
+            fake.set_missing_dir(gone);
+            task_at(&store, TaskState::Closed, gone);
+            let got = h.sweep(true).await.unwrap();
+            assert_eq!(got.len(), 6, "{got:?}");
+            assert!(got.iter().all(|e| e.action == SweepAction::Kept), "{got:?}");
+            assert!(!got.iter().any(|e| e.path == gone), "gone is not listed");
+            let shown = got.iter().find(|e| e.path.ends_with("/shown")).unwrap();
+            assert!(
+                shown
+                    .why
+                    .as_deref()
+                    .is_some_and(|w| w.contains("did not open")),
+                "{shown:?}"
+            );
+            assert!(
+                fake.removed_checkouts().is_empty(),
+                "{:?}",
+                fake.removed_checkouts()
+            );
+        }
+
+        /// Another machine's rows are not this machine's to sweep.
+        #[tokio::test(start_paused = true)]
+        async fn another_machines_worktrees_are_left_alone() {
+            let fake = FakeHerdr::new();
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let (h, _events) = connected(&fake, &store).await;
+            let mut t = task_at(&store, TaskState::Closed, PATH);
+            t.machine = Some("elsewhere".into());
+            store.update_task(&mut t).unwrap();
+            assert!(h.sweep(true).await.unwrap().is_empty());
+            assert!(fake.removed_checkouts().is_empty());
+        }
+    }
+
+    /// A task whose agent has finished its prompt and sits idle: the one a
+    /// move asks to save its work. The fake, the store, the handle, the row.
+    async fn idle_task() -> (FakeHerdr, Arc<Store>, MachineHandle, Task) {
+        let (fake, store, h, t, _events) = idle_task_and_events().await;
+        (fake, store, h, t)
+    }
+
+    /// `idle_task`, and the machine's events from then on.
+    async fn idle_task_and_events() -> (
+        FakeHerdr,
+        Arc<Store>,
+        MachineHandle,
+        Task,
+        broadcast::Receiver<PastorEvent>,
+    ) {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        fake.set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Idle);
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+        let t = store.get_task(t.id).unwrap().unwrap();
+        while events.try_recv().is_ok() {}
+        (fake, store, h, t, events)
+    }
+
+    fn refused_code(err: &anyhow::Error) -> Option<&'static str> {
+        err.downcast_ref::<SendRefused>().map(|r| r.code)
+    }
+
+    /// The `task.*` events for task `id` so far.
+    fn task_events(events: &mut broadcast::Receiver<PastorEvent>, id: i64) -> Vec<String> {
+        let mut out = vec![];
+        while let Ok(ev) = events.try_recv() {
+            if ev.task_id == Some(id) && ev.kind.starts_with("task.") {
+                out.push(ev.kind);
+            }
+        }
+        out
+    }
+
+    /// The save turn is not the task's work: while it runs, and after it,
+    /// whether it saved or not, the row keeps its state and nothing is
+    /// emitted for it. A done Claude task whose save times out mid-turn,
+    /// and a non-Claude task blocked idle without `task done` whose save
+    /// goes through, each stay as they were; a later idle at the save's
+    /// sequence completes nothing.
+    #[tokio::test(start_paused = true)]
+    async fn the_save_turn_leaves_the_row_alone() {
+        // A done Claude task; the save times out while the agent works.
+        let (fake, store, h, t, mut events) = idle_task_and_events().await;
+        let pane = t.pane_id.clone().unwrap();
+        let saving = tokio::spawn({
+            let h = h.clone();
+            async move { h.save_work(t.id, Duration::from_secs(5)).await }
+        });
+        wait_for("the save prompt", || save_typed(&fake)).await;
+        fake.set_status(&pane, AgentStatus::Working);
+        let err = saving.await.unwrap().unwrap_err();
+        assert_eq!(refused_code(&err), Some("save_timeout"), "{err:#}");
+        fake.set_status(&pane, AgentStatus::Idle);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Done);
+        assert_eq!(task_events(&mut events, t.id), Vec::<String>::new());
+
+        // A codex task blocked for going idle without `task done`.
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task_of(&store, "codex").id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("blocked", || state_of(&store, t.id) == TaskState::Blocked).await;
+        task_events(&mut events, t.id);
+        let saving = tokio::spawn({
+            let h = h.clone();
+            async move { h.save_work(t.id, Duration::from_secs(60)).await }
+        });
+        wait_for("the save prompt", || save_typed(&fake)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        fake.set_status(&pane, AgentStatus::Idle);
+        let saved = saving.await.unwrap().unwrap();
+        assert_eq!(saved.state, TaskState::Blocked);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Blocked);
+        assert_eq!(task_events(&mut events, t.id), Vec::<String>::new());
+        let row = store.get_task(t.id).unwrap().unwrap();
+        assert!(row.last_completion_seq >= Some(fake.agents()[0].state_change_seq));
+    }
+
+    /// An agent that stops on a question during the save turn fails it at
+    /// once, not at the end of the timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_question_during_the_save_turn_is_save_blocked_at_once() {
+        let (fake, _store, h, t) = idle_task().await;
+        let pane = t.pane_id.clone().unwrap();
+        let started = Instant::now();
+        let saving = tokio::spawn({
+            let h = h.clone();
+            async move { h.save_work(t.id, Duration::from_secs(600)).await }
+        });
+        wait_for("the save prompt", || save_typed(&fake)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        fake.set_status(&pane, AgentStatus::Blocked);
+        let err = saving.await.unwrap().unwrap_err();
+        assert_eq!(refused_code(&err), Some("save_blocked"), "{err:#}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A save turn shorter than a poll, on a herdr with no
+    /// `completion_seq`: the poll only ever sees the agent idle, but the
+    /// actor saw it working, so the save is done.
+    #[tokio::test(start_paused = true)]
+    async fn a_save_turn_shorter_than_a_poll_is_seen() {
+        let (fake, _store, h, t) = idle_task().await;
+        fake.set_inbox_result(Some("accepted"));
+        let pane = t.pane_id.clone().unwrap();
+        let saving = tokio::spawn({
+            let h = h.clone();
+            async move { h.save_work(t.id, Duration::from_secs(30)).await }
+        });
+        wait_for("the save prompt", || save_by_socket(&fake) == 1).await;
+        // The send set it working; done again before the first poll.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        fake.set_status(&pane, AgentStatus::Idle);
+        let saved = tokio::time::timeout(Duration::from_secs(10), saving)
+            .await
+            .expect("the save ends well before its timeout")
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.id, t.id);
+    }
+
+    /// The save prompt goes in, typed on a machine with no inbox socket
+    /// send, and the reply waits until the agent has worked on it and gone
+    /// idle again.
+    #[tokio::test(start_paused = true)]
+    async fn save_work_prompts_and_waits_for_idle() {
+        let (fake, _store, h, t) = idle_task().await;
+        let pane = t.pane_id.clone().unwrap();
+        let saving = tokio::spawn({
+            let h = h.clone();
+            async move { h.save_work(t.id, Duration::from_secs(60)).await }
+        });
+        wait_for("the save prompt", || {
+            calls(&fake, "agent.prompt")
+                .iter()
+                .any(|p| p["text"] == crate::task::MOVE_SAVE_PROMPT)
+        })
+        .await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!saving.is_finished(), "the agent is still working");
+        fake.set_status(&pane, AgentStatus::Idle);
+        let saved = saving.await.unwrap().unwrap();
+        assert_eq!(saved.id, t.id);
+    }
+
+    fn save_typed(fake: &FakeHerdr) -> bool {
+        calls(fake, "agent.prompt")
+            .iter()
+            .any(|p| p["text"] == crate::task::MOVE_SAVE_PROMPT)
+    }
+
+    fn save_by_socket(fake: &FakeHerdr) -> usize {
+        fake.inbox_sends()
+            .iter()
+            .filter(|s| s.text == crate::task::MOVE_SAVE_PROMPT)
+            .count()
+    }
+
+    /// A Claude session that takes the save prompt through its inbox socket
+    /// gets it there, not typed; the save counts from just before the send.
+    #[tokio::test(start_paused = true)]
+    async fn save_work_goes_through_the_inbox_socket() {
+        let (fake, _store, h, t) = idle_task().await;
+        fake.set_inbox_result(Some("accepted"));
+        let pane = t.pane_id.clone().unwrap();
+        let saving = tokio::spawn({
+            let h = h.clone();
+            async move { h.save_work(t.id, Duration::from_secs(60)).await }
+        });
+        wait_for("the save prompt", || save_by_socket(&fake) == 1).await;
+        let sent = &fake.inbox_sends()[0];
+        assert_eq!(Some(sent.session.as_str()), t.spec.session_id.as_deref());
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!saving.is_finished(), "the agent is still working");
+        assert!(!save_typed(&fake), "not typed");
+        fake.set_status(&pane, AgentStatus::Idle);
+        assert_eq!(saving.await.unwrap().unwrap().id, t.id);
+        assert_eq!(save_by_socket(&fake), 1);
+    }
+
+    /// A socket that does not take it, and a task with no session to send
+    /// it to, get the save prompt typed instead.
+    #[tokio::test(start_paused = true)]
+    async fn save_work_the_socket_does_not_take_is_typed() {
+        for no_session in [false, true] {
+            let (fake, store, h, mut t) = idle_task().await;
+            if no_session {
+                fake.set_inbox_result(Some("accepted"));
+                t.spec.session_id = None;
+                store.update_task(&mut t).unwrap();
+            } else {
+                fake.set_inbox_result(Some("not_running"));
+            }
+            let pane = t.pane_id.clone().unwrap();
+            let saving = tokio::spawn({
+                let h = h.clone();
+                async move { h.save_work(t.id, Duration::from_secs(60)).await }
+            });
+            wait_for("the typed save prompt", || save_typed(&fake)).await;
+            assert_eq!(save_by_socket(&fake), usize::from(!no_session));
+            fake.set_status(&pane, AgentStatus::Idle);
+            assert_eq!(saving.await.unwrap().unwrap().id, t.id);
+        }
+    }
+
+    /// An agent waiting on a question would get the save prompt in its
+    /// dialog: refused, nothing sent either way.
+    #[tokio::test(start_paused = true)]
+    async fn save_work_refuses_a_blocked_agent() {
+        let (fake, _store, h, t) = idle_task().await;
+        fake.set_inbox_result(Some("accepted"));
+        fake.set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Blocked);
+        let err = h
+            .save_work(t.id, Duration::from_secs(60))
+            .await
+            .unwrap_err();
+        assert_eq!(refused_code(&err), Some("save_blocked"), "{err:#}");
+        assert!(!save_typed(&fake));
+        assert_eq!(save_by_socket(&fake), 0);
+    }
+
+    /// A working agent is in the middle of something: a save prompt would
+    /// land in its turn, so it is refused and nothing is typed.
+    #[tokio::test(start_paused = true)]
+    async fn save_work_refuses_a_working_agent() {
+        let (fake, _store, h, t) = idle_task().await;
+        fake.set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Working);
+        let prompts = calls(&fake, "agent.prompt").len();
+        let err = h
+            .save_work(t.id, Duration::from_secs(60))
+            .await
+            .unwrap_err();
+        assert_eq!(refused_code(&err), Some("agent_busy"), "{err:#}");
+        assert_eq!(calls(&fake, "agent.prompt").len(), prompts);
+    }
+
+    /// A task with no pane has no agent to save anything.
+    #[tokio::test(start_paused = true)]
+    async fn save_work_refuses_a_task_without_a_pane() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let queued = new_task(&store);
+        let err = h
+            .save_work(queued.id, Duration::from_secs(60))
+            .await
+            .unwrap_err();
+        assert_eq!(refused_code(&err), Some("task_not_live"), "{err:#}");
+        assert!(calls(&fake, "agent.prompt").is_empty());
+    }
+
+    /// An agent that never finishes the save is `save_timeout`; the pane
+    /// and the row stay as they were, for the caller to decide.
+    #[tokio::test(start_paused = true)]
+    async fn save_work_times_out_and_leaves_the_pane() {
+        let (fake, store, h, t) = idle_task().await;
+        fake.ignore_prompts(true);
+        let err = h.save_work(t.id, Duration::from_secs(5)).await.unwrap_err();
+        assert_eq!(refused_code(&err), Some("save_timeout"), "{err:#}");
+        assert!(closes(&fake).is_empty(), "the pane stays");
+        let pane = t.pane_id.as_deref().unwrap();
+        assert!(fake.agents().iter().any(|a| a.pane_id == pane));
+        let row = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(row.state, TaskState::Done);
+        assert_eq!(row.pane_id, t.pane_id);
+    }
+
+    /// A done task whose agent accepts the save prompt but never reacts to
+    /// it (`fake.ignore_prompts`, as `save_work_times_out_and_leaves_the_pane`
+    /// uses it) reads exactly like one that finished on its own and has sat
+    /// idle since: same pane, same agent status, same sequence. Without
+    /// tracking the save in flight, `auto_close_done` cannot tell the two
+    /// apart, and would take its pane once the grace elapses while the save
+    /// is still waiting on the agent.
+    #[tokio::test(start_paused = true)]
+    async fn save_work_in_progress_is_not_auto_closed() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn_with_settings(&fake, &store, auto_close_settings());
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+
+        fake.ignore_prompts(true);
+        let saving = tokio::spawn({
+            let h = h.clone();
+            async move { h.save_work(t.id, Duration::from_secs(60)).await }
+        });
+        wait_for("the save prompt", || {
+            calls(&fake, "agent.prompt")
+                .iter()
+                .any(|p| p["text"] == crate::task::MOVE_SAVE_PROMPT)
+        })
+        .await;
+
+        // Well past its grace: without the guard this looks exactly like a
+        // task that finished on its own and has sat idle since, and
+        // auto-close would take its pane mid-save.
+        finished_an_hour_ago(&store, t.id);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            state_of(&store, t.id),
+            TaskState::Done,
+            "a task being saved is not auto-closed"
+        );
+        assert!(
+            calls(&fake, "pane.close").is_empty(),
+            "the pane stays while the save is in flight"
+        );
+
+        // The agent never reacted, so the save times out; once it is no
+        // longer in flight, the next check closes the row.
+        let err = saving.await.unwrap().unwrap_err();
+        assert_eq!(refused_code(&err), Some("save_timeout"), "{err:#}");
+        wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
+    }
+
+    /// The preflight check for the agent is bounded by the save's own
+    /// `timeout`, not the full `request_timeout`: a herdr that stops
+    /// answering there is `save_timeout` at the deadline the save was asked
+    /// to keep, the same as one that stops answering during the wait.
+    #[tokio::test(start_paused = true)]
+    async fn save_work_preflight_is_bounded_by_the_save_timeout() {
+        let (fake, _store, h, t) = idle_task().await;
+        fake.hang_method("agent.list");
+        let started = Instant::now();
+        let err = h
+            .save_work(t.id, Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert_eq!(refused_code(&err), Some("save_timeout"), "{err:#}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "bounded by the save's own timeout, not the 5s request_timeout: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Idle past the save prompt's own sequence is not proof the save
+    /// finished: the agent may have stopped to ask a question instead (over
+    /// a force-push, say). Reading the pane before trusting that, as
+    /// `pane_end` does for a real completion, catches it instead of
+    /// reporting a save that never happened.
+    #[tokio::test(start_paused = true)]
+    async fn save_work_rejects_a_question_instead_of_a_finished_save() {
+        let (fake, _store, h, t) = idle_task().await;
+        let pane = t.pane_id.clone().unwrap();
+        let saving = tokio::spawn({
+            let h = h.clone();
+            async move { h.save_work(t.id, Duration::from_secs(60)).await }
+        });
+        wait_for("the save prompt", || {
+            calls(&fake, "agent.prompt")
+                .iter()
+                .any(|p| p["text"] == crate::task::MOVE_SAVE_PROMPT)
+        })
+        .await;
+        fake.set_pane_text(
+            &pane,
+            "● Should I force-push over the remote branch?\n\n❯\n",
+        );
+        fake.set_status(&pane, AgentStatus::Idle);
+        let err = saving.await.unwrap().unwrap_err();
+        assert_eq!(refused_code(&err), Some("save_blocked"), "{err:#}");
+    }
+
+    /// A save prompt answered by a command left running in the background is
+    /// not finished either: `save_work` keeps polling past the first idle
+    /// instead of calling it done on the shell's own pause, the same rule
+    /// `pane_end` applies to a real completion.
+    #[tokio::test(start_paused = true)]
+    async fn save_work_waits_out_a_background_shell() {
+        let (fake, _store, h, t) = idle_task().await;
+        let pane = t.pane_id.clone().unwrap();
+        let saving = tokio::spawn({
+            let h = h.clone();
+            async move { h.save_work(t.id, Duration::from_secs(60)).await }
+        });
+        wait_for("the save prompt", || {
+            calls(&fake, "agent.prompt")
+                .iter()
+                .any(|p| p["text"] == crate::task::MOVE_SAVE_PROMPT)
+        })
+        .await;
+        fake.set_pane_text(
+            &pane,
+            "● Committing in the background.\n\n❯\n  ⏵⏵ auto mode on · 1 shell still running\n",
+        );
+        fake.set_status(&pane, AgentStatus::Idle);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            !saving.is_finished(),
+            "a background shell is not a finished save"
+        );
+
+        fake.set_status(&pane, AgentStatus::Working);
+        fake.set_pane_text(&pane, "● Committed and pushed.\n\n❯\n");
+        fake.set_status(&pane, AgentStatus::Idle);
+        let saved = saving.await.unwrap().unwrap();
+        assert_eq!(saved.id, t.id);
     }
 }

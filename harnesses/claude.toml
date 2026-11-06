@@ -1,0 +1,53 @@
+# Claude Code. The login check prints who is signed in and exits non-zero
+# when nobody is; it reads no secret and takes none. The release source is
+# left out until its sum is published somewhere pastor can check it.
+
+id = "claude"
+name = "Claude Code"
+binary = "claude"
+bin_dirs = ["~/.local/bin", "~/.cargo/bin"]
+
+[version]
+args = ["--version"]
+
+# `pastor login` types `start` into a pane on the machine. Claude shows a
+# URL to sign in at, and waits for the code the browser gives back.
+[login]
+check = ["claude", "auth", "status", "--text"]
+start = ["claude", "auth", "login"]
+paste = "Paste code here"
+
+[[install]]
+source = "npm"
+package = "@anthropic-ai/claude-code"
+
+[[install]]
+source = "script"
+url = "https://claude.ai/install.sh"
+shell = "bash"
+args = ["{version}"]                    # the installer takes a version, stable or latest
+
+# Claude updates itself unless this is set; pastor sets it for agents of a
+# pinned claude, so the pin holds.
+[update]
+env = { DISABLE_AUTOUPDATER = "1" }
+
+# Bundle MCP servers go in a local plugin pastor writes into each home: the
+# file below is one a running Claude rewrites, so pastor stays out of it.
+[mcp]
+method = "plugin"
+
+# CLAUDE_CONFIG_DIR moves the home. Its MCP servers and its project trust
+# live in .claude.json: in the home when the var is set, beside the default
+# home (~/.claude.json) when it is not.
+[paths]
+home_env = "CLAUDE_CONFIG_DIR"
+home = "~/.claude"
+skills = "skills"
+hooks = "hooks"
+instructions = "CLAUDE.md"
+settings = "settings.json"
+mcp = ".claude.json"
+mcp_default = "~/.claude.json"
+# Its login; pastor never reads it, nor writes over it.
+secrets = [".credentials.json"]

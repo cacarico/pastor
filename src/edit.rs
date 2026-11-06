@@ -395,6 +395,36 @@ fn lock(path: &Path) -> anyhow::Result<std::fs::File> {
     }
 }
 
+/// An `flock` held on a file, released when dropped.
+///
+/// Closing the file is not enough to release it at once: the lock belongs
+/// to the open file, which a child forked by another thread shares until it
+/// runs its program, close-on-exec or not. Unlocking does release it for
+/// every copy.
+#[derive(Debug)]
+pub(crate) struct FileLock(std::fs::File);
+
+impl FileLock {
+    /// Wrap `file`, which the caller has just locked.
+    pub(crate) fn held(file: std::fs::File) -> Self {
+        Self(file)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn file(&self) -> &std::fs::File {
+        &self.0
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: flock on a descriptor this guard owns. A failure leaves
+        // the lock to the close that follows.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 /// A lock file at `path`, created private if missing, never through a
 /// symlink.
 pub(crate) fn open_lock(path: &Path) -> anyhow::Result<std::fs::File> {

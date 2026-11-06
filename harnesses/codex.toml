@@ -1,0 +1,13 @@
+# Codex: where it keeps what a bundle places. Its version, login and install
+# are not described here yet.
+
+id = "codex"
+name = "Codex"
+
+[paths]
+home_env = "CODEX_HOME"
+home = "~/.codex"
+skills = "skills"
+instructions = "AGENTS.md"
+# Its login; pastor never reads it, nor writes over it.
+secrets = ["auth.json"]

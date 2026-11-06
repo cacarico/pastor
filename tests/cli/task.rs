@@ -278,6 +278,30 @@ fn prune_works_without_a_daemon_and_retry_does_not() {
     assert_eq!(err["code"], "usage_error");
 }
 
+/// A task pane that was never told where the head is (no `PASTOR_HEAD`, as
+/// on an `ssh` machine of a head with no `head_address`) and has no serve to
+/// talk to. "Start pastor serve" is the wrong fix there: the error names
+/// `head_address` instead.
+#[test]
+fn task_done_in_a_pane_with_no_head_names_head_address() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = pastor()
+        .args(["task", "done", "--summary", "done: x"])
+        .env("PASTOR_TASK", "t-99")
+        .env("PASTOR_CONFIG_DIR", tmp.path().join("c"))
+        .env("PASTOR_STATE_DIR", tmp.path().join("s"))
+        .env("PASTOR_DATA_DIR", tmp.path().join("d"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(err["code"], "head_unknown", "{err}");
+    let message = err["message"].as_str().unwrap();
+    assert!(message.contains("head_address"), "{message}");
+    assert!(message.contains("PASTOR_HEAD"), "{message}");
+    assert!(!message.contains("start it with"), "{message}");
+}
+
 #[test]
 fn task_send_types_into_a_live_task_and_refuses_a_finished_one() {
     let env = start();
@@ -506,6 +530,88 @@ fn a_task_done_with_a_summary_shows_it() {
     assert_eq!(t2["summary"]["source"], "pane", "{t2}");
 }
 
+/// `task done --current` is the one command an agent runs to end its own
+/// task: no task argument, from `PASTOR_TASK` alone, ending with `DONE` as
+/// the very last line.
+#[test]
+fn done_current_ends_its_own_task_and_prints_done_last() {
+    let env = start();
+    let t = env.json(&["task", "run", "say hi", "--repo", "/tmp", "--json"]);
+    assert_eq!(t["state"], "running");
+    let own = t["agent_name"].as_str().unwrap();
+    let out = pastor()
+        .args(["task", "done", "--current", "--summary", "done: said hi"])
+        .env("PASTOR_CONFIG_DIR", &env.config)
+        .env("PASTOR_STATE_DIR", &env.state)
+        .env("PASTOR_TASK", own)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.lines().last(), Some("DONE"), "{stdout}");
+    let described = env.json(&["task", "describe", own, "--json"]);
+    assert_eq!(described["state"], "done");
+    assert_eq!(described["summary"]["outcome"], "done");
+
+    // Outside a task pane, --current is a clear error, not a guess at
+    // which task to end.
+    let out = pastor()
+        .args(["task", "done", "--current", "--summary", "done: x"])
+        .env("PASTOR_CONFIG_DIR", &env.config)
+        .env("PASTOR_STATE_DIR", &env.state)
+        .env_remove("PASTOR_TASK")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&out.stderr).unwrap()["code"],
+        "usage_error"
+    );
+
+    // --current and a task argument are mutually exclusive: clap refuses
+    // it (exit 2), not a runtime error.
+    let out = env.cmd(&["task", "done", "t-2", "--current"]);
+    assert_eq!(out.status.code(), Some(2));
+}
+
+/// `--current --json` leaves out the `DONE` sentinel: a trailing bare word
+/// after the task object would make stdout unparseable even though the
+/// task ended cleanly.
+#[test]
+fn done_current_json_prints_no_trailing_sentinel() {
+    let env = start();
+    let t = env.json(&["task", "run", "say hi", "--repo", "/tmp", "--json"]);
+    let own = t["agent_name"].as_str().unwrap();
+    let out = pastor()
+        .args([
+            "task",
+            "done",
+            "--current",
+            "--summary",
+            "done: said hi",
+            "--json",
+        ])
+        .env("PASTOR_CONFIG_DIR", &env.config)
+        .env("PASTOR_STATE_DIR", &env.state)
+        .env("PASTOR_TASK", own)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("stdout is not one JSON value: {e}\n{stdout}");
+    });
+    assert_eq!(parsed["state"], "done", "{stdout}");
+}
+
 /// With a head running, `limit` goes through it; an agent pastor started
 /// may list the limits but not clear one.
 #[test]
@@ -602,10 +708,45 @@ fn a_tasks_priority_is_set_shown_and_changed() {
     }
 }
 
+/// `task run --no-fetch` is recorded on a worktree task (`spec.fetch.skip`)
+/// and `task describe` says so; a task without it says nothing about a
+/// fetch. (A `command` machine runs no shell, so no fetch is made here
+/// either way: the real fetch is covered against a real git.)
+#[test]
+fn no_fetch_is_recorded_and_described() {
+    let env = start();
+    let t = env.json(&[
+        "task",
+        "run",
+        "skip it",
+        "--worktree",
+        "--repo",
+        "/tmp/r",
+        "--no-fetch",
+        "--json",
+    ]);
+    assert_eq!(t["spec"]["fetch"]["skip"], true, "{t}");
+    let text = String::from_utf8_lossy(&env.cmd(&["task", "describe", "t-1"]).stdout).to_string();
+    assert!(text.contains("fetch:      skipped (--no-fetch)"), "{text}");
+
+    let t = env.json(&[
+        "task",
+        "run",
+        "fetch it",
+        "--worktree",
+        "--repo",
+        "/tmp/r",
+        "--json",
+    ]);
+    assert!(t["spec"].get("fetch").is_none(), "{t}");
+    let text = String::from_utf8_lossy(&env.cmd(&["task", "describe", "t-2"]).stdout).to_string();
+    assert!(!text.contains("fetch:"), "{text}");
+}
+
 /// `task attach` on a task whose pane is gone: one of a kind with no
-/// session keeps the old error with a hint that only Claude tasks reopen; a
-/// Claude task goes on to its machine to reopen the session, which a
-/// `command` machine cannot show.
+/// session keeps the old error with a hint that only Claude or agy tasks
+/// reopen; a Claude task goes on to its machine to reopen the session,
+/// which a `command` machine cannot show.
 #[test]
 fn attach_on_a_closed_task_reopens_only_a_claude_session() {
     let env = start();
@@ -616,10 +757,49 @@ fn attach_on_a_closed_task_reopens_only_a_claude_session() {
     assert_eq!(error_code(&out), "no_agent");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("t-1 is closed; nothing to attach to"), "{err}");
-    assert!(err.contains("only Claude tasks can be reopened"), "{err}");
+    assert!(
+        err.contains("only Claude or agy tasks can be reopened"),
+        "{err}"
+    );
 
     let t = env.json(&["task", "run", "hi", "--json"]);
     assert!(t["spec"]["session_id"].is_string(), "{t}");
     env.json(&["task", "close", "t-2", "--json"]);
     env.fails_with(&["task", "attach", "t-2"], "no_terminal");
+}
+
+/// `task sweep` asks the head, lists nothing when no task left a worktree,
+/// refuses `--yes` with `--dry-run`, and is refused to a task's pane
+/// (dry run or not: it is the head's machines it would touch).
+#[test]
+fn task_sweep_lists_by_default_and_is_refused_to_an_agent() {
+    let env = start();
+    let out = env.cmd(&["task", "sweep"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("no worktrees kept"),
+        "{out:?}"
+    );
+    let out = env.cmd(&["task", "sweep", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["yes"], false);
+    assert!(v["entries"].as_array().unwrap().is_empty());
+    assert_eq!(
+        env.cmd(&["task", "sweep", "--yes", "--dry-run"])
+            .status
+            .code(),
+        Some(2)
+    );
+    assert_eq!(
+        error_code(&env.cmd(&["task", "sweep", "--machine", "ghost"])),
+        "unknown_machine"
+    );
+    let from_agent = pastor()
+        .args(["task", "sweep"])
+        .env("PASTOR_CONFIG_DIR", &env.config)
+        .env("PASTOR_STATE_DIR", &env.state)
+        .env("PASTOR_TASK", "t-3")
+        .output()
+        .unwrap();
+    assert_eq!(error_code(&from_agent), "agent_refused");
 }

@@ -74,6 +74,35 @@ fn a_remote_head_answers_what_the_local_one_would() {
     assert!(!c.state.join("pastor.db").exists());
 }
 
+/// `task describe` through a remote head lists the env of the head's config,
+/// each key with the layer that gave it, not this machine's: this machine has
+/// no config at all.
+#[test]
+fn describe_through_a_remote_head_lists_the_heads_env() {
+    let env = start();
+    let c = client(Some(&env));
+    ok(c.head_set("head-up", &[]));
+    ok(c.cmd(&["task", "run", "hello", "--repo", "/tmp", "--json"]));
+    env.wait_done("t-1");
+    let mut text = std::fs::read_to_string(env.config.join("pastor.toml")).unwrap();
+    text.push_str("[defaults]\nenv = { NOTES_URL = \"http://notes.example:8790\" }\n");
+    std::fs::write(env.config.join("pastor.toml"), text).unwrap();
+
+    let v: serde_json::Value =
+        serde_json::from_str(&ok(c.cmd(&["task", "describe", "t-1", "--json"]))).unwrap();
+    assert_eq!(
+        v["env"]["NOTES_URL"],
+        serde_json::json!({"value": "http://notes.example:8790", "from": "defaults"}),
+        "{v}"
+    );
+    let text = ok(c.cmd(&["task", "describe", "t-1"]));
+    assert!(
+        text.contains("NOTES_URL=http://notes.example:8790 (defaults)"),
+        "{text}"
+    );
+    assert!(!c.config.join("pastor.toml").exists(), "nothing here");
+}
+
 /// With a head set, `pastor events` pages through the head's log with
 /// `EventsSince` and prints what the head's own `pastor events` prints, with
 /// `--json` and `--task` too; `--follow` asks again every second and prints
@@ -447,4 +476,102 @@ fn an_unexpected_head_reply_is_a_json_error() {
             .unwrap_or_else(|e| panic!("{args:?}: {e}: {stderr}"));
         assert_eq!(err["code"], "internal", "{args:?}: {err}");
     }
+}
+
+/// Inside Codex's sandbox every root-owned file shows another owner, and ssh
+/// stops on the system's `ssh_config.d` files with `Bad owner or permissions`,
+/// so an agent's `pastor task done` could not reach its head. The fake ssh
+/// here refuses that way unless it is given `-F`; the request is tried again
+/// with the user's own ssh configuration (or `/dev/null`), which leaves the
+/// system's out, and reaches the head.
+#[test]
+fn a_head_is_reached_from_a_sandbox_ssh_will_not_read_the_system_config_in() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = start();
+    let c = client(Some(&env));
+    let bin = c.tmp.path().join("bin");
+    std::fs::rename(bin.join("ssh"), bin.join("ssh.real")).unwrap();
+    let tries = c.tmp.path().join("tries");
+    let wrapper = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {tries}\n\
+         if [ \"$1\" = -F ]; then shift 2; exec {real} \"$@\"; fi\n\
+         echo 'Bad owner or permissions on /etc/ssh/ssh_config.d/20-systemd-ssh-proxy.conf' >&2\n\
+         exit 255\n",
+        tries = tries.display(),
+        real = bin.join("ssh.real").display()
+    );
+    std::fs::write(bin.join("ssh"), wrapper).unwrap();
+    std::fs::set_permissions(bin.join("ssh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    ok(c.head_set("head-up", &[]));
+    let tries = std::fs::read_to_string(&tries).unwrap();
+    let tries: Vec<&str> = tries.lines().collect();
+    assert_eq!(tries.len(), 2, "{tries:?}: one refusal, one retry");
+    assert!(!tries[0].starts_with("-F"), "{tries:?}");
+    let retry: Vec<&str> = tries[1].split_whitespace().collect();
+    assert!(
+        retry[..2] == ["-F", "/dev/null"] || retry[0] == "-F" && retry[1].ends_with("/.ssh/config"),
+        "{tries:?}"
+    );
+    // No shared master: the state dir is read-only there.
+    assert!(tries[1].contains("ControlPath=none"), "{tries:?}");
+    // And it goes on working: a later request does the same.
+    assert_eq!(ok(c.cmd(&["head", "show"])), "head: head-up (remote)\n");
+}
+
+/// When the user's own ssh configuration is refused too (a symlink into a
+/// root-owned store), the last try reads `/dev/null`, which still reaches a
+/// `user@host` head: three tries, the first two refused.
+#[test]
+fn a_refused_user_ssh_config_falls_back_to_an_empty_one() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = start();
+    let c = client(Some(&env));
+    let bin = c.tmp.path().join("bin");
+    std::fs::rename(bin.join("ssh"), bin.join("ssh.real")).unwrap();
+    let tries = c.tmp.path().join("tries");
+    let wrapper = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$1 $2\" >> {tries}\n\
+         if [ \"$1 $2\" = '-F /dev/null' ]; then shift 2; exec {real} \"$@\"; fi\n\
+         echo 'Bad owner or permissions on /nix/store/x-ssh_config' >&2\n\
+         exit 255\n",
+        tries = tries.display(),
+        real = bin.join("ssh.real").display()
+    );
+    std::fs::write(bin.join("ssh"), wrapper).unwrap();
+    std::fs::set_permissions(bin.join("ssh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let home = c.tmp.path().join("home");
+    std::fs::create_dir_all(home.join(".ssh")).unwrap();
+    std::fs::write(home.join(".ssh/config"), "").unwrap();
+
+    let out = pastor()
+        .args([
+            "head",
+            "set",
+            "head-up",
+            "--pastor",
+            env!("CARGO_BIN_EXE_pastor"),
+        ])
+        .env("PASTOR_CONFIG_DIR", &c.config)
+        .env("PASTOR_STATE_DIR", &c.state)
+        .env("PASTOR_DATA_DIR", &c.data)
+        .env("PATH", &c.path)
+        .env("HOME", &home)
+        .env_remove("PASTOR_HEAD")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let tries = std::fs::read_to_string(&tries).unwrap();
+    let want = format!("-F {}", home.join(".ssh/config").display());
+    let tries: Vec<&str> = tries.lines().collect();
+    assert_eq!(tries.len(), 3, "{tries:?}");
+    assert!(
+        tries[1].starts_with(&want) || tries[1] == "-F /dev/null",
+        "{tries:?}"
+    );
+    assert_eq!(tries[2], "-F /dev/null", "{tries:?}");
 }

@@ -285,6 +285,8 @@ mod tests {
 
     fn row(name: &str, channel: &str) -> MachineRow {
         MachineRow {
+            cordon: None,
+            reserved: 0,
             name: name.into(),
             host: format!("user@{name}"),
             endpoint: String::new(),
@@ -304,7 +306,10 @@ mod tests {
             orphans: Vec::new(),
             now: Vec::new(),
             profile: None,
+            no_head_address: false,
             description: None,
+            harness: vec![],
+            room: None,
         }
     }
 

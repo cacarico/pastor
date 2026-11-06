@@ -26,6 +26,8 @@ Restart=always
 RestartSec=5s
 StandardOutput=journal
 StandardError=journal
+# A build an agent runs, killed for memory, must not stop every other agent.
+OOMPolicy=continue
 
 [Install]
 WantedBy=default.target

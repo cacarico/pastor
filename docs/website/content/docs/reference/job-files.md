@@ -103,6 +103,7 @@ task's flock, its machine or `[defaults]` in
 | `place` | the flock's, `[defaults]` | where a task's pane goes: `repo`, `own`, `pastor` or `pane:<workspace>` |
 | `label` | the flock's, `[defaults]` | the workspace name template |
 | `keep_pane` | the flock's, `[defaults]`, no | `true` keeps each task's pane once it ends, until `pastor task close` |
+| `remove_worktree` | the flock's, `[defaults]`, no | `true` removes each task's worktree when it fails or goes stale too, not only when done |
 | `max_tasks_per_run` | `[defaults]`, 5 | at most this many tasks per run; the rest stay unseen for the next run |
 | `backfill` | `"0s"` | on the first run, the connector's `since` points this far back |
 

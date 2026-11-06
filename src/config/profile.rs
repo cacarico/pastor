@@ -28,6 +28,10 @@ pub struct ProfileDef {
     /// Tool patterns the agent must never use; wins over `allow`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
+    /// What an agy machine under this profile gets in its settings besides
+    /// the lists (`[profiles.<name>.agy]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agy: Option<super::agy::Options>,
 }
 
 /// Where a profile's definition comes from.
@@ -67,6 +71,20 @@ pub struct Profile {
     pub allow: Vec<String>,
     /// Every link's deny, farthest first, once each.
     pub deny: Vec<String>,
+    /// Every link's agy options, a nearer link's key over a farther one's.
+    #[serde(skip_serializing_if = "super::agy::Options::is_empty")]
+    pub agy: super::agy::Options,
+}
+
+impl Profile {
+    /// The profile as agy's settings take it (`provision::agy`).
+    pub fn agy_policy(&self) -> super::agy::Policy {
+        super::agy::Policy {
+            allow: self.allow.clone(),
+            deny: self.deny.clone(),
+            options: self.agy.clone(),
+        }
+    }
 }
 
 /// The code of a profile name no table defines and none is built in.
@@ -112,6 +130,7 @@ pub fn builtin() -> BTreeMap<String, ProfileDef> {
                     &["Edit", "Write", "NotebookEdit", "Bash(git push:*)"],
                     destructive,
                 ]),
+                agy: None,
             },
         ),
         (
@@ -123,6 +142,7 @@ pub fn builtin() -> BTreeMap<String, ProfileDef> {
                 extends: None,
                 allow: list(&[READ_TOOLS, &["Edit", "Write", "NotebookEdit", "Bash"]]),
                 deny: list(&[destructive]),
+                agy: None,
             },
         ),
         (
@@ -142,6 +162,7 @@ pub fn builtin() -> BTreeMap<String, ProfileDef> {
                     ],
                 ]),
                 deny: vec![],
+                agy: None,
             },
         ),
     ])
@@ -224,6 +245,11 @@ impl Profiles {
             }
         }
         allow.retain(|p| !deny.contains(p));
+        let agy = links
+            .iter()
+            .rev()
+            .filter_map(|def| def.agy.as_ref())
+            .fold(super::agy::Options::default(), |far, near| near.over(&far));
         Ok(Profile {
             name: name.to_string(),
             source: *source,
@@ -232,6 +258,7 @@ impl Profiles {
             chain,
             allow,
             deny,
+            agy,
         })
     }
 
@@ -293,6 +320,9 @@ impl Profiles {
             check_profile_name(name)?;
             check_tools(&format!("profiles.{name}.allow"), &def.allow)?;
             check_tools(&format!("profiles.{name}.deny"), &def.deny)?;
+            if let Some(agy) = &def.agy {
+                agy.check(&format!("profiles.{name}.agy"))?;
+            }
             if let Some(d) = &def.description
                 && d.contains(['\n', '\r'])
             {
@@ -418,6 +448,54 @@ mod tests {
         .unwrap();
     }
 
+    /// `[profiles.<name>.agy]` is read, a nearer link's key wins over a
+    /// farther one's, and the resolved profile hands agy's settings its lists
+    /// and options. A word agy does not know fails the load.
+    #[test]
+    fn agy_options_follow_extends_and_are_checked() {
+        let p = profiles(
+            "[base]\nallow = [\"Read\"]\n[base.agy]\nqueued_messages = \"send-immediately\"\n\
+             agent_mode = \"request-review\"\n\
+             [top]\nextends = \"base\"\ndeny = [\"Edit\"]\n[top.agy]\nagent_mode = \"auto\"\n\
+             allow_non_workspace_access = true\n",
+        );
+        p.validate().unwrap();
+        let top = p.resolve("top").unwrap();
+        assert_eq!(top.agy.agent_mode.as_deref(), Some("auto"));
+        assert_eq!(top.agy.queued_messages.as_deref(), Some("send-immediately"));
+        assert_eq!(top.agy.allow_non_workspace_access, Some(true));
+        assert_eq!(top.agy.tool_permission, None);
+        let policy = top.agy_policy();
+        assert_eq!(policy.allow, vec!["Read"]);
+        assert_eq!(policy.deny, vec!["Edit"]);
+        assert_eq!(policy.options, top.agy);
+        assert!(
+            Profiles::default()
+                .resolve("develop")
+                .unwrap()
+                .agy
+                .is_empty()
+        );
+
+        for (text, says) in [
+            (
+                "[a.agy]\ntool_permission = \"yes\"\n",
+                "profiles.a.agy.tool_permission",
+            ),
+            ("[a.agy]\nagent_mode = \"\"\n", "profiles.a.agy.agent_mode"),
+            ("[a.agy]\nqueued_messages = \"later\"\n", "send-immediately"),
+        ] {
+            let err = profiles(text).validate().unwrap_err();
+            assert!(err.contains(says), "{text}: {err}");
+        }
+        assert!(
+            toml::from_str::<Profiles>("[a.agy]\nmodel = \"x\"\n")
+                .unwrap_err()
+                .to_string()
+                .contains("model")
+        );
+    }
+
     #[test]
     fn a_table_overrides_the_builtin_of_its_name() {
         let p = profiles("[review]\nallow = [\"Read\"]\n");
@@ -447,6 +525,8 @@ mod tests {
             ("[A]\n", "profile name"),
             ("[a]\nallow = [\"--yolo\"]\n", "profiles.a.allow"),
             ("[a]\ndeny = [\" \"]\n", "profiles.a.deny"),
+            ("[a]\nallow = [\"mcp__\"]\n", "profiles.a.allow"),
+            ("[a]\ndeny = [\"mcp__nexus(post)\"]\n", "mcp__<server>"),
             ("[a]\ndescription = \"x\\ny\"\n", "one line"),
         ] {
             let err = profiles(text).validate().unwrap_err();

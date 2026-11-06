@@ -90,9 +90,13 @@ Create a one-off task and dispatch it
 | `--worktree` | A git worktree per task, branched from --repo (so it needs --repo) |  |
 | `--branch <BRANCH>` | Branch for the worktree (needs --worktree; a plain workspace has no branch) |  |
 | `--tag <TAGS>` | Only a machine with this tag takes the task; repeat for more, and it needs them all |  |
+| `--load <LOAD>` | The kind of work the task is (`rust`, `light`): only a machine that takes this load in flock.toml places it (default: its agent's `load`, else its repo's under `[repos]`, else none) |  |
 | `--timeout <TIMEOUT>` | Mark the task stale once it has run this long (30m, 2h; default: the flock's, else `[defaults] timeout`) |  |
 | `--label <TEMPLATE>` | Label template of the workspace pastor makes for the task, with {{ task.id }}, {{ flock }}, {{ machine }}, {{ job }} and {{ item.key }} (default: the flock's `label`, else `[defaults] label`, else {{ flock }}/{{ task.id }}). The agent stays t-N |  |
 | `--keep-pane` | Keep the agent's pane open once the task is done, failed or stale, until `pastor task close`, so you can go on talking to the agent; a kept done task holds no slot (default: the flock's `keep_pane`, else `[defaults] keep_pane`, else no) |  |
+| `--remove-worktree` | Remove the task's worktree once it ends, failed or stale too, not only done, as its pane closes; its branch stays, and a dirty checkout is kept with a note (default: the flock's `remove_worktree`, else `[defaults] remove_worktree`, else no) |  |
+| `--no-fetch` | Do not fetch the repo's remote before the task's worktree is made (default: fetch it; a fetch that fails warns, and the worktree is made from the repo as it is) |  |
+| `--workdir-set <SET>` | A workdir set to place in the agent's folder before each start: a JSON or TOML file, a directory with a pastor-workdir.toml, or '-' for stdin. Its profile must be the task's, or none (it takes the task's); a failed place fails the start (workdir_failed) |  |
 | `--place <PLACE>` | Where the agent's pane goes: repo (under the repo it works on), own (its own workspace), pastor (the `pastor` workspace) or pane:&lt;workspace&gt; (default: the flock's, else `[defaults] place`, else repo) |  |
 | `--role <ROLE>` | What the agent may change through the head: agent (read, and end its own task) or orchestrator (also run, retry, send to and close tasks and enable and disable jobs). Only a person may start an orchestrator, never a task (one of `agent`, `orchestrator`) | `agent` |
 | `--summary <MODE>` | Ask the agent for a summary when it finishes (ask), also fail the task if it stops without one (require), or neither (off) (default: the flock's `summary`, else `[defaults] summary`, else ask) (one of `ask`, `require`, `off`) |  |
@@ -184,6 +188,17 @@ Delete old finished tasks; their items stay seen
 | `--older-than <DURATION>` | Only tasks that finished longer ago than this (30m, 12h, 3d) (required) |  |
 | `--json` | Print as a JSON object |  |
 
+### pastor task sweep
+
+List the worktrees pastor kept for tasks that ended, and with --yes remove those with nothing in them to lose
+
+| argument | does | default |
+|---|---|---|
+| `--machine <MACHINE>` | Only this machine's worktrees |  |
+| `--yes` | Remove what can be removed; without it nothing is removed and the worktrees are only listed |  |
+| `--dry-run` | List and remove nothing (this is what no flag does too) |  |
+| `--json` | Print as a JSON object, {entries, failed} |  |
+
 ### pastor task send
 
 Type text or press keys in a live task's agent, to answer what it is waiting on
@@ -207,6 +222,7 @@ Mark a task done, its pane to close after close_done_after; an agent may end its
 | `<TASK>` | A task, like t-12 or 12: the one to end (default: the task this pane runs, from PASTOR_TASK) |  |
 | `--summary <TEXT>` | What you did, its first line the outcome: done, partial, blocked or nothing to do (kept to 2,000 characters) |  |
 | `--summary-file <PATH>` | Read the summary from a file, or - for stdin |  |
+| `--current` | Do the whole end of a task in one step, for the task this pane runs (from PASTOR_TASK): check its worktree, if it has one, has nothing uncommitted, push its branch if it is not pushed yet, send the summary, and print DONE last. A dirty worktree or a failed push leaves the task as it was, with a clear error, instead of ending it |  |
 | `--json` | Print as a JSON object |  |
 
 ## queue
@@ -263,6 +279,19 @@ Add a machine to flock.toml, reached over ssh, locally or by a command
 | `--flock <FLOCK>` | The flock it joins (default: the default flock) |  |
 | `--description <TEXT>` | One line on what the machine is for, for `machine list --wide` |  |
 | `--herdr` | Also save it in herdr's sidebar (runs `herdr machine add`) |  |
+| `--agent-key <FILE>` | The public key its agents reach the head with (a .pub file, or - for stdin): its marked line goes in this host's authorized_keys, run on the head |  |
+| `--dry-run` | Change nothing: say what would be added, and the authorized_keys line with --agent-key |  |
+| `--bootstrap` | Set the machine up over ssh from the head, as its login user, after adding it: pin its host key, copy pastor and herdr, run pastor bootstrap there (needs a running head and head_address) |  |
+| `--host-key <KEY>` | With --bootstrap: the host key the machine must offer, as a SHA256: fingerprint or an ssh-ed25519 key; unset, the key is trusted the first time it is seen |  |
+
+### pastor machine bootstrap
+
+Set an ssh machine up from the head, as its login user, or finish a setup that stopped; pins its host key on first use and never replaces it
+
+| argument | does | default |
+|---|---|---|
+| `<NAME>` | The machine, as flock.toml names it |  |
+| `--host-key <KEY>` | The host key the machine must offer, as a SHA256: fingerprint or an ssh-ed25519 key |  |
 
 ### pastor machine remove
 
@@ -272,6 +301,7 @@ Remove a machine from flock.toml; tasks already on it keep their rows
 |---|---|---|
 | `<NAME>` | The machine, as flock.toml names it |  |
 | `--herdr` | Also remove herdr's saved machine with this label |  |
+| `--dry-run` | Change nothing: list what would go (its flock.toml entry, its marked authorized_keys lines, its known_hosts entry, its bootstrap state) |  |
 
 ### pastor machine move
 
@@ -281,6 +311,23 @@ Take a machine out of every flock and put it in this one; tasks already on it st
 |---|---|---|
 | `<NAME>` | The machine, as flock.toml names it |  |
 | `<FLOCK>` | The flock it moves to |  |
+
+### pastor machine cordon
+
+Take no new task on a machine until it is uncordoned; the tasks it runs go on
+
+| argument | does | default |
+|---|---|---|
+| `<NAME>` | The machine, as flock.toml names it |  |
+| `--reason <TEXT>` | Why, one line; `machine list` and `machine describe` show it |  |
+
+### pastor machine uncordon
+
+Let a cordoned machine take tasks again, and place what waited for it
+
+| argument | does | default |
+|---|---|---|
+| `<NAME>` | The machine, as flock.toml names it |  |
 
 ### pastor machine list
 
@@ -301,6 +348,28 @@ One machine in full: host, flock, channel, versions, agents, recent errors
 | `<NAME>` | The machine, as flock.toml names it |  |
 | `--json` | Print as a JSON object |  |
 
+### pastor machine check
+
+Run a machine's provisioner's checks there and say what it is missing for the agents that can land on it; changes nothing, and exits 1 if a check failed
+
+| argument | does | default |
+|---|---|---|
+| `<NAME>` | The machine, as flock.toml names it |  |
+| `--provisioner <ID>` | Use this provisioner instead of the machine's own or the first that fits it |  |
+| `--json` | Print as a JSON object, {machine, provisioner, version, agents, rows} |  |
+
+### pastor machine install
+
+Install or update each harness the machine's flock pins, and herdr when pastor.toml pins it, to the pinned version, as the machine's user; exits 1 if one could not be
+
+| argument | does | default |
+|---|---|---|
+| `<NAME>` | The machine, as flock.toml names it |  |
+| `--agent <AGENT>` | Only the harness this agent runs |  |
+| `--kind <KIND>` | Only this kind of harness, such as claude, or herdr |  |
+| `--dry-run` | Say what would change, and change nothing |  |
+| `--json` | Print as a JSON object, {machine, dry_run, rows} |  |
+
 ### pastor machine open
 
 Open the full herdr UI on a machine
@@ -311,12 +380,15 @@ Open the full herdr UI on a machine
 
 ### pastor machine authorized-key
 
-Print the authorized_keys line that lets a machine's agents reach this head
+Print the authorized_keys line that lets a machine's agents reach this head; with --write, put it there on its marked line
 
 | argument | does | default |
 |---|---|---|
 | `<NAME>` | The machine, as flock.toml names it |  |
 | `--key <FILE>` | The public key of the machine's user: a .pub file, or - for stdin (required) |  |
+| `--shepherd` | The line for the machine's shepherd instead of its agents': `bridge --shepherd`, for a pull machine's own key |  |
+| `--write` | Write the machine's marked line in this host's authorized_keys, replacing the one it had; run on the head |  |
+| `--dry-run` | With --write: print the line and the file, and change nothing |  |
 
 ## flock
 
@@ -350,7 +422,7 @@ Put a machine in a flock, or change its number there; it stays in its other floc
 |---|---|---|
 | `<FLOCK>` | The flock |  |
 | `<MACHINE>` | The machine, as flock.toml names it |  |
-| `--max <N>` | At most this many of the flock's tasks on the machine (default: its max_agents, or its number there already) |  |
+| `--max <N>` | At most this many of the flock's tasks on the machine; 0 drains it (default: its max_agents, or its number there already) |  |
 
 ### pastor flock leave
 
@@ -615,6 +687,30 @@ The agent goes to ~/Library/LaunchAgents. With no action flag it is installed, e
 | `--stop` | Stop the agent now |  |
 | `-y, --yes` | Skip the confirmation prompt; needed when stdin is not a terminal (a script, a task, `ssh host pastor setup launchd`) |  |
 
+## bootstrap
+
+Set this machine up for a flock, as the login user: keys, client.toml, services, harnesses
+
+| argument | does | default |
+|---|---|---|
+| `--name <NAME>` | The machine's name in the head's flock.toml (the hostname when unset) |  |
+| `--head-key <PUBKEY>` | The head's public key line, for this user's authorized_keys |  |
+| `--json` | Print as a JSON object: isolation, each step, the public keys and versions, the check |  |
+
+## fleet
+
+The fleet as a whole: pastor updates
+
+### pastor fleet update
+
+Put pastor &lt;version&gt; from the head's artifact cache on every machine the head reaches, the head last
+
+| argument | does | default |
+|---|---|---|
+| `--machine <MACHINE>` | Only this machine, as flock.toml names it |  |
+| `--dry-run` | Look at every machine and say what would be updated; change nothing |  |
+| `--json` | Print as a JSON object: version, ok, and per machine its status, the version it ran, its live tasks and why |  |
+
 ## connector
 
 Install, link, list and try out connectors
@@ -682,6 +778,121 @@ Try a connector: run its command once for a job and print its items; creates no 
 | `--job <JOB>` | The job whose [connector] config to use; need not exist yet |  |
 | `--since <SINCE>` | How far back `since` points (default: the job's backfill, or 0s) |  |
 
+## bundle
+
+Bundles of skills, settings, MCP servers and instructions for agents' homes
+
+### pastor bundle add
+
+Add a bundle from a directory, or from a git ref: validate it, refuse secrets, and keep it as a new version when its content changed
+
+| argument | does | default |
+|---|---|---|
+| `<DIR>` | The bundle's directory, with its pastor-bundle.toml |  |
+| `--git <GIT>` | A git repository to fetch the bundle from, with --ref |  |
+| `--ref <GIT_REF>` | The branch, tag or commit to fetch; the commit it names is recorded |  |
+| `--path <PATH>` | The bundle's directory inside the repository |  |
+| `--json` | Print as a JSON object |  |
+
+### pastor bundle list
+
+List bundles: version, content hash, versions kept, the flocks naming each
+
+| argument | does | default |
+|---|---|---|
+| `--json` | Print as a JSON array |  |
+
+### pastor bundle show
+
+One bundle in full: what it carries, who names it, the versions kept
+
+| argument | does | default |
+|---|---|---|
+| `<ID>` | The bundle's id, as `bundle list` shows it |  |
+| `--json` | Print as a JSON object |  |
+
+### pastor bundle remove
+
+Remove a bundle and its versions; refused while flock.toml or a job names it
+
+| argument | does | default |
+|---|---|---|
+| `<ID>` | The bundle's id, as `bundle list` shows it |  |
+| `--json` | Print as a JSON object |  |
+
+### pastor bundle apply
+
+Place a machine's bundles in its agents' homes: skills, hooks, bin files and instruction blocks, and take out what it no longer gets
+
+| argument | does | default |
+|---|---|---|
+| `<MACHINE>` | The machine; unset, every machine reached by ssh or locally |  |
+| `--dry-run` | Say what would change, and change nothing |  |
+| `--json` | Print as a JSON array, one object per machine |  |
+
+### pastor bundle adopt
+
+Take over the homes of a machine's agents in one step: back up what it touches, make linked files and dirs plain copies, and apply its bundles with the bundle's value winning over the user's
+
+| argument | does | default |
+|---|---|---|
+| `<MACHINE>` | The machine |  |
+| `--agent <AGENT>` | Only the home of this agent; unset, every home on the machine |  |
+| `--dry-run` | List what would be replaced, and change nothing |  |
+| `--json` | Print as a JSON object |  |
+
+## workdir
+
+Sets of files placed in an agent's working directory before it starts
+
+### pastor workdir place
+
+Place a set of files in an agent's working directory before it starts, and take out what an earlier version of the set placed that this one no longer has
+
+| argument | does | default |
+|---|---|---|
+| `--local` | Place it in a directory on this machine, without the head |  |
+| `<[MACHINE] DIR>` | The machine, then the working directory on it as an absolute path; with --local, the directory alone |  |
+| `--set <SET>` | The set: a JSON or TOML file, a directory with a pastor-workdir.toml, or - for stdin |  |
+| `--bundle <BUNDLE>` | A stored workdir bundle in place of a set: the head builds its set for --kind from the newest version kept, with the vars of the machine's flock that names it |  |
+| `--kind <KIND>` | With --bundle: the kind of agent that starts in the directory |  |
+| `--machine <MACHINE>` | With --local: this machine's name in the flock, for a set that names a profile: settled as for a task on it, so `unrestricted` goes only where the machine's own profile is. Left out, the rules that look at the machine are not checked. It also names the machine in the report sent to a remote head; left out there, `[shepherd] machine` of pastor.toml, else the hostname |  |
+| `--dry-run` | Say what would change, and change nothing |  |
+| `--json` | Print as a JSON object |  |
+
+### pastor workdir remove
+
+Take out what pastor placed in a working directory, as long as it still holds what pastor wrote
+
+| argument | does | default |
+|---|---|---|
+| `--local` | Remove it from a directory on this machine, without the head |  |
+| `<[MACHINE] DIR>` | The machine, then the working directory on it, which may be gone already; with --local, the directory alone |  |
+| `--id <ID>` | Only this set; unset, every set placed there |  |
+| `--machine <MACHINE>` | With --local: this machine's name in the flock, for the report sent to a remote head. Left out, `[shepherd] machine` of pastor.toml, else the hostname |  |
+| `--dry-run` | Say what would change, and change nothing |  |
+| `--json` | Print as a JSON object |  |
+
+### pastor workdir check
+
+Say whether a directory still holds the sets the head placed in it: each read on the machine and placed again as a dry run, with its state; ok only when nothing would change
+
+| argument | does | default |
+|---|---|---|
+| `<MACHINE>` | The machine the directory is on |  |
+| `<DIR>` | The working directory on the machine, as an absolute path |  |
+| `--id <ID>` | Only this set; unset, every set the head placed there |  |
+| `--json` | Print as a JSON array, one object per set |  |
+
+### pastor workdir list
+
+The directories the head placed sets in, from its record
+
+| argument | does | default |
+|---|---|---|
+| `<MACHINE>` | Only this machine's |  |
+| `--json` | Print as a JSON array |  |
+
 ## profile
 
 Permission profiles: named tool allow and deny lists, built in and from pastor.toml
@@ -703,13 +914,24 @@ One profile with its extends followed: the allow and deny lists it adds up to
 | `<PROFILE>` | The profile's name, as `profile list` shows it |  |
 | `--json` | Print as a JSON object |  |
 
+### pastor profile render
+
+What a profile becomes for claude or agy: its flags, env and settings, and what it cannot carry
+
+| argument | does | default |
+|---|---|---|
+| `<PROFILE>` | The profile's name; with --machine, left out for the machine's own |  |
+| `--kind <KIND>` | The kind of agent to render for (one of `claude`, `agy`, `opencode`, `codex`) (required) |  |
+| `--machine <MACHINE>` | Settle the profile as for a task on this machine: `unrestricted` only where the machine's own profile is, and no name means the machine's own |  |
+| `--json` | Print as a JSON object |  |
+
 ## limit
 
 The accounts that ran out of usage, which no new task starts on until they reset
 
 ### pastor limit list
 
-Every exhausted account: its model, when it is tried again, what ran out, who saw it
+Every exhausted account and signed-out agent: its model, when it is tried again, what ran out, who saw it
 
 | argument | does | default |
 |---|---|---|
@@ -717,12 +939,62 @@ Every exhausted account: its model, when it is tried again, what ran out, who sa
 
 ### pastor limit clear
 
-Forget an account's limit, so queued and waiting tasks start on it on the next pass
+Forget an account's limit or signed-out mark, so queued and waiting tasks start on it on the next pass
 
 | argument | does | default |
 |---|---|---|
 | `<ACCOUNT>` | The account, as `limit list` shows it: an agent's `account`, or `<machine>/<agent>` |  |
 | `--model <MODEL>` | Clear only this model's limit, not the whole account's |  |
+
+## agent
+
+Agents on machines: check that one is signed in
+
+### pastor agent signed-in
+
+Run an agent's login check on a machine; when it passes, clear the agent's signed-out mark there
+
+| argument | does | default |
+|---|---|---|
+| `<AGENT>` | The agent, as tasks name it (`claude`, or an `[agents.<name>]`) |  |
+| `--machine <MACHINE>` | The machine to check it on (required) |  |
+
+## login
+
+Sign an agent in on a machine: open its login in a pane there, show the URL and code, and clear its signed-out mark once it passes
+
+| argument | does | default |
+|---|---|---|
+| `<MACHINE>` | The machine to sign the agent in on |  |
+| `<AGENT>` | The agent, as tasks name it (`claude`, or an `[agents.<name>]`) |  |
+| `--json` | Print as a JSON object: `pending`, the login started (machine, agent, pane, url, code, paste, started; null when the agent was signed in already), and `cleared`, the marks that cleared |  |
+
+### pastor login list
+
+Every login the head is watching: machine, agent, the URL and code to sign in with
+
+| argument | does | default |
+|---|---|---|
+| `--json` | Print as a JSON array |  |
+
+### pastor login code
+
+Type the code the browser gave back into a pending login's pane, then Enter
+
+| argument | does | default |
+|---|---|---|
+| `<MACHINE>` | The machine of the pending login |  |
+| `<AGENT>` | The agent of the pending login |  |
+| `<CODE>` | The code; read from stdin when left out, so it stays out of the shell's history |  |
+
+### pastor login cancel
+
+Close a pending login's pane; the agent stays signed out
+
+| argument | does | default |
+|---|---|---|
+| `<MACHINE>` | The machine of the pending login |  |
+| `<AGENT>` | The agent of the pending login |  |
 
 ## trust
 
@@ -754,6 +1026,45 @@ Forget a saved trust; the repo's next task asks again
 | `<MACHINE>` | The machine, as flock.toml names it |  |
 | `<REPO>` | The repo's path on that machine, as `trust list` shows it |  |
 
+## join
+
+Join a head with a one-time token as a pull machine, or make and list the tokens on the head
+
+| argument | does | default |
+|---|---|---|
+| `--name <NAME>` | This machine's name in the head's flock.toml (the hostname when unset) |  |
+| `--token-stdin` | Read the token from stdin; else from PASTOR_JOIN_TOKEN, else it is asked for on the terminal |  |
+| `--skip-bootstrap` | Join and name the serve only, for a machine set up beforehand: no herdr is fetched and no service installed |  |
+| `--json` | Print as a JSON object: the bootstrap report |  |
+
+### pastor join create
+
+Make a one-time token a new machine joins the fleet with, as a pull machine; prints the token
+
+| argument | does | default |
+|---|---|---|
+| `--flock <FLOCK>` | The flock the machine joins (default: the default flock) |  |
+| `--tag <TAGS>` | A tag the machine gets; repeat for more |  |
+| `--replace <REPLACE>` | The one machine name already in flock.toml the token may take over, and the only name it joins as |  |
+| `--ttl <TTL>` | How long the token works, like 30m or 1h | `1h` |
+| `--json` | Print as a JSON object: the id, the token and its expiry |  |
+
+### pastor join list
+
+The join tokens the head knows: id, flock, tags, what it replaces, expiry, when used
+
+| argument | does | default |
+|---|---|---|
+| `--json` | Print as a JSON array |  |
+
+### pastor join revoke
+
+Remove a join token's key from authorized_keys and forget it
+
+| argument | does | default |
+|---|---|---|
+| `<ID>` | The token's id, as `join list` shows it |  |
+
 ## bridge
 
 Pass request lines from stdin to this machine's head; for a remote CLI over ssh
@@ -761,7 +1072,25 @@ Pass request lines from stdin to this machine's head; for a remote CLI over ssh
 | argument | does | default |
 |---|---|---|
 | `--agent` | Pass on only what an agent on --machine may ask: its machine's tasks |  |
-| `--machine <MACHINE>` | The machine whose agents this bridge serves, as flock.toml names it |  |
+| `--shepherd` | Pass on only what the shepherd of pull machine --machine may ask: its own claims, reports, trust, jobs and events |  |
+| `--machine <MACHINE>` | The machine this bridge serves (needs --agent or --shepherd), as flock.toml names it |  |
+| `--gen <N>` | The enrollment of --machine this shepherd's key belongs to; every request is refused once the head moves past it (needs --shepherd) |  |
+| `--join <ID>` | Take one join request for join token ID, and nothing else: the way in for a machine that joins with it |  |
+
+## inbox
+
+Talk to a Claude session's inbox socket on this machine
+
+### pastor inbox send
+
+Send the text on stdin to a Claude session's inbox socket and print one JSON line: the result (accepted, held, denied, expired, refused, dropped or no-session), a detail and the message id; exits 0 only for accepted
+
+| argument | does | default |
+|---|---|---|
+| `--config-dir <CONFIG_DIR>` | Claude's config directory on this machine; default $CLAUDE_CONFIG_DIR, else ~/.claude |  |
+| `--session <SESSION>` | The session's id, as `sessionId` in its registry record (required) |  |
+| `--mode <MODE>` | The permission class the session was launched with; a bypassing session holds every message that does not say bypass (one of `prompting`, `bypass`) (required) |  |
+| `--wait <WAIT>` | Seconds to listen for a receipt; Claude sends none for an accepted message, so this is also how long an accepted send takes | `3` |
 
 ## head
 
@@ -788,3 +1117,11 @@ Print the head this CLI uses
 ### pastor head unset
 
 Use the head on this machine again
+
+## leave
+
+Take from this host what pastor put there for itself: its marked authorized_keys lines and its own key files in the state directory, nothing else
+
+| argument | does | default |
+|---|---|---|
+| `--dry-run` | Change nothing: list what would go |  |

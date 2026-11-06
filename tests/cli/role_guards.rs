@@ -15,7 +15,7 @@ fn an_agent_pastor_started_is_refused_a_task_run() {
     assert_eq!(error_code(&out), "agent_refused");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("t-3"), "{err}");
-    assert!(err.contains("agents_change_fleet"), "{err}");
+    assert!(!err.contains("agents_change_fleet"), "{err}");
     let out = pastor()
         .args(["task", "list", "--json"])
         .env("PASTOR_CONFIG_DIR", &env.config)
@@ -25,6 +25,40 @@ fn an_agent_pastor_started_is_refused_a_task_run() {
         .unwrap();
     let tasks: serde_json::Value = serde_json::from_slice(&ok(out).into_bytes()).unwrap();
     assert_eq!(tasks, serde_json::json!([]), "nothing was queued");
+}
+
+/// `pastor task done` from a task's pane takes no `--head` flag and no
+/// `--summary-file`, but the head `PASTOR_HEAD` names is the task's own: how
+/// a task on another machine reaches it. The guard must not read that head
+/// as a flag. (The head here does not resolve, so a command past the guard
+/// fails later, with another error.)
+#[test]
+fn a_task_may_end_itself_through_its_pastor_head_but_not_a_head_flag() {
+    let env = start();
+    let head = "nobody@pastor-test-head.invalid";
+    let as_task = |args: &[&str], with_env: bool| {
+        let mut cmd = pastor();
+        cmd.args(args)
+            .env("PASTOR_CONFIG_DIR", &env.config)
+            .env("PASTOR_STATE_DIR", &env.state)
+            .env("PASTOR_TASK", "t-1")
+            .env_remove("PASTOR_HEAD");
+        if with_env {
+            cmd.env("PASTOR_HEAD", head);
+        }
+        cmd.output().unwrap()
+    };
+    let done = ["task", "done", "--summary", "done: x"];
+    let code = |out: &std::process::Output| error_code(out);
+    assert_ne!(code(&as_task(&done, true)), "agent_refused");
+    let flagged = ["--head", head, "task", "done", "--summary", "done: x"];
+    assert_eq!(code(&as_task(&flagged, false)), "agent_refused");
+    assert_eq!(code(&as_task(&flagged, true)), "agent_refused");
+    for file in ["-", "notes.txt"] {
+        let args = ["task", "done", "--summary-file", file];
+        assert_eq!(code(&as_task(&args, true)), "agent_refused", "{file}");
+        assert_eq!(code(&as_task(&args, false)), "agent_refused", "{file}");
+    }
 }
 
 /// An agent may end its own task, `pastor task done` from its pane, and
@@ -211,8 +245,9 @@ fn a_pre_scripts_pastor_calls_get_the_orchestrator_role() {
 }
 
 /// Machine, flock and job edits need no head, so the CLI refuses them
-/// itself, and leaves flock.toml as it was; `agents_change_fleet = true`
-/// turns that off.
+/// itself, and leaves flock.toml as it was. A pastor.toml that sets the
+/// removed `agents_change_fleet = true` does not turn that off: it does not
+/// load.
 #[test]
 fn an_agent_pastor_started_may_not_edit_the_flock() {
     let tmp = tempfile::tempdir().unwrap();
@@ -258,21 +293,35 @@ fn an_agent_pastor_started_may_not_edit_the_flock() {
         std::fs::read_to_string(config.join("flock.toml")).unwrap(),
         before
     );
-    // pastor.toml holds agents_change_fleet, so editing it is refused too.
+    // pastor.toml sets the head's address and more, so editing it is refused too.
     assert_eq!(error_code(&run(&["config", "edit"])), "agent_refused");
     ok(run(&["flock", "list"]));
     ok(run(&["flock", "describe", "default"]));
     ok(run(&["machine", "describe", "pi-1"]));
     ok(run(&["connector", "list"]));
 
+    // The removed setting does not lift the guard: a file that still says
+    // `true` is refused by name, and one that says `false` changes nothing.
     std::fs::write(config.join("pastor.toml"), "agents_change_fleet = true\n").unwrap();
-    ok(run(&["flock", "add", "work"]));
+    let out = pastor()
+        .args(["profile", "list"])
+        .env("PASTOR_CONFIG_DIR", &config)
+        .env("PASTOR_STATE_DIR", &state)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("agents_change_fleet was removed"),
+        "{out:?}"
+    );
+    std::fs::write(config.join("pastor.toml"), "agents_change_fleet = false\n").unwrap();
+    assert_eq!(error_code(&run(&["flock", "add", "work"])), "agent_refused");
 }
 
 /// `job enable|disable` on a shepherd's own job (`local_job`) never reaches
 /// the head, so a task caller is refused there too: the head is the only
 /// place that knows a task's role, and this machine's shepherd keeps no
-/// task store to check it. `agents_change_fleet` still lets it through.
+/// task store to check it.
 #[test]
 fn an_agent_task_may_not_toggle_this_machine_s_own_job() {
     let env = start_with_jobs(&[("nightly", NIGHTLY)]);
@@ -306,8 +355,4 @@ fn an_agent_task_may_not_toggle_this_machine_s_own_job() {
         SWEEP,
         "an agent's refused enable/disable must not touch the file"
     );
-
-    std::fs::write(c.config.join("pastor.toml"), "agents_change_fleet = true\n").unwrap();
-    let text = ok(as_agent(&["job", "enable", "sweep"]));
-    assert!(text.contains("enabled sweep"), "{text}");
 }

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::flock::{DEFAULT_FLOCK, Flock, FlockNumber};
 use crate::ipc::{Client, IpcRequest, IpcResponse, RequestError, connect_error_means_no_daemon};
-use crate::machine::MachineStatus;
+use crate::machine::{MachineStatus, Room};
 use crate::scheduler::{JobRunReport, JobStatus};
 use crate::task::Task;
 
@@ -306,6 +306,12 @@ pub fn task_detail(t: &Task) -> String {
 /// `task_detail` with `summaries` in place of the last round's: `task
 /// describe --all-summaries` passes every round's.
 pub fn task_detail_with(t: &Task, summaries: &[crate::task::TaskSummary]) -> String {
+    task_detail_env(t, summaries, &TaskEnv::None)
+}
+
+/// `task_detail_with`, and the env the task's agent gets (`task_env`) as an
+/// `env` row; none, no row.
+pub fn task_detail_env(t: &Task, summaries: &[crate::task::TaskSummary], env: &TaskEnv) -> String {
     let opt = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".into());
     let when = |v: Option<chrono::DateTime<Utc>>| {
         v.map(|at| format!("{} ({} ago)", at.format("%Y-%m-%d %H:%M:%S UTC"), age(at)))
@@ -397,6 +403,11 @@ pub fn task_detail_with(t: &Task, summaries: &[crate::task::TaskSummary]) -> Str
         ("fallback", fallback),
         ("profile", profile),
         ("agent args", args),
+    ];
+    if !env.is_empty() {
+        fields.push(("env", shown_env(env)));
+    }
+    fields.extend([
         ("allow", unapplied(list(&t.spec.allow))),
         ("deny", unapplied(list(&t.spec.deny))),
         ("repo", repo),
@@ -418,6 +429,62 @@ pub fn task_detail_with(t: &Task, summaries: &[crate::task::TaskSummary]) -> Str
             ),
         ),
         ("tags", tags),
+    ]);
+    if let Some(load) = &t.spec.load {
+        fields.push(("load", format!("{load}{}", from(t.spec.load_from.as_ref()))));
+    }
+    if let Some(w) = &t.spec.workdir {
+        let word = |key: &str| w.set.get(key).and_then(|v| v.as_str()).unwrap_or("?");
+        let placed = match &w.placed_in {
+            Some(dir) => format!(", placed in {dir}"),
+            None => String::new(),
+        };
+        fields.push((
+            "workdir set",
+            format!("{} ({}){placed}", word("id"), word("kind")),
+        ));
+    }
+    if !t.spec.workdir_bundles.is_empty() {
+        let ids: Vec<String> = t
+            .spec
+            .workdir_bundles
+            .iter()
+            .map(|b| match &b.from {
+                Some(from) => format!("{} ({from})", b.id),
+                None => b.id.clone(),
+            })
+            .collect();
+        let skipped = match t
+            .spec
+            .workdir_bundles
+            .iter()
+            .find_map(|b| b.skipped.as_deref())
+        {
+            Some(why) => format!("; not placed: {why}"),
+            None => String::new(),
+        };
+        fields.push(("workdir bundles", format!("{}{skipped}", ids.join(", "))));
+    }
+    // What auto-close does with a worktree task's checkout.
+    if t.spec.worktree {
+        let what = if t.spec.keeps_pane() {
+            "kept with the pane"
+        } else if t.spec.removes_worktree() {
+            "removed when the task ends, failed or stale too"
+        } else {
+            "removed when the task is done; kept when it fails"
+        };
+        fields.push((
+            "worktree",
+            format!("{what}{}", from(t.spec.remove_worktree_from.as_ref())),
+        ));
+        if t.spec.fetch.skip {
+            fields.push(("fetch", "skipped (--no-fetch)".into()));
+        } else if let Some(why) = &t.spec.fetch.warning {
+            fields.push(("fetch", format!("warning: {why}")));
+        }
+    }
+    fields.extend([
         (
             "timeout",
             format!(
@@ -431,7 +498,7 @@ pub fn task_detail_with(t: &Task, summaries: &[crate::task::TaskSummary]) -> Str
         ("created", when(Some(t.created_at))),
         ("started", when(t.started_at)),
         ("finished", when(t.finished_at)),
-    ];
+    ]);
     if let Some(at) = t.pause.paused_at {
         let by = t
             .pause
@@ -636,6 +703,24 @@ pub fn request_error(err: &RequestError) -> CliError {
     }
 }
 
+/// `err` as a task pane (`task`, from `PASTOR_TASK`) with no remote head
+/// should read it. An agent on an `ssh` machine learns where the head is only
+/// from `PASTOR_HEAD`, which the head sets from `head_address`. Without it
+/// the CLI tries a local socket nobody serves, and "start it with `pastor
+/// serve`" is the wrong fix: agents may not run serve, and a second head on
+/// that machine would not own the task. So the error names the setting.
+pub fn in_task_pane(err: CliError, task: Option<&str>, remote: bool) -> CliError {
+    match task {
+        Some(task) if !remote && err.code == "daemon_not_running" => CliError {
+            code: "head_unknown".into(),
+            message: format!(
+                "task {task} cannot reach the head: no PASTOR_HEAD in this pane and no pastor serve on this machine; on a machine other than the head, set head_address in the head's pastor.toml so its panes are told where it is"
+            ),
+        },
+        _ => err,
+    }
+}
+
 /// What `request_head` got, as the CLI takes it: a reply, or a `CliError`
 /// for an error reply or for no reply at all (`request_error`).
 pub fn reply(got: Result<IpcResponse, RequestError>) -> Result<IpcResponse, CliError> {
@@ -657,6 +742,125 @@ pub async fn ask(client: &Client, req: IpcRequest) -> Result<IpcResponse, CliErr
 /// another version: an error with code `internal`, never a panic.
 pub fn unexpected(resp: IpcResponse) -> anyhow::Error {
     CliError::err("internal", format!("unexpected daemon reply: {resp:?}"))
+}
+
+/// The env a task's agent gets from the config, for `task describe`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum TaskEnv {
+    /// Each key with its value and the layer that gave it: `defaults`,
+    /// `flock <name>`, `machine <name>` or `agent <name>`.
+    Layers(std::collections::BTreeMap<String, (String, String)>),
+    /// The task runs on a pull machine, whose own `pastor serve` applies the
+    /// layers of its own config; the head cannot say what they are.
+    PullMachine,
+    #[default]
+    None,
+}
+
+impl TaskEnv {
+    pub fn is_empty(&self) -> bool {
+        matches!(self, TaskEnv::None) || matches!(self, TaskEnv::Layers(l) if l.is_empty())
+    }
+}
+
+/// The env the agent of task `t` gets from the config as `config` and
+/// `flock` (the head's) read now: `[defaults]`, the task's flock, its
+/// machine, then the agent's own `env`, each over the one before
+/// (`config::EnvLayers`, `Agents::env_over`), with where each key came
+/// from. What pastor sets itself (the renderer for Claude, the task mark)
+/// is not config and not listed. A task on a pull machine gets the layers
+/// of that machine's own config, which are not known here: `PullMachine`.
+pub fn task_env(config: &crate::config::PastorConfig, flock: &Flock, t: &Task) -> TaskEnv {
+    let machine = t.machine.as_deref().and_then(|name| flock.get(name));
+    if machine.is_some_and(|m| m.pull) {
+        return TaskEnv::PullMachine;
+    }
+    let layers = match machine {
+        Some(m) => crate::config::EnvLayers::of(&config.defaults, flock, m),
+        None => crate::config::EnvLayers {
+            defaults: config.defaults.env.clone(),
+            flocks: t
+                .flock
+                .as_deref()
+                .and_then(|f| flock.entry(f))
+                .filter(|f| !f.env.is_empty())
+                .map(|f| (f.name.clone(), f.env.clone()))
+                .into_iter()
+                .collect(),
+            machine: Default::default(),
+        },
+    };
+    let mut env = layers.merged_from(t.flock.as_deref(), t.machine.as_deref().unwrap_or(""));
+    if let Some(def) = config.agents.0.get(&t.spec.agent) {
+        for (k, v) in &def.env {
+            env.insert(k.clone(), (v.clone(), format!("agent {}", t.spec.agent)));
+        }
+    }
+    TaskEnv::Layers(env)
+}
+
+/// The env layers below the agent's own that a dispatch of `t` gave its
+/// pane (`[defaults]`, the task's flock, its machine), per the head's
+/// `config` and `flock`: what `task attach` puts in the pane it reopens. A
+/// task on a pull machine, or on none, gets none: its own serve's config
+/// decides, and is not known here.
+pub fn dispatch_env(
+    config: &crate::config::PastorConfig,
+    flock: &Flock,
+    t: &Task,
+) -> std::collections::BTreeMap<String, String> {
+    match t.machine.as_deref().and_then(|name| flock.get(name)) {
+        Some(m) if !m.pull => {
+            crate::config::EnvLayers::of(&config.defaults, flock, m).merged(t.flock.as_deref())
+        }
+        _ => Default::default(),
+    }
+}
+
+/// What `task describe` says of an agent's env: `KEY=value (layer)`, comma
+/// separated, the value of a key that looks like a secret (or one that holds
+/// what looks like one) hidden.
+pub fn shown_env(env: &TaskEnv) -> String {
+    match env {
+        TaskEnv::Layers(env) => env
+            .iter()
+            .map(|(k, (v, from))| format!("{k}={} ({from})", shown_env_value(k, v)))
+            .collect::<Vec<_>>()
+            .join(", "),
+        TaskEnv::PullMachine => {
+            "set by the pull machine's own config, which this head does not know".into()
+        }
+        TaskEnv::None => String::new(),
+    }
+}
+
+/// `env` in `task describe --json`: each key with its shown value and the
+/// layer that gave it; nothing for a pull machine's task or no env.
+pub fn env_json(env: &TaskEnv) -> Option<serde_json::Value> {
+    let TaskEnv::Layers(env) = env else {
+        return None;
+    };
+    (!env.is_empty()).then(|| {
+        env.iter()
+            .map(|(k, (v, from))| {
+                (
+                    k.clone(),
+                    serde_json::json!({"value": shown_env_value(k, v), "from": from}),
+                )
+            })
+            .collect()
+    })
+}
+
+/// The value of env variable `key` as it may be shown.
+pub fn shown_env_value(key: &str, value: &str) -> String {
+    if crate::bundle::secrets::env_name_looks_secret(key)
+        || crate::bundle::secrets::env_finding(key, value).is_some()
+    {
+        "(hidden)".into()
+    } else {
+        value.to_string()
+    }
 }
 
 /// One task, as `task show` prints it: JSON, or a one-row table.
@@ -914,6 +1118,10 @@ pub struct MachineRow {
     pub job_slots: u32,
     #[serde(default)]
     pub burst: u32,
+    /// `MachineConfig::reserved`, the slots kept free of pastor's own
+    /// tasks. Defaulted so a CLI can still read a head that predates it.
+    #[serde(default)]
+    pub reserved: u32,
     pub tags: Vec<String>,
     /// `MachineStatus::orphans`; a probe works them out itself from
     /// `agent.list` and the store, and leaves them empty when it cannot.
@@ -928,9 +1136,52 @@ pub struct MachineRow {
     /// Its `description` in flock.toml.
     #[serde(default)]
     pub description: Option<String>,
+    /// `MachineStatus::no_head_address`: its agents cannot run `pastor task
+    /// done`. A probe works it out from this machine's pastor.toml.
+    #[serde(default)]
+    pub no_head_address: bool,
+    /// `MachineStatus::harness`: the harness versions the machine's pins
+    /// name, with whether each drifts. A probe leaves it empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub harness: Vec<crate::harness::HarnessStatus>,
+    /// `MachineStatus::room`: what the machine had free, last read.
+    /// `None` from a probe, which does not read it, and from a head that
+    /// predates the field.
+    #[serde(default)]
+    pub room: Option<Room>,
+    /// `MachineStatus::cordon`: an operator cordoned it. `None` from a
+    /// probe, and from a head that predates cordons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cordon: Option<crate::store::Cordon>,
 }
 
+/// What `machine list` and `machine describe` say of a machine whose
+/// agents cannot reach the head (`MachineRow::no_head_address`).
+pub const CUT_OFF: &str = "no head_address: its agents cannot run pastor task done";
+
 impl MachineRow {
+    /// The ERROR column and `describe`'s error line: the machine's error,
+    /// then `CUT_OFF` when its agents cannot reach the head.
+    pub fn problems(&self) -> Option<String> {
+        let parts: Vec<&str> = self
+            .error
+            .as_deref()
+            .into_iter()
+            .chain(self.no_head_address.then_some(CUT_OFF))
+            .collect();
+        (!parts.is_empty()).then(|| parts.join("; "))
+    }
+
+    /// `cordoned: <reason>` for a machine an operator cordoned; the cordon
+    /// is not an error, but it is what the ERROR column is read for.
+    pub fn cordon_note(&self) -> Option<String> {
+        let c = self.cordon.as_ref()?;
+        Some(match &c.reason {
+            Some(reason) => format!("cordoned: {reason}"),
+            None => "cordoned".to_string(),
+        })
+    }
+
     pub fn in_flock(&self, flock: &str) -> bool {
         if self.flocks.is_empty() {
             self.flock == flock
@@ -976,19 +1227,24 @@ impl From<&MachineStatus> for MachineRow {
             max_agents: m.max_agents,
             job_slots: m.job_slots,
             burst: m.burst,
+            reserved: m.reserved,
             tags: m.tags.clone(),
             orphans: m.orphans.clone(),
             now: m.now.clone(),
             profile: m.profile.clone(),
             description: m.description.clone(),
+            no_head_address: m.no_head_address,
+            harness: m.harness.clone(),
+            room: m.room.clone(),
+            cordon: m.cordon.clone(),
         }
     }
 }
 
 /// AGENTS counts orphans too; ORPHANS names them (see `MachineStatus::orphans`).
-pub const MACHINE_HEADER: [&str; 11] = [
-    "NAME", "HOST", "FLOCKS", "PROFILE", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "ORPHANS", "TAGS",
-    "ERROR",
+pub const MACHINE_HEADER: [&str; 12] = [
+    "NAME", "HOST", "FLOCKS", "PROFILE", "CHANNEL", "HERDR", "PASTOR", "HARNESS", "AGENTS",
+    "ORPHANS", "TAGS", "ERROR",
 ];
 
 /// The machine that is the head itself: the first `local` one, whose herdr
@@ -1006,8 +1262,9 @@ pub fn head_machine_first(rows: &mut [MachineRow]) {
 }
 
 /// The line `machine list` opens with when a head runs: its version, its
-/// host and the herdr there, how many machines follow, and, when the head
-/// is itself one of them, which.
+/// host and the herdr there, how many machines follow, when the head is
+/// itself one of them, which, and the machines whose agents cannot reach
+/// it for want of a `head_address`.
 pub fn head_line(head: &HeadRow, rows: &[MachineRow]) -> String {
     let n = rows.len();
     let mut line = format!(
@@ -1019,6 +1276,17 @@ pub fn head_line(head: &HeadRow, rows: &[MachineRow]) -> String {
     );
     if let Some(m) = rows.iter().find(|m| is_head_machine(m)) {
         line.push_str(&format!(", {} is the head of the flock", m.name));
+    }
+    let cut_off: Vec<&str> = rows
+        .iter()
+        .filter(|m| m.no_head_address)
+        .map(|m| m.name.as_str())
+        .collect();
+    if !cut_off.is_empty() {
+        line.push_str(&format!(
+            "; no head_address, so agents on {} cannot run pastor task done",
+            cut_off.join(", ")
+        ));
     }
     line
 }
@@ -1063,6 +1331,7 @@ pub fn machine_rows(ms: &[MachineRow]) -> Vec<Vec<String>> {
                 m.channel.clone(),
                 m.herdr_version.clone().unwrap_or_else(dash),
                 m.pastor_version.clone().unwrap_or_else(dash),
+                crate::harness::cell(&m.harness),
                 agents_cell(m),
                 if m.orphans.is_empty() {
                     dash()
@@ -1074,10 +1343,63 @@ pub fn machine_rows(ms: &[MachineRow]) -> Vec<Vec<String>> {
                 } else {
                     m.tags.join(",")
                 },
-                m.error.clone().unwrap_or_default(),
+                [m.problems(), m.cordon_note()]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join("; "),
             ]
         })
         .collect()
+}
+
+/// How stale a room reading must be, twice `MachineSettings::room_every`'s
+/// default (it is not in pastor.toml, so there is only the one value to
+/// compare against), before `machine list --wide` adds its age to the DISK
+/// and MEM cells.
+const ROOM_STALE_AFTER: chrono::Duration = chrono::Duration::seconds(120);
+
+/// A free-space number in KiB, as `machine list --wide` shows it: `900K`,
+/// `340M`, `1.2G`.
+fn format_kib(kib: u64) -> String {
+    const KI: u64 = 1024;
+    if kib >= KI * KI {
+        format!("{:.1}G", kib as f64 / (KI * KI) as f64)
+    } else if kib >= KI {
+        format!("{:.1}M", kib as f64 / KI as f64)
+    } else {
+        format!("{kib}K")
+    }
+}
+
+/// " (5m ago)" once `asked_at` is older than `ROOM_STALE_AFTER`, else empty.
+fn room_age_suffix(asked_at: Option<chrono::DateTime<Utc>>) -> String {
+    match asked_at {
+        Some(at) if Utc::now() - at > ROOM_STALE_AFTER => format!(" ({} ago)", age(at)),
+        _ => String::new(),
+    }
+}
+
+/// The DISK and MEM cells of `machine list --wide`: DISK is the smaller of
+/// `$HOME` and `/tmp` free space, with which path (`1.2G /tmp`), shown once
+/// with no path when both are on one filesystem (equal); `?` when either
+/// number is unread, since an unread side could be the smaller (even full)
+/// one and a lone reading would otherwise look like a clean bill of health;
+/// `-` for a machine with no room read at all. Both cells carry the
+/// reading's age once it is stale (`ROOM_STALE_AFTER`).
+pub fn room_cells(room: Option<&Room>) -> (String, String) {
+    let Some(room) = room else {
+        return ("-".into(), "-".into());
+    };
+    let suffix = room_age_suffix(room.asked_at);
+    let disk = match (room.home_free, room.tmp_free) {
+        (None, None) | (Some(_), None) | (None, Some(_)) => "?".to_string(),
+        (Some(h), Some(t)) if h == t => format_kib(h),
+        (Some(h), Some(t)) if h < t => format!("{} $HOME", format_kib(h)),
+        (Some(_), Some(t)) => format!("{} /tmp", format_kib(t)),
+    };
+    let mem = room.mem_free.map_or_else(|| "?".to_string(), format_kib);
+    (format!("{disk}{suffix}"), format!("{mem}{suffix}"))
 }
 
 /// `machine list --json`: the head under its own key so `machines` holds
@@ -1275,10 +1597,153 @@ mod tests {
         }
     }
 
+    /// `task describe` shows the env its agent gets from the config: every
+    /// layer's keys with the layer that gave each, the agent's over the
+    /// machine's over the flock's over `[defaults]`'s; a key that looks like
+    /// a secret, or one holding what looks like one, shows its name and not
+    /// its value; no env, no row; a task on a pull machine says its own
+    /// config decides and lists none of the head's layers.
+    #[test]
+    fn task_describe_shows_the_merged_env_with_its_layers_and_hides_secrets() {
+        let config = crate::config::PastorConfig::parse(
+            std::path::Path::new("pastor.toml"),
+            "[defaults]\nenv = { NOTES_URL = \"http://notes.example:8790\", LEVEL = \"defaults\" }\n\
+             [agents.claude]\nenv = { AGENT_ONLY = \"a\", API_TOKEN = \"not-a-long-one\" }\n",
+        )
+        .unwrap();
+        let flock = Flock::parse(
+            std::path::Path::new("flock.toml"),
+            "[[flock]]\nname = \"work\"\ndefault = true\nmachines = { pi-3 = 1 }\n\
+             env = { LEVEL = \"flock\", FLOCK_ONLY = \"f\" }\n\
+             [[machine]]\nname = \"pi-3\"\nssh = \"a@pi-3\"\nenv = { LEVEL = \"machine\" }\n\
+             [[machine]]\nname = \"far\"\npull = true\nenv = { LEVEL = \"far\" }\n",
+        )
+        .unwrap();
+        let spec: crate::task::DispatchSpec = serde_json::from_value(serde_json::json!({
+            "now": false, "agent": "claude", "agent_args": [], "allow": [], "deny": [],
+            "worktree": false, "machine": null, "tags": [], "timeout_secs": 60,
+        }))
+        .unwrap();
+        let mut t = task_with(spec);
+        t.flock = Some("work".into());
+        let from = |env: &TaskEnv, key: &str| -> (String, String) {
+            let TaskEnv::Layers(l) = env else {
+                panic!("no layers: {env:?}")
+            };
+            l[key].clone()
+        };
+        let env = task_env(&config, &flock, &t);
+        let at = |v: &str, f: &str| (v.to_string(), f.to_string());
+        assert_eq!(from(&env, "LEVEL"), at("machine", "machine pi-3"));
+        assert_eq!(
+            from(&env, "NOTES_URL"),
+            at("http://notes.example:8790", "defaults")
+        );
+        assert_eq!(from(&env, "FLOCK_ONLY"), at("f", "flock work"));
+        assert_eq!(from(&env, "AGENT_ONLY"), at("a", "agent claude"));
+        let out = task_detail_env(&t, t.summary.as_slice(), &env);
+        assert!(
+            out.contains(
+                "env:        AGENT_ONLY=a (agent claude), API_TOKEN=(hidden) (agent claude), FLOCK_ONLY=f (flock work), LEVEL=machine (machine pi-3), NOTES_URL=http://notes.example:8790 (defaults)\n"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("not-a-long-one"), "{out}");
+        // A value that looks like a secret is hidden under a name that does not say so.
+        let held = TaskEnv::Layers(
+            [(
+                "CHECKOUT".to_string(),
+                (
+                    format!("gh{}_{}", "p", "aB3dE6gH9jK2mN5pQ8sT1vW4yZ7cF0hJ3kL6"),
+                    "defaults".to_string(),
+                ),
+            )]
+            .into(),
+        );
+        assert_eq!(shown_env(&held), "CHECKOUT=(hidden) (defaults)");
+        assert_eq!(
+            env_json(&held).unwrap()["CHECKOUT"],
+            serde_json::json!({"value": "(hidden)", "from": "defaults"})
+        );
+        // A task of another flock gets that flock's layer, not this one's.
+        t.flock = Some("elsewhere".into());
+        let TaskEnv::Layers(other) = task_env(&config, &flock, &t) else {
+            panic!("layers")
+        };
+        assert!(!other.contains_key("FLOCK_ONLY"));
+        // A task on a machine the head dispatches on: that machine's layer.
+        t.flock = Some("work".into());
+        t.machine = Some("pi-3".into());
+        assert_eq!(
+            from(&task_env(&config, &flock, &t), "LEVEL").1,
+            "machine pi-3"
+        );
+        // What a reopened pane gets: the same layers, none for a pull machine.
+        let under = dispatch_env(&config, &flock, &t);
+        assert_eq!(under["LEVEL"], "machine");
+        assert_eq!(under["FLOCK_ONLY"], "f");
+        assert!(
+            !under.contains_key("AGENT_ONLY"),
+            "the agent's own is added by reopen"
+        );
+        // No env at all: no row.
+        let bare = task_detail_env(&task_with(t.spec.clone()), &[], &TaskEnv::None);
+        assert!(!bare.contains("env:"), "{bare}");
+        // On a pull machine its own serve's config decides: none of the
+        // head's layers are claimed.
+        t.machine = Some("far".into());
+        let pull = task_env(&config, &flock, &t);
+        assert_eq!(pull, TaskEnv::PullMachine);
+        assert!(dispatch_env(&config, &flock, &t).is_empty());
+        let out = task_detail_env(&t, &[], &pull);
+        assert!(
+            out.contains("env:        set by the pull machine's own config"),
+            "{out}"
+        );
+        assert!(!out.contains("NOTES_URL"), "{out}");
+        assert!(env_json(&pull).is_none());
+    }
+
+    /// `task describe` of a worktree task says when it skipped the fetch of
+    /// its base and when the fetch failed; a task that fetched fine, or has
+    /// no worktree, says nothing.
+    #[test]
+    fn task_describe_says_what_became_of_the_fetch() {
+        let spec: crate::task::DispatchSpec = serde_json::from_value(serde_json::json!({
+            "now": false, "agent": "claude", "agent_args": [], "allow": [], "deny": [],
+            "worktree": true, "repo": "/r/app", "machine": null, "tags": [], "timeout_secs": 60,
+        }))
+        .unwrap();
+        let mut t = task_with(spec);
+        assert!(!task_detail(&t).contains("fetch:"));
+        t.spec.fetch.skip = true;
+        assert!(
+            task_detail(&t).contains("fetch:      skipped (--no-fetch)\n"),
+            "{}",
+            task_detail(&t)
+        );
+        t.spec.fetch = crate::task::FetchNote {
+            skip: false,
+            warning: Some("could not fetch origin: fatal: no route".into()),
+        };
+        assert!(
+            task_detail(&t)
+                .contains("fetch:      warning: could not fetch origin: fatal: no route\n"),
+            "{}",
+            task_detail(&t)
+        );
+        // Nothing is made or fetched for a task with no worktree.
+        t.spec.worktree = false;
+        assert!(!task_detail(&t).contains("fetch:"));
+    }
+
     fn status(name: &str, host: &str) -> MachineStatus {
         MachineStatus {
+            cordon: None,
+            reserved: 0,
             now: Vec::new(),
             description: None,
+            no_head_address: false,
             name: name.into(),
             host: host.into(),
             endpoint: format!("ssh {host} (session default)"),
@@ -1287,6 +1752,7 @@ mod tests {
             pastor_version: Some("0.2.0".into()),
             pastor_read_at: Some(Utc::now()),
             room: None,
+            reach: None,
             protocol: Some(22),
             error: None,
             live: 1,
@@ -1301,6 +1767,7 @@ mod tests {
             live_by_flock: vec![],
             shutting_down: false,
             profile: None,
+            harness: vec![],
         }
     }
 
@@ -1332,8 +1799,8 @@ mod tests {
         assert_eq!(
             cells(0),
             [
-                "NAME", "HOST", "FLOCKS", "PROFILE", "CHANNEL", "HERDR", "PASTOR", "AGENTS",
-                "ORPHANS", "TAGS", "ERROR"
+                "NAME", "HOST", "FLOCKS", "PROFILE", "CHANNEL", "HERDR", "PASTOR", "HARNESS",
+                "AGENTS", "ORPHANS", "TAGS", "ERROR"
             ]
         );
         assert_eq!(cells(1)[..3], ["here", "local", "default"]);
@@ -1347,6 +1814,7 @@ mod tests {
                 "connected",
                 "0.9.1",
                 "0.2.0",
+                "-",
                 "1/3",
                 "-",
                 "fast,arm"
@@ -1376,6 +1844,36 @@ mod tests {
         );
     }
 
+    /// An `ssh` machine of a head with no `head_address` is marked on the
+    /// head line and in its own row: its agents cannot run `pastor task
+    /// done`, so every task there ends with no summary.
+    #[test]
+    fn machines_cut_off_from_the_head_show_on_the_head_line_and_their_row() {
+        let v = env!("CARGO_PKG_VERSION");
+        let cut_off = |name: &str| MachineRow {
+            no_head_address: true,
+            ..row(name, &format!("user@{name}"))
+        };
+        let rows = vec![row("desk", "local"), cut_off("pi-3"), cut_off("pi-4")];
+        assert_eq!(
+            head_line(&head(), &rows),
+            format!(
+                "pastor {v} on desk (herdr 0.9.1), 3 machines, desk is the head of the flock; no head_address, so agents on pi-3, pi-4 cannot run pastor task done"
+            )
+        );
+        let cells = machine_rows(&rows);
+        assert_eq!(cells[0][11], "", "the head's own machine uses the socket");
+        assert_eq!(cells[1][11], CUT_OFF);
+        let both = MachineRow {
+            error: Some("connection refused".into()),
+            ..cut_off("pi-5")
+        };
+        assert_eq!(
+            machine_rows(&[both])[0][11],
+            format!("connection refused; {CUT_OFF}")
+        );
+    }
+
     #[test]
     fn a_probed_machine_without_a_count_shows_a_dash_and_its_error() {
         let r = MachineRow {
@@ -1399,11 +1897,49 @@ mod tests {
                 "unreachable",
                 "-",
                 "-",
+                "-",
                 "-/3",
                 "-",
                 "-",
                 "no route to host"
             ]
+        );
+    }
+
+    /// The HARNESS cell says nothing is pinned, that every pin holds, or which
+    /// kinds drift; `--json` carries the pin and what the machine runs.
+    #[test]
+    fn machine_list_shows_harness_drift() {
+        use crate::harness::HarnessStatus;
+        let drifted = vec![
+            HarnessStatus::new("claude", "2.1.310", Some("2.1.309".into())),
+            HarnessStatus::new("agy", "1.4", Some("1.4.7".into())),
+        ];
+        let cell = |harness: Vec<HarnessStatus>| {
+            let r = MachineRow {
+                harness,
+                ..row("pi-3", "user@pi-3")
+            };
+            machine_rows(&[r])[0][7].clone()
+        };
+        assert_eq!(cell(vec![]), "-");
+        assert_eq!(cell(drifted[1..].to_vec()), "ok");
+        assert_eq!(cell(drifted.clone()), "drift claude");
+        let r = MachineRow {
+            harness: drifted,
+            ..row("pi-3", "user@pi-3")
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            v["harness"][0],
+            serde_json::json!({"kind": "claude", "pin": "2.1.310", "version": "2.1.309", "drift": true})
+        );
+        // Nothing pinned: the field is left out, as for a head that predates it.
+        assert!(
+            serde_json::to_value(row("pi-3", "x"))
+                .unwrap()
+                .get("harness")
+                .is_none()
         );
     }
 
@@ -1422,7 +1958,7 @@ mod tests {
             ..status("pi-3", "fleet@pi-3")
         };
         let row = MachineRow::from(&m);
-        assert_eq!(machine_rows(std::slice::from_ref(&row))[0][7], "1/2+1j+1b");
+        assert_eq!(machine_rows(std::slice::from_ref(&row))[0][8], "1/2+1j+1b");
         let v = serde_json::to_value(&row).unwrap();
         assert_eq!(v["job_slots"], 1);
         assert_eq!(v["burst"], 1);
@@ -1497,6 +2033,14 @@ mod tests {
             cwd: None,
             keep_pane: None,
             keep_pane_from: None,
+            remove_worktree: None,
+            remove_worktree_from: None,
+            load: None,
+            load_from: None,
+            fetch: Default::default(),
+            start_prompt: None,
+            workdir: None,
+            workdir_bundles: Vec::new(),
             rounds: Default::default(),
         };
         let running_gone = task_with(spec.clone()); // on pi-3, running
@@ -1512,6 +2056,10 @@ mod tests {
         let flock = Flock {
             flocks: vec![],
             machines: vec![MachineConfig {
+                reserved: 0,
+                provisioner: None,
+                bundles: Vec::new(),
+                bundle_apply: None,
                 pull: false,
                 description: None,
                 name: "pi-1".into(),
@@ -1523,6 +2071,7 @@ mod tests {
                 job_slots: 1,
                 burst: 1,
                 tags: vec![],
+                loads: vec![],
                 flock: None,
                 agent: None,
                 agent_args: None,
@@ -1534,6 +2083,8 @@ mod tests {
                 min_disk: None,
                 min_memory: None,
                 unknown_room: None,
+                pins: Default::default(),
+                env: Default::default(),
             }],
         };
         let mut rows = task_rows(&tasks);
@@ -1575,6 +2126,14 @@ mod tests {
             cwd: None,
             keep_pane: None,
             keep_pane_from: None,
+            remove_worktree: None,
+            remove_worktree_from: None,
+            load: None,
+            load_from: None,
+            fetch: Default::default(),
+            start_prompt: None,
+            workdir: None,
+            workdir_bundles: Vec::new(),
             rounds: Default::default(),
         };
         let out = task_detail(&task_with(spec.clone()));
@@ -1608,7 +2167,7 @@ mod tests {
     #[test]
     fn task_detail_prints_where_the_agent_came_from() {
         let spec = crate::task::DispatchSpec {
-            agent: "claude-personal".into(),
+            agent: "claude-alt".into(),
             agent_args: vec!["--model".into(), "claude-opus-5-5".into()],
             agent_source: Some(Box::new(crate::task::AgentSource {
                 ask: Default::default(),
@@ -1629,7 +2188,7 @@ mod tests {
         };
         let out = task_detail(&task_with(spec.clone()));
         assert!(
-            out.contains("agent:      claude-personal (from machine own)\n"),
+            out.contains("agent:      claude-alt (from machine own)\n"),
             "{out}"
         );
         assert!(
@@ -1656,7 +2215,7 @@ mod tests {
             ..spec
         }));
         assert!(
-            bare.contains("agent:      claude-personal (from defaults)\n"),
+            bare.contains("agent:      claude-alt (from defaults)\n"),
             "{bare}"
         );
         assert!(bare.contains("agent args: -\n"), "{bare}");
@@ -1829,12 +2388,165 @@ mod tests {
             ..status("pi", "local")
         };
         let rows = machine_rows(&[MachineRow::from(&m)]);
-        assert_eq!(rows[0][7], "4/3 now:t-9");
+        assert_eq!(rows[0][8], "4/3 now:t-9");
         let plain = MachineStatus {
             now: vec![],
             ..m.clone()
         };
-        assert_eq!(machine_rows(&[MachineRow::from(&plain)])[0][7], "4/3");
+        assert_eq!(machine_rows(&[MachineRow::from(&plain)])[0][8], "4/3");
+    }
+
+    /// A cordoned machine says so in the ERROR column, with its reason,
+    /// after any error it has.
+    #[test]
+    fn machine_rows_name_a_cordon() {
+        let cordon = |reason: Option<&str>| crate::store::Cordon {
+            machine: "pi".into(),
+            reason: reason.map(str::to_string),
+            since: Utc::now(),
+        };
+        let m = MachineStatus {
+            cordon: Some(cordon(Some("kernel update"))),
+            ..status("pi", "local")
+        };
+        let rows = machine_rows(&[MachineRow::from(&m)]);
+        assert_eq!(rows[0][11], "cordoned: kernel update");
+        let m = MachineStatus {
+            cordon: Some(cordon(None)),
+            error: Some("boom".into()),
+            ..status("pi", "local")
+        };
+        assert_eq!(
+            machine_rows(&[MachineRow::from(&m)])[0][11],
+            "boom; cordoned"
+        );
+        assert_eq!(
+            machine_rows(&[MachineRow::from(&status("pi", "local"))])[0][11],
+            ""
+        );
+    }
+
+    fn room(home: Option<u64>, tmp: Option<u64>, mem: Option<u64>) -> Room {
+        Room {
+            home_free: home,
+            tmp_free: tmp,
+            mem_free: mem,
+            asked_at: Some(Utc::now()),
+            error: None,
+        }
+    }
+
+    /// `machine list --wide`'s DISK is the smaller of home and tmp free
+    /// space, with the path it came from.
+    #[test]
+    fn room_cells_show_the_smaller_disk_number() {
+        let r = room(
+            Some(2 * 1024 * 1024),
+            Some(1_258_291),
+            Some(2 * 1024 * 1024),
+        );
+        let (disk, mem) = room_cells(Some(&r));
+        assert_eq!(disk, "1.2G /tmp");
+        assert_eq!(mem, "2.0G");
+    }
+
+    /// The home side is labelled `$HOME`, not `/home`: the probe
+    /// (`src/herdr/transport.rs::ROOM_COMMAND`) runs `df` against `$HOME`,
+    /// which on macOS or for a non-default account is not under `/home`.
+    #[test]
+    fn room_cells_label_the_home_side_dollar_home() {
+        let r = room(Some(500_000), Some(1_258_291), None);
+        let (disk, _) = room_cells(Some(&r));
+        assert_eq!(disk, "488.3M $HOME");
+    }
+
+    /// Equal home and tmp numbers are one filesystem: shown once, with no
+    /// path.
+    #[test]
+    fn room_cells_show_one_filesystem_once() {
+        let r = room(Some(1024 * 1024), Some(1024 * 1024), None);
+        let (disk, mem) = room_cells(Some(&r));
+        assert_eq!(disk, "1.0G");
+        assert_eq!(mem, "?", "mem_free unread shows as unknown, not a dash");
+    }
+
+    /// A machine with no memory reading (macOS has no `/proc/meminfo`)
+    /// shows `?` for MEM, not a dash: the room was read, just not that
+    /// number.
+    #[test]
+    fn room_cells_mark_an_unread_number_with_a_question_mark() {
+        let r = room(Some(500_000), Some(300_000), None);
+        let (_, mem) = room_cells(Some(&r));
+        assert_eq!(mem, "?");
+        let r = room(None, None, Some(1024));
+        let (disk, _) = room_cells(Some(&r));
+        assert_eq!(disk, "?");
+    }
+
+    /// A `df` that failed on one side only (`src/herdr/transport.rs`'s
+    /// `ROOM_COMMAND` reads each path separately) leaves DISK unknown
+    /// rather than showing the side that did read: that reading alone isn't
+    /// "the smaller of home and tmp", and the unread side could be the
+    /// fuller one.
+    #[test]
+    fn room_cells_mark_disk_unknown_when_only_one_side_read() {
+        let r = room(Some(500_000), None, None);
+        let (disk, _) = room_cells(Some(&r));
+        assert_eq!(disk, "?");
+        let r = room(None, Some(500_000), None);
+        let (disk, _) = room_cells(Some(&r));
+        assert_eq!(disk, "?");
+    }
+
+    /// A room read more than twice `room_every` ago (the default: two
+    /// minutes) carries its age, even past an error that kept the old
+    /// numbers rather than blanking them.
+    #[test]
+    fn room_cells_add_the_age_of_a_stale_reading() {
+        let r = Room {
+            home_free: Some(2 * 1024 * 1024),
+            tmp_free: Some(1024 * 1024),
+            mem_free: Some(2 * 1024 * 1024),
+            asked_at: Some(Utc::now() - chrono::Duration::minutes(5)),
+            error: Some("ssh timed out".into()),
+        };
+        let (disk, mem) = room_cells(Some(&r));
+        assert_eq!(disk, "1.0G /tmp (5m ago)");
+        assert_eq!(mem, "2.0G (5m ago)");
+    }
+
+    /// No room at all (an older head, or a probe) shows a dash, the same
+    /// convention as the other columns, not `?`.
+    #[test]
+    fn room_cells_show_a_dash_with_no_room_read_at_all() {
+        assert_eq!(room_cells(None), ("-".into(), "-".into()));
+    }
+
+    /// `machine list --json` carries the whole `Room` through a
+    /// `MachineRow`, round-tripping every field including an older head's
+    /// absent one.
+    #[test]
+    fn machine_row_json_round_trips_the_room() {
+        let m = MachineStatus {
+            room: Some(room(Some(1), Some(2), Some(3))),
+            ..status("pi", "local")
+        };
+        let row = MachineRow::from(&m);
+        let v = serde_json::to_value(&row).unwrap();
+        let back: MachineRow = serde_json::from_value(v).unwrap();
+        assert_eq!(back.room, row.room);
+
+        let old: MachineRow = serde_json::from_value(serde_json::json!({
+            "name": "pi-3", "host": "h", "endpoint": "e", "flock": "work",
+            "channel": "connected", "herdr_version": null, "pastor_version": null,
+            "protocol": null, "error": null, "live": 0, "max_agents": 1,
+            "tags": [], "orphans": []
+        }))
+        .unwrap();
+        assert_eq!(
+            old.room, None,
+            "a head that predates the field reads as none"
+        );
     }
 
     /// `task describe` gives the level and the layer that set it, and
@@ -1890,6 +2602,106 @@ mod tests {
         assert_eq!(t.to_json()["spec"]["keep_pane_from"], "task run");
         t.state = TaskState::Running;
         assert_eq!(task_rows(std::slice::from_ref(&t))[0][1], "running");
+    }
+
+    /// `task describe` names a task's workdir set and where it was placed;
+    /// a task with none has no line.
+    #[test]
+    fn a_task_s_workdir_set_shows_in_its_detail() {
+        let mut t = task_with(serde_json::from_str(r#"{"agent": "claude"}"#).unwrap());
+        assert!(!task_detail(&t).contains("workdir set"));
+        t.spec.workdir = Some(Box::new(crate::task::TaskWorkdir {
+            set: serde_json::json!({"id": "reviewer", "kind": "claude"}),
+            placed_in: Some("/w".into()),
+            render: None,
+        }));
+        let out = task_detail(&t);
+        assert!(out.contains("reviewer (claude), placed in /w\n"), "{out}");
+    }
+
+    /// `task describe` lists a task's stored workdir bundles with who named
+    /// each, and why its last start left them out.
+    #[test]
+    fn a_task_s_workdir_bundles_show_in_its_detail() {
+        let mut t = task_with(serde_json::from_str(r#"{"agent": "claude"}"#).unwrap());
+        assert!(!task_detail(&t).contains("workdir bundles"));
+        t.spec.workdir_bundles = vec![
+            crate::task::WorkdirBundle {
+                from: Some("flock ops".into()),
+                ..crate::task::WorkdirBundle::named("repo-notes")
+            },
+            crate::task::WorkdirBundle {
+                from: Some("job nightly".into()),
+                ..crate::task::WorkdirBundle::named("style")
+            },
+        ];
+        let out = task_detail(&t);
+        assert!(
+            out.contains("repo-notes (flock ops), style (job nightly)\n"),
+            "{out}"
+        );
+        for b in &mut t.spec.workdir_bundles {
+            b.skipped = Some("p-1 is a pull machine".into());
+        }
+        let out = task_detail(&t);
+        assert!(
+            out.contains("style (job nightly); not placed: p-1 is a pull machine\n"),
+            "{out}"
+        );
+        for b in &mut t.spec.workdir_bundles {
+            b.skipped = Some(
+                "shared folder (/srv/app): stored workdir bundles go only in a task's own worktree"
+                    .into(),
+            );
+        }
+        let out = task_detail(&t);
+        assert!(
+            out.contains("; not placed: shared folder (/srv/app)"),
+            "{out}"
+        );
+    }
+
+    /// `task describe` shows a task's load and where it came from, and no
+    /// line for a task with none; `--json` carries both.
+    #[test]
+    fn a_load_shows_with_where_it_came_from() {
+        let mut t = task_with(serde_json::from_str(r#"{"agent": "claude"}"#).unwrap());
+        assert!(!task_detail(&t).contains("load:"));
+        t.spec.load = Some("rust".into());
+        t.spec.load_from = Some("agent builder".into());
+        let out = task_detail(&t);
+        assert!(
+            out.contains("load:       rust (from agent builder)\n"),
+            "{out}"
+        );
+        assert_eq!(t.to_json()["spec"]["load"], "rust");
+        assert_eq!(t.to_json()["spec"]["load_from"], "agent builder");
+    }
+
+    /// `task describe` says what becomes of a worktree task's checkout,
+    /// and where `remove_worktree` came from; a task with no worktree has
+    /// no such line.
+    #[test]
+    fn remove_worktree_shows_with_where_it_came_from() {
+        let mut t = task_with(serde_json::from_str(r#"{"agent": "claude"}"#).unwrap());
+        assert!(!task_detail(&t).contains("worktree:"));
+        t.spec.worktree = true;
+        let out = task_detail(&t);
+        assert!(
+            out.contains("worktree:   removed when the task is done; kept when it fails\n"),
+            "{out}"
+        );
+        t.spec.remove_worktree = Some(true);
+        t.spec.remove_worktree_from = Some("flock push".into());
+        let out = task_detail(&t);
+        assert!(
+            out.contains(
+                "worktree:   removed when the task ends, failed or stale too (from flock push)\n"
+            ),
+            "{out}"
+        );
+        assert_eq!(t.to_json()["spec"]["remove_worktree"], true);
+        assert_eq!(t.to_json()["spec"]["remove_worktree_from"], "flock push");
     }
 
     /// A waiting task reads `waiting 03:00` in `task list`, and `task
@@ -2029,6 +2841,14 @@ mod tests {
             cwd: None,
             keep_pane: None,
             keep_pane_from: None,
+            remove_worktree: None,
+            remove_worktree_from: None,
+            load: None,
+            load_from: None,
+            fetch: Default::default(),
+            start_prompt: None,
+            workdir: None,
+            workdir_bundles: Vec::new(),
             rounds: Default::default(),
         });
         let out = task_detail(&t);
@@ -2070,6 +2890,14 @@ mod tests {
             cwd: None,
             keep_pane: None,
             keep_pane_from: None,
+            remove_worktree: None,
+            remove_worktree_from: None,
+            load: None,
+            load_from: None,
+            fetch: Default::default(),
+            start_prompt: None,
+            workdir: None,
+            workdir_bundles: Vec::new(),
             rounds: Default::default(),
         });
         t.error = Some("ssh failed:\nPermission denied\r\nbye".into());
@@ -2122,6 +2950,14 @@ mod tests {
             cwd: None,
             keep_pane: None,
             keep_pane_from: None,
+            remove_worktree: None,
+            remove_worktree_from: None,
+            load: None,
+            load_from: None,
+            fetch: Default::default(),
+            start_prompt: None,
+            workdir: None,
+            workdir_bundles: Vec::new(),
             rounds: Default::default(),
         });
         t.item = serde_json::json!({"key": "k", "title": format!("x\n t-9  done\x1b[2K{}", "y".repeat(80))});
@@ -2158,6 +2994,14 @@ mod tests {
             cwd: None,
             keep_pane: None,
             keep_pane_from: None,
+            remove_worktree: None,
+            remove_worktree_from: None,
+            load: None,
+            load_from: None,
+            fetch: Default::default(),
+            start_prompt: None,
+            workdir: None,
+            workdir_bundles: Vec::new(),
             rounds: Default::default(),
         });
         t.prompt = "look at\x1b]8;;http://x\x07this\r\nand stop".into();
@@ -2388,9 +3232,9 @@ mod tests {
         assert_eq!(orphan_lines(&three, None, Some(DEFAULT_FLOCK)).len(), 3);
         assert!(orphan_lines(&three, Some("pi-3"), Some(DEFAULT_FLOCK)).is_empty());
         let rows = machine_rows(&[MachineRow::from(&m), MachineRow::from(&none)]);
-        assert_eq!(rows[0][7], "3/4");
-        assert_eq!(rows[0][8], "t-4,t-9");
-        assert_eq!(rows[1][8], "-");
+        assert_eq!(rows[0][8], "3/4");
+        assert_eq!(rows[0][9], "t-4,t-9");
+        assert_eq!(rows[1][9], "-");
         assert_eq!(rows[0].len(), MACHINE_HEADER.len());
     }
 
@@ -2471,6 +3315,31 @@ mod tests {
                 .unwrap();
         assert_eq!(old.number_label().as_deref(), Some("2"));
         assert!(!old.has_room() && !old.under_share());
+    }
+
+    /// A machine drained to 0 in a flock lists as `desk 1/0` while its last
+    /// task runs.
+    #[test]
+    fn a_machine_at_0_lists_its_live_over_0() {
+        let f: Flock = toml::from_str(
+            "[[flock]]\nname = \"work\"\ndefault = true\nmachines = { desk = 0 }\n\n\
+             [[machine]]\nname = \"desk\"\nlocal = true\nmax_agents = 4\n",
+        )
+        .unwrap();
+        f.validate().unwrap();
+        let seat = crate::machine::FlockSeat::new(
+            "work",
+            Some(crate::config::flock::FlockNumber::plain(0)),
+            1,
+        );
+        let desk = MachineStatus {
+            flock: Some("work".into()),
+            flocks: vec![seat],
+            ..status("desk", "local")
+        };
+        let rows = flock_list(&f, Some(std::slice::from_ref(&desk)), &[]);
+        assert_eq!(flock_rows(&rows)[0][2], "desk 1/0");
+        assert_eq!(MachineRow::from(&desk).flock_label(), "work:0");
     }
 
     /// A status carries every flock of the machine; one from a head before

@@ -9,7 +9,7 @@
 # REPO is a checkout on each machine (quoted, so ~ is that machine's home).
 # CLAUDE, OPENCODE and AGY name machines from flock.toml; leave one out to
 # skip that agent; CLAUDE_AGENT, OPENCODE_AGENT and AGY_AGENT pick another
-# agent of that kind (an [agents] name such as claude-personal). An AGY
+# agent of that kind (an [agents] name such as claude-alt). An AGY
 # machine's own profile must be review, with review's rules in its agy
 # settings (see the manual's Permission profiles). The head must run the
 # pastor under test: the profile reaches the agent when the head dispatches

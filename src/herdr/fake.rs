@@ -9,7 +9,9 @@ use tokio::sync::broadcast;
 // redraw along with the actor's own timers.
 use tokio::time::Instant;
 
-use super::{AgentInfo, AgentStatus, BoxRead, BoxWrite, Connection, Event, Request};
+use super::{
+    AgentInfo, AgentSessionInfo, AgentStatus, BoxRead, BoxWrite, Connection, Event, Request,
+};
 
 /// How `agent.start` behaves. herdr's `agent.start` never reports readiness
 /// (its error codes are `agent_pane_*`, `unsupported_agent_kind`,
@@ -27,6 +29,15 @@ pub enum StartBehaviour {
 pub enum PaneInput {
     Text(String),
     Keys(Vec<String>),
+}
+
+/// One `Connector::inbox_send`, as the fake received it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxSend {
+    pub config_dir: Option<String>,
+    pub session: String,
+    pub mode: crate::inbox::Mode,
+    pub text: String,
 }
 
 #[derive(Default)]
@@ -91,11 +102,26 @@ struct State {
     /// Checkouts, by path, holding commits that are on no remote: what
     /// `Connector::unpushed_commits` reports.
     unpushed: HashSet<String>,
+    /// pane id -> the pid of its shell, as `pane.process_info` reports it
+    /// (`set_shell_pid`); a pane with none reports no shell.
+    shell_pids: HashMap<String, u32>,
+    /// What `Connector::find_processes` was asked for, in order.
+    reaps: Vec<crate::reap::Spec>,
+    /// What `Connector::end_processes` was asked to end, in order.
+    ends: Vec<Vec<crate::reap::Candidate>>,
+    /// What `find_processes` answers while it does not really look
+    /// (`set_leftovers`).
+    leftovers: Vec<crate::reap::Candidate>,
+    /// Whether the two really look for and end processes, on this machine
+    /// (`run_reaps`); otherwise they only record the ask and answer none.
+    run_reaps: bool,
     /// What `Connector::pastor_version` reports.
     pastor_version: Option<String>,
     /// When set, `Connector::pastor_version` fails as a lost ssh would,
     /// while the ping and everything else still answer.
     pastor_version_fails: bool,
+    /// What `Connector::harness_version` reports for each kind.
+    harness_versions: std::collections::BTreeMap<String, String>,
     /// What `Connector::room` reports; `None` like a `command` machine.
     room: Option<crate::machine::Room>,
     /// When set, `Connector::room` fails as a lost ssh would, while the
@@ -105,8 +131,16 @@ struct State {
     /// `Connector::claude_usage` reports. `None` for the config dir is
     /// `~/.claude`.
     usage: HashMap<(Option<String>, String), crate::usage::TaskUsage>,
+    /// What `Connector::inbox_send` answers: `None` like a machine that
+    /// cannot send that way (the default), else that result.
+    inbox_result: Option<&'static str>,
+    /// Every `Connector::inbox_send`, in order.
+    inbox_sends: Vec<InboxSend>,
+    /// Claude session id -> the pane of the agent started on it
+    /// (`--session-id` or `--resume` in `agent.start`'s args).
+    sessions: HashMap<String, String>,
     /// What `Connector::opencode_permission_rules` reports.
-    opencode_permissions: Option<bool>,
+    opencode_permissions: Option<Vec<crate::config::opencode::ConfigCheckHit>>,
     /// agy's settings file, as `Connector::agy_settings` reads it and
     /// `Connector::write_agy_settings` writes it; `None` like a `command`
     /// machine.
@@ -116,12 +150,42 @@ struct State {
     agy_saves: std::collections::VecDeque<Option<String>>,
     /// Every content `Connector::write_agy_settings` put in place.
     agy_writes: Vec<String>,
+    /// The other files of the machine `Connector::home_file` reads and
+    /// `write_home_file` writes, by the path they are asked for with. agy's
+    /// settings are `agy_settings` above, whichever way they are asked for.
+    home_files: std::collections::BTreeMap<String, crate::provision::agy::AgySettings>,
+    /// What a harness saves into a file, in the order of its writes, just
+    /// before `write_home_file` compares: a concurrent writer.
+    file_saves: std::collections::BTreeMap<String, std::collections::VecDeque<Option<String>>>,
+    /// What a harness saves into a file just after `write_home_file` wrote it:
+    /// a session rewriting the file from memory, the entry lost.
+    file_overwrites: std::collections::BTreeMap<String, std::collections::VecDeque<String>>,
+    /// Every `(path, content)` `write_home_file` put in place.
+    file_writes: Vec<(String, String)>,
+    /// How many of the next writes to a file find its lock held by another
+    /// process (`Busy`).
+    file_busy: std::collections::BTreeMap<String, u32>,
+    /// The `lock` of every `write_home_file` call, with its path.
+    file_locks: Vec<(String, bool)>,
     /// What `Connector::opencode_config_permission_keys` reports.
     opencode_deny_keys: crate::config::opencode::MachineDenyKeys,
+    /// What `Connector::command_succeeds` answers, and the commands it was
+    /// asked to run, in order.
+    command_answer: Option<bool>,
+    commands_run: Vec<String>,
     /// Branches `Connector::restore_worktree` finds gone.
     gone_branches: HashSet<String>,
     /// Every `Connector::restore_worktree` call, as (repo, path, branch).
     restored: Vec<(String, String, String)>,
+    /// What `Connector::fetch_base` answers; unset, that it fetched `origin`.
+    fetch_answer: Option<super::transport::Fetched>,
+    /// Every repo `Connector::fetch_base` was asked about, with how many
+    /// requests herdr had seen by then.
+    fetched: Vec<(String, usize)>,
+    /// Checkouts, by path, that `Connector::remove_checkout` finds dirty.
+    dirty_checkouts: HashSet<String>,
+    /// Every path `Connector::remove_checkout` was asked to remove.
+    removed_checkouts: Vec<String>,
     /// Every path `Connector::ensure_dir` made.
     made_dirs: Vec<String>,
     /// Paths `Connector::ensure_dir` fails to make.
@@ -159,12 +223,25 @@ struct State {
     /// Everything typed into each pane, by pane id.
     pane_input: HashMap<String, Vec<PaneInput>>,
     /// Startup dialogs agents started from now on stop at, in order: the
-    /// screen `agent.read` shows and the keys `pane.send_keys` must send
-    /// exactly to answer it (see `set_startup_dialogs`, `set_trust_prompt`).
-    /// Empty: none.
+    /// screen `agent.read` shows and the keys `pane.send_keys` must send, in
+    /// order, across however many calls it takes, to answer it (see
+    /// `set_startup_dialogs`, `set_trust_prompt`): `--trust` sends one key,
+    /// reads the pane, then sends the next, rather than all of them in one
+    /// call. A key that does not extend the current dialog's match so far
+    /// is dropped. Empty: none.
     dialogs: Vec<(String, Vec<String>)>,
     /// pane id -> how many of `dialogs` it has answered.
     dialogs_done: HashMap<String, usize>,
+    /// Pane id -> how much of its current (not yet answered) dialog's keys
+    /// have arrived so far, across calls; reset once that dialog is
+    /// answered. Also what `agent.read` moves the trust screen's cursor off
+    /// "No, exit" for, once it is not empty (see `claude_trust_screen`).
+    trust_progress: HashMap<String, Vec<String>>,
+    /// Pane id -> how many of its next keys through `pane.send_keys` are
+    /// accepted and recorded (`pane_input`) but never reach
+    /// `trust_progress`, the way `Down` once never reached a real pane
+    /// (see `lose_next_trust_keys`).
+    lost_trust_keys: HashMap<String, usize>,
     /// How long after its trust question is answered an agent still redraws:
     /// `agent.prompt` is accepted in that window but the text is lost, as
     /// Claude loses input typed while it replaces the dialog with its prompt
@@ -245,6 +322,21 @@ pub struct FakeHerdr {
 /// Claude Code's folder-trust dialog as a pane shows it (2.1).
 pub const CLAUDE_TRUST_SCREEN: &str = "Accessing workspace:\n\n/r\n\nQuick safety check: Is this a project you created or one you trust?\n\n\u{276f} 1. No, exit\n  2. Yes, I trust this folder\n\nEnter to confirm \u{b7} Esc to cancel\n";
 
+/// `CLAUDE_TRUST_SCREEN`, cursor on "No, exit" until `selected`, then moved
+/// onto "Yes, I trust this folder": what `--trust`'s `Down` moves it to, and
+/// what `trust_option_selected` then reads before the key that confirms it
+/// goes.
+fn claude_trust_screen(selected: bool) -> String {
+    let (no, yes) = if selected {
+        ("  ", "\u{276f} ")
+    } else {
+        ("\u{276f} ", "  ")
+    };
+    format!(
+        "Accessing workspace:\n\n/r\n\nQuick safety check: Is this a project you created or one you trust?\n\n{no}1. No, exit\n{yes}2. Yes, I trust this folder\n\nEnter to confirm \u{b7} Esc to cancel\n"
+    )
+}
+
 #[derive(Default)]
 struct Wedge {
     on: bool,
@@ -268,6 +360,7 @@ impl FakeHerdr {
                 home: Some("/home/fake".into()),
                 pastor_version: Some("fake".into()),
                 pastor_version_fails: false,
+                harness_versions: Default::default(),
                 room: Some(crate::machine::Room {
                     home_free: Some(50 * 1024 * 1024),
                     tmp_free: Some(10 * 1024 * 1024),
@@ -276,7 +369,13 @@ impl FakeHerdr {
                     error: None,
                 }),
                 room_fails: false,
-                opencode_permissions: Some(false),
+                opencode_permissions: Some(vec![]),
+                home_files: Default::default(),
+                file_saves: Default::default(),
+                file_overwrites: Default::default(),
+                file_busy: Default::default(),
+                file_locks: Default::default(),
+                file_writes: Vec::new(),
                 agy_settings: Some(crate::provision::agy::AgySettings {
                     content: Some(
                         r#"{"permissions":{"deny":["write_file(*)","command(git push)","command(rm -rf)","command(sudo)"]}}"#
@@ -298,13 +397,90 @@ impl FakeHerdr {
     pub fn set_home(&self, home: Option<&str>) {
         self.state.lock().unwrap().home = home.map(str::to_string);
     }
-    /// What the machine's own opencode config says about permission rules.
-    pub fn set_opencode_permissions(&self, rules: Option<bool>) {
+    /// What `Connector::command_succeeds` answers from now on: an agent's
+    /// login check passing, failing, or unknown (`None`, the default).
+    pub fn set_command_answer(&self, answer: Option<bool>) {
+        self.state.lock().unwrap().command_answer = answer;
+    }
+    /// Every command `Connector::command_succeeds` was asked to run.
+    pub fn commands_run(&self) -> Vec<String> {
+        self.state.lock().unwrap().commands_run.clone()
+    }
+    /// What the machine's managed opencode config or managed preferences
+    /// has, as `config::opencode::CONFIG_CHECK_COMMAND` would name it.
+    pub fn set_opencode_permissions(
+        &self,
+        rules: Option<Vec<crate::config::opencode::ConfigCheckHit>>,
+    ) {
         self.state.lock().unwrap().opencode_permissions = rules;
     }
     /// agy's settings file on the machine; `None` like a `command` machine.
     pub fn set_agy_settings(&self, settings: Option<crate::provision::agy::AgySettings>) {
         self.state.lock().unwrap().agy_settings = settings;
+    }
+    /// Put a file on the machine, as `home_file` finds it.
+    pub fn set_home_file(&self, path: &str, content: Option<&str>) {
+        let file = crate::provision::agy::AgySettings {
+            content: content.map(str::to_string),
+            link: false,
+        };
+        if path == crate::provision::agy::SETTINGS_FILE {
+            self.state.lock().unwrap().agy_settings = Some(file);
+        } else {
+            self.state
+                .lock()
+                .unwrap()
+                .home_files
+                .insert(path.into(), file);
+        }
+    }
+    /// What the file holds now.
+    pub fn home_file_now(&self, path: &str) -> Option<String> {
+        let st = self.state.lock().unwrap();
+        if path == crate::provision::agy::SETTINGS_FILE {
+            st.agy_settings.as_ref()?.content.clone()
+        } else {
+            st.home_files.get(path)?.content.clone()
+        }
+    }
+    /// A harness saves `content` into the file just before the next write's
+    /// compare, once.
+    pub fn file_saves_before_write(&self, path: &str, content: Option<&str>) {
+        self.state
+            .lock()
+            .unwrap()
+            .file_saves
+            .entry(path.into())
+            .or_default()
+            .push_back(content.map(str::to_string));
+    }
+    /// A harness saves `content` into the file just after the next write
+    /// lands, once: a session that rewrites it from an older copy.
+    pub fn file_overwritten_after_write(&self, path: &str, content: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .file_overwrites
+            .entry(path.into())
+            .or_default()
+            .push_back(content.to_string());
+    }
+    /// The next `times` writes to the file find its lock held by another
+    /// process.
+    pub fn file_lock_held(&self, path: &str, times: u32) {
+        self.state
+            .lock()
+            .unwrap()
+            .file_busy
+            .insert(path.into(), times);
+    }
+    /// Whether each `write_home_file` call asked to hold the file's lock.
+    pub fn file_locks(&self) -> Vec<(String, bool)> {
+        self.state.lock().unwrap().file_locks.clone()
+    }
+    /// Every `(path, content)` written through `write_home_file`.
+    pub fn file_writes(&self) -> Vec<(String, String)> {
+        self.state.lock().unwrap().file_writes.clone()
     }
     /// agy's settings file as it now is.
     pub fn agy_settings_now(&self) -> Option<crate::provision::agy::AgySettings> {
@@ -329,6 +505,16 @@ impl FakeHerdr {
     pub fn set_opencode_deny_keys(&self, keys: crate::config::opencode::MachineDenyKeys) {
         self.state.lock().unwrap().opencode_deny_keys = keys;
     }
+    /// What `Connector::inbox_send` answers from now on: `None` (the
+    /// default) cannot send that way, else that result. An `accepted` one
+    /// sets the session's agent working, as `agent.prompt` does.
+    pub fn set_inbox_result(&self, result: Option<&'static str>) {
+        self.state.lock().unwrap().inbox_result = result;
+    }
+    /// Every `Connector::inbox_send` so far, in order.
+    pub fn inbox_sends(&self) -> Vec<InboxSend> {
+        self.state.lock().unwrap().inbox_sends.clone()
+    }
     /// Claude session `session` under `config_dir` (`None` for `~/.claude`)
     /// used `usage`.
     pub fn set_usage(
@@ -345,6 +531,14 @@ impl FakeHerdr {
     }
     pub fn set_pastor_version(&self, version: Option<&str>) {
         self.state.lock().unwrap().pastor_version = version.map(str::to_string);
+    }
+    /// What the machine runs of `kind`'s CLI (none: not installed).
+    pub fn set_harness_version(&self, kind: &str, version: Option<&str>) {
+        let mut state = self.state.lock().unwrap();
+        match version {
+            Some(v) => state.harness_versions.insert(kind.into(), v.into()),
+            None => state.harness_versions.remove(kind),
+        };
     }
     pub fn set_pastor_version_fails(&self, fails: bool) {
         self.state.lock().unwrap().pastor_version_fails = fails;
@@ -375,10 +569,41 @@ impl FakeHerdr {
             .gone_branches
             .insert(branch.to_string());
     }
+    /// `Connector::remove_checkout` finds the checkout at `path` dirty.
+    pub fn set_dirty_checkout(&self, path: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .dirty_checkouts
+            .insert(path.to_string());
+    }
+    /// The checkout at `path` is clean again.
+    pub fn set_clean_checkout(&self, path: &str) {
+        self.state.lock().unwrap().dirty_checkouts.remove(path);
+    }
+    /// Every checkout `Connector::remove_checkout` was asked to remove.
+    pub fn removed_checkouts(&self) -> Vec<String> {
+        self.state.lock().unwrap().removed_checkouts.clone()
+    }
     /// Every worktree `Connector::restore_worktree` was asked to put back,
     /// as (repo, path, branch).
     pub fn restored(&self) -> Vec<(String, String, String)> {
         self.state.lock().unwrap().restored.clone()
+    }
+    /// What `Connector::fetch_base` answers from now on.
+    pub fn set_fetch(&self, answer: super::transport::Fetched) {
+        self.state.lock().unwrap().fetch_answer = Some(answer);
+    }
+    /// Every repo `Connector::fetch_base` was asked to fetch, in order.
+    pub fn fetches(&self) -> Vec<String> {
+        let st = self.state.lock().unwrap();
+        st.fetched.iter().map(|(repo, _)| repo.clone()).collect()
+    }
+    /// How many requests herdr had seen at each `fetch_base`, to tell what
+    /// came before it from what came after.
+    pub fn fetched_after(&self) -> Vec<usize> {
+        let st = self.state.lock().unwrap();
+        st.fetched.iter().map(|(_, n)| *n).collect()
     }
     /// Every directory `Connector::ensure_dir` made, in order.
     pub fn made_dirs(&self) -> Vec<String> {
@@ -398,6 +623,31 @@ impl FakeHerdr {
         self.state.lock().unwrap().unmakeable_dirs.remove(path);
     }
     /// The checkout at `path` has commits on no remote.
+    /// `pane.process_info` reports `pid` as the shell of `pane_id`.
+    pub fn set_shell_pid(&self, pane_id: &str, pid: u32) {
+        self.state
+            .lock()
+            .unwrap()
+            .shell_pids
+            .insert(pane_id.to_string(), pid);
+    }
+    /// What `Connector::find_processes` was asked for so far.
+    pub fn reaps(&self) -> Vec<crate::reap::Spec> {
+        self.state.lock().unwrap().reaps.clone()
+    }
+    /// `find_processes` answers `found` while it does not really look.
+    pub fn set_leftovers(&self, found: Vec<crate::reap::Candidate>) {
+        self.state.lock().unwrap().leftovers = found;
+    }
+    /// What `Connector::end_processes` was asked to end so far.
+    pub fn ended(&self) -> Vec<Vec<crate::reap::Candidate>> {
+        self.state.lock().unwrap().ends.clone()
+    }
+    /// Make `find_processes` and `end_processes` really look for and end
+    /// processes, here, with the scripts an ssh machine runs.
+    pub fn run_reaps(&self) {
+        self.state.lock().unwrap().run_reaps = true;
+    }
     pub fn set_unpushed(&self, path: &str) {
         self.state.lock().unwrap().unpushed.insert(path.to_string());
     }
@@ -566,8 +816,9 @@ impl FakeHerdr {
 
     /// Agents started from now on stop at each of `dialogs` in turn,
     /// `blocked`, with its screen on `agent.read`, until `pane.send_keys`
-    /// sends exactly its keys; after the last they are idle and ready, as
-    /// Claude is once its startup dialogs are answered. Empty turns it off.
+    /// has sent its keys, in order, across however many calls it takes;
+    /// after the last they are idle and ready, as Claude is once its
+    /// startup dialogs are answered. Empty turns it off.
     pub fn set_startup_dialogs(&self, dialogs: Vec<(String, Vec<String>)>) {
         self.state.lock().unwrap().dialogs = dialogs;
     }
@@ -578,6 +829,19 @@ impl FakeHerdr {
         self.state.lock().unwrap().dialogs = keys
             .map(|k| vec![(CLAUDE_TRUST_SCREEN.to_string(), k)])
             .unwrap_or_default();
+    }
+
+    /// The next `n` keys sent to `pane_id` through `pane.send_keys` are
+    /// accepted and recorded as usual but never move its current dialog's
+    /// match forward, simulating a keystroke lost on the way to a real pane.
+    /// Only the default trust screen's cursor moves on this: a
+    /// pane given `set_trust_screen` is static and does not react to keys.
+    pub fn lose_next_trust_keys(&self, pane_id: &str, n: usize) {
+        self.state
+            .lock()
+            .unwrap()
+            .lost_trust_keys
+            .insert(pane_id.into(), n);
     }
 
     /// What `agent.read` answers for an agent still at its first startup
@@ -652,6 +916,26 @@ impl FakeHerdr {
     /// shows it.
     pub fn set_status_silently(&self, pane_id: &str, status: AgentStatus) {
         change_status(&mut self.state.lock().unwrap(), pane_id, status);
+    }
+
+    /// herdr forgets workspace `ws` without a word: no event, and its
+    /// agents stay listed. The pastor that recorded it finds
+    /// `workspace_not_found` the next time it names it.
+    pub fn forget_workspace(&self, ws: &str) {
+        let mut s = self.state.lock().unwrap();
+        s.workspaces.remove(ws);
+        s.panes.remove(ws);
+        s.dirty.remove(ws);
+        s.workspace_checkout.remove(ws);
+    }
+
+    /// The agent on `pane_id` reports its own session, as a hook would
+    /// (`AgentInfo::agent_session`); `None` clears it, as a machine with no
+    /// such hook installed never sets one.
+    pub fn set_agent_session(&self, pane_id: &str, session: Option<AgentSessionInfo>) {
+        if let Some(a) = self.state.lock().unwrap().agents.get_mut(pane_id) {
+            a.agent_session = session;
+        }
     }
 
     /// The pane goes away, as when a human closes it. Its workspace had only
@@ -1138,6 +1422,7 @@ impl FakeHerdr {
                     name: p["name"].as_str().map(str::to_string),
                     agent: p["kind"].as_str().map(str::to_string),
                     agent_status: AgentStatus::Idle,
+                    agent_session: None,
                     completion_seq: None,
                     state_change_seq: s.seq,
                     launch_pending: false,
@@ -1168,6 +1453,17 @@ impl FakeHerdr {
                 }
                 s.started.insert(pane_id.clone(), Instant::now());
                 s.agents.insert(pane_id.clone(), info.clone());
+                let args: Vec<&str> = p["args"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect();
+                for pair in args.windows(2) {
+                    if matches!(pair[0], "--session-id" | "--resume") {
+                        s.sessions.insert(pair[1].to_string(), pane_id.clone());
+                    }
+                }
                 if !s.dialogs.is_empty() && !s.trust_idle {
                     // Its first screen is the trust question, which herdr
                     // reports as `blocked`.
@@ -1269,12 +1565,45 @@ impl FakeHerdr {
                     }
                     PaneInput::Keys(keys)
                 };
-                let answered = matches!(&input, PaneInput::Keys(k) if s.dialog_at(&pane_id).is_some_and(|(_, keys)| keys == k))
-                    && s.agents
-                        .get(&pane_id)
-                        .is_some_and(|a| a.agent_status == AgentStatus::Blocked || s.trust_idle);
+                // A pane still at its current (unanswered) dialog tracks how
+                // much of its keys has arrived, across however many calls
+                // it takes: `--trust` sends one key, reads the pane, then
+                // sends the next. A key `lose_next_trust_keys` marked is
+                // recorded in `pane_input` below like any other, but never
+                // reaches the tally, the way a keystroke once never reached
+                // a real pane.
+                let mut answered = false;
+                if let PaneInput::Keys(keys) = &input {
+                    let eligible = s.dialog_at(&pane_id).is_some()
+                        && s.agents.get(&pane_id).is_some_and(|a| {
+                            a.agent_status == AgentStatus::Blocked || s.trust_idle
+                        });
+                    if eligible {
+                        let prompt = s.dialog_at(&pane_id).expect("checked above").1.clone();
+                        for key in keys {
+                            if let Some(n) = s.lost_trust_keys.get_mut(&pane_id)
+                                && *n > 0
+                            {
+                                *n -= 1;
+                                continue;
+                            }
+                            let progress = s.trust_progress.entry(pane_id.clone()).or_default();
+                            if progress.len() < prompt.len() && prompt[progress.len()] == *key {
+                                progress.push(key.clone());
+                            } else {
+                                // A key that does not extend the match: a
+                                // later key in the same call must not be
+                                // allowed to complete it out of order.
+                                break;
+                            }
+                        }
+                        answered =
+                            s.trust_progress.get(&pane_id).map(Vec::len) == Some(prompt.len());
+                    }
+                }
                 s.pane_input.entry(pane_id.clone()).or_default().push(input);
                 if answered {
+                    s.trust_progress.remove(&pane_id);
                     *s.dialogs_done.entry(pane_id.clone()).or_default() += 1;
                     s.dialog_answered.insert(pane_id.clone(), Instant::now());
                 }
@@ -1315,13 +1644,30 @@ impl FakeHerdr {
                         .flatten()
                 });
                 // A pane whose agent is gone is read by its id.
-                let pane = found.map_or(target, |a| a.pane_id.as_str());
-                let text = match (s.pane_text.get(pane), dialog) {
-                    (Some(text), _) => text.as_str(),
-                    (None, Some((screen, _))) => screen.as_str(),
-                    (None, None) => "fake output\n",
+                let pane = found.map_or(target, |a| a.pane_id.as_str()).to_string();
+                let text = match (s.pane_text.get(&pane), dialog) {
+                    (Some(text), _) => text.clone(),
+                    (None, Some((screen, _))) if screen.as_str() == CLAUDE_TRUST_SCREEN => {
+                        let selected = s.trust_progress.get(&pane).is_some_and(|p| !p.is_empty());
+                        claude_trust_screen(selected)
+                    }
+                    (None, Some((screen, _))) => screen.clone(),
+                    (None, None) => "fake output\n".to_string(),
                 };
                 Ok(json!({"type": "pane_read", "read": {"text": text}}))
+            }
+            // herdr 0.9.5: `pane.process_info {pane_id}` answers the pane's
+            // shell and the foreground of its terminal.
+            "pane.process_info" => {
+                let pane_id = p["pane_id"].as_str().unwrap_or("").to_string();
+                if !Self::pane_open(&s, &pane_id) {
+                    return Err(("pane_not_found".into(), format!("pane {pane_id} not found")));
+                }
+                Ok(json!({"type": "pane_process_info", "process_info": {
+                    "pane_id": pane_id,
+                    "shell_pid": s.shell_pids.get(&pane_id),
+                    "foreground_processes": [],
+                }}))
             }
             // herdr 0.9.1: `pane.split {target_pane_id, direction, cwd, env}`
             // answers `pane_info` with the new pane, in the target's workspace.
@@ -1467,9 +1813,77 @@ impl super::transport::Connector for FakeHerdr {
         }
         Box::pin(async move { Ok(Some(made)) })
     }
+    fn find_processes(&self, spec: &crate::reap::Spec) -> super::transport::FindFuture<'_> {
+        let (run, canned) = {
+            let mut st = self.state.lock().unwrap();
+            st.reaps.push(spec.clone());
+            (st.run_reaps, st.leftovers.clone())
+        };
+        let spec = spec.clone();
+        Box::pin(async move {
+            if !run {
+                return Ok(Some(canned));
+            }
+            crate::reap::find_here(&spec).await.map(Some).map_err(|e| {
+                super::transport::ConnectError {
+                    message: format!("reap: {e}"),
+                }
+            })
+        })
+    }
+    fn end_processes(
+        &self,
+        candidates: &[crate::reap::Candidate],
+    ) -> super::transport::ReapFuture<'_> {
+        let run = {
+            let mut st = self.state.lock().unwrap();
+            st.ends.push(candidates.to_vec());
+            st.run_reaps
+        };
+        let candidates = candidates.to_vec();
+        Box::pin(async move {
+            if !run {
+                return Ok(Some(vec![]));
+            }
+            // A short grace: a test's stubborn process is not waited on long.
+            crate::reap::end_here(&candidates, std::time::Duration::from_secs(1))
+                .await
+                .map(Some)
+                .map_err(|e| super::transport::ConnectError {
+                    message: format!("reap: {e}"),
+                })
+        })
+    }
     fn unpushed_commits(&self, path: &str) -> super::transport::DirFuture<'_> {
         let unpushed = self.state.lock().unwrap().unpushed.contains(path);
         Box::pin(async move { Ok(Some(unpushed)) })
+    }
+    fn checkout_dirty(&self, path: &str) -> super::transport::DirFuture<'_> {
+        let dirty = self.state.lock().unwrap().dirty_checkouts.contains(path);
+        Box::pin(async move { Ok(Some(dirty)) })
+    }
+    /// Records the call; unless the checkout is dirty, it is gone from
+    /// then on, and so is herdr's record of it.
+    fn remove_checkout(&self, path: &str) -> super::transport::DirFuture<'_> {
+        let mut st = self.state.lock().unwrap();
+        st.removed_checkouts.push(path.to_string());
+        let removed = !st.dirty_checkouts.contains(path);
+        if removed {
+            st.checkouts.retain(|_, p| p != path);
+            st.missing_dirs.insert(path.to_string());
+        }
+        Box::pin(async move { Ok(Some(removed)) })
+    }
+    /// Records the call and answers `set_fetch`'s answer.
+    fn fetch_base(&self, repo: &str) -> super::transport::FetchFuture<'_> {
+        let mut st = self.state.lock().unwrap();
+        let seen = st.requests.len();
+        st.fetched.push((repo.to_string(), seen));
+        let answer = st
+            .fetch_answer
+            .clone()
+            .unwrap_or(super::transport::Fetched::Done("origin".into()));
+        Box::pin(async move { Ok(Some(answer)) })
     }
     /// Records the call; unless the branch is gone, the path exists from
     /// then on.
@@ -1485,11 +1899,13 @@ impl super::transport::Connector for FakeHerdr {
         let added = !st.gone_branches.contains(branch);
         if added {
             st.missing_dirs.remove(path);
+            st.checkouts
+                .insert((repo.to_string(), branch.to_string()), path.to_string());
         }
         Box::pin(async move { Ok(Some(added)) })
     }
-    fn opencode_permission_rules(&self) -> super::transport::DirFuture<'_> {
-        let rules = self.state.lock().unwrap().opencode_permissions;
+    fn opencode_permission_rules(&self) -> super::transport::ConfigCheckFuture<'_> {
+        let rules = self.state.lock().unwrap().opencode_permissions.clone();
         Box::pin(async move { Ok(rules) })
     }
     fn agy_settings(&self) -> super::transport::AgySettingsFuture<'_> {
@@ -1512,6 +1928,72 @@ impl super::transport::Connector for FakeHerdr {
                 None => "==== end\n".to_string(),
             });
         Box::pin(async move { Ok(out) })
+    }
+    fn home_file(&self, path: &str) -> super::transport::AgySettingsFuture<'_> {
+        let st = self.state.lock().unwrap();
+        let file =
+            if path == crate::provision::agy::SETTINGS_FILE {
+                st.agy_settings.clone()
+            } else {
+                Some(st.home_files.get(path).cloned().unwrap_or(
+                    crate::provision::agy::AgySettings {
+                        content: None,
+                        link: false,
+                    },
+                ))
+            };
+        drop(st);
+        Box::pin(async move { Ok(file) })
+    }
+    fn write_home_file(
+        &self,
+        path: &str,
+        expected: Option<&str>,
+        new: &str,
+        lock: bool,
+    ) -> super::transport::AgyWriteFuture<'_> {
+        use crate::provision::agy::{AgySettings, AgyWrite};
+        self.state
+            .lock()
+            .unwrap()
+            .file_locks
+            .push((path.to_string(), lock));
+        if path == crate::provision::agy::SETTINGS_FILE {
+            return self.write_agy_settings(expected, new);
+        }
+        let mut st = self.state.lock().unwrap();
+        if let Some(n) = st.file_busy.get_mut(path)
+            && *n > 0
+        {
+            *n -= 1;
+            return Box::pin(async { Ok(Some(AgyWrite::Busy)) });
+        }
+        let saved = st.file_saves.get_mut(path).and_then(|q| q.pop_front());
+        let file = st
+            .home_files
+            .entry(path.to_string())
+            .or_insert(AgySettings {
+                content: None,
+                link: false,
+            });
+        if let Some(saved) = saved {
+            file.content = saved;
+        }
+        let answer = if file.link {
+            AgyWrite::Link
+        } else if file.content.as_deref() != expected {
+            AgyWrite::Changed
+        } else {
+            file.content = Some(new.to_string());
+            let again = st.file_overwrites.get_mut(path).and_then(|q| q.pop_front());
+            if let Some(again) = again {
+                st.home_files.get_mut(path).unwrap().content = Some(again);
+            }
+            st.file_writes.push((path.to_string(), new.to_string()));
+            AgyWrite::Written
+        };
+        drop(st);
+        Box::pin(async move { Ok(Some(answer)) })
     }
     fn write_agy_settings(
         &self,
@@ -1556,6 +2038,19 @@ impl super::transport::Connector for FakeHerdr {
         drop(state);
         Box::pin(async move { answer })
     }
+    fn harness_version(
+        &self,
+        harness: &crate::harness_manifest::Manifest,
+    ) -> super::transport::VersionFuture<'_> {
+        let answer = self
+            .state
+            .lock()
+            .unwrap()
+            .harness_versions
+            .get(&harness.id)
+            .cloned();
+        Box::pin(async move { Ok(answer) })
+    }
     fn room(&self) -> super::transport::RoomFuture<'_> {
         let state = self.state.lock().unwrap();
         let answer = if state.room_fails {
@@ -1568,6 +2063,12 @@ impl super::transport::Connector for FakeHerdr {
         drop(state);
         Box::pin(async move { answer })
     }
+    fn command_succeeds(&self, command: &str) -> super::transport::DirFuture<'_> {
+        let mut st = self.state.lock().unwrap();
+        st.commands_run.push(command.to_string());
+        let answer = st.command_answer;
+        Box::pin(async move { Ok(answer) })
+    }
     fn claude_usage(
         &self,
         config_dir: Option<&str>,
@@ -1576,6 +2077,41 @@ impl super::transport::Connector for FakeHerdr {
         let key = (config_dir.map(str::to_string), session.to_string());
         let usage = self.state.lock().unwrap().usage.get(&key).cloned();
         Box::pin(async move { Ok(usage) })
+    }
+    fn inbox_send(
+        &self,
+        config_dir: Option<&str>,
+        session: &str,
+        mode: crate::inbox::Mode,
+        text: &str,
+    ) -> super::transport::InboxFuture<'_> {
+        let mut s = self.state.lock().unwrap();
+        s.inbox_sends.push(InboxSend {
+            config_dir: config_dir.map(str::to_string),
+            session: session.to_string(),
+            mode,
+            text: text.to_string(),
+        });
+        let Some(result) = s.inbox_result else {
+            return Box::pin(async { Ok(None) });
+        };
+        let pane = s.sessions.get(session).cloned();
+        if result == "accepted"
+            && !s.ignore_prompts
+            && let Some(pane) = pane
+            && let Some(info) = change_status(&mut s, &pane, AgentStatus::Working)
+        {
+            let _ = self.events.send(Event {
+                event: "pane.agent_status_changed".into(),
+                data: json!({"pane_id": info.pane_id, "workspace_id": info.workspace_id, "agent_status": "working"}),
+            });
+        }
+        let outcome = crate::inbox::Outcome {
+            result,
+            detail: (result != "accepted").then(|| "fake".to_string()),
+            msg_id: Some("00000000-0000-4000-8000-000000000000".into()),
+        };
+        Box::pin(async move { Ok(Some(outcome)) })
     }
 }
 

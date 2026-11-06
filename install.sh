@@ -3,6 +3,17 @@
 #
 #   curl -fsSL https://cacari.co/pastor/install.sh | sh
 #
+# With `join` first, it then runs `pastor join` with the rest of its
+# arguments, as they are, to make this machine a pull machine of a head. As
+# the login user, like the install: nothing here uses sudo or a package
+# manager. The join token is a secret, so it is never an argument, which `ps`
+# shows. Without one given, pastor asks for it on the terminal with echo off;
+# or set PASTOR_JOIN_TOKEN, which this script takes out of its environment
+# and hands to pastor on a pipe:
+#
+#   curl -fsSL https://cacari.co/pastor/install.sh | sh -s -- join
+#   PASTOR_JOIN_TOKEN=pjt_... sh -c "$(curl -fsSL https://cacari.co/pastor/install.sh)" sh join
+#
 # PASTOR_VERSION      the version to install (default: the latest release)
 # PASTOR_INSTALL_DIR  where the binary goes (default: ~/.local/bin)
 # PASTOR_DOWNLOAD_URL where the tarball and SHA256SUMS are fetched from
@@ -25,6 +36,26 @@ fail() {
     echo "install.sh: $*" >&2
     exit 1
 }
+
+# `join` and what follows are for pastor, so "$@" keeps them as they came:
+# never split again, never evaluated.
+mode=install
+if [ "${1:-}" = join ]; then
+    mode=join
+    shift
+    # Out of the environment before any other command runs, so no child has
+    # it in its own.
+    token=${PASTOR_JOIN_TOKEN:-}
+    unset PASTOR_JOIN_TOKEN
+    stdin_flag=--token-stdin
+    for arg in "$@"; do
+        case "$arg" in
+            pjt_*) fail "the join token is never an argument, which ps shows; type it when asked, or set PASTOR_JOIN_TOKEN" ;;
+            --token-stdin) stdin_flag= ;;
+        esac
+    done
+    [ "$(id -u)" != 0 ] || fail "run this as the login user that will own pastor; it never needs root"
+fi
 
 for tool in curl tar; do
     command -v "$tool" >/dev/null 2>&1 || fail "$tool is needed"
@@ -92,4 +123,16 @@ case ":$PATH:" in
     *":$dir:"*) ;;
     *) echo "note: $dir is not on your PATH" >&2 ;;
 esac
+if [ "$mode" = join ]; then
+    if [ -n "$token" ]; then
+        # printf is a builtin: the token reaches pastor on a pipe, never in an
+        # argument or the environment. Unquoted on purpose: one fixed word, or
+        # none when --token-stdin was given.
+        # shellcheck disable=SC2086
+        printf '%s\n' "$token" | "$dir/pastor" join $stdin_flag "$@"
+    else
+        "$dir/pastor" join "$@"
+    fi
+    exit
+fi
 echo "next: pastor completions bash|fish|zsh, then pastor setup systemd (setup launchd on macOS)"

@@ -91,6 +91,7 @@ fn setup_systemd_yes_installs_without_a_prompt() {
             .env_remove("PASTOR_DATA_DIR")
             .env("PASTOR_CONFIG_DIR", &config)
             .env("PASTOR_STATE_DIR", &state)
+            .env("USER", "tester")
             .stdin(Stdio::null())
             .output()
             .unwrap();
@@ -124,6 +125,12 @@ fn setup_systemd_yes_installs_without_a_prompt() {
             calls.contains("--user enable --now pastor.service"),
             "{calls}"
         );
+        // Nobody to ask: the head's address comes from this host's name,
+        // and setup says so; the second run keeps it.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("head_address"), "{flag}: {stdout}");
+        let toml = std::fs::read_to_string(config.join("pastor.toml")).unwrap();
+        assert!(toml.contains("head_address = \"tester@"), "{toml}");
     }
 }
 

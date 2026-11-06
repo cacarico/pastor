@@ -16,7 +16,7 @@ use crate::task::{
     TaskSummary,
 };
 
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 20;
 
 /// The tables schema 2 added: created on a fresh database and by the v1
 /// migration.
@@ -82,12 +82,13 @@ const V13_TABLES: &str = "CREATE TABLE IF NOT EXISTS task_summaries (
 
 /// Schema 15: the accounts (or one model of one) that ran out of usage
 /// (`AccountLimit`), one row per account and model, `''` for the whole
-/// account.
+/// account. `signed_out` (schema 20) marks an agent found signed out.
 const V15_TABLES: &str = "CREATE TABLE IF NOT EXISTS limits (
         account TEXT NOT NULL,
         model TEXT NOT NULL DEFAULT '',
         hard INTEGER NOT NULL,
         no_credit INTEGER NOT NULL DEFAULT 0,
+        signed_out INTEGER NOT NULL DEFAULT 0,
         until TEXT,
         retry_at TEXT NOT NULL,
         line TEXT NOT NULL,
@@ -111,6 +112,32 @@ const V16_TABLES: &str = "CREATE TABLE IF NOT EXISTS task_usage (
         read_at TEXT NOT NULL
      );";
 
+/// Schema 19: how each machine's bootstrap ended (`MachineState`, one row
+/// per machine), and the one-use tokens a new machine joins with
+/// (`JoinToken`). `generation` is a pull machine's enrollment, which its
+/// shepherd's forced command carries: 0 until a join sets it. A token's `id`
+/// is its public name, never the token itself, and `tags` a JSON list.
+const V19_TABLES: &str = "CREATE TABLE IF NOT EXISTS machine_state (
+        machine TEXT PRIMARY KEY,
+        bootstrap TEXT NOT NULL,
+        isolation TEXT,
+        failed_step TEXT,
+        why TEXT,
+        host_key TEXT,
+        herdr_version TEXT,
+        pastor_version TEXT,
+        generation INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL
+     );
+     CREATE TABLE IF NOT EXISTS join_tokens (
+        id TEXT PRIMARY KEY,
+        flock TEXT,
+        tags TEXT NOT NULL DEFAULT '[]',
+        replace TEXT,
+        expires_at TEXT NOT NULL,
+        used_at TEXT
+     );";
+
 /// A task row with its last round's summary as JSON (`summary_json`) and
 /// its usage (`usage_json`), which `row_to_task` reads when the query has
 /// them.
@@ -132,6 +159,107 @@ pub struct TrustedRepo {
     pub repo: String,
     pub trusted_at: DateTime<Utc>,
 }
+
+/// How a machine's bootstrap stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BootstrapState {
+    Pending,
+    Ok,
+    Failed,
+}
+
+impl BootstrapState {
+    fn as_str(self) -> &'static str {
+        match self {
+            BootstrapState::Pending => "pending",
+            BootstrapState::Ok => "ok",
+            BootstrapState::Failed => "failed",
+        }
+    }
+
+    fn parse(s: &str) -> Option<BootstrapState> {
+        Some(match s {
+            "pending" => BootstrapState::Pending,
+            "ok" => BootstrapState::Ok,
+            "failed" => BootstrapState::Failed,
+            _ => return None,
+        })
+    }
+}
+
+/// A machine an operator cordoned: it takes no new task until it is
+/// uncordoned, and the tasks it runs go on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cordon {
+    pub machine: String,
+    pub reason: Option<String>,
+    pub since: DateTime<Utc>,
+}
+
+/// The `meta` key a machine's cordon is kept under, so the schema stays as
+/// it was: a value is the cordon as JSON.
+const CORDON_PREFIX: &str = "cordon:";
+
+/// What the store knows of a machine's bootstrap: how it ended, the
+/// isolation it chose, the host key it pinned, the versions it saw and its
+/// enrollment generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineState {
+    pub machine: String,
+    pub bootstrap: BootstrapState,
+    pub isolation: Option<String>,
+    pub failed_step: Option<String>,
+    pub why: Option<String>,
+    pub host_key: Option<String>,
+    pub herdr_version: Option<String>,
+    pub pastor_version: Option<String>,
+    pub generation: i64,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A one-use token a new machine joins with. The store keeps the token's
+/// public `id` and what it grants; the token itself, which holds a private
+/// key, never reaches it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinToken {
+    pub id: String,
+    pub flock: Option<String>,
+    pub tags: Vec<String>,
+    /// The machine a join with this token may replace.
+    pub replace: Option<String>,
+    pub expires_at: DateTime<Utc>,
+    pub used_at: Option<DateTime<Utc>>,
+}
+
+/// What `Store::use_join_token` found. Only `Ok` marked the token used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinTokenUse {
+    Ok,
+    Used,
+    Expired,
+    NotFound,
+}
+
+/// A `join_tokens` row, selected as `id, flock, tags, replace, expires_at,
+/// used_at`.
+fn join_token_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JoinToken> {
+    let tags: String = r.get(2)?;
+    let expires_at: String = r.get(4)?;
+    let used_at: Option<String> = r.get(5)?;
+    Ok(JoinToken {
+        id: r.get(0)?,
+        flock: r.get(1)?,
+        tags: serde_json::from_str(&tags).map_err(conversion_failure)?,
+        replace: r.get(3)?,
+        expires_at: parse_utc(&expires_at)?,
+        used_at: used_at.as_deref().map(parse_utc).transpose()?,
+    })
+}
+
+/// Every token begins with this, so an id that does is a token handed to
+/// the store by mistake.
+const JOIN_TOKEN_PREFIX: &str = "pjt_";
 
 /// Runs a call that may wait on SQLite (the connection's lock, then up to
 /// `BUSY_TIMEOUT` for another connection's) without holding up the tokio
@@ -460,6 +588,7 @@ impl Store {
                 tx.execute_batch(V15_TABLES)?;
                 tx.execute_batch(V16_TABLES)?;
                 tx.execute_batch(V18_TABLES)?;
+                tx.execute_batch(V19_TABLES)?;
                 tx.execute(
                     "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)",
                     params![SCHEMA_VERSION.to_string()],
@@ -475,6 +604,7 @@ impl Store {
                 tx.execute_batch(V15_TABLES)?;
                 tx.execute_batch(V16_TABLES)?;
                 tx.execute_batch(V18_TABLES)?;
+                tx.execute_batch(V19_TABLES)?;
             }
             Some(v) if v < SCHEMA_VERSION => {
                 // One `if v < N` block per migration. The job tables go in
@@ -599,6 +729,26 @@ impl Store {
                         params![Utc::now().to_rfc3339()],
                     )?;
                 }
+                // Bootstrap state and join tokens. No machine was
+                // bootstrapped or joined with a token before.
+                if v < 19 {
+                    tx.execute_batch(V19_TABLES)?;
+                }
+                // Signed-out agents, kept as limits. A table made at 15
+                // to 19 lacks the column; one made just above has it.
+                if v < 20 {
+                    let present: bool = tx.query_row(
+                        "SELECT COUNT(*) FROM pragma_table_info('limits') WHERE name = 'signed_out'",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )? > 0;
+                    if !present {
+                        tx.execute(
+                            "ALTER TABLE limits ADD COLUMN signed_out INTEGER NOT NULL DEFAULT 0",
+                            [],
+                        )?;
+                    }
+                }
                 tx.execute(
                     "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
                     params![SCHEMA_VERSION.to_string()],
@@ -712,6 +862,17 @@ impl Store {
     /// pastor read them (`note_pane_tail`), marked `source = pane`.
     pub fn end_round(&self, id: i64, summary: Option<&str>) -> anyhow::Result<TaskSummary> {
         let row = self.summary_row(id, summary);
+        self.insert_round(id, row)
+    }
+
+    /// `end_round` with no summary for a round whose agent could not reach
+    /// the head to give one (`MachineSettings::cut_off_from_head`): the
+    /// pane's last lines, as `no head` rather than `no summary`.
+    pub fn end_round_unreached(&self, id: i64) -> anyhow::Result<TaskSummary> {
+        let row = TaskSummary {
+            outcome: Outcome::NoHead,
+            ..self.summary_row(id, None)
+        };
         self.insert_round(id, row)
     }
 
@@ -1092,7 +1253,8 @@ impl Store {
             // keeps the level (the one it had before it aged: the copy waits
             // afresh), its role, description and where it came from,
             // but queues last in it, and waits for a slot even when the task
-            // it copies ran with `--now`.
+            // it copies ran with `--now`. It starts fresh, so the resume prompt
+            // of the run it copies is dropped.
             let n = tx.execute(
             "INSERT INTO tasks (job, item, prompt, spec, flock, role, description, state, retry_of, priority, priority_from, preempt, created_at, updated_at)
              SELECT job, item, prompt,
@@ -1104,7 +1266,7 @@ impl Store {
                                                    'path', json_extract(spec, '$.checkout.path'),
                                                    'agent', COALESCE(agent_name, 't-' || id)))
                          ELSE json_remove(spec, '$.branch', '$.checkout', '$.reopen') END,
-                         '$.session_id', '$.label.name', '$.label.note', '$.now'), ?3),
+                         '$.session_id', '$.label.name', '$.label.note', '$.now', '$.start_prompt'), ?3),
                     flock, role, description, 'queued', id, COALESCE(aged_from, priority), priority_from, preempt, ?2, ?2 FROM tasks
              WHERE id = ?1 AND state IN ('failed', 'stale')",
             params![of, now, patch],
@@ -1807,6 +1969,259 @@ impl Store {
         self.conn.lock().recover().execute_batch(sql).unwrap();
     }
 
+    /// The bootstrap record of `machine`, if it has one.
+    pub fn machine_state(&self, machine: &str) -> anyhow::Result<Option<MachineState>> {
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            Ok(conn
+                .query_row(
+                    "SELECT machine, bootstrap, isolation, failed_step, why, host_key,
+                            herdr_version, pastor_version, generation, updated_at
+                     FROM machine_state WHERE machine = ?1",
+                    params![machine],
+                    |r| {
+                        let bootstrap: String = r.get(1)?;
+                        let updated_at: String = r.get(9)?;
+                        Ok(MachineState {
+                            machine: r.get(0)?,
+                            bootstrap: BootstrapState::parse(&bootstrap).ok_or_else(|| {
+                                conversion_failure(format!("unknown bootstrap state {bootstrap:?}"))
+                            })?,
+                            isolation: r.get(2)?,
+                            failed_step: r.get(3)?,
+                            why: r.get(4)?,
+                            host_key: r.get(5)?,
+                            herdr_version: r.get(6)?,
+                            pastor_version: r.get(7)?,
+                            generation: r.get(8)?,
+                            updated_at: parse_utc(&updated_at)?,
+                        })
+                    },
+                )
+                .optional()?)
+        })
+    }
+
+    /// Save `s`, replacing the machine's earlier record whole.
+    pub fn put_machine_state(&self, s: &MachineState) -> anyhow::Result<()> {
+        blocking(|| {
+            self.conn.lock().recover().execute(
+                "INSERT OR REPLACE INTO machine_state
+                    (machine, bootstrap, isolation, failed_step, why, host_key,
+                     herdr_version, pastor_version, generation, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    s.machine,
+                    s.bootstrap.as_str(),
+                    s.isolation,
+                    s.failed_step,
+                    s.why,
+                    s.host_key,
+                    s.herdr_version,
+                    s.pastor_version,
+                    s.generation,
+                    s.updated_at.to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Record the versions read from `machine`. A `None` keeps what was
+    /// there; a machine with no record is left alone.
+    pub fn set_versions(
+        &self,
+        machine: &str,
+        herdr: Option<&str>,
+        pastor: Option<&str>,
+    ) -> anyhow::Result<()> {
+        blocking(|| {
+            self.conn.lock().recover().execute(
+                "UPDATE machine_state
+                 SET herdr_version = COALESCE(?2, herdr_version),
+                     pastor_version = COALESCE(?3, pastor_version)
+                 WHERE machine = ?1",
+                params![machine, herdr, pastor],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn drop_machine_state(&self, machine: &str) -> anyhow::Result<()> {
+        blocking(|| {
+            self.conn.lock().recover().execute(
+                "DELETE FROM machine_state WHERE machine = ?1",
+                params![machine],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Cordon `machine`, replacing an earlier cordon's reason.
+    pub fn put_cordon(&self, c: &Cordon) -> anyhow::Result<()> {
+        self.set_meta(
+            &format!("{CORDON_PREFIX}{}", c.machine),
+            &serde_json::to_string(c)?,
+        )
+    }
+
+    /// The cordon of `machine`, if it has one.
+    pub fn cordon(&self, machine: &str) -> anyhow::Result<Option<Cordon>> {
+        self.meta(&format!("{CORDON_PREFIX}{machine}"))?
+            .map(|text| {
+                serde_json::from_str(&text)
+                    .with_context(|| format!("the cordon of {machine} is not readable"))
+            })
+            .transpose()
+    }
+
+    /// Every cordon, by machine name.
+    pub fn cordons(&self) -> anyhow::Result<Vec<Cordon>> {
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let mut stmt =
+                conn.prepare("SELECT key, value FROM meta WHERE key LIKE 'cordon:%' ORDER BY key")?;
+            let rows =
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (key, text) = row?;
+                out.push(
+                    serde_json::from_str(&text)
+                        .with_context(|| format!("{key} is not readable"))?,
+                );
+            }
+            Ok(out)
+        })
+    }
+
+    /// Lift the cordon of `machine`; whether there was one.
+    pub fn drop_cordon(&self, machine: &str) -> anyhow::Result<bool> {
+        blocking(|| {
+            let n = self.conn.lock().recover().execute(
+                "DELETE FROM meta WHERE key = ?1",
+                params![format!("{CORDON_PREFIX}{machine}")],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
+    /// Save a new token. An id already saved is refused rather than
+    /// replaced, so a used token never reads as unused again, and so is one
+    /// that is a token itself: the store keeps only the public id.
+    pub fn put_join_token(&self, t: &JoinToken) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !t.id.starts_with(JOIN_TOKEN_PREFIX),
+            "a join token's id, not the token, goes in the store"
+        );
+        blocking(|| {
+            self.conn.lock().recover().execute(
+                "INSERT INTO join_tokens (id, flock, tags, replace, expires_at, used_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    t.id,
+                    t.flock,
+                    serde_json::to_string(&t.tags)?,
+                    t.replace,
+                    t.expires_at.to_rfc3339(),
+                    t.used_at.map(|d| d.to_rfc3339()),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn join_token(&self, id: &str) -> anyhow::Result<Option<JoinToken>> {
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            Ok(conn
+                .query_row(
+                    "SELECT id, flock, tags, replace, expires_at, used_at
+                     FROM join_tokens WHERE id = ?1",
+                    params![id],
+                    join_token_row,
+                )
+                .optional()?)
+        })
+    }
+
+    /// Every token the store keeps, oldest expiry first.
+    pub fn join_tokens(&self) -> anyhow::Result<Vec<JoinToken>> {
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let mut stmt = conn.prepare(
+                "SELECT id, flock, tags, replace, expires_at, used_at
+                 FROM join_tokens ORDER BY julianday(expires_at), id",
+            )?;
+            let rows = stmt
+                .query_map([], join_token_row)?
+                .collect::<Result<_, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// Forget a token. True if there was one.
+    pub fn drop_join_token(&self, id: &str) -> anyhow::Result<bool> {
+        blocking(|| {
+            let n = self
+                .conn
+                .lock()
+                .recover()
+                .execute("DELETE FROM join_tokens WHERE id = ?1", params![id])?;
+            Ok(n == 1)
+        })
+    }
+
+    /// Mark the token used at `now`, if it is unused and `now` is before its
+    /// expiry. The check and the mark are one statement, so of two joins
+    /// with one token only one gets `Ok`; a refusal is only explained after,
+    /// and a token once used or expired stays so. The times are compared
+    /// parsed, not as text, so a row written in another offset still sorts
+    /// right.
+    pub fn use_join_token(&self, id: &str, now: DateTime<Utc>) -> anyhow::Result<JoinTokenUse> {
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let n = conn.execute(
+                "UPDATE join_tokens SET used_at = ?2
+                 WHERE id = ?1 AND used_at IS NULL
+                   AND julianday(expires_at) > julianday(?2)",
+                params![id, now.to_rfc3339()],
+            )?;
+            if n == 1 {
+                return Ok(JoinTokenUse::Ok);
+            }
+            let used: Option<Option<String>> = conn
+                .query_row(
+                    "SELECT used_at FROM join_tokens WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(match used {
+                None => JoinTokenUse::NotFound,
+                Some(Some(_)) => JoinTokenUse::Used,
+                Some(None) => JoinTokenUse::Expired,
+            })
+        })
+    }
+
+    /// Ids of the unused tokens whose time ran out by `now`, the ones whose
+    /// access the head must take back.
+    pub fn expired_join_tokens(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<String>> {
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let mut stmt = conn.prepare(
+                "SELECT id FROM join_tokens
+                 WHERE used_at IS NULL AND julianday(expires_at) <= julianday(?1)
+                 ORDER BY id",
+            )?;
+            let ids = stmt
+                .query_map(params![now.to_rfc3339()], |r| r.get(0))?
+                .collect::<Result<_, _>>()?;
+            Ok(ids)
+        })
+    }
+
     /// Save `repo` on `machine` as trusted. Returns whether it was new.
     pub fn trust_repo(&self, machine: &str, repo: &str) -> anyhow::Result<bool> {
         blocking(|| {
@@ -1877,8 +2292,8 @@ impl Store {
             let conn = self.conn.lock().recover();
             conn.execute(
                 "INSERT OR REPLACE INTO limits
-                   (account, model, hard, no_credit, until, retry_at, line, task_id, machine, agent, seen_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                   (account, model, hard, no_credit, until, retry_at, line, task_id, machine, agent, seen_at, signed_out)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     limit.account,
                     limit.model.as_deref().unwrap_or(""),
@@ -1891,6 +2306,7 @@ impl Store {
                     limit.machine,
                     limit.agent,
                     limit.seen_at.to_rfc3339(),
+                    limit.signed_out,
                 ],
             )?;
             Ok(())
@@ -1934,6 +2350,25 @@ impl Store {
             anyhow::Ok(())
         })?;
         Ok(gone.into_iter().map(|(l, _)| l).collect())
+    }
+
+    /// Delete `account`'s signed-out rows, answering them; its usage limits
+    /// stay.
+    pub fn clear_signed_out(&self, account: &str) -> anyhow::Result<Vec<AccountLimit>> {
+        let gone: Vec<AccountLimit> = self
+            .limits()?
+            .into_iter()
+            .filter(|l| l.account == account && l.signed_out)
+            .collect();
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            conn.execute(
+                "DELETE FROM limits WHERE account = ?1 AND signed_out = 1",
+                params![account],
+            )?;
+            anyhow::Ok(())
+        })?;
+        Ok(gone)
     }
 
     /// Delete `account`'s limits, answering them: only `model`'s row when
@@ -1996,6 +2431,7 @@ impl Store {
                     model: (!model.is_empty()).then_some(model),
                     hard: r.get("hard")?,
                     no_credit: r.get("no_credit")?,
+                    signed_out: r.get("signed_out")?,
                     until: r.get::<_, Option<String>>("until")?.map(time).transpose()?,
                     retry_at: time(retry_at.clone())?,
                     line: r.get("line")?,
@@ -2158,6 +2594,13 @@ fn add_column(conn: &Connection, name: &str, definition: &str) -> anyhow::Result
         conn.execute(&format!("ALTER TABLE tasks ADD COLUMN {definition}"), [])?;
     }
     Ok(())
+}
+
+/// An RFC 3339 time read back from a row, in UTC.
+fn parse_utc(s: &str) -> rusqlite::Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|d| d.with_timezone(&Utc))
+        .map_err(conversion_failure)
 }
 
 /// A corrupt database must be surfaced, never silently reinterpreted: any column
@@ -2439,6 +2882,14 @@ mod tests {
             cwd: None,
             keep_pane: None,
             keep_pane_from: None,
+            remove_worktree: None,
+            remove_worktree_from: None,
+            load: None,
+            load_from: None,
+            fetch: Default::default(),
+            start_prompt: None,
+            workdir: None,
+            workdir_bundles: Vec::new(),
             rounds: Default::default(),
         }
     }
@@ -2859,6 +3310,301 @@ mod tests {
         assert_eq!(s.trust_keys(2).unwrap(), Some(vec!["Enter".to_string()]));
     }
 
+    fn at(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    fn sample_state() -> MachineState {
+        MachineState {
+            machine: "pi-1".into(),
+            bootstrap: BootstrapState::Failed,
+            isolation: Some("none".into()),
+            failed_step: Some("herdr".into()),
+            why: Some("download failed".into()),
+            host_key: Some("ssh-ed25519 AAAA".into()),
+            herdr_version: None,
+            pastor_version: Some("0.9.0".into()),
+            generation: 1,
+            updated_at: at("2026-10-16T10:00:00Z"),
+        }
+    }
+
+    /// A record reads back as it was saved, a later one replaces it whole,
+    /// `set_versions` changes only the versions it is given, and a dropped
+    /// record is gone.
+    #[test]
+    fn machine_state_round_trips() {
+        let s = Store::open_in_memory().unwrap();
+        assert!(s.machine_state("pi-1").unwrap().is_none());
+        let mut m = sample_state();
+        s.put_machine_state(&m).unwrap();
+        assert_eq!(s.machine_state("pi-1").unwrap(), Some(m.clone()));
+        m.bootstrap = BootstrapState::Ok;
+        m.failed_step = None;
+        m.why = None;
+        m.generation = 2;
+        m.updated_at = at("2026-10-16T11:00:00Z");
+        s.put_machine_state(&m).unwrap();
+        assert_eq!(s.machine_state("pi-1").unwrap(), Some(m.clone()));
+        s.set_versions("pi-1", Some("0.9.6"), None).unwrap();
+        let got = s.machine_state("pi-1").unwrap().unwrap();
+        assert_eq!(got.herdr_version.as_deref(), Some("0.9.6"));
+        assert_eq!(got.pastor_version.as_deref(), Some("0.9.0"));
+        assert_eq!(got.generation, 2);
+        s.set_versions("pi-1", None, Some("1.0.0")).unwrap();
+        let got = s.machine_state("pi-1").unwrap().unwrap();
+        assert_eq!(got.herdr_version.as_deref(), Some("0.9.6"));
+        assert_eq!(got.pastor_version.as_deref(), Some("1.0.0"));
+        s.set_versions("pi-2", Some("0.9.6"), Some("1.0.0"))
+            .unwrap();
+        assert!(s.machine_state("pi-2").unwrap().is_none());
+        s.drop_machine_state("pi-1").unwrap();
+        assert!(s.machine_state("pi-1").unwrap().is_none());
+    }
+
+    /// A cordon reads back as saved, a later one replaces its reason, the
+    /// list has every machine's, and a lifted one is gone. It lives in the
+    /// file: a store opened again still has it.
+    #[test]
+    fn cordons_round_trip_and_survive_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pastor.db");
+        let s = Store::open(&path).unwrap();
+        assert!(s.cordon("pi-1").unwrap().is_none());
+        let c = Cordon {
+            machine: "pi-1".into(),
+            reason: Some("kernel update".into()),
+            since: at("2026-10-31T10:00:00Z"),
+        };
+        s.put_cordon(&c).unwrap();
+        s.put_cordon(&Cordon {
+            machine: "pi-2".into(),
+            reason: None,
+            since: at("2026-10-31T10:05:00Z"),
+        })
+        .unwrap();
+        assert_eq!(s.cordon("pi-1").unwrap(), Some(c.clone()));
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.cordon("pi-1").unwrap(), Some(c.clone()));
+        let machines: Vec<String> = s
+            .cordons()
+            .unwrap()
+            .into_iter()
+            .map(|c| c.machine)
+            .collect();
+        assert_eq!(machines, ["pi-1", "pi-2"]);
+        let again = Cordon {
+            reason: Some("rebooting".into()),
+            ..c
+        };
+        s.put_cordon(&again).unwrap();
+        assert_eq!(s.cordon("pi-1").unwrap(), Some(again));
+        assert!(s.drop_cordon("pi-1").unwrap());
+        assert!(!s.drop_cordon("pi-1").unwrap());
+        assert!(s.cordon("pi-1").unwrap().is_none());
+        assert_eq!(s.cordons().unwrap().len(), 1);
+    }
+
+    /// A bootstrap state the store does not know is an error, not a guess.
+    #[test]
+    fn an_unknown_bootstrap_state_is_an_error() {
+        let s = Store::open_in_memory().unwrap();
+        s.put_machine_state(&sample_state()).unwrap();
+        s.execute_raw("UPDATE machine_state SET bootstrap = 'maybe'");
+        let err = s.machine_state("pi-1").unwrap_err();
+        assert!(format!("{err:#}").contains("maybe"), "{err:#}");
+    }
+
+    fn token(id: &str, expires_at: &str) -> JoinToken {
+        JoinToken {
+            id: id.into(),
+            flock: Some("work".into()),
+            tags: vec!["gpu".into(), "arm".into()],
+            replace: None,
+            expires_at: at(expires_at),
+            used_at: None,
+        }
+    }
+
+    /// A token works once: the first use marks it, every later one is
+    /// refused as used, and saving the same id again cannot reset it.
+    #[test]
+    fn use_join_token_is_single_use() {
+        let s = Store::open_in_memory().unwrap();
+        let t = token("a", "2026-10-16T12:00:00Z");
+        s.put_join_token(&t).unwrap();
+        assert_eq!(s.join_token("a").unwrap(), Some(t.clone()));
+        let now = at("2026-10-16T11:00:00Z");
+        assert_eq!(s.use_join_token("a", now).unwrap(), JoinTokenUse::Ok);
+        assert_eq!(s.use_join_token("a", now).unwrap(), JoinTokenUse::Used);
+        assert_eq!(
+            s.use_join_token("a", at("2026-10-16T11:30:00Z")).unwrap(),
+            JoinTokenUse::Used
+        );
+        assert_eq!(s.join_token("a").unwrap().unwrap().used_at, Some(now));
+        assert!(s.put_join_token(&t).is_err());
+        assert_eq!(s.join_token("a").unwrap().unwrap().used_at, Some(now));
+    }
+
+    /// A refusal says why: past its expiry (even written in another
+    /// offset, or at the very second), already used after it ran out, or
+    /// no such token. An expired token is never marked used.
+    #[test]
+    fn use_join_token_distinguishes_expired_and_missing() {
+        let s = Store::open_in_memory().unwrap();
+        s.put_join_token(&token("old", "2026-10-16T10:00:00Z"))
+            .unwrap();
+        s.put_join_token(&token("edge", "2026-10-16T11:00:00Z"))
+            .unwrap();
+        s.put_join_token(&token("offset", "2026-10-16T10:30:00Z"))
+            .unwrap();
+        // Written in another offset, as an older or other writer may have:
+        // as text it sorts after `now`, though it is half an hour before.
+        s.execute_raw(
+            "UPDATE join_tokens SET expires_at = '2026-10-16T12:30:00+02:00' WHERE id = 'offset'",
+        );
+        let now = at("2026-10-16T11:00:00Z");
+        assert_eq!(s.use_join_token("old", now).unwrap(), JoinTokenUse::Expired);
+        assert_eq!(
+            s.use_join_token("edge", now).unwrap(),
+            JoinTokenUse::Expired
+        );
+        assert_eq!(
+            s.use_join_token("offset", now).unwrap(),
+            JoinTokenUse::Expired
+        );
+        assert_eq!(s.join_token("old").unwrap().unwrap().used_at, None);
+        assert_eq!(
+            s.use_join_token("nope", now).unwrap(),
+            JoinTokenUse::NotFound
+        );
+        s.put_join_token(&token("late", "2026-10-16T10:30:00Z"))
+            .unwrap();
+        assert_eq!(
+            s.use_join_token("late", at("2026-10-16T10:00:00Z"))
+                .unwrap(),
+            JoinTokenUse::Ok
+        );
+        assert_eq!(s.use_join_token("late", now).unwrap(), JoinTokenUse::Used);
+        assert!(s.drop_join_token("late").unwrap());
+        assert!(!s.drop_join_token("late").unwrap());
+        assert_eq!(
+            s.use_join_token("late", now).unwrap(),
+            JoinTokenUse::NotFound
+        );
+    }
+
+    /// Only unused tokens whose time is up are listed: not a live one, and
+    /// not a used one, whose access is already gone.
+    #[test]
+    fn expired_tokens_listed() {
+        let s = Store::open_in_memory().unwrap();
+        s.put_join_token(&token("old", "2026-10-16T10:00:00Z"))
+            .unwrap();
+        s.put_join_token(&token("edge", "2026-10-16T11:00:00Z"))
+            .unwrap();
+        s.put_join_token(&token("live", "2026-10-16T12:00:00Z"))
+            .unwrap();
+        s.put_join_token(&token("used", "2026-10-16T10:30:00Z"))
+            .unwrap();
+        s.put_join_token(&token("offset", "2026-10-16T10:30:00Z"))
+            .unwrap();
+        // Written in another offset, as an older or other writer may have:
+        // as text it sorts after `now`, though it is half an hour before.
+        s.execute_raw(
+            "UPDATE join_tokens SET expires_at = '2026-10-16T12:30:00+02:00' WHERE id = 'offset'",
+        );
+        assert_eq!(
+            s.use_join_token("used", at("2026-10-16T10:00:00Z"))
+                .unwrap(),
+            JoinTokenUse::Ok
+        );
+        assert_eq!(
+            s.expired_join_tokens(at("2026-10-16T11:00:00Z")).unwrap(),
+            ["edge", "offset", "old"]
+        );
+    }
+
+    /// The store keeps a token's id, never the token: one handed to it by
+    /// mistake is refused and nothing is saved.
+    #[test]
+    fn a_join_token_itself_is_refused() {
+        let s = Store::open_in_memory().unwrap();
+        let t = token("pjt_c2VjcmV0", "2026-10-16T12:00:00Z");
+        assert!(s.put_join_token(&t).is_err());
+        assert!(s.join_token("pjt_c2VjcmV0").unwrap().is_none());
+    }
+
+    /// Tags that are not a JSON list are an error, not an empty list.
+    #[test]
+    fn join_token_tags_that_are_not_json_are_an_error() {
+        let s = Store::open_in_memory().unwrap();
+        s.put_join_token(&token("bad", "2026-10-16T12:00:00Z"))
+            .unwrap();
+        s.execute_raw("UPDATE join_tokens SET tags = 'not json' WHERE id = 'bad'");
+        assert!(s.join_token("bad").is_err());
+    }
+
+    /// A schema 18 store with rows in every table opens at the current
+    /// schema with those rows intact and the bootstrap tables empty and in
+    /// use.
+    #[test]
+    fn a_v18_database_with_rows_gains_the_bootstrap_tables() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        let fresh = tmp.path().join("fresh.db");
+        drop(Store::open(&fresh).unwrap());
+        let (task, usage) = {
+            let s = Store::open(&path).unwrap();
+            let t = s.insert_task(new_task("run")).unwrap();
+            s.trust_repo("pi-1", "~/work/api").unwrap();
+            s.mark_seen("nightly", "2026-10-16", Some(t.id)).unwrap();
+            s.end_round(t.id, Some("done: built it")).unwrap();
+            s.record_limit(&limit_row("me", None, 60)).unwrap();
+            let usage = crate::usage::TaskUsage {
+                model: Some("claude-opus-5-5".into()),
+                api_calls: 3,
+                input: 10,
+                cache_write: 20,
+                cache_read: 30,
+                output: 40,
+                read_at: at("2026-10-16T10:00:00Z"),
+            };
+            s.set_usage(t.id, &usage).unwrap();
+            s.execute_raw(
+                "DROP TABLE machine_state;
+                 DROP TABLE join_tokens;
+                 UPDATE meta SET value = '18' WHERE key = 'schema_version'",
+            );
+            (s.get_task(t.id).unwrap().unwrap(), usage)
+        };
+        assert!(!table_names(&path).contains(&"machine_state".to_string()));
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.meta("schema_version").unwrap().unwrap(),
+            SCHEMA_VERSION.to_string()
+        );
+        let got = s.get_task(task.id).unwrap().unwrap();
+        assert_eq!(got.prompt, task.prompt);
+        assert_eq!(got.usage, Some(usage));
+        assert_eq!(s.summaries(task.id).unwrap()[0].text, "done: built it");
+        assert!(s.is_trusted("pi-1", "~/work/api").unwrap());
+        assert!(s.is_seen("nightly", "2026-10-16").unwrap());
+        assert_eq!(s.limits().unwrap().len(), 1);
+        assert!(s.machine_state("pi-1").unwrap().is_none());
+        s.put_machine_state(&sample_state()).unwrap();
+        assert_eq!(s.machine_state("pi-1").unwrap(), Some(sample_state()));
+        s.put_join_token(&token("a", "2026-10-16T12:00:00Z"))
+            .unwrap();
+        assert_eq!(
+            s.use_join_token("a", at("2026-10-16T11:00:00Z")).unwrap(),
+            JoinTokenUse::Ok
+        );
+        drop(s);
+        assert_eq!(shape(&path), shape(&fresh));
+    }
+
     /// A round that ends with no summary keeps the pane's last lines, and
     /// leaves them for the finish command.
     #[test]
@@ -2992,7 +3738,9 @@ mod tests {
             vec![
                 "answered_dialogs",
                 "event_seq",
+                "join_tokens",
                 "limits",
+                "machine_state",
                 "meta",
                 "task_summaries",
                 "task_usage",
@@ -3007,7 +3755,9 @@ mod tests {
                 "answered_dialogs",
                 "event_seq",
                 "job_state",
+                "join_tokens",
                 "limits",
+                "machine_state",
                 "meta",
                 "seen",
                 "task_summaries",
@@ -3051,7 +3801,9 @@ mod tests {
                 "answered_dialogs",
                 "event_seq",
                 "job_state",
+                "join_tokens",
                 "limits",
+                "machine_state",
                 "meta",
                 "seen",
                 "task_summaries",
@@ -3624,6 +4376,31 @@ mod tests {
             .insert_retry_placed(t.id, Some(&crate::task::Place::Repo))
             .unwrap();
         assert_eq!(home.spec.place, crate::task::Place::Repo);
+    }
+
+    /// A retry is a fresh start: it must not carry the resume prompt the
+    /// task it copies was last started with, or a reload before its own
+    /// start writes the row would send that prompt into a new session.
+    #[test]
+    fn a_retry_drops_the_start_prompt_it_copies() {
+        for state in [TaskState::Failed, TaskState::Stale] {
+            let s = Store::open_in_memory().unwrap();
+            let t = s
+                .insert_task(NewTask {
+                    spec: DispatchSpec {
+                        start_prompt: Some("resume".into()),
+                        ..spec()
+                    },
+                    ..new_task("run")
+                })
+                .unwrap();
+            assert_eq!(t.spec.start_prompt.as_deref(), Some("resume"));
+            set_state(&s, t.id, state);
+            let copy = s.insert_retry(t.id).unwrap();
+            assert_eq!(copy.spec.start_prompt, None, "{state:?}");
+            let stored = s.get_task(copy.id).unwrap().unwrap();
+            assert_eq!(stored.spec.start_prompt, None, "{state:?}");
+        }
     }
 
     /// `task retry --place` records itself as the override's source, not
@@ -4594,9 +5371,11 @@ mod tests {
                  DROP TABLE limits;
                  DROP TABLE task_usage;
                  DROP TABLE answered_dialogs;
+                 DROP TABLE machine_state;
+                 DROP TABLE join_tokens;
                  UPDATE meta SET value = '1' WHERE key = 'schema_version';
                  CREATE TRIGGER no_bump BEFORE UPDATE ON meta
-                   WHEN NEW.value = '18' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+                   WHEN NEW.value = '20' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
             );
         }
         assert!(Store::open(&path).is_err());
@@ -4642,7 +5421,9 @@ mod tests {
                 && !tables.contains(&"task_summaries".to_string())
                 && !tables.contains(&"limits".to_string())
                 && !tables.contains(&"task_usage".to_string())
-                && !tables.contains(&"answered_dialogs".to_string()),
+                && !tables.contains(&"answered_dialogs".to_string())
+                && !tables.contains(&"machine_state".to_string())
+                && !tables.contains(&"join_tokens".to_string()),
             "rolled back: {tables:?}"
         );
     }
@@ -4705,6 +5486,7 @@ mod tests {
             model: model.map(str::to_string),
             hard: true,
             no_credit: false,
+            signed_out: false,
             until: Some(now + chrono::Duration::minutes(retry_in_mins)),
             retry_at: now + chrono::Duration::minutes(retry_in_mins),
             line: "You've hit your limit".into(),
@@ -4713,6 +5495,50 @@ mod tests {
             agent: Some("claude".into()),
             seen_at: now,
         }
+    }
+
+    /// A schema 19 store gains `limits.signed_out`, and keeps its rows as
+    /// limits that are not signed out.
+    #[test]
+    fn a_v19_database_gains_the_signed_out_column() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fresh = tmp.path().join("fresh.db");
+        drop(Store::open(&fresh).unwrap());
+        let old = tmp.path().join("old.db");
+        {
+            let s = Store::open(&old).unwrap();
+            s.record_limit(&limit_row("me", None, 60)).unwrap();
+            s.execute_raw(
+                "ALTER TABLE limits DROP COLUMN signed_out;
+                 UPDATE meta SET value = '19' WHERE key = 'schema_version'",
+            );
+        }
+        let s = Store::open(&old).unwrap();
+        assert_eq!(
+            s.meta("schema_version").unwrap().unwrap(),
+            SCHEMA_VERSION.to_string()
+        );
+        let rows = s.limits().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].signed_out);
+        drop(s);
+        assert_eq!(shape(&old), shape(&fresh));
+    }
+
+    /// A signed-out row reads back signed out, and time never expires it.
+    #[test]
+    fn a_signed_out_row_is_kept_until_it_is_cleared() {
+        let s = Store::open_in_memory().unwrap();
+        let mut row = limit_row("pi-1/claude", None, 60);
+        row.signed_out = true;
+        row.until = None;
+        row.retry_at = crate::limit::signed_out_until();
+        s.record_limit(&row).unwrap();
+        assert_eq!(s.limits().unwrap(), vec![row.clone()]);
+        let later = Utc::now() + chrono::Duration::days(3650);
+        assert!(s.expire_limits(later).unwrap().is_empty());
+        assert_eq!(s.live_limits(later).unwrap(), vec![row.clone()]);
+        assert_eq!(s.clear_limits("pi-1/claude", None).unwrap(), vec![row]);
     }
 
     /// One row per account and model: a later limit on the same key

@@ -17,6 +17,9 @@ fn default_one() -> u32 {
 fn is_one(n: &u32) -> bool {
     *n == 1
 }
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -47,8 +50,18 @@ pub struct MachineConfig {
     /// turns it off.
     #[serde(default = "default_one", skip_serializing_if = "is_one")]
     pub burst: u32,
+    /// Agent slots of `max_agents` kept free for panes pastor did not
+    /// start: dispatch places at most `max_agents - reserved` of its own
+    /// tasks there. `task run --now` looks past it. At most `max_agents`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reserved: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// The loads this machine takes (`rust`, `light`), on top of those of
+    /// the flocks it is in (`Flock::loads_of`): a task with a load goes
+    /// only to a machine that takes it (`DispatchSpec::load`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loads: Vec<String>,
     /// The old way to put a machine in a flock: membership in it with the
     /// machine's own limits (`max_agents`, job slots, burst) as the flock's
     /// number here. Kept as written; `None` adds nothing (see
@@ -99,6 +112,29 @@ pub struct MachineConfig {
     /// as room.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unknown_room: Option<crate::config::UnknownRoom>,
+    /// The provisioner that checks and sets this machine up for agents: a
+    /// built-in id (`macos`, `raspberry-pi-os`, `arch`) or one copied into
+    /// the data dir (`provision::Catalog`). Unset: `machine check` has
+    /// nothing to run here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provisioner: Option<String>,
+    /// Bundles this machine gets on top of its flocks' (`bundle::Catalog`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bundles: Vec<String>,
+    /// How this machine takes a new version of its bundles, over its
+    /// flocks' (`Flock::bundle_apply`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_apply: Option<crate::bundle::Apply>,
+    /// Harness version pins for this machine, per kind (`claude`, `agy`),
+    /// over its flock's `pins`: `pins = { claude = "2.1.310" }`. Checked,
+    /// not enforced (see `harness`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pins: crate::harness::Pins,
+    /// Environment for the panes of every agent on this machine, over its
+    /// flock's and `[defaults]` and under the agent's own
+    /// (`config::EnvLayers`). A value that looks like a secret is refused.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
     /// One line on what the machine is for (`machine list --wide`,
     /// `describe`); nothing reads it but people.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -109,7 +145,9 @@ pub struct MachineConfig {
 /// and a max (`desk = { share = 2, max = 4 }`). Under its share the flock
 /// takes a free slot as usual; from its share up to its max it takes one
 /// only while no task of a flock under its share there is waiting. The
-/// plain form is a share equal to the max.
+/// plain form is a share equal to the max. 0 keeps the machine in the
+/// flock with no slots: its tasks there run to the end and no new one
+/// starts, to drain it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum FlockNumber {
@@ -159,7 +197,6 @@ impl FlockNumber {
     /// Why the number does not load, if it does not.
     fn problem(&self) -> Option<String> {
         match *self {
-            FlockNumber::Plain(0) => Some("the number must be at least 1".into()),
             FlockNumber::Plain(_) => None,
             FlockNumber::Split(SplitNumber { share: None, .. }) => {
                 Some("max alone is not allowed; a plain number (`= N`) is the hard ceiling".into())
@@ -171,8 +208,8 @@ impl FlockNumber {
                 share: Some(share),
                 max: Some(max),
             }) => {
-                if share == 0 {
-                    Some("the share must be at least 1".into())
+                if share == 0 && max > 0 {
+                    Some("the share must be at least 1 while max is above 0".into())
                 } else if max < share {
                     Some(format!("max {max} is below share {share}"))
                 } else {
@@ -246,6 +283,18 @@ pub struct FlockEntry {
     /// `[defaults] profile`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// The version of each harness's CLI this flock expects on its
+    /// machines, per kind: `pins = { claude = "2.1.310", agy = "1.4" }`. A
+    /// part left out is any (`"2.1"` takes `2.1.310`), `"latest"` pins
+    /// nothing. A `[[machine]]` entry's `pins` replace a kind's here. Checked
+    /// by `machine check` and shown by `machine list`; nothing installs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pins: crate::harness::Pins,
+    /// Environment for the panes of every agent of this flock's tasks, over
+    /// `[defaults] env` and under the machine's and the agent's own
+    /// (`config::EnvLayers`). A value that looks like a secret is refused.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
     /// How long this flock's tasks may run (`"2h"`) when the task or job
     /// sets none, before `[defaults] timeout` (`Defaults::resolve_timeout`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -272,11 +321,43 @@ pub struct FlockEntry {
     /// task and its job say nothing; before `[defaults] keep_pane`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_pane: Option<bool>,
+    /// Whether this flock's tasks lose their worktree once they end, failed
+    /// or stale too, when the task and its job say nothing; before
+    /// `[defaults] remove_worktree`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remove_worktree: Option<bool>,
     /// How a machine whose room cannot be read counts for this flock's
     /// tasks, before the machine's own `unknown_room`
     /// (`config::resolve_unknown_room`); unset, as room.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unknown_room: Option<crate::config::UnknownRoom>,
+    /// The accounts this flock's machines must be logged into, `github`
+    /// and `claude` being the ones pastor knows how to check: a machine's
+    /// provisioner runs the checks marked with them (`provision::Account`).
+    /// A list of kinds, or a map from kind to the account name `machine
+    /// check` expects the machine to be signed in as (`Accounts`).
+    #[serde(default, skip_serializing_if = "Accounts::is_empty")]
+    pub accounts: Accounts,
+    /// The bundles this flock's machines get, by id (`bundle::Catalog`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bundles: Vec<String>,
+    /// The workdir bundles (`target = "workdir"`) placed in the working
+    /// directory of each of this flock's tasks before its agent starts, by
+    /// id (`bundle::workdir_stored`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workdir_bundles: Vec<String>,
+    /// Values for the vars its bundles declare, by name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bundle_vars: BTreeMap<String, String>,
+    /// How its machines take a new version of their bundles; unset is
+    /// `manual`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_apply: Option<crate::bundle::Apply>,
+    /// The loads every machine of this flock takes (`rust`, `light`), for
+    /// any flock's task placed there, not only this one's
+    /// (`Flock::loads_of`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loads: Vec<String>,
     /// One line on what the flock is for (`flock list --wide`, `describe`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -293,6 +374,45 @@ pub enum TaskFlockError {
         flocks: Vec<String>,
         requested: String,
     },
+}
+
+/// Who names a bundle in flock.toml (`Flock::bundle_users`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct BundleUsers {
+    /// Flocks whose `bundles` list it.
+    pub flocks: Vec<String>,
+    /// Machines whose own `bundles` list it.
+    pub machines: Vec<String>,
+    /// Every machine that gets it, through a flock or its own list.
+    pub affected: Vec<String>,
+}
+
+impl BundleUsers {
+    pub fn is_empty(&self) -> bool {
+        self.flocks.is_empty() && self.machines.is_empty()
+    }
+}
+
+/// A `bundles` list: bundle ids, each once.
+fn check_bundle_ids(ids: &[String]) -> Result<(), String> {
+    for (i, id) in ids.iter().enumerate() {
+        crate::connector::manifest::check_id(id)?;
+        if ids[..i].contains(id) {
+            return Err(format!("{id} is listed twice"));
+        }
+    }
+    Ok(())
+}
+
+/// A `loads` list: load names, each once.
+fn check_loads(loads: &[String]) -> Result<(), String> {
+    for (i, load) in loads.iter().enumerate() {
+        crate::task::check_load(load)?;
+        if loads[..i].contains(load) {
+            return Err(format!("{load} is listed twice"));
+        }
+    }
+    Ok(())
 }
 
 /// `flock a` or `flocks a, b`.
@@ -313,6 +433,99 @@ pub struct Flock {
     pub flocks: Vec<FlockEntry>,
     #[serde(default, rename = "machine")]
     pub machines: Vec<MachineConfig>,
+}
+
+/// What a machine name may be: the one rule for the name in a flock, in a
+/// forced `authorized_keys` command and in a marker (`authkeys::valid_name`).
+pub const MACHINE_NAME_RULE: &str =
+    "start with a letter or digit, then letters, digits, '.', '_' and '-'";
+
+/// A flock's `accounts`: the kinds its machines must be signed in to, as a
+/// list (`["github", "claude"]`) or as a map from kind to the account name
+/// `machine check` expects (`{ github = "alice", claude = "alice@example.com" }`).
+/// The list form names no account, so it checks only that a login exists.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Accounts {
+    list: Vec<crate::provision::Account>,
+    names: BTreeMap<crate::provision::Account, String>,
+}
+
+impl Accounts {
+    /// The list form: these kinds, no names.
+    pub fn of(list: Vec<crate::provision::Account>) -> Accounts {
+        Accounts {
+            list,
+            names: BTreeMap::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.list.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &crate::provision::Account> {
+        self.list.iter()
+    }
+
+    pub fn contains(&self, account: &crate::provision::Account) -> bool {
+        self.list.contains(account)
+    }
+
+    /// The account name `machine check` expects for `account`; None in the
+    /// list form, and for a kind the map does not name.
+    pub fn name(&self, account: crate::provision::Account) -> Option<&str> {
+        self.names.get(&account).map(String::as_str)
+    }
+
+    /// A kind listed twice, if one is.
+    fn duplicate(&self) -> Option<crate::provision::Account> {
+        self.list
+            .iter()
+            .enumerate()
+            .find(|(i, a)| self.list[..*i].contains(a))
+            .map(|(_, a)| *a)
+    }
+}
+
+impl Serialize for Accounts {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if self.names.is_empty() {
+            self.list.serialize(s)
+        } else {
+            self.names.serialize(s)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Accounts {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Accounts, D::Error> {
+        use serde::de::{MapAccess, SeqAccess, Visitor};
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Accounts;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a list of accounts or a map from account to its name")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Accounts, A::Error> {
+                let mut list = Vec::new();
+                while let Some(a) = seq.next_element::<crate::provision::Account>()? {
+                    list.push(a);
+                }
+                Ok(Accounts::of(list))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Accounts, A::Error> {
+                let mut out = Accounts::default();
+                while let Some((account, name)) =
+                    map.next_entry::<crate::provision::Account, String>()?
+                {
+                    out.list.push(account);
+                    out.names.insert(account, name);
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 impl Flock {
@@ -351,7 +564,55 @@ impl Flock {
         flock
             .validate()
             .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        // A name from before the rule loads, and is said once for each
+        // version of the file: a command reads flock.toml many times.
+        flock.warn_odd_machine_names(path, text);
         Ok(flock)
+    }
+
+    /// Log `machine_name_warnings` of the flock `text` read from `path`, each
+    /// at most once in this process for the file, what it says and the name:
+    /// a command that reads an unchanged file many times says it once, and
+    /// `pastor serve` says it again for each change of the file.
+    fn warn_odd_machine_names(&self, path: &Path, text: &str) {
+        use std::hash::{Hash, Hasher};
+        static SAID: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+            std::sync::OnceLock::new();
+        let said = SAID.get_or_init(Default::default);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut hasher);
+        let version = hasher.finish();
+        for (m, w) in self
+            .machines
+            .iter()
+            .filter(|m| !crate::authkeys::valid_name(&m.name))
+            .zip(self.machine_name_warnings())
+        {
+            let first = said
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(format!("{}\0{version:x}\0{}", path.display(), m.name));
+            if first {
+                tracing::warn!(file = %path.display(), "{w}");
+            }
+        }
+    }
+
+    /// One line for each machine whose name `machine add` would refuse
+    /// (`MACHINE_NAME_RULE`). A flock written before the rule still loads
+    /// with them: the name only fails later, where it goes into an
+    /// `authorized_keys` command, so it is said now and left to rename.
+    pub fn machine_name_warnings(&self) -> Vec<String> {
+        self.machines
+            .iter()
+            .filter(|m| !crate::authkeys::valid_name(&m.name))
+            .map(|m| {
+                format!(
+                    "machine {:?} breaks the naming rule ({MACHINE_NAME_RULE}); rename it, as `machine authorized-key` and the bridge will refuse it",
+                    m.name
+                )
+            })
+            .collect()
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
@@ -386,6 +647,8 @@ impl Flock {
             }
             crate::config::check_kind_agent_names(&f.agents)
                 .map_err(|e| format!("flock {}: {e}", f.name))?;
+            crate::harness::check_pins(&format!("flock {}: pins", f.name), &f.pins)?;
+            crate::config::check_env(&format!("flock {}", f.name), &f.env)?;
             if let Some(p) = &f.profile {
                 crate::config::check_profile_name(p)
                     .map_err(|e| format!("flock {}: {e}", f.name))?;
@@ -400,6 +663,28 @@ impl Flock {
             if let Some(v) = &f.age_after {
                 crate::config::check_age_after(v)
                     .map_err(|e| format!("flock {}: age_after: {e}", f.name))?;
+            }
+            // The set itself is closed by the type: serde names the two
+            // allowed values when the file has another.
+            if let Some(twice) = f.accounts.duplicate() {
+                return Err(format!(
+                    "flock {}: accounts: {twice} is listed twice",
+                    f.name
+                ));
+            }
+            if let Some((account, _)) = f.accounts.names.iter().find(|(_, n)| n.trim().is_empty()) {
+                return Err(format!(
+                    "flock {}: accounts: the name for {account} is empty",
+                    f.name
+                ));
+            }
+            check_bundle_ids(&f.bundles).map_err(|e| format!("flock {}: bundles: {e}", f.name))?;
+            check_bundle_ids(&f.workdir_bundles)
+                .map_err(|e| format!("flock {}: workdir_bundles: {e}", f.name))?;
+            check_loads(&f.loads).map_err(|e| format!("flock {}: loads: {e}", f.name))?;
+            for name in f.bundle_vars.keys() {
+                crate::bundle::manifest::check_var_name(name)
+                    .map_err(|e| format!("flock {}: bundle_vars: {e}", f.name))?;
             }
         }
         if !self.flocks.is_empty() {
@@ -440,6 +725,7 @@ impl Flock {
             {
                 return Err(format!("machine {}: ssh {target:?} {why}", m.name));
             }
+            check_loads(&m.loads).map_err(|e| format!("machine {}: loads: {e}", m.name))?;
             if m.command.as_ref().is_some_and(|c| c.is_empty()) {
                 return Err(format!("machine {}: command is empty", m.name));
             }
@@ -461,12 +747,26 @@ impl Flock {
             }
             crate::config::check_kind_agent_names(&m.agents)
                 .map_err(|e| format!("machine {}: {e}", m.name))?;
+            crate::harness::check_pins(&format!("machine {}: pins", m.name), &m.pins)?;
+            crate::config::check_env(&format!("machine {}", m.name), &m.env)?;
             if let Some(p) = &m.profile {
                 crate::config::check_profile_name(p)
                     .map_err(|e| format!("machine {}: {e}", m.name))?;
             }
+            if let Some(p) = &m.provisioner {
+                crate::connector::manifest::check_id(p)
+                    .map_err(|e| format!("machine {}: provisioner {e}", m.name))?;
+            }
+            check_bundle_ids(&m.bundles)
+                .map_err(|e| format!("machine {}: bundles: {e}", m.name))?;
             if m.max_agents == 0 {
                 return Err(format!("machine {}: max_agents must be at least 1", m.name));
+            }
+            if m.reserved > m.max_agents {
+                return Err(format!(
+                    "machine {}: reserved {} is more than max_agents {}",
+                    m.name, m.reserved, m.max_agents
+                ));
             }
             for (key, size) in [("min_disk", &m.min_disk), ("min_memory", &m.min_memory)] {
                 if let Some(v) = size {
@@ -505,15 +805,25 @@ impl Flock {
 
     /// Refuse a flock or machine `model` that `[models]` in pastor.toml does
     /// not define, an `agents` entry `check_kind_agents` refuses by the kinds
-    /// `[agents]` gives, or a `profile` that is neither built in nor in
-    /// `[profiles]`. Apart from `validate` because models, agents and
-    /// profiles live in the other file; every caller that loads both runs it.
+    /// `[agents]` gives, a `profile` that is neither built in nor in
+    /// `[profiles]`, or a machine `provisioner` the catalog lacks. Apart from
+    /// `validate` because models, agents and profiles live in the other
+    /// file and provisioners in the data dir; every caller that loads both
+    /// runs it.
     pub fn check_config(
         &self,
         models: &crate::config::Models,
         agents: &crate::config::Agents,
         profiles: &crate::config::profile::Profiles,
+        provisioners: &crate::provision::Catalog,
     ) -> anyhow::Result<()> {
+        for m in &self.machines {
+            if let Some(p) = &m.provisioner {
+                provisioners
+                    .check(p)
+                    .map_err(|e| anyhow::anyhow!("flock.toml: machine {}: {e}", m.name))?;
+            }
+        }
         let flocks = self.flocks.iter().map(|f| {
             (
                 "flock",
@@ -575,6 +885,188 @@ impl Flock {
         }
     }
 
+    /// The bundles `m` gets: its flocks' in file order, then its own, each
+    /// once.
+    pub fn bundles_of(&self, m: &MachineConfig) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let flocks = self.flocks_of(m);
+        let from_flocks = flocks
+            .iter()
+            .filter_map(|(name, _)| self.entry(name))
+            .flat_map(|f| &f.bundles);
+        for id in from_flocks.chain(&m.bundles) {
+            if !out.contains(id) {
+                out.push(id.clone());
+            }
+        }
+        out
+    }
+
+    /// How `m` takes a new version of its bundles: its own `bundle_apply`,
+    /// else its flocks' when they agree, else `manual`. Two flocks that
+    /// differ give `manual`: automatic is never forced on a machine.
+    pub fn bundle_apply(&self, m: &MachineConfig) -> crate::bundle::Apply {
+        if let Some(a) = m.bundle_apply {
+            return a;
+        }
+        let modes: Vec<crate::bundle::Apply> = self
+            .flocks_of(m)
+            .iter()
+            .map(|(name, _)| {
+                self.entry(name)
+                    .and_then(|f| f.bundle_apply)
+                    .unwrap_or_default()
+            })
+            .collect();
+        match modes.split_first() {
+            Some((first, rest)) if rest.iter().all(|a| a == first) => *first,
+            _ => crate::bundle::Apply::Manual,
+        }
+    }
+
+    /// The flocks and machines that name bundle `id` in flock.toml, and the
+    /// machines that get it. A flock's `workdir_bundles` names it too; it
+    /// reaches no machine's home.
+    pub fn bundle_users(&self, id: &str) -> BundleUsers {
+        let has = |list: &[String]| list.iter().any(|b| b == id);
+        BundleUsers {
+            flocks: self
+                .flocks
+                .iter()
+                .filter(|f| has(&f.bundles) || has(&f.workdir_bundles))
+                .map(|f| f.name.clone())
+                .collect(),
+            machines: self
+                .machines
+                .iter()
+                .filter(|m| has(&m.bundles))
+                .map(|m| m.name.clone())
+                .collect(),
+            affected: self
+                .machines
+                .iter()
+                .filter(|m| has(&self.bundles_of(m)))
+                .map(|m| m.name.clone())
+                .collect(),
+        }
+    }
+
+    /// Refuse a bundle that the bundles dir lacks or that does not load,
+    /// and vars that do not fit the bundles: a flock must give every var
+    /// of the bundles it names, and a machine every var of the bundles it
+    /// gets from its flocks' values, which may not differ. A var no bundle
+    /// declares is let be: it may be set before the version that needs it
+    /// is added. Apart from `validate` because bundles live in the config
+    /// dir; every caller that loads flock.toml for a head runs it.
+    pub fn check_bundles(&self, bundles: &crate::bundle::Catalog) -> anyhow::Result<()> {
+        let problems = self.bundle_problems(bundles);
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("flock.toml: {}", problems.join("; ")))
+        }
+    }
+
+    /// Each way `check_bundles` finds flock.toml does not fit `bundles`,
+    /// as `flock F: ...` or `machine M: ...`.
+    pub fn bundle_problems(&self, bundles: &crate::bundle::Catalog) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut get = |owner: String, id: &str| match bundles.check(id) {
+            Ok(b) => Some(b.manifest.clone()),
+            Err(e) => {
+                let e = format!("{owner}: {e}");
+                if !out.contains(&e) {
+                    out.push(e);
+                }
+                None
+            }
+        };
+        let mut found: Vec<String> = Vec::new();
+        let home = crate::bundle::manifest::Target::Home;
+        for f in &self.flocks {
+            for id in &f.workdir_bundles {
+                let Some(manifest) = get(format!("flock {}", f.name), id) else {
+                    continue;
+                };
+                if manifest.target() == home {
+                    found.push(format!(
+                        "flock {}: bundle {id} is a home bundle: name it in bundles, not workdir_bundles",
+                        f.name
+                    ));
+                    continue;
+                }
+                for var in manifest
+                    .var_names()
+                    .filter(|v| !f.bundle_vars.contains_key(*v))
+                {
+                    found.push(format!(
+                        "flock {}: bundle {id} needs bundle_vars {var}",
+                        f.name
+                    ));
+                }
+            }
+            for id in &f.bundles {
+                let Some(manifest) = get(format!("flock {}", f.name), id) else {
+                    continue;
+                };
+                if manifest.target() != home {
+                    found.push(format!(
+                        "flock {}: bundle {id} goes into tasks' working directories: name it in workdir_bundles, not bundles",
+                        f.name
+                    ));
+                    continue;
+                }
+                for var in manifest
+                    .var_names()
+                    .filter(|v| !f.bundle_vars.contains_key(*v))
+                {
+                    found.push(format!(
+                        "flock {}: bundle {id} needs bundle_vars {var}",
+                        f.name
+                    ));
+                }
+            }
+        }
+        for m in &self.machines {
+            let mut values: BTreeMap<&str, (&str, &str)> = BTreeMap::new();
+            for (name, _) in self.flocks_of(m) {
+                let Some(f) = self.entry(name) else { continue };
+                for (k, v) in &f.bundle_vars {
+                    match values.get(k.as_str()) {
+                        Some((other, w)) if w != v => found.push(format!(
+                            "machine {}: bundle_vars {k} is {w:?} in flock {other} and {v:?} in flock {name}",
+                            m.name
+                        )),
+                        Some(_) => {}
+                        None => {
+                            values.insert(k, (name, v));
+                        }
+                    }
+                }
+            }
+            for id in &m.bundles {
+                let Some(manifest) = get(format!("machine {}", m.name), id) else {
+                    continue;
+                };
+                if manifest.target() != home {
+                    found.push(format!(
+                        "machine {}: bundle {id} goes into tasks' working directories: name it in a flock's workdir_bundles",
+                        m.name
+                    ));
+                    continue;
+                }
+                for var in manifest.var_names().filter(|v| !values.contains_key(v)) {
+                    found.push(format!(
+                        "machine {}: bundle {id} needs bundle_vars {var}, in one of its flocks",
+                        m.name
+                    ));
+                }
+            }
+        }
+        out.extend(found);
+        out
+    }
+
     /// The `[[flock]]` entry named `name`; `None` for the implicit flock of
     /// a file that declares none, which has no settings.
     pub fn entry(&self, name: &str) -> Option<&FlockEntry> {
@@ -618,6 +1110,33 @@ impl Flock {
         self.get(name).map(|m| self.flocks_of(m))
     }
 
+    /// The loads `m` takes: its own `loads`, then those of each flock it
+    /// is in, each once. A task with a load is placed only on a machine
+    /// whose list has it, whatever flock the task is in.
+    pub fn loads_of(&self, m: &MachineConfig) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let flocks = self.flocks_of(m);
+        let theirs = flocks
+            .iter()
+            .filter_map(|(f, _)| self.entry(f))
+            .flat_map(|f| &f.loads);
+        for load in m.loads.iter().chain(theirs) {
+            if !out.contains(load) {
+                out.push(load.clone());
+            }
+        }
+        out
+    }
+
+    /// The machines of `flock` that take `load`, in file order.
+    pub fn takers(&self, flock: &str, load: &str) -> Vec<&str> {
+        self.machines
+            .iter()
+            .filter(|m| self.in_flock(m, flock) && self.loads_of(m).iter().any(|l| l == load))
+            .map(|m| m.name.as_str())
+            .collect()
+    }
+
     /// Whether `m` is in `flock`.
     pub fn in_flock(&self, m: &MachineConfig, flock: &str) -> bool {
         self.flocks_of(m).iter().any(|(f, _)| *f == flock)
@@ -640,6 +1159,17 @@ impl Flock {
                 .flocks
                 .iter()
                 .all(|f| !f.machines.contains_key(&m.name))
+    }
+
+    /// The harness pins that hold on `m`: its own over its primary flock's,
+    /// per kind.
+    pub fn pins_for(&self, m: &MachineConfig) -> crate::harness::Pins {
+        let mut pins = self
+            .entry(self.primary_flock(m))
+            .map(|f| f.pins.clone())
+            .unwrap_or_default();
+        pins.extend(m.pins.clone());
+        pins
     }
 
     /// The one flock that stands for `m` where one name is wanted (a task
@@ -724,6 +1254,8 @@ pub enum EditError {
     MachineExists(String),
     #[error("machine {0} not found")]
     UnknownMachine(String),
+    #[error("machine name {0:?} is refused: {MACHINE_NAME_RULE}")]
+    InvalidMachineName(String),
     #[error("flock {0} already exists")]
     FlockExists(String),
     #[error("flock {0} does not exist")]
@@ -752,6 +1284,7 @@ impl EditError {
         match self {
             EditError::MachineExists(_) => "machine_exists",
             EditError::UnknownMachine(_) => "unknown_machine",
+            EditError::InvalidMachineName(_) => "invalid_machine",
             EditError::FlockExists(_) => "flock_exists",
             EditError::UnknownFlock(_) => "unknown_flock",
             EditError::FlockHasMachines { .. } => "flock_not_empty",
@@ -955,6 +1488,9 @@ impl FlockDoc {
     }
 
     pub fn add_machine(&mut self, m: &MachineConfig) -> Result<(), EditError> {
+        if !crate::authkeys::valid_name(&m.name) {
+            return Err(EditError::InvalidMachineName(m.name.clone()));
+        }
         let f = self.current()?;
         if f.get(&m.name).is_some() {
             return Err(EditError::MachineExists(m.name.clone()));
@@ -1062,11 +1598,6 @@ impl FlockDoc {
             .ok_or_else(|| EditError::UnknownMachine(machine.into()))?;
         if !f.has_flock(flock) {
             return Err(EditError::UnknownFlock(flock.into()));
-        }
-        if max == Some(0) {
-            return Err(EditError::Invalid(format!(
-                "flock {flock}: machine {machine}: the number must be at least 1; to take it out, `pastor flock leave {flock} {machine}`"
-            )));
         }
         let listed = f
             .entry(flock)
@@ -1344,6 +1875,10 @@ mod tests {
         let mut doc = FlockDoc::open(&path).unwrap();
         doc.add_flock("b", false, &[]).unwrap();
         doc.add_machine(&MachineConfig {
+            reserved: 0,
+            provisioner: None,
+            bundles: Vec::new(),
+            bundle_apply: None,
             name: "pi".into(),
             local: false,
             pull: false,
@@ -1354,6 +1889,7 @@ mod tests {
             job_slots: 0,
             burst: 2,
             tags: vec!["arm".into()],
+            loads: vec![],
             flock: Some("a".into()),
             agent: Some("codex".into()),
             agent_args: Some(vec![]),
@@ -1366,6 +1902,8 @@ mod tests {
             min_memory: None,
             unknown_room: None,
             description: Some("the pi".into()),
+            pins: Default::default(),
+            env: Default::default(),
         })
         .unwrap();
         doc.join_flock("pi", "b", None).unwrap();
@@ -1378,6 +1916,10 @@ mod tests {
 
     fn pi(name: &str) -> MachineConfig {
         MachineConfig {
+            reserved: 0,
+            provisioner: None,
+            bundles: Vec::new(),
+            bundle_apply: None,
             pull: false,
             description: None,
             name: name.into(),
@@ -1389,6 +1931,7 @@ mod tests {
             job_slots: 1,
             burst: 1,
             tags: vec![],
+            loads: vec![],
             flock: None,
             agent: None,
             agent_args: None,
@@ -1400,6 +1943,8 @@ mod tests {
             min_disk: None,
             min_memory: None,
             unknown_room: None,
+            pins: Default::default(),
+            env: Default::default(),
         }
     }
 
@@ -1694,11 +2239,6 @@ ssh = "user@spare"
             flocks(&unknown).unwrap_err(),
             "flock work: machine nope is not declared"
         );
-        let zero = MANY.replace("desk = 2", "desk = 0");
-        assert_eq!(
-            flocks(&zero).unwrap_err(),
-            "flock work: machine desk: the number must be at least 1"
-        );
         let twice = MANY.replace(
             "name = \"play\"\n",
             "name = \"play\"\nmachines = { lab = 1 }\n",
@@ -1708,6 +2248,33 @@ ssh = "user@spare"
             "machine lab: in flock play twice, by its flock key and by the flock's machines"
         );
         assert!(flocks(&MANY.replace("desk = 2", "desk = \"two\"")).is_err());
+    }
+
+    /// 0 keeps a machine in a flock with no slots, to drain it: the plain
+    /// number and a share and a max both at 0 load, `flock join --max 0`
+    /// writes it, and a negative or fractional number stays refused.
+    #[test]
+    fn a_number_of_0_drains_the_machine() {
+        let f = flocks(&MANY.replace("desk = 2", "desk = 0")).unwrap();
+        let work = f.entry("work").unwrap().machines["desk"];
+        assert_eq!((work.share(), work.max()), (0, 0));
+        assert_eq!(work.to_string(), "0");
+        let split = flocks(&MANY.replace("desk = 2", "desk = { share = 0, max = 0 }")).unwrap();
+        let work = split.entry("work").unwrap().machines["desk"];
+        assert_eq!((work.share(), work.max()), (0, 0));
+        for bad in ["desk = -1", "desk = 1.5", "desk = { share = -1, max = 0 }"] {
+            assert!(flocks(&MANY.replace("desk = 2", bad)).is_err(), "{bad}");
+        }
+        assert_eq!(
+            flocks(&MANY.replace("desk = 2", "desk = { share = 1, max = 0 }")).unwrap_err(),
+            "flock work: machine desk: max 0 is below share 1"
+        );
+        let mut d = FlockDoc::parse(MANY).unwrap();
+        assert_eq!(
+            d.join_flock("desk", "work", Some(0)).unwrap(),
+            FlockNumber::plain(0)
+        );
+        assert!(d.to_string().contains("machines = { desk = 0 }"), "{d}");
     }
 
     /// A flock's number on a machine can be a share and a max. The plain
@@ -1749,7 +2316,7 @@ ssh = "user@spare"
         );
         assert_eq!(
             err("desk = { share = 0, max = 2 }"),
-            "flock work: machine desk: the share must be at least 1"
+            "flock work: machine desk: the share must be at least 1 while max is above 0"
         );
         assert!(flocks(&MANY.replace("desk = 2", "desk = { share = 2, most = 4 }")).is_err());
         // Joining again keeps a share and a max; `--max` makes it plain.
@@ -1844,6 +2411,103 @@ ssh = "user@spare"
         let err =
             flocks("[[flock]]\nname = \"home\"\ndefault = true\ndeny = [\"-x\"]\n").unwrap_err();
         assert!(err.contains("flock home: deny"), "{err}");
+    }
+
+    /// `machine add` refuses a name `authkeys::valid_name` refuses, naming
+    /// the rule, before anything is written; a good one is added.
+    #[test]
+    fn adding_a_machine_follows_the_naming_rule() {
+        let mut d = FlockDoc::parse(COMMENTED).unwrap();
+        for bad in [
+            "", "-pi", "--agent", ".pi", "_pi", "pi 4", "pi;id", "pi$(id)", "pi|x", "pi\nx",
+            "pi/4", "pi'4", "é1",
+        ] {
+            let err = d.add_machine(&pi(bad)).unwrap_err();
+            assert_eq!(err, EditError::InvalidMachineName(bad.into()), "{bad:?}");
+            assert_eq!(err.code(), "invalid_machine");
+            assert!(err.to_string().contains(MACHINE_NAME_RULE), "{err}");
+        }
+        assert_eq!(d.to_string(), COMMENTED, "nothing was written");
+        for ok in ["pi-4", "Build_01", "a.b", "9", "x"] {
+            d.add_machine(&pi(ok)).unwrap();
+        }
+    }
+
+    /// A flock written before the rule still loads; the machine is named, with
+    /// the rule, so it can be renamed. A good flock says nothing.
+    #[test]
+    fn an_old_flock_with_an_odd_name_loads_and_says_so() {
+        let text = "[[machine]]\nname = \"-old\"\nssh = \"u@a\"\n[[machine]]\nname = \"fine-1\"\nssh = \"u@b\"\n[[machine]]\nname = \"two words\"\nssh = \"u@c\"\n";
+        let f = Flock::parse(std::path::Path::new("flock.toml"), text).unwrap();
+        let w = f.machine_name_warnings();
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(
+            w[0].contains("\"-old\"") && w[0].contains(MACHINE_NAME_RULE),
+            "{w:?}"
+        );
+        assert!(w[1].contains("two words"), "{w:?}");
+        assert!(!w.iter().any(|l| l.contains("fine-1")));
+        let good = Flock::parse(
+            std::path::Path::new("flock.toml"),
+            "[[machine]]\nname = \"pi-1\"\nlocal = true\n",
+        )
+        .unwrap();
+        assert!(good.machine_name_warnings().is_empty());
+    }
+
+    /// The load warning is said once for an unchanged file however often it
+    /// is read, and again when the file changes, as `pastor serve` reads it.
+    #[test]
+    fn the_warning_is_said_again_when_the_file_changes() {
+        use std::io::Write;
+        #[derive(Clone, Default)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = Capture;
+            fn make_writer(&'a self) -> Capture {
+                self.clone()
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("flock.toml");
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let said = || {
+            String::from_utf8(capture.0.lock().unwrap().clone())
+                .unwrap()
+                .matches("breaks the naming rule")
+                .count()
+        };
+        let one = "[[machine]]\nname = \"-old-name\"\nssh = \"u@a\"\n";
+        let two = "[[machine]]\nname = \"-old-name\"\nssh = \"u@a\"\n[[machine]]\nname = \"pi-2\"\nssh = \"u@b\"\n";
+        tracing::subscriber::with_default(subscriber, || {
+            std::fs::write(&path, one).unwrap();
+            Flock::load(&path).unwrap();
+            Flock::load_existing(&path).unwrap();
+            assert_eq!(said(), 1, "an unchanged file is said once");
+            std::fs::write(&path, two).unwrap();
+            Flock::load_existing(&path).unwrap();
+            assert_eq!(said(), 2, "a changed file is said again");
+            Flock::load_existing(&path).unwrap();
+            Flock::load(&path).unwrap();
+            assert_eq!(said(), 2, "and once for that version");
+            // Back to the first text: a version already said stays said.
+            std::fs::write(&path, one).unwrap();
+            Flock::load_existing(&path).unwrap();
+            assert_eq!(said(), 2);
+        });
     }
 
     const COMMENTED: &str = "# my fleet\n\n[[machine]]\nname = \"pi-1\"   # the desk one\nlocal = true\n\n# spare\n[[machine]]\nname = \"pi-3\"\nssh = \"user@pi-3\"\n";
@@ -2112,10 +2776,6 @@ ssh = "user@spare"
         assert_eq!(
             d.join_flock("desk", "nope", None).unwrap_err(),
             EditError::UnknownFlock("nope".into())
-        );
-        assert_eq!(
-            d.join_flock("desk", "work", Some(0)).unwrap_err().code(),
-            "config_error"
         );
     }
 
@@ -2386,6 +3046,84 @@ ssh = "user@spare"
         }
     }
 
+    /// A machine takes its own loads and those of every flock it is in,
+    /// each once; a machine outside the flock that lists a load does not
+    /// take it.
+    #[test]
+    fn a_machine_takes_its_own_loads_and_its_flocks() {
+        let text = r#"
+[[flock]]
+name = "default"
+default = true
+machines = { a = 2, b = 2, c = 2 }
+
+[[flock]]
+name = "rust"
+machines = { b = 1 }
+loads = ["rust"]
+
+[[machine]]
+name = "a"
+local = true
+
+[[machine]]
+name = "b"
+ssh = "b"
+loads = ["light", "rust"]
+
+[[machine]]
+name = "c"
+ssh = "c"
+"#;
+        let f = Flock::parse(Path::new("flock.toml"), text).unwrap();
+        let loads = |name: &str| f.loads_of(f.get(name).unwrap());
+        assert!(loads("a").is_empty());
+        assert_eq!(
+            loads("b"),
+            ["light", "rust"],
+            "its own, then its flocks', once"
+        );
+        assert!(loads("c").is_empty());
+        assert_eq!(
+            f.takers("default", "rust"),
+            ["b"],
+            "a flock's load counts in any flock"
+        );
+        assert_eq!(f.takers("rust", "rust"), ["b"]);
+        assert!(f.takers("default", "gpu").is_empty());
+    }
+
+    /// A load in flock.toml is a load name, listed once.
+    #[test]
+    fn loads_are_checked() {
+        let machine = |loads: &[&str]| Flock {
+            flocks: vec![],
+            machines: vec![MachineConfig {
+                loads: loads.iter().map(|l| l.to_string()).collect(),
+                ..pi("x")
+            }],
+        };
+        machine(&["rust", "light_2"]).validate().unwrap();
+        let err = machine(&["rust", "rust"]).validate().unwrap_err();
+        assert!(
+            err.contains("machine x: loads: rust is listed twice"),
+            "{err}"
+        );
+        let err = machine(&["no space"]).validate().unwrap_err();
+        assert!(err.contains("machine x: loads:"), "{err}");
+        let flock = Flock {
+            flocks: vec![FlockEntry {
+                name: "f".into(),
+                default: true,
+                loads: vec!["-rust".into()],
+                ..Default::default()
+            }],
+            machines: vec![],
+        };
+        let err = flock.validate().unwrap_err();
+        assert!(err.contains("flock f: loads:"), "{err}");
+    }
+
     #[test]
     fn parses_spec_example() {
         let text = r#"
@@ -2431,6 +3169,24 @@ tags = ["fast"]
         std::fs::write(&path, "").unwrap();
         let f = Flock::load_existing(&path).unwrap();
         assert!(f.machines.is_empty());
+    }
+
+    /// A flock's `remove_worktree` is a yes or no; a flock without it
+    /// leaves it to `[defaults]`.
+    #[test]
+    fn a_flock_remove_worktree_is_a_bool() {
+        let flock = |extra: &str| {
+            Flock::parse(
+                Path::new("flock.toml"),
+                &format!(
+                    "[[flock]]\nname = \"p\"\ndefault = true\n{extra}\n[[machine]]\nname = \"m\"\nlocal = true\nflock = \"p\"\n"
+                ),
+            )
+        };
+        let remove = |extra: &str| flock(extra).unwrap().entry("p").unwrap().remove_worktree;
+        assert_eq!(remove(""), None);
+        assert_eq!(remove("remove_worktree = true"), Some(true));
+        assert!(flock("remove_worktree = \"yes\"").is_err());
     }
 
     /// A flock's `keep_pane` is a yes or no; a flock without it leaves it
@@ -2499,13 +3255,19 @@ tags = ["fast"]
         let f = flock("model = \"sonnet\"").unwrap();
         let models: crate::config::Models =
             toml::from_str("[sonnet]\nkind = \"claude\"\nargs = []\n").unwrap();
-        f.check_config(&models, &Default::default(), &Default::default())
-            .unwrap();
+        f.check_config(
+            &models,
+            &Default::default(),
+            &Default::default(),
+            &crate::provision::Catalog::builtin(),
+        )
+        .unwrap();
         let err = f
             .check_config(
                 &Default::default(),
                 &Default::default(),
                 &Default::default(),
+                &crate::provision::Catalog::builtin(),
             )
             .unwrap_err()
             .to_string();
@@ -2554,15 +3316,25 @@ tags = ["fast"]
         ] {
             let err = parse(text)
                 .unwrap()
-                .check_config(&models, &Default::default(), &Default::default())
+                .check_config(
+                    &models,
+                    &Default::default(),
+                    &Default::default(),
+                    &crate::provision::Catalog::builtin(),
+                )
                 .unwrap_err()
                 .to_string();
             assert!(err.contains(says), "{err}");
         }
         let f = parse("[[machine]]\nname = \"m\"\nlocal = true\nfallback = []\n").unwrap();
         assert_eq!(f.machines[0].fallback, Some(vec![]));
-        f.check_config(&models, &Default::default(), &Default::default())
-            .unwrap();
+        f.check_config(
+            &models,
+            &Default::default(),
+            &Default::default(),
+            &crate::provision::Catalog::builtin(),
+        )
+        .unwrap();
     }
 
     /// A flock's `label` is a label template, checked on load.
@@ -2602,7 +3374,12 @@ tags = ["fast"]
         let f = flock("profile = \"develop\"", "profile = \"ci\"").unwrap();
         assert_eq!(f.flocks[0].profile.as_deref(), Some("develop"));
         let err = f
-            .check_config(&none, &Default::default(), &Default::default())
+            .check_config(
+                &none,
+                &Default::default(),
+                &Default::default(),
+                &crate::provision::Catalog::builtin(),
+            )
             .unwrap_err()
             .to_string();
         assert!(
@@ -2611,8 +3388,442 @@ tags = ["fast"]
         );
         let profiles: crate::config::profile::Profiles =
             toml::from_str("[ci]\nextends = \"develop\"\n").unwrap();
-        f.check_config(&none, &Default::default(), &profiles)
-            .unwrap();
+        f.check_config(
+            &none,
+            &Default::default(),
+            &profiles,
+            &crate::provision::Catalog::builtin(),
+        )
+        .unwrap();
+    }
+
+    /// `provisioner` on a machine names a provisioner the catalog has, built
+    /// in or copied; the id's alphabet is checked by `validate`, its
+    /// existence by `check_config`, since the catalog lives in the data dir.
+    #[test]
+    fn a_machine_provisioner_must_be_in_the_catalog() {
+        use crate::provision::Catalog;
+        let flock = |machine: &str| {
+            Flock::parse(
+                Path::new("flock.toml"),
+                &format!("[[machine]]\nname = \"m\"\nlocal = true\n{machine}\n"),
+            )
+        };
+        let err = format!("{:#}", flock("provisioner = \"Mac OS\"").unwrap_err());
+        assert!(
+            err.contains("machine m: provisioner id \"Mac OS\" must match"),
+            "{err}"
+        );
+        let f = flock("provisioner = \"macos\"").unwrap();
+        assert_eq!(f.machines[0].provisioner.as_deref(), Some("macos"));
+        let check = |f: &Flock, catalog: &Catalog| {
+            f.check_config(
+                &Default::default(),
+                &Default::default(),
+                &Default::default(),
+                catalog,
+            )
+            .map_err(|e| e.to_string())
+        };
+        check(&f, &Catalog::builtin()).unwrap();
+        let f = flock("provisioner = \"nixos\"").unwrap();
+        let err = check(&f, &Catalog::builtin()).unwrap_err();
+        assert!(
+            err.contains("flock.toml: machine m: provisioner \"nixos\" is not available"),
+            "{err}"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::config::Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        let dir = paths.provisioners_dir().join("nixos");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(crate::provision::MANIFEST_FILE),
+            "id = \"nixos\"\nversion = \"0.1.0\"\n[platform]\nos = \"linux\"\ndistro = [\"nixos\"]\n[[check]]\nid = \"nix\"\ncommand = [\"sh\", \"-c\", \"command -v nix\"]\n",
+        )
+        .unwrap();
+        check(&f, &Catalog::load(&paths).unwrap()).unwrap();
+        // A machine with none is fine with any catalog.
+        check(&flock("").unwrap(), &Catalog::builtin()).unwrap();
+    }
+
+    /// `accounts` on a flock takes `github` and `claude`, each once.
+    #[test]
+    fn flock_accounts_are_github_and_claude() {
+        use crate::provision::Account;
+        let flock = |extra: &str| {
+            Flock::parse(
+                Path::new("flock.toml"),
+                &format!("[[flock]]\nname = \"p\"\ndefault = true\n{extra}\n"),
+            )
+        };
+        let f = flock("accounts = [\"github\", \"claude\"]").unwrap();
+        let kinds = |f: &Flock| f.flocks[0].accounts.iter().copied().collect::<Vec<_>>();
+        assert_eq!(kinds(&f), [Account::Github, Account::Claude]);
+        let f = flock("accounts = [\"claude\"]").unwrap();
+        assert_eq!(kinds(&f), [Account::Claude]);
+        assert!(flock("").unwrap().flocks[0].accounts.is_empty());
+        let err = format!("{:#}", flock("accounts = [\"slack\"]").unwrap_err());
+        assert!(
+            err.contains("slack") && err.contains("github") && err.contains("claude"),
+            "{err}"
+        );
+        let err = format!(
+            "{:#}",
+            flock("accounts = [\"github\", \"github\"]").unwrap_err()
+        );
+        assert!(
+            err.contains("flock p: accounts: github is listed twice"),
+            "{err}"
+        );
+        let err = format!("{:#}", flock("accounts = \"github\"").unwrap_err());
+        assert!(err.contains("accounts"), "{err}");
+        // Round trip: what `save` writes loads back the same.
+        let text = toml::to_string_pretty(&f).unwrap();
+        assert!(text.contains("accounts = [\"claude\"]"), "{text}");
+        assert_eq!(Flock::parse(Path::new("flock.toml"), &text).unwrap(), f);
+    }
+
+    /// `accounts` as a map names the account `machine check` expects for
+    /// each kind; the list form names none, and both load, save and load
+    /// back the same.
+    #[test]
+    fn flock_accounts_as_a_map_name_the_expected_account() {
+        use crate::provision::Account;
+        let flock = |extra: &str| {
+            Flock::parse(
+                Path::new("flock.toml"),
+                &format!("[[flock]]\nname = \"p\"\ndefault = true\n{extra}\n"),
+            )
+        };
+        let f = flock("accounts = { github = \"alice\", claude = \"alice@example.com\" }").unwrap();
+        let a = &f.flocks[0].accounts;
+        assert_eq!(a.name(Account::Github), Some("alice"));
+        assert_eq!(a.name(Account::Claude), Some("alice@example.com"));
+        assert_eq!(a.iter().count(), 2);
+        // One kind named: the other is not an account of the flock.
+        let f = flock("accounts = { claude = \"alice@example.com\" }").unwrap();
+        assert!(!f.flocks[0].accounts.contains(&Account::Github));
+        assert_eq!(f.flocks[0].accounts.name(Account::Github), None);
+        // The list form has no names.
+        let old = flock("accounts = [\"github\", \"claude\"]").unwrap();
+        assert_eq!(old.flocks[0].accounts.name(Account::Github), None);
+        assert!(old.flocks[0].accounts.contains(&Account::Github));
+        // An unknown kind, a name that is not text and an empty name.
+        for bad in [
+            "accounts = { slack = \"x\" }",
+            "accounts = { github = 3 }",
+            "accounts = { github = \" \" }",
+        ] {
+            assert!(flock(bad).is_err(), "{bad}");
+        }
+        let err = format!("{:#}", flock("accounts = { github = \"\" }").unwrap_err());
+        assert!(
+            err.contains("flock p: accounts: the name for github is empty"),
+            "{err}"
+        );
+        // Round trip, in the form it was written.
+        let text = toml::to_string_pretty(&f).unwrap();
+        assert!(text.contains("claude = \"alice@example.com\""), "{text}");
+        assert_eq!(Flock::parse(Path::new("flock.toml"), &text).unwrap(), f);
+    }
+
+    /// `reserved` on a machine keeps agent slots free of pastor's own tasks:
+    /// 0 by default and not written then, up to `max_agents`, and more than
+    /// that fails the load with the machine and the numbers.
+    #[test]
+    fn a_machine_may_reserve_slots_up_to_max_agents() {
+        let load = |extra: &str| {
+            Flock::parse(
+                Path::new("flock.toml"),
+                &format!(
+                    "[[machine]]\nname = \"pi-3\"\nssh = \"u@pi-3\"\nmax_agents = 3\n{extra}\n"
+                ),
+            )
+        };
+        let f = load("").unwrap();
+        assert_eq!(f.get("pi-3").unwrap().reserved, 0);
+        assert!(!toml::to_string(&f).unwrap().contains("reserved"));
+        let f = load("reserved = 2").unwrap();
+        assert_eq!(f.get("pi-3").unwrap().reserved, 2);
+        let text = toml::to_string(&f).unwrap();
+        assert!(text.contains("reserved = 2"), "{text}");
+        assert_eq!(Flock::parse(Path::new("flock.toml"), &text).unwrap(), f);
+        assert_eq!(
+            load("reserved = 3").unwrap().get("pi-3").unwrap().reserved,
+            3
+        );
+        let err = format!("{:#}", load("reserved = 4").unwrap_err());
+        assert!(
+            err.contains("machine pi-3: reserved 4 is more than max_agents 3"),
+            "{err}"
+        );
+        assert!(load("reserved = -1").is_err());
+    }
+
+    /// `bundles`, `bundle_vars` and `bundle_apply` on a flock, `bundles`
+    /// and `bundle_apply` on a machine: their syntax at load, and a round
+    /// trip.
+    #[test]
+    fn bundle_keys_load_and_are_checked() {
+        use crate::bundle::Apply;
+        let flock = |flock_extra: &str, machine_extra: &str| {
+            Flock::parse(
+                Path::new("flock.toml"),
+                &format!(
+                    "[[flock]]\nname = \"ops\"\ndefault = true\nmachines = {{ build-01 = 2 }}\n{flock_extra}\n\
+                     [[machine]]\nname = \"build-01\"\nssh = \"u@b\"\n{machine_extra}\n"
+                ),
+            )
+        };
+        let f = flock(
+            "bundles = [\"base\", \"team-rules\"]\nbundle_vars = { ticket_url = \"https://tickets.example.com\" }\nbundle_apply = \"auto\"",
+            "bundles = [\"gpu-tools\"]\nbundle_apply = \"manual\"",
+        )
+        .unwrap();
+        assert_eq!(f.flocks[0].bundles, ["base", "team-rules"]);
+        assert_eq!(
+            f.flocks[0].bundle_vars["ticket_url"],
+            "https://tickets.example.com"
+        );
+        assert_eq!(f.flocks[0].bundle_apply, Some(Apply::Auto));
+        assert_eq!(f.machines[0].bundles, ["gpu-tools"]);
+        assert_eq!(f.machines[0].bundle_apply, Some(Apply::Manual));
+        let text = toml::to_string_pretty(&f).unwrap();
+        assert_eq!(Flock::parse(Path::new("flock.toml"), &text).unwrap(), f);
+
+        let bad: &[(&str, &str, &str)] = &[
+            (
+                "bundles = [\"Base\"]",
+                "",
+                "flock ops: bundles: id \"Base\" must match",
+            ),
+            (
+                "bundles = [\"a\", \"a\"]",
+                "",
+                "flock ops: bundles: a is listed twice",
+            ),
+            (
+                "bundle_vars = { Url = \"x\" }",
+                "",
+                "flock ops: bundle_vars: \"Url\" must match",
+            ),
+            ("bundle_apply = \"sometimes\"", "", "unknown variant"),
+            (
+                "",
+                "bundles = [\"a b\"]",
+                "machine build-01: bundles: id \"a b\" must match",
+            ),
+            ("", "bundle_apply = \"always\"", "unknown variant"),
+        ];
+        for (fx, mx, want) in bad {
+            let err = format!("{:#}", flock(fx, mx).unwrap_err());
+            assert!(err.contains(want), "{fx} {mx}\n=> {err}");
+        }
+    }
+
+    /// A machine gets its flocks' bundles in file order, then its own, each
+    /// once; it applies as its own `bundle_apply` says, else as its flocks
+    /// agree, else `manual`.
+    #[test]
+    fn a_machine_gets_its_flocks_bundles_and_apply_mode() {
+        use crate::bundle::Apply;
+        let f = Flock::parse(
+            Path::new("flock.toml"),
+            "[[flock]]\nname = \"ops\"\ndefault = true\nbundles = [\"base\", \"team-rules\"]\nbundle_apply = \"auto\"\n\
+             machines = { a = 1, b = 1, c = 1 }\n\
+             [[flock]]\nname = \"desk\"\nbundles = [\"base\", \"laptop\"]\nmachines = { b = 1 }\n\
+             [[machine]]\nname = \"a\"\nssh = \"u@a\"\nbundles = [\"gpu-tools\"]\n\
+             [[machine]]\nname = \"b\"\nssh = \"u@b\"\n\
+             [[machine]]\nname = \"c\"\nssh = \"u@c\"\nbundle_apply = \"manual\"\n",
+        )
+        .unwrap();
+        let m = |n: &str| f.get(n).unwrap();
+        assert_eq!(f.bundles_of(m("a")), ["base", "team-rules", "gpu-tools"]);
+        assert_eq!(f.bundles_of(m("b")), ["base", "team-rules", "laptop"]);
+        assert_eq!(f.bundle_apply(m("a")), Apply::Auto);
+        assert_eq!(
+            f.bundle_apply(m("b")),
+            Apply::Manual,
+            "ops says auto, desk nothing"
+        );
+        assert_eq!(f.bundle_apply(m("c")), Apply::Manual);
+        let users = f.bundle_users("base");
+        assert_eq!(users.flocks, ["ops", "desk"]);
+        assert!(users.machines.is_empty());
+        assert_eq!(users.affected, ["a", "b", "c"]);
+        let users = f.bundle_users("gpu-tools");
+        assert_eq!(
+            (users.flocks.len(), users.machines.as_slice()),
+            (0, &["a".to_string()][..])
+        );
+        assert!(f.bundle_users("nobody").is_empty());
+    }
+
+    /// A flock's `workdir_bundles` names workdir bundles, a home bundle
+    /// goes in `bundles`, and each list holds only its own target; the
+    /// flock gives the vars of both. A machine has no `workdir_bundles`.
+    #[test]
+    fn workdir_bundles_name_workdir_bundles_only() {
+        use crate::bundle::{Bundle, Catalog, Manifest};
+        let bundle = |id: &str, target: &str, vars: &[&str]| {
+            let vars: String = vars.iter().map(|v| format!("{v} = {{}}\n")).collect();
+            let item = if target == "workdir" {
+                "[[file]]\nsrc = \"f\"\npath = \"x\"\n"
+            } else {
+                "[[require]]\nid = \"r\"\ncommand = [\"true\"]\n"
+            };
+            Bundle {
+                id: id.into(),
+                dir: format!("/bundles/{id}").into(),
+                manifest: Manifest::parse(&format!(
+                    "id = \"{id}\"\nversion = \"1\"\ntarget = \"{target}\"\n[vars]\n{vars}{item}"
+                ))
+                .unwrap(),
+            }
+        };
+        let catalog = Catalog::of(vec![
+            bundle("base", "home", &[]),
+            bundle("repo-notes", "workdir", &["ticket_url"]),
+        ]);
+        let check = |text: &str| {
+            Flock::parse(Path::new("flock.toml"), text)
+                .map_err(|e| format!("{e:#}"))?
+                .check_bundles(&catalog)
+                .map_err(|e| format!("{e:#}"))
+        };
+        let ok = String::from(
+            "[[flock]]\nname = \"ops\"\ndefault = true\nbundles = [\"base\"]\nworkdir_bundles = [\"repo-notes\"]\n\
+             bundle_vars = { ticket_url = \"https://t.example.com\" }\nmachines = { a = 1 }\n\
+             [[machine]]\nname = \"a\"\nssh = \"u@a\"\n",
+        );
+        check(&ok).unwrap();
+        let parsed = Flock::parse(Path::new("flock.toml"), &ok).unwrap();
+        assert_eq!(parsed.flocks[0].workdir_bundles, ["repo-notes"]);
+        assert_eq!(parsed.bundle_users("repo-notes").flocks, ["ops"]);
+        assert!(
+            parsed.bundles_of(parsed.get("a").unwrap()) == ["base"],
+            "a workdir bundle reaches no home"
+        );
+        let cases: &[(String, &str)] = &[
+            (
+                ok.replace(
+                    "workdir_bundles = [\"repo-notes\"]",
+                    "workdir_bundles = [\"base\"]",
+                ),
+                "flock ops: bundle base is a home bundle: name it in bundles, not workdir_bundles",
+            ),
+            (
+                ok.replace(
+                    "bundles = [\"base\"]\n",
+                    "bundles = [\"base\", \"repo-notes\"]\n",
+                ),
+                "flock ops: bundle repo-notes goes into tasks' working directories: name it in workdir_bundles",
+            ),
+            (
+                ok.replace(
+                    "bundle_vars = { ticket_url = \"https://t.example.com\" }",
+                    "",
+                ),
+                "flock ops: bundle repo-notes needs bundle_vars ticket_url",
+            ),
+            (
+                format!("{ok}bundles = [\"repo-notes\"]\n"),
+                "machine a: bundle repo-notes goes into tasks' working directories",
+            ),
+            (
+                ok.replace("\"repo-notes\"]", "\"repo-notes\", \"repo-notes\"]"),
+                "flock ops: workdir_bundles: repo-notes is listed twice",
+            ),
+            (
+                format!("{ok}workdir_bundles = [\"repo-notes\"]\n"),
+                "unknown field `workdir_bundles`",
+            ),
+        ];
+        for (text, want) in cases {
+            let err = check(text).unwrap_err();
+            assert!(err.contains(want), "{text}\n=> {err}");
+        }
+    }
+
+    /// The bundles a flock or machine names must be in the bundles dir,
+    /// and the vars must fit them.
+    #[test]
+    fn check_bundles_wants_the_bundles_and_their_vars() {
+        use crate::bundle::{Bundle, Catalog, Manifest};
+        let bundle = |id: &str, vars: &[&str]| {
+            let vars: String = vars.iter().map(|v| format!("{v} = {{}}\n")).collect();
+            Bundle {
+                id: id.into(),
+                dir: format!("/bundles/{id}").into(),
+                manifest: Manifest::parse(&format!(
+                    "id = \"{id}\"\nversion = \"1\"\n[vars]\n{vars}[[require]]\nid = \"r\"\ncommand = [\"true\"]\n"
+                ))
+                .unwrap(),
+            }
+        };
+        let catalog = Catalog::of(vec![
+            bundle("base", &[]),
+            bundle("team-rules", &["ticket_url"]),
+            bundle("gpu-tools", &["driver"]),
+        ]);
+        let check = |text: &str| {
+            Flock::parse(Path::new("flock.toml"), text)
+                .unwrap()
+                .check_bundles(&catalog)
+                .map_err(|e| format!("{e:#}"))
+        };
+        let machines =
+            "[[machine]]\nname = \"a\"\nssh = \"u@a\"\n[[machine]]\nname = \"b\"\nssh = \"u@b\"\n";
+        let ok = format!(
+            "[[flock]]\nname = \"ops\"\ndefault = true\nbundles = [\"base\", \"team-rules\"]\n\
+             bundle_vars = {{ ticket_url = \"https://t.example.com\" }}\nmachines = {{ a = 1 }}\n{machines}"
+        );
+        check(&ok).unwrap();
+        let cases: &[(String, &str)] = &[
+            (
+                ok.replace("\"team-rules\"]", "\"team-rules\", \"absent\"]"),
+                "flock ops: bundle \"absent\" is not in the bundles dir",
+            ),
+            (
+                ok.replace(
+                    "bundle_vars = { ticket_url = \"https://t.example.com\" }",
+                    "",
+                ),
+                "flock ops: bundle team-rules needs bundle_vars ticket_url",
+            ),
+            (
+                format!("{ok}bundles = [\"gpu-tools\"]\n"),
+                "machine b: bundle gpu-tools needs bundle_vars driver, in one of its flocks",
+            ),
+            // Every problem is named, not only the first.
+            (
+                format!("{ok}bundles = [\"absent\", \"gpu-tools\"]\n"),
+                "machine b: bundle \"absent\" is not in the bundles dir; add it with `pastor bundle add`; \
+                 machine b: bundle gpu-tools needs bundle_vars driver, in one of its flocks",
+            ),
+        ];
+        for (text, want) in cases {
+            let err = check(text).unwrap_err();
+            assert!(err.contains(want), "{text}\n=> {err}");
+        }
+        // A var no bundle declares yet is let be: set before the version
+        // that needs it is added.
+        check(&ok.replace("ticket_url = ", "driver = \"x\", ticket_url = ")).unwrap();
+        // A machine's var comes from any of its flocks, and a flock may give
+        // one for its machines' own bundles; two flocks may not differ.
+        let two = String::from(
+            "[[flock]]\nname = \"ops\"\ndefault = true\nmachines = { a = 1 }\nbundle_vars = { driver = \"x\" }\n\
+             [[flock]]\nname = \"lab\"\nmachines = { a = 1 }\nbundle_vars = { driver = \"x\" }\n\
+             [[machine]]\nname = \"a\"\nssh = \"u@a\"\nbundles = [\"gpu-tools\"]\n",
+        );
+        check(&two).unwrap();
+        let err = check(&two.replacen("driver = \"x\"", "driver = \"y\"", 1)).unwrap_err();
+        assert!(
+            err.contains(
+                "machine a: bundle_vars driver is \"y\" in flock ops and \"x\" in flock lab"
+            ),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2649,6 +3860,121 @@ tags = ["fast"]
             ..pi("zero")
         });
         assert!(f.validate().unwrap_err().contains("zero"));
+    }
+
+    /// `env` on a flock and on a machine: read, kept in a round trip, and
+    /// checked at load: a name that is no variable name, or a value that
+    /// looks like a secret, fails naming the flock or machine and the key,
+    /// never the value.
+    #[test]
+    fn env_on_a_flock_and_a_machine_is_read_and_checked() {
+        let text = "[[flock]]\nname = \"work\"\ndefault = true\nmachines = { pi-3 = 1 }\n\
+             env = { NOTES_URL = \"http://notes.example:8790\" }\n\
+             [[machine]]\nname = \"pi-3\"\nssh = \"a@pi-3\"\nenv = { CARGO_BUILD_JOBS = \"2\" }\n";
+        let f = Flock::parse(std::path::Path::new("flock.toml"), text).unwrap();
+        assert_eq!(
+            f.entry("work").unwrap().env["NOTES_URL"],
+            "http://notes.example:8790"
+        );
+        assert_eq!(f.get("pi-3").unwrap().env["CARGO_BUILD_JOBS"], "2");
+        let again = Flock::parse(
+            std::path::Path::new("flock.toml"),
+            &toml::to_string(&f).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(again, f);
+        assert!(!toml::to_string(&Flock::default()).unwrap().contains("env"));
+
+        let secret = format!("gh{}_{}", "p", "aB3dE6gH9jK2mN5pQ8sT1vW4yZ7cF0hJ3kL6");
+        for (flock_env, machine_env, says) in [
+            (
+                "env = { \"1BAD\" = \"x\" }\n",
+                "",
+                "flock work: env: \"1BAD\" is not a variable name",
+            ),
+            (
+                "",
+                "env = { \"A-B\" = \"x\" }\n",
+                "machine pi-3: env: \"A-B\" is not a variable name",
+            ),
+            (
+                &format!("env = {{ GH = \"{secret}\" }}\n"),
+                "",
+                "flock work: env: GH holds a GitHub token",
+            ),
+            (
+                "",
+                &format!("env = {{ GH = \"{secret}\" }}\n"),
+                "machine pi-3: env: GH holds a GitHub token",
+            ),
+        ] {
+            let text = format!(
+                "[[flock]]\nname = \"work\"\ndefault = true\nmachines = {{ pi-3 = 1 }}\n{flock_env}\
+                 [[machine]]\nname = \"pi-3\"\nssh = \"a@pi-3\"\n{machine_env}"
+            );
+            let err = Flock::parse(std::path::Path::new("flock.toml"), &text).unwrap_err();
+            let said = format!("{err:#}");
+            assert!(said.contains(says), "{said}");
+            assert!(!said.contains(&secret), "the value is never said: {said}");
+        }
+    }
+
+    /// `pins` on a flock and on a machine: read, kept in a round trip,
+    /// checked at load, and the machine's own replace its flock's per kind.
+    #[test]
+    fn pins_are_read_checked_and_overridden_by_the_machine() {
+        let text = "[[flock]]\nname = \"work\"\ndefault = true\nmachines = { pi-3 = 1, pi-4 = 1 }\n\
+             pins = { claude = \"2.1.310\", agy = \"1.4\" }\n\
+             [[machine]]\nname = \"pi-3\"\nssh = \"a@pi-3\"\n\
+             [[machine]]\nname = \"pi-4\"\nssh = \"a@pi-4\"\npins = { claude = \"2.1.309\" }\n";
+        let f = Flock::parse(std::path::Path::new("flock.toml"), text).unwrap();
+        let pins = |m: &str| -> Vec<(String, String)> {
+            f.pins_for(f.get(m).unwrap()).into_iter().collect()
+        };
+        assert_eq!(
+            pins("pi-3"),
+            [
+                ("agy".into(), "1.4".into()),
+                ("claude".into(), "2.1.310".into())
+            ]
+        );
+        assert_eq!(
+            pins("pi-4"),
+            [
+                ("agy".into(), "1.4".into()),
+                ("claude".into(), "2.1.309".into())
+            ]
+        );
+        let again = Flock::parse(
+            std::path::Path::new("flock.toml"),
+            &toml::to_string(&f).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(again, f);
+        // No pins is none, and writes none.
+        assert!(!toml::to_string(&Flock::default()).unwrap().contains("pins"));
+
+        for (bad, says) in [
+            ("pins = { codex = \"1.0\" }\n", "flock work: pins.codex"),
+            (
+                "pins = { claude = \"newest\" }\n",
+                "flock work: pins.claude",
+            ),
+            ("pins = { claude = \"\" }\n", "is not a version"),
+        ] {
+            let text = format!(
+                "[[flock]]\nname = \"work\"\ndefault = true\n{bad}\
+                 [[machine]]\nname = \"pi-3\"\nssh = \"a@pi-3\"\n"
+            );
+            let err = Flock::parse(std::path::Path::new("flock.toml"), &text).unwrap_err();
+            assert!(format!("{err:#}").contains(says), "{bad}: {err:#}");
+        }
+        let text = "[[machine]]\nname = \"pi-3\"\nssh = \"a@pi-3\"\npins = { opencode = \"1\" }\n";
+        let err = Flock::parse(std::path::Path::new("flock.toml"), text).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("machine pi-3: pins.opencode"),
+            "{err:#}"
+        );
     }
 
     #[test]

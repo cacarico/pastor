@@ -55,6 +55,10 @@ pub struct Limit {
     /// reset is coming, someone has to pay.
     #[serde(default)]
     pub no_credit: bool,
+    /// The agent is signed out (`signed_out_in`): no reset is coming,
+    /// someone has to sign it in again.
+    #[serde(default)]
+    pub signed_out: bool,
     /// The line it was read from, without its marker.
     pub line: String,
 }
@@ -71,6 +75,9 @@ impl Limit {
     /// else `retry_after_no_credit` from `now` for no credit, else
     /// `unknown_reset_wait` from `now`.
     pub fn retry_at_under(&self, now: DateTime<Utc>, limits: &LimitsConfig) -> DateTime<Utc> {
+        if self.signed_out {
+            return signed_out_until();
+        }
         let wait = if self.no_credit {
             limits.retry_after_no_credit_duration()
         } else {
@@ -87,8 +94,35 @@ impl Limit {
     /// What ran out, in a few words: `5-hour limit`, `Opus weekly limit`,
     /// `no credit`, `rate limit`.
     pub fn what(&self) -> String {
+        if self.signed_out {
+            return SIGNED_OUT.into();
+        }
         what_of(&self.line, self.hard, self.no_credit)
     }
+
+    /// The agent signed out, read from `line`: a hard stop with no reset.
+    pub fn signed_out(line: &str) -> Limit {
+        Limit {
+            hard: true,
+            until: None,
+            model_scoped: false,
+            no_credit: false,
+            signed_out: true,
+            line: line.to_string(),
+        }
+    }
+}
+
+/// What a signed-out row says ran out.
+pub const SIGNED_OUT: &str = "signed out";
+
+/// The `retry_at` of a signed-out row: far enough that time never clears
+/// it (`Store::expire_limits`), near enough to write and read back as
+/// RFC 3339.
+pub fn signed_out_until() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(9999, 12, 31, 0, 0, 0)
+        .single()
+        .expect("a valid date")
 }
 
 /// `Limit::what` from a limit's parts, for a row that kept only those.
@@ -131,6 +165,10 @@ pub struct AccountLimit {
     pub model: Option<String>,
     pub hard: bool,
     pub no_credit: bool,
+    /// The agent is signed out (`Limit::signed_out`): `retry_at` is
+    /// `SIGNED_OUT_UNTIL`, and only a sign-in clears the row.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub signed_out: bool,
     /// The reset the message named, if it named one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub until: Option<DateTime<Utc>>,
@@ -168,6 +206,7 @@ impl AccountLimit {
             model: model.filter(|_| limit.model_scoped).map(str::to_string),
             hard: limit.hard,
             no_credit: limit.no_credit,
+            signed_out: limit.signed_out,
             until: limit.until,
             retry_at: limit.retry_at_under(now, limits),
             line: limit.line.clone(),
@@ -187,7 +226,7 @@ impl AccountLimit {
     }
 
     /// The account, and the model when the row is one model's:
-    /// `claude-personal`, `claude-personal opus`.
+    /// `claude-alt`, `claude-alt opus`.
     pub fn name(&self) -> String {
         match &self.model {
             Some(m) => format!("{} {m}", self.account),
@@ -197,7 +236,30 @@ impl AccountLimit {
 
     /// What ran out, as `Limit::what` says it.
     pub fn what(&self) -> String {
+        if self.signed_out {
+            return SIGNED_OUT.into();
+        }
         what_of(&self.line, self.hard, self.no_credit)
+    }
+
+    /// The event that says the row was kept: `agent.signed_out` for a
+    /// signed-out agent, else `agent.exhausted`.
+    pub fn kept_event(&self) -> &'static str {
+        if self.signed_out {
+            "agent.signed_out"
+        } else {
+            "agent.exhausted"
+        }
+    }
+
+    /// The event that says the row was dropped: `agent.signed_in` for a
+    /// signed-out agent, else `agent.reset`.
+    pub fn cleared_event(&self) -> &'static str {
+        if self.signed_out {
+            "agent.signed_in"
+        } else {
+            "agent.reset"
+        }
     }
 
     /// The detail of `agent.exhausted` (`by` is `None`) or `agent.reset`
@@ -218,6 +280,10 @@ impl AccountLimit {
                     obj.insert("until".into(), serde_json::json!(self.until));
                     obj.insert("hard".into(), self.hard.into());
                     obj.insert("no_credit".into(), self.no_credit.into());
+                    if self.signed_out {
+                        obj.insert("signed_out".into(), true.into());
+                        obj.insert("machine".into(), serde_json::json!(self.machine));
+                    }
                     obj.insert("what".into(), self.what().into());
                     obj.insert("line".into(), self.line.clone().into());
                 }
@@ -226,8 +292,11 @@ impl AccountLimit {
         detail
     }
 
-    /// `claude-personal exhausted until 03:00`: `note` without what ran out.
+    /// `claude-alt exhausted until 03:00`: `note` without what ran out.
     pub fn short_note(&self, now: DateTime<Utc>) -> String {
+        if self.signed_out {
+            return format!("{} {SIGNED_OUT}", self.name());
+        }
         format!(
             "{} exhausted until {}",
             self.name(),
@@ -235,13 +304,20 @@ impl AccountLimit {
         )
     }
 
-    /// `claude-personal exhausted until 03:00 (5-hour limit, seen by t-412)`:
+    /// `claude-alt exhausted until 03:00 (5-hour limit, seen by t-12)`:
     /// why a task does not start on it, with `retry_at` in local time.
     pub fn note(&self, now: DateTime<Utc>) -> String {
         let seen = self
             .task_id
             .map(|id| format!(", seen by t-{id}"))
             .unwrap_or_default();
+        if self.signed_out {
+            let seen = seen.strip_prefix(", ").unwrap_or_default();
+            return match seen {
+                "" => format!("{} {SIGNED_OUT}", self.name()),
+                seen => format!("{} {SIGNED_OUT} ({seen})", self.name()),
+            };
+        }
         format!(
             "{} exhausted until {} ({}{seen})",
             self.name(),
@@ -295,6 +371,54 @@ pub fn limit_in(kind: &str, text: &str, now: DateTime<Utc>) -> Option<Limit> {
         "opencode" => opencode_limit(text, now),
         _ => None,
     }
+}
+
+/// Whether an agent of `kind` stopped signed out, read from `text` (the
+/// end of its pane, or what it left when it exited): its login screen at
+/// the bottom of the pane (one of `markers`, `Agents::login_markers`), or,
+/// for Claude, a turn that ended on its message that the login is gone
+/// (`Not logged in · Please run /login`), read where `limit_in` reads a
+/// limit, so a grep of the message is not one.
+pub fn signed_out_in(kind: &str, text: &str, markers: &[String]) -> Option<Limit> {
+    for marker in markers {
+        if crate::config::shows_trust_marker(text, marker) {
+            return Some(Limit::signed_out(marker.trim()));
+        }
+    }
+    if kind == "claude" {
+        return claude_turn_end(text, |said, _| {
+            claude_signed_out(said).then(|| Limit::signed_out(said))
+        });
+    }
+    None
+}
+
+/// How Claude's messages start when its login is gone, from its own
+/// error texts: `Not logged in · Please run /login`, `Login expired ·
+/// Please run /login`, `OAuth token revoked · Please run /login`, `Session
+/// expired. Please run /login to sign in again.`, `Invalid API key · Fix
+/// external API key`, and the API's own 401.
+const CLAUDE_SIGNED_OUT: [&str; 9] = [
+    "not logged in",
+    "login expired",
+    "oauth token revoked",
+    "oauth token has expired",
+    "authentication required",
+    "session expired",
+    "your session has expired",
+    "invalid api key",
+    "api error: 401",
+];
+
+/// Whether `said`, the first line of a message of Claude's, says its login
+/// is gone.
+fn claude_signed_out(said: &str) -> bool {
+    let lower = said.to_ascii_lowercase();
+    CLAUDE_SIGNED_OUT.iter().any(|words| {
+        lower
+            .strip_prefix(words)
+            .is_some_and(|rest| !rest.starts_with(char::is_alphanumeric))
+    })
 }
 
 /// The lines of a paragraph of agy's that are read, the first one and the
@@ -392,6 +516,7 @@ fn read_agy(said: &str, more: &str, now: DateTime<Utc>) -> Option<Limit> {
         until: reset_in(&whole, now),
         model_scoped: false,
         no_credit: false,
+        signed_out: false,
         line: said.to_string(),
     })
 }
@@ -473,6 +598,7 @@ fn read_opencode(said: &str, more: &str, now: DateTime<Utc>) -> Option<Limit> {
         until: reset_in(&whole, now),
         model_scoped,
         no_credit,
+        signed_out: false,
         line: said.to_string(),
     })
 }
@@ -491,6 +617,15 @@ fn anthropic_short(lower: &str) -> bool {
 }
 
 fn claude_limit(text: &str, now: DateTime<Utc>) -> Option<Limit> {
+    claude_turn_end(text, |said, more| read_claude(said, more, now))
+}
+
+/// The first of the lines that end Claude's turn (as `limit_in` reads
+/// them, newest first) that `read` takes, given the line without its marker
+/// and what the message goes on to say on its next lines. The last message
+/// of the turn ends the search: what is above it is not the end of the
+/// turn.
+fn claude_turn_end<T>(text: &str, read: impl Fn(&str, &str) -> Option<T>) -> Option<T> {
     let text = text.replace('\u{a0}', " ");
     let lines: Vec<&str> = text.lines().collect();
     let is_prompt = |i: usize| {
@@ -553,12 +688,12 @@ fn claude_limit(text: &str, now: DateTime<Utc>) -> Option<Limit> {
                 .collect::<Vec<_>>()
                 .join(" ")
         };
-        if let Some(limit) = read_claude(said.trim(), &more, now) {
-            return Some(limit);
+        if let Some(found) = read(said.trim(), &more) {
+            return Some(found);
         }
         if message.is_some() && !in_footer {
-            // The last message, and it is not a limit: what is above it is
-            // not the end of the turn.
+            // The last message, and it is not what `read` looks for: what
+            // is above it is not the end of the turn.
             return None;
         }
     }
@@ -621,6 +756,7 @@ fn read_claude(said: &str, more: &str, now: DateTime<Utc>) -> Option<Limit> {
         until: reset_in(&whole, now),
         model_scoped,
         no_credit,
+        signed_out: false,
         line: said.to_string(),
     })
 }
@@ -764,6 +900,7 @@ fn claude_picker(text: &str, now: DateTime<Utc>) -> Option<LimitPicker> {
             until: reset_in(&near, now),
             model_scoped: false,
             no_credit: false,
+            signed_out: false,
             line: above
                 .first()
                 .map_or_else(|| STOP_AND_WAIT.to_string(), |l| l.to_string()),
@@ -1006,6 +1143,98 @@ mod tests {
         limit_in("claude", text, now())
     }
 
+    /// `signed_out_in` with `agent`'s built-in login markers.
+    fn signed_out(kind: &str, text: &str) -> Option<Limit> {
+        let markers = crate::config::Agents::default().login_markers(kind);
+        signed_out_in(kind, text, &markers)
+    }
+
+    /// Claude's login screen, and its messages that the login is gone at
+    /// the end of a turn, read signed out; the line is kept.
+    #[test]
+    fn claude_signs_out_on_its_login_screen_or_a_lost_login() {
+        let screen = "Welcome to Claude Code\n\n Select login method:\n\n \u{276f} 1. Claude account with subscription\n   2. Anthropic Console account\n";
+        let out = signed_out("claude", screen).unwrap();
+        assert!(out.signed_out && out.hard && out.until.is_none());
+        assert_eq!(out.line, "Select login method:");
+        assert_eq!(out.what(), "signed out");
+        for said in [
+            "Not logged in · Please run /login",
+            "Login expired · Please run /login",
+            "OAuth token revoked · Please run /login",
+            "Session expired. Please run /login to sign in again.",
+            "Invalid API key · Fix external API key",
+            "API Error: 401 {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\"}}",
+        ] {
+            let text =
+                format!("> fix it\n\n● Half done.\n\n  ⎿  {said}\n\n────────\n❯ \n────────\n");
+            let out = signed_out("claude", &text).unwrap_or_else(|| panic!("{said}"));
+            assert_eq!(out.line, said);
+            // The raw message, as `claude -p` or a task's error leave it.
+            assert!(signed_out("claude", said).is_some(), "{said}");
+        }
+    }
+
+    /// The same words anywhere but the end of the turn are not a sign-out:
+    /// a tool call's output, a message further up, a sentence about them,
+    /// and a usage limit.
+    #[test]
+    fn claude_is_not_signed_out_by_the_words_elsewhere() {
+        for text in [
+            "> fix it\n\n● Bash(grep -rn login src)\n  ⎿  Not logged in · Please run /login\n\n────────\n❯ \n────────\n",
+            "> fix it\n\n  ⎿  Not logged in · Please run /login\n\n● Done: it works now.\n",
+            "> fix it\n\n● Not logged inside the sandbox, so I fixed it.\n",
+            "> fix it\n\n● You've hit your limit · resets 3am\n",
+            "● I added a test for \"Select login method:\" and it passes.\n",
+        ] {
+            assert_eq!(signed_out("claude", text), None, "{text}");
+        }
+        assert!(claude("> fix it\n\n  ⎿  Not logged in · Please run /login\n").is_none());
+    }
+
+    /// agy signs out on its own screen; a kind with no marker never does,
+    /// and an agent's own `login_marker` stands in.
+    #[test]
+    fn agy_and_own_markers_sign_out() {
+        let agy = "Welcome back! You are currently not signed in.\n\n> Sign in with Google\n";
+        assert!(signed_out("agy", agy).unwrap().signed_out);
+        assert_eq!(signed_out("codex", agy), None);
+        assert_eq!(signed_out("agy", "> fix it\n\nDone.\n"), None);
+        let own = vec!["Sign in with ChatGPT".to_string()];
+        let screen =
+            "Welcome to Codex\n\n> 1. Sign in with ChatGPT\n  2. Provide your own API key\n";
+        assert_eq!(
+            signed_out_in("codex", screen, &own).unwrap().line,
+            "Sign in with ChatGPT"
+        );
+    }
+
+    /// A signed-out row says so, never names a reset, and is kept and
+    /// dropped with its own events.
+    #[test]
+    fn a_signed_out_row_reads_signed_out() {
+        let row = AccountLimit::of(
+            "me",
+            Some("opus"),
+            &Limit::signed_out("Select login method:"),
+            Some(12),
+            Some("pi-1"),
+            Some("claude-alt"),
+            now(),
+            &LimitsConfig::default(),
+        );
+        assert!(row.signed_out);
+        assert_eq!(row.model, None, "a sign-out is the whole account's");
+        assert_eq!(row.retry_at, signed_out_until());
+        assert_eq!(row.note(now()), "me signed out (seen by t-12)");
+        assert_eq!(row.short_note(now()), "me signed out");
+        assert_eq!(row.kept_event(), "agent.signed_out");
+        assert_eq!(row.cleared_event(), "agent.signed_in");
+        let detail = row.event_detail(None);
+        assert_eq!(detail["signed_out"], true);
+        assert_eq!(detail["what"], "signed out");
+    }
+
     #[test]
     fn a_message_at_the_end_of_the_turn_is_a_limit() {
         let limit = claude("> fix it\n\n● You've hit your limit · resets 3am (UTC)\n").unwrap();
@@ -1016,6 +1245,7 @@ mod tests {
                 until: utc(9, 30, 3, 0),
                 model_scoped: false,
                 no_credit: false,
+                signed_out: false,
                 line: "You've hit your limit · resets 3am (UTC)".into(),
             }
         );
@@ -1070,12 +1300,12 @@ mod tests {
         let limit = claude("● 5-hour limit reached ∙ resets 3am (UTC)\n").unwrap();
         assert_eq!(limit.what(), "5-hour limit");
         let row = AccountLimit::of(
-            "claude-personal",
+            "claude-alt",
             Some("opus"),
             &limit,
-            Some(412),
+            Some(12),
             Some("pi-1"),
-            Some("claude-personal"),
+            Some("claude-alt"),
             now(),
             &LimitsConfig::default(),
         );
@@ -1084,7 +1314,7 @@ mod tests {
         let at = local_time(row.retry_at, now());
         assert_eq!(
             row.note(now()),
-            format!("claude-personal exhausted until {at} (5-hour limit, seen by t-412)")
+            format!("claude-alt exhausted until {at} (5-hour limit, seen by t-12)")
         );
         let opus = claude("● Opus weekly limit reached\n").unwrap();
         assert_eq!(opus.what(), "Opus weekly limit");
@@ -1303,7 +1533,7 @@ mod tests {
         assert!(limit_in("claude", pane, now()).is_some());
         assert!(opencode(&error_turn("Overloaded")).is_some());
         assert_eq!(limit_in("opencode", pane, now()), None);
-        for kind in ["codex", "claude-personal", "agy", ""] {
+        for kind in ["codex", "claude-alt", "agy", ""] {
             assert_eq!(limit_in(kind, pane, now()), None, "{kind}");
             assert_eq!(
                 limit_in(kind, &error_turn("Overloaded"), now()),
