@@ -40,13 +40,37 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 /// (`DispatchSpec::keep_pane`, a job's `[dispatch] keep_pane`,
 /// `FlockEntry::keep_pane`). 30: usage limits (`LimitList`, `LimitClear`,
 /// `TaskReport::limit`). 31: saved trust on pull machines (`PullTrust`,
-/// `TaskReport::trusted`).
-pub const IPC_PROTOCOL: u32 = 31;
+/// `TaskReport::trusted`). 32: a pull machine's own checkout
+/// (`TaskReport::checkout`). 33: removing a task's worktree whatever it
+/// ends in (`DispatchSpec::remove_worktree`, a job's `[dispatch]
+/// remove_worktree`, `FlockEntry::remove_worktree`). 34: `MachineCheck`.
+/// 35: skipping the fetch before a task's worktree (`DispatchSpec::fetch`, a
+/// job's `[dispatch] no_fetch`). 36: `AgentSignedIn`. 37: `machine remove` cleans
+/// up after the machine and takes `--dry-run`. 38: `BootstrapReport`. 39:
+/// the shepherd bridge (`ShepherdCheck`, `EventsSince::machine`, and
+/// `TaskClaim`'s `herdr_version` and `pastor_version`). 40: `ArtifactLocate`. 41: `TaskSweep`.
+/// 42: `MachineBootstrap`.
+/// 43: join tokens (`JoinCreate`, `JoinList`, `JoinRevoke`, `Join`).
+/// 44: `pastor login` (`LoginStart`, `LoginList`, `LoginCode`, `LoginCancel`).
+/// 45: `pastor machine cordon` (`MachineCordon`, `MachineUncordon`).
+/// 46: a task's load (`DispatchSpec::load`, `loads` in flock.toml).
+/// 47: workdir sets through the head (`WorkdirPlace`, `WorkdirRemove`,
+/// `WorkdirCheck`, `WorkdirList`).
+/// 48: workdir sets kept and read (`Record::state`, `items` and `read_at`,
+/// a check's `state` and `items`, `machine describe`'s `workdirs`).
+/// 49: a pull or command machine's report of its workdir sets
+/// (`WorkdirReport`).
+/// 50: a task's workdir set (`DispatchSpec::workdir`).
+/// 51: stored workdir bundles (`DispatchSpec::workdir_bundles`, a job's
+/// `[dispatch] workdir_bundles`, `WorkdirPlace::bundle`).
+/// 52: workdir sets on pull machines (`TaskClaim::workdir_sets`,
+/// `WorkdirBundle::set`, `TaskWorkdir::render`, `TaskReport::workdir_skipped`).
+pub const IPC_PROTOCOL: u32 = 52;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
 /// `FROM_TASK_FIELD`, and the head refuses such a caller any request that
-/// changes the fleet unless `agents_change_fleet` allows it. It is a guard
+/// changes the fleet. It is a guard
 /// against an agent acting on its own, not a boundary: the agent runs as the
 /// same user and can unset it.
 pub const TASK_ENV: &str = "PASTOR_TASK";
@@ -220,6 +244,81 @@ pub const LIMIT_PROTOCOL: u32 = 30;
 /// one refuses the first as unreadable and drops the second.
 pub const PULL_TRUST_PROTOCOL: u32 = 31;
 
+/// The first protocol whose head records `TaskReport::checkout`, the
+/// worktree a pull machine opened for a task itself. An older one drops
+/// it, leaving the head's row without a checkout for a worktree task it
+/// never dispatched.
+pub const CHECKOUT_PROTOCOL: u32 = 32;
+
+/// The first protocol whose head answers `AgentSignedIn`. An older one
+/// refuses it as unreadable.
+pub const SIGNED_IN_PROTOCOL: u32 = 36;
+
+/// The first protocol whose head answers `TaskSweep`. An older one refuses
+/// it as unreadable.
+pub const SWEEP_PROTOCOL: u32 = 41;
+
+/// The first protocol whose head answers `MachineBootstrap`. An older one
+/// refuses it as unreadable.
+pub const BOOTSTRAP_PUSH_PROTOCOL: u32 = 42;
+
+/// The first protocol whose head answers `ArtifactLocate`. An older one
+/// refuses it as unreadable.
+pub const ARTIFACT_PROTOCOL: u32 = 40;
+
+/// The first protocol whose head makes, lists, revokes and redeems join
+/// tokens. An older one refuses them as unreadable.
+pub const JOIN_TOKEN_PROTOCOL: u32 = 43;
+
+/// The first protocol whose head answers `ShepherdCheck`, cuts
+/// `EventsSince` to one machine, and keeps the versions a `TaskClaim`
+/// carries. An older one refuses the check as unreadable, and would read
+/// every machine's events or drop the versions.
+pub const SHEPHERD_BRIDGE_PROTOCOL: u32 = 39;
+
+/// The first protocol whose head answers the `Login*` requests. An older
+/// one refuses them as unreadable.
+pub const LOGIN_PROTOCOL: u32 = 44;
+
+/// The first protocol whose head answers `MachineCordon` and
+/// `MachineUncordon`, and places no new task on a cordoned machine. An
+/// older one refuses them as unreadable.
+pub const CORDON_PROTOCOL: u32 = 45;
+
+/// The first protocol whose head places a task only where its load is
+/// taken (`task run --load`, `loads` in flock.toml). An older one would
+/// drop the load and place the task on any machine without a word, or
+/// drop a flock.toml with `loads` on reload.
+pub const LOAD_PROTOCOL: u32 = 46;
+
+/// The first protocol whose head answers `WorkdirPlace`, `WorkdirRemove`,
+/// `WorkdirCheck` and `WorkdirList`. An older one refuses them as
+/// unreadable.
+pub const WORKDIR_PROTOCOL: u32 = 47;
+
+/// The first protocol whose head answers `WorkdirReport`. An older one
+/// refuses it as unreadable, and the report waits on the machine.
+pub const WORKDIR_REPORT_PROTOCOL: u32 = 49;
+
+/// The first protocol whose head places a task's workdir set before its
+/// agent starts (`task run --workdir-set`, a job's `workdir_set`). An older
+/// one would start the agent without it.
+pub const WORKDIR_TASK_PROTOCOL: u32 = 50;
+
+/// The first protocol whose head places the stored workdir bundles a task
+/// names (`DispatchSpec::workdir_bundles`, a job's `workdir_bundles`) and
+/// places one through `WorkdirPlace::bundle`. An older one would start the
+/// agent without them, refuse the job's key, or refuse the place as
+/// unreadable.
+pub const WORKDIR_BUNDLES_PROTOCOL: u32 = 51;
+
+/// The first protocol whose head hands a pull machine that places workdir
+/// sets (`TaskClaim::workdir_sets`) its tasks' sets in the claim reply,
+/// settled, built and rendered, and records the bundles that machine's own
+/// start left out (`TaskReport::workdir_skipped`). An older one would
+/// refuse the claim as unreadable, and drop the skips.
+pub const WORKDIR_PULL_PROTOCOL: u32 = 52;
+
 /// The first protocol whose head honours `Run::priority` and knows
 /// `TaskPriority`. An older one would queue the task at its own level
 /// without a word, or refuse the request as unreadable.
@@ -259,6 +358,32 @@ pub const SUMMARY_MODE_PROTOCOL: u32 = 20;
 /// would close it after `close_done_after` without a word, or refuse the
 /// job's dispatch table as unreadable.
 pub const KEEP_PANE_PROTOCOL: u32 = 29;
+
+/// The first protocol whose head removes a task's worktree whatever it
+/// ends in (`task run --remove-worktree`, a job's or flock's
+/// `remove_worktree`). An older one would keep a failed task's worktree
+/// without a word, or refuse the job's dispatch table as unreadable.
+pub const REMOVE_WORKTREE_PROTOCOL: u32 = 33;
+
+/// The first protocol whose head fetches the base of a task's worktree, and
+/// honours `--no-fetch` and a job's `no_fetch`. An older one would fetch
+/// nothing whatever the task said, or refuse the job's dispatch table as
+/// unreadable.
+pub const NO_FETCH_PROTOCOL: u32 = 35;
+
+/// The first protocol whose head cleans up after `machine remove` (the
+/// machine's authorized_keys lines, known_hosts entry and bootstrap row) and
+/// honours `--dry-run`. An older one would remove the machine at once.
+pub const MACHINE_CLEANUP_PROTOCOL: u32 = 37;
+
+/// The first protocol whose head answers `BootstrapReport`, keeps the
+/// machine's state it carries and places no task on a machine that is
+/// pending or failed. An older one refuses the request as unreadable.
+pub const BOOTSTRAP_PROTOCOL: u32 = 38;
+
+/// The first protocol whose head answers `MachineCheck`; an older one
+/// refuses it as unreadable.
+pub const MACHINE_CHECK_PROTOCOL: u32 = 34;
 
 /// The first protocol whose head runs orchestrator files and answers the
 /// `Orchestrator*` requests; an older one refuses them as unreadable.
@@ -332,7 +457,20 @@ const JOB_LABEL: &str =
 const JOB_SUMMARY: &str = "predates a job with summary, and would refuse its dispatch table";
 const KEEP_PANE: &str = "predates keeping a task's pane, and would close it once the task is done";
 const JOB_KEEP_PANE: &str = "predates a job with keep_pane, and would refuse its dispatch table";
+const REMOVE_WORKTREE: &str =
+    "predates removing a failed task's worktree, and would keep it once the task fails";
+const JOB_REMOVE_WORKTREE: &str =
+    "predates a job with remove_worktree, and would refuse its dispatch table";
+const MACHINE_CLEANUP: &str = "predates machine remove --dry-run, and would remove the machine";
+const BOOTSTRAP: &str = "predates bootstrap reports, and would refuse them";
+const SWEEP: &str = "predates task sweep, and would refuse it";
+const BOOTSTRAP_PUSH: &str = "predates bootstrapping a machine from the head, and would refuse it";
+const ARTIFACT: &str = "predates artifact lookups, and would refuse them";
+const JOIN_TOKENS: &str = "predates join tokens, and would refuse them";
+const NO_FETCH: &str = "predates fetching a worktree's base, and would ignore --no-fetch";
+const JOB_NO_FETCH: &str = "predates a job with no_fetch, and would refuse its dispatch table";
 const PULL: &str = "predates pull machines, and would refuse the claim or report";
+const MACHINE_CHECK: &str = "predates machine check, and would refuse the request";
 const ORCHESTRATOR: &str = "predates orchestrator files, and would refuse the request";
 const SESSION: &str = "predates session orchestrators, and would refuse the request";
 const LIMITS: &str = "predates usage limits, and would refuse the request";
@@ -340,6 +478,27 @@ const REPORT_LIMIT: &str = "predates usage limits, and would drop the limit the 
 const PULL_TRUST: &str = "predates saved trust on pull machines, and would refuse the request";
 const REPORT_TRUSTED: &str =
     "predates saved trust on pull machines, and would drop the trust answer the report carries";
+const REPORT_CHECKOUT: &str =
+    "predates checkout reports, and would drop the checkout the report carries";
+const REPORT_WORKDIR_SKIPPED: &str =
+    "predates workdir sets on pull machines, and would drop the workdir skips the report carries";
+const SIGNED_IN: &str = "predates the sign-in check, and would refuse the request";
+const SHEPHERD_CHECK: &str = "predates the shepherd bridge, and would refuse the request";
+const EVENTS_MACHINE: &str =
+    "predates the shepherd bridge, and would answer with every machine's events";
+const CLAIM_VERSIONS: &str =
+    "predates the shepherd bridge, and would drop the versions the claim carries";
+const LOGIN: &str = "predates pastor login, and would refuse the request";
+const CORDON: &str = "predates machine cordon, and would refuse the request";
+const LOAD: &str = "predates a task's load, and would place it on any machine";
+const WORKDIR: &str = "predates workdir sets through the head, and would refuse the request";
+const WORKDIR_REPORT: &str =
+    "predates workdir reports from pull and command machines, and would refuse the request";
+const WORKDIR_TASK: &str = "predates a task's workdir set, and would start its agent without it";
+const WORKDIR_BUNDLES: &str =
+    "predates stored workdir bundles, and would start the task's agent without them";
+const WORKDIR_PULL: &str =
+    "predates workdir sets on pull machines, and would refuse the claim as unreadable";
 
 /// How long a head's `Pong` settles the protocol check before it is asked
 /// again: a long-lived sender (a headless serve) sees a restarted head
@@ -534,15 +693,66 @@ pub enum IpcRequest {
     MachineAdd {
         machine: crate::config::flock::MachineConfig,
     },
+    /// What a bootstrap run found on `machine`, saved as the machine's
+    /// state: dispatch places nothing on a machine whose state is pending or
+    /// failed, `machine describe` shows it, and the head emits
+    /// `machine.bootstrapped` or `machine.bootstrap_failed`. Answers `Text`.
+    BootstrapReport {
+        machine: String,
+        result: crate::bootstrap::Outcome,
+    },
+    /// `join create`: a one-time token a new machine joins with, as a pull
+    /// machine in `flock` (the default when `None`) with `tags`, or as
+    /// machine `replace` taking over its name. Answers `JoinCreated`.
+    JoinCreate {
+        flock: Option<String>,
+        #[serde(default)]
+        tags: Vec<String>,
+        replace: Option<String>,
+        ttl_secs: u64,
+    },
+    /// `join list`. Answers `JoinTokens`.
+    JoinList,
+    /// `join revoke`: the token's line and row go. Answers `Text`.
+    JoinRevoke {
+        id: String,
+    },
+    /// A machine redeeming join token `id` under `name`, with its public
+    /// machine and agent keys and its ssh host key. Only `bridge --join`
+    /// sends it, with `id` set from its forced command. Answers `Joined`.
+    Join {
+        id: String,
+        name: String,
+        machine_key: String,
+        agent_key: String,
+        host_key: String,
+    },
     /// `machine remove`, the flock.toml part, as for `MachineAdd`. Answers
     /// `Text`.
     MachineRemove {
         name: String,
+        /// Change nothing: list what would go. Defaulted so a request from a
+        /// CLI that predates it parses (and, sent to a head that predates
+        /// it, would remove: `need` refuses it there).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        dry_run: bool,
     },
     /// `machine move`. Answers `Text`.
     MachineMove {
         name: String,
         flock: String,
+    },
+    /// `machine cordon`: the machine takes no new task until it is
+    /// uncordoned, the tasks it runs go on. `reason` is shown with it.
+    /// Answers `Text`.
+    MachineCordon {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// `machine uncordon`. Answers `Text`.
+    MachineUncordon {
+        name: String,
     },
     /// One scheduler pass now; `job` forces that job regardless of schedule.
     Tick {
@@ -607,8 +817,8 @@ pub enum IpcRequest {
         input: crate::machine::SendInput,
     },
     /// The task's agent says it is finished: mark the task done so its pane
-    /// closes after `close_done_after`. The one change an agent may make
-    /// without `agents_change_fleet`, and only to its own task
+    /// closes after `close_done_after`. The one change an agent may make,
+    /// and only to its own task
     /// (`ends_own_task`). Answers `Task`.
     TaskDone {
         id: i64,
@@ -626,12 +836,26 @@ pub enum IpcRequest {
         limit: u32,
         #[serde(default)]
         task: Option<i64>,
+        /// Only the records about this machine: a `machine.*` event of it,
+        /// or one whose task is placed there. Cut before `limit`, so a page
+        /// of other machines' records never hides this one's. Set by a
+        /// shepherd's bridge (`bridge::answer_shepherd`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        machine: Option<String>,
     },
     /// Delete rows in `states` that finished more than `older_than_secs`
     /// ago. Answers `Pruned`.
     TaskPrune {
         states: Vec<TaskState>,
         older_than_secs: u64,
+    },
+    /// The worktrees pastor kept for tasks that ended, on `machine` or on
+    /// every machine the head connects to, each removed (with `yes`) or
+    /// listed with why it stays (`Actor::run_sweep`). Without `yes` nothing
+    /// is removed. Answers `Swept`.
+    TaskSweep {
+        machine: Option<String>,
+        yes: bool,
     },
     /// The text of one of the head's config files, `flock`, `config` or
     /// `job:<name>` (`edit::ConfigFile`), with its hash. Answers `File`.
@@ -709,6 +933,68 @@ pub enum IpcRequest {
     MachineDescribe {
         name: String,
     },
+    /// `workdir place <machine> <dir>`: check `set` (a set's document, as
+    /// `bundle::workdir::Set::to_doc` writes it), render its profile for the
+    /// machine and place it there (`bundle::workdir_push`). Answers
+    /// `Workdir` with one answer. With `bundle` and `kind` in place of
+    /// `set`, the head builds the set stored workdir bundle `bundle` gives
+    /// an agent of `kind` (`bundle::workdir_stored`), with the vars of
+    /// `flock`, else of the machine's first flock that names it; it answers
+    /// none when the bundle has nothing for that kind.
+    WorkdirPlace {
+        machine: String,
+        dir: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        set: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bundle: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        flock: Option<String>,
+        #[serde(default)]
+        dry_run: bool,
+    },
+    /// `workdir remove <machine> <dir>`: take out set `id`, or every set.
+    /// Answers `Workdir` with one answer.
+    WorkdirRemove {
+        machine: String,
+        dir: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default)]
+        dry_run: bool,
+    },
+    /// `workdir check <machine> <dir>`: each set the head placed there
+    /// (only `id`, when given), placed again as a dry run. Answers
+    /// `Workdir`, one answer per set.
+    WorkdirCheck {
+        machine: String,
+        dir: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+    /// `workdir list`: the head's record of the sets it placed, on
+    /// `machine` only when given. Answers `Workdirs`.
+    WorkdirList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        machine: Option<String>,
+    },
+    /// What a pull or command machine placed or removed with `workdir
+    /// place|remove --local`, for the head's record. The shepherd's bridge
+    /// sets `machine` to its own machine's name. Answers `Ok`.
+    WorkdirReport {
+        machine: String,
+        reports: Vec<crate::bundle::workdir_push::Reported>,
+    },
+    /// `machine check`: run a machine's provisioner's checks there, the one
+    /// `provisioner` names instead when given, and raise
+    /// `machine.check_failed` for each failed row. Answers `MachineChecked`.
+    MachineCheck {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provisioner: Option<String>,
+    },
     /// A pull machine's headless serve asks for work: at most `free_slots`
     /// queued tasks to start, those pinned to `machine` first, then, with
     /// `flock_work`, any its flocks would place there now. Each one handed
@@ -719,6 +1005,18 @@ pub enum IpcRequest {
         free_slots: u32,
         #[serde(default)]
         flock_work: bool,
+        /// The herdr and pastor the machine runs, as it read them; the head
+        /// keeps them on its `machine_state` row. `None` when not known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        herdr_version: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pastor_version: Option<String>,
+        /// The serve places a task's workdir sets itself: the head may hand
+        /// it tasks with sets, each with what it needs to place them
+        /// (`WorkdirBundle::set`, `TaskWorkdir::render`). A serve from
+        /// before that sends nothing, and gets none.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        workdir_sets: bool,
     },
     /// A pull machine's serve says what became of a task it claimed: its
     /// state, its pane, and `detail`, the note the task carries there (why
@@ -744,6 +1042,19 @@ pub enum IpcRequest {
         /// task.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         trusted: Option<Vec<String>>,
+        /// The worktree the machine opened for this task, dispatched there
+        /// itself since a pull machine's own shepherd never goes through
+        /// the head's dispatch. Missing from the head's row until a report
+        /// carries it, which `task done --current` needs to push the
+        /// branch and check the worktree clean (`Fleet::report`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checkout: Option<crate::task::Checkout>,
+        /// The stored workdir bundles the machine's own start left out, and
+        /// why: what only it can see (a checkout that was already open, an
+        /// agent of another kind than the claim's). The head writes each on
+        /// its row, unless the row already says why it was left out.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        workdir_skipped: Vec<crate::task::WorkdirSkip>,
     },
     /// A pull machine's serve asks for the folder trust saved for it: the
     /// repos `trust add` saved on `machine`, and no other machine's, so its
@@ -753,6 +1064,36 @@ pub enum IpcRequest {
     PullTrust {
         machine: String,
     },
+    /// Whether a shepherd's bridge started as `--gen generation` still
+    /// speaks for `machine`: the machine is in the head's flock.toml and
+    /// its `machine_state` row is at that generation. Refused
+    /// `machine_revoked` otherwise. Answers `Text`.
+    ShepherdCheck {
+        machine: String,
+        generation: i64,
+    },
+    /// Where the head's artifact cache keeps `name` (`pastor`, `herdr`, or a
+    /// harness's release) at `version` for `target`, and its sha256 and size:
+    /// only what the cache already holds, checked against its recorded sum,
+    /// never fetched for the asker. Refused `invalid_artifact` for a name
+    /// that could leave the cache and `artifact_not_cached` for one it does
+    /// not hold. Answers `Artifact`; `pastor bridge --shepherd` streams the
+    /// file itself after the reply line.
+    ArtifactLocate {
+        name: String,
+        version: String,
+        target: String,
+    },
+    /// Set `name` up over ssh from the head, as its login user
+    /// (`bootstrap::push`): with `machine`, adding that entry first
+    /// (`machine add --bootstrap`). `host_key` is the key it must offer.
+    /// Answers `Bootstrapped`, whether the steps passed or not; an error is a
+    /// push that never started.
+    MachineBootstrap {
+        name: String,
+        machine: Option<crate::config::flock::MachineConfig>,
+        host_key: Option<String>,
+    },
     /// Every usage limit the head keeps. Answers `Limits`.
     LimitList,
     /// Forget `account`'s limits, only `model`'s when given. Answers
@@ -761,6 +1102,34 @@ pub enum IpcRequest {
         account: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+    },
+    /// Run `agent`'s login check on `machine` (`Agents::login_check_command`)
+    /// and, when it passes, clear the agent's signed-out mark there.
+    /// Answers `Limits`, those cleared.
+    AgentSignedIn {
+        machine: String,
+        agent: String,
+    },
+    /// Open `agent`'s interactive login in a pane on `machine` and watch
+    /// it until the login check passes (`login::start`). Answers `Login`.
+    LoginStart {
+        machine: String,
+        agent: String,
+    },
+    /// The logins the head is watching. Answers `Logins`.
+    LoginList,
+    /// Type `code`, pasted back from the browser, into a pending login's
+    /// pane. Answers `Logins`, that login.
+    LoginCode {
+        machine: String,
+        agent: String,
+        code: String,
+    },
+    /// Close a pending login's pane and forget it. Answers `Logins`, that
+    /// login.
+    LoginCancel {
+        machine: String,
+        agent: String,
     },
     /// Every orchestrator file the head reads. Answers `Orchestrators`.
     OrchestratorList,
@@ -818,6 +1187,7 @@ impl IpcRequest {
             | R::TaskClose { .. }
             | R::TaskSend { .. }
             | R::TaskPrune { .. } => {}
+            R::TaskSweep { .. } => need.at(SWEEP_PROTOCOL, SWEEP),
             R::List { filter } => {
                 if filter.flock.is_some() {
                     need.at(FLOCK_PROTOCOL, FLOCKS);
@@ -875,6 +1245,21 @@ impl IpcRequest {
                 if spec.keep_pane.is_some() {
                     need.at(KEEP_PANE_PROTOCOL, KEEP_PANE);
                 }
+                if spec.remove_worktree.is_some() {
+                    need.at(REMOVE_WORKTREE_PROTOCOL, REMOVE_WORKTREE);
+                }
+                if spec.fetch.skip {
+                    need.at(NO_FETCH_PROTOCOL, NO_FETCH);
+                }
+                if spec.load.is_some() {
+                    need.at(LOAD_PROTOCOL, LOAD);
+                }
+                if spec.workdir.is_some() {
+                    need.at(WORKDIR_TASK_PROTOCOL, WORKDIR_TASK);
+                }
+                if !spec.workdir_bundles.is_empty() {
+                    need.at(WORKDIR_BUNDLES_PROTOCOL, WORKDIR_BUNDLES);
+                }
             }
             R::Tick { dry_run, .. } => {
                 if !dry_run {
@@ -902,7 +1287,12 @@ impl IpcRequest {
                 }
             }
             R::TaskSummaries { .. } => need.at(SUMMARY_PROTOCOL, SUMMARY),
-            R::EventsSince { .. } => need.at(EVENTS_PROTOCOL, EVENTS),
+            R::EventsSince { machine, .. } => {
+                need.at(EVENTS_PROTOCOL, EVENTS);
+                if machine.is_some() {
+                    need.at(SHEPHERD_BRIDGE_PROTOCOL, EVENTS_MACHINE);
+                }
+            }
             R::FlockAdd {
                 description,
                 machines,
@@ -917,8 +1307,15 @@ impl IpcRequest {
                 }
             }
             R::FlockJoin { .. } | R::FlockLeave { .. } => need.at(JOIN_PROTOCOL, JOIN),
-            R::FlockSetDefault { .. } | R::MachineRemove { .. } | R::MachineMove { .. } => {
+            R::BootstrapReport { .. } => need.at(BOOTSTRAP_PROTOCOL, BOOTSTRAP),
+            R::FlockSetDefault { .. } | R::MachineMove { .. } => {
                 need.at(FLEET_EDIT_PROTOCOL, FLEET_EDIT);
+            }
+            R::MachineRemove { dry_run, .. } => {
+                need.at(FLEET_EDIT_PROTOCOL, FLEET_EDIT);
+                if *dry_run {
+                    need.at(MACHINE_CLEANUP_PROTOCOL, MACHINE_CLEANUP);
+                }
             }
             R::MachineAdd { machine } => {
                 need.at(FLEET_EDIT_PROTOCOL, FLEET_EDIT);
@@ -968,6 +1365,18 @@ impl IpcRequest {
                 if dispatch.get("keep_pane").is_some_and(|v| !v.is_null()) {
                     need.at(KEEP_PANE_PROTOCOL, JOB_KEEP_PANE);
                 }
+                if dispatch
+                    .get("remove_worktree")
+                    .is_some_and(|v| !v.is_null())
+                {
+                    need.at(REMOVE_WORKTREE_PROTOCOL, JOB_REMOVE_WORKTREE);
+                }
+                if dispatch.get("no_fetch").is_some_and(|v| !v.is_null()) {
+                    need.at(NO_FETCH_PROTOCOL, JOB_NO_FETCH);
+                }
+                if has("workdir_bundles") {
+                    need.at(WORKDIR_BUNDLES_PROTOCOL, WORKDIR_BUNDLES);
+                }
             }
             R::JobTask {
                 agent,
@@ -994,14 +1403,46 @@ impl IpcRequest {
                 if spec.keep_pane.is_some() {
                     need.at(KEEP_PANE_PROTOCOL, JOB_KEEP_PANE);
                 }
+                if spec.remove_worktree.is_some() {
+                    need.at(REMOVE_WORKTREE_PROTOCOL, JOB_REMOVE_WORKTREE);
+                }
+                if spec.workdir.is_some() {
+                    need.at(WORKDIR_TASK_PROTOCOL, WORKDIR_TASK);
+                }
+                if !spec.workdir_bundles.is_empty() {
+                    need.at(WORKDIR_BUNDLES_PROTOCOL, WORKDIR_BUNDLES);
+                }
+                if spec.fetch.skip {
+                    need.at(NO_FETCH_PROTOCOL, JOB_NO_FETCH);
+                }
             }
             R::TrustList
             | R::TrustAdd { .. }
             | R::TrustRemove { .. }
             | R::FlockDescribe { .. }
             | R::MachineDescribe { .. } => need.at(HEAD_READS_PROTOCOL, HEAD_READS),
-            R::TaskClaim { .. } => need.at(PULL_PROTOCOL, PULL),
-            R::TaskReport { limit, trusted, .. } => {
+            R::MachineCheck { .. } => need.at(MACHINE_CHECK_PROTOCOL, MACHINE_CHECK),
+            R::TaskClaim {
+                herdr_version,
+                pastor_version,
+                workdir_sets,
+                ..
+            } => {
+                need.at(PULL_PROTOCOL, PULL);
+                if herdr_version.is_some() || pastor_version.is_some() {
+                    need.at(SHEPHERD_BRIDGE_PROTOCOL, CLAIM_VERSIONS);
+                }
+                if *workdir_sets {
+                    need.at(WORKDIR_PULL_PROTOCOL, WORKDIR_PULL);
+                }
+            }
+            R::TaskReport {
+                limit,
+                trusted,
+                checkout,
+                workdir_skipped,
+                ..
+            } => {
                 need.at(PULL_PROTOCOL, PULL);
                 if limit.is_some() {
                     need.at(LIMIT_PROTOCOL, REPORT_LIMIT);
@@ -1009,9 +1450,38 @@ impl IpcRequest {
                 if trusted.is_some() {
                     need.at(PULL_TRUST_PROTOCOL, REPORT_TRUSTED);
                 }
+                if checkout.is_some() {
+                    need.at(CHECKOUT_PROTOCOL, REPORT_CHECKOUT);
+                }
+                if !workdir_skipped.is_empty() {
+                    need.at(WORKDIR_PULL_PROTOCOL, REPORT_WORKDIR_SKIPPED);
+                }
             }
             R::PullTrust { .. } => need.at(PULL_TRUST_PROTOCOL, PULL_TRUST),
+            R::ShepherdCheck { .. } => need.at(SHEPHERD_BRIDGE_PROTOCOL, SHEPHERD_CHECK),
+            R::ArtifactLocate { .. } => need.at(ARTIFACT_PROTOCOL, ARTIFACT),
+            R::MachineBootstrap { .. } => need.at(BOOTSTRAP_PUSH_PROTOCOL, BOOTSTRAP_PUSH),
+            R::JoinCreate { .. } | R::JoinList | R::JoinRevoke { .. } | R::Join { .. } => {
+                need.at(JOIN_TOKEN_PROTOCOL, JOIN_TOKENS);
+            }
             R::LimitList | R::LimitClear { .. } => need.at(LIMIT_PROTOCOL, LIMITS),
+            R::AgentSignedIn { .. } => need.at(SIGNED_IN_PROTOCOL, SIGNED_IN),
+            R::MachineCordon { .. } | R::MachineUncordon { .. } => {
+                need.at(CORDON_PROTOCOL, CORDON);
+            }
+            R::WorkdirPlace { bundle, .. } => {
+                need.at(WORKDIR_PROTOCOL, WORKDIR);
+                if bundle.is_some() {
+                    need.at(WORKDIR_BUNDLES_PROTOCOL, WORKDIR_BUNDLES);
+                }
+            }
+            R::WorkdirRemove { .. } | R::WorkdirCheck { .. } | R::WorkdirList { .. } => {
+                need.at(WORKDIR_PROTOCOL, WORKDIR)
+            }
+            R::WorkdirReport { .. } => need.at(WORKDIR_REPORT_PROTOCOL, WORKDIR_REPORT),
+            R::LoginStart { .. } | R::LoginList | R::LoginCode { .. } | R::LoginCancel { .. } => {
+                need.at(LOGIN_PROTOCOL, LOGIN);
+            }
             R::OrchestratorStart { .. } | R::OrchestratorStop { .. } => {
                 need.at(SESSION_PROTOCOL, SESSION);
             }
@@ -1040,12 +1510,24 @@ impl IpcRequest {
             | IpcRequest::EventsSince { .. }
             | IpcRequest::TrustList
             | IpcRequest::PullTrust { .. }
+            | IpcRequest::ShepherdCheck { .. }
+            | IpcRequest::ArtifactLocate { .. }
             | IpcRequest::FlockDescribe { .. }
             | IpcRequest::MachineDescribe { .. }
+            | IpcRequest::MachineCheck { .. }
             | IpcRequest::OrchestratorList
             | IpcRequest::OrchestratorDescribe { .. }
             | IpcRequest::LimitList
+            | IpcRequest::JoinList
+            | IpcRequest::LoginList
+            | IpcRequest::WorkdirCheck { .. }
+            | IpcRequest::WorkdirList { .. }
             | IpcRequest::Queue { .. } => false,
+            // Saying what a set would change is a read; placing one hands an
+            // agent files another agent starts with.
+            IpcRequest::WorkdirPlace { dry_run, .. }
+            | IpcRequest::WorkdirRemove { dry_run, .. } => !dry_run,
+            IpcRequest::WorkdirReport { .. } => true,
             IpcRequest::FileGet { .. } | IpcRequest::JobDescribe { .. } => false,
             IpcRequest::Reload
             | IpcRequest::Tick { .. }
@@ -1058,6 +1540,8 @@ impl IpcRequest {
             | IpcRequest::MachineAdd { .. }
             | IpcRequest::MachineRemove { .. }
             | IpcRequest::MachineMove { .. }
+            | IpcRequest::MachineCordon { .. }
+            | IpcRequest::MachineUncordon { .. }
             | IpcRequest::JobRun { .. }
             | IpcRequest::TaskRetry { .. }
             | IpcRequest::TaskPriority { .. }
@@ -1066,6 +1550,8 @@ impl IpcRequest {
             | IpcRequest::TaskSend { .. }
             | IpcRequest::TaskDone { .. }
             | IpcRequest::TaskPrune { .. }
+            | IpcRequest::TaskSweep { .. }
+            | IpcRequest::MachineBootstrap { .. }
             | IpcRequest::FilePut { .. }
             | IpcRequest::JobSetEnabled { .. }
             | IpcRequest::JobSubmit { .. }
@@ -1075,6 +1561,14 @@ impl IpcRequest {
             | IpcRequest::TaskClaim { .. }
             | IpcRequest::TaskReport { .. }
             | IpcRequest::LimitClear { .. }
+            | IpcRequest::AgentSignedIn { .. }
+            | IpcRequest::BootstrapReport { .. }
+            | IpcRequest::JoinCreate { .. }
+            | IpcRequest::JoinRevoke { .. }
+            | IpcRequest::Join { .. }
+            | IpcRequest::LoginStart { .. }
+            | IpcRequest::LoginCode { .. }
+            | IpcRequest::LoginCancel { .. }
             | IpcRequest::OrchestratorRun { .. }
             | IpcRequest::OrchestratorStart { .. }
             | IpcRequest::OrchestratorStop { .. }
@@ -1084,7 +1578,7 @@ impl IpcRequest {
     }
 
     /// Whether an orchestrator task (`TaskRole::Orchestrator`) may make this
-    /// change without `agents_change_fleet`: run, retry, type into and close
+    /// change: run, retry, type into and close
     /// tasks, enable or disable a job, and keep its own handover note (the
     /// head checks whose). An orchestrator's pre and post scripts get the
     /// same table.
@@ -1197,6 +1691,12 @@ pub enum IpcResponse {
     Runs(Vec<JobRunReport>),
     Jobs(Vec<JobStatus>),
     Pruned(crate::store::PruneOutcome),
+    /// What a sweep found, and the machines it could not ask, with why.
+    Swept {
+        entries: Vec<crate::machine::SweepEntry>,
+        #[serde(default)]
+        failed: Vec<(String, String)>,
+    },
     Events(crate::events::EventsPage),
     File(FileText),
     Job(crate::describe::JobDescription),
@@ -1208,14 +1708,42 @@ pub enum IpcResponse {
         refused: Vec<(String, String)>,
     },
     Trusted(Vec<crate::store::TrustedRepo>),
+    /// How a push bootstrap ended.
+    Bootstrapped(crate::bootstrap::Outcome),
+    /// A cached artifact: its sum and size, and where the head keeps it. The
+    /// shepherd bridge reads the file there and sends its caller the reply
+    /// with `path` empty.
+    Artifact {
+        path: String,
+        sha256: String,
+        size: u64,
+    },
+    /// A token `join create` made: the only time the head sees it.
+    JoinCreated {
+        id: String,
+        token: String,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    },
+    JoinTokens(Vec<crate::store::JoinToken>),
+    /// A join went through: `name` is a pull machine in flock.toml, and
+    /// `herdr_version` the herdr it should run.
+    Joined {
+        name: String,
+        herdr_version: Option<String>,
+    },
     FlockDescription(crate::describe::FlockDescription),
     MachineDescription(crate::describe::MachineDescription),
+    MachineChecked(crate::machine_check::Report),
     Queue(Vec<crate::queue::QueueEntry>),
     Moved(crate::store::Moved),
     Summaries(Vec<crate::task::TaskSummary>),
     Orchestrators(Vec<crate::orchestrator::OrchestratorStatus>),
     Orchestrator(crate::orchestrator::OrchestratorDescription),
     Limits(Vec<crate::limit::AccountLimit>),
+    Login(crate::login::Started),
+    Logins(Vec<crate::login::PendingLogin>),
+    Workdir(Vec<crate::bundle::workdir::Placed>),
+    Workdirs(Vec<crate::bundle::workdir_push::Record>),
 }
 
 /// One of the head's config files as `FileGet` found it.
@@ -1241,7 +1769,7 @@ impl IpcResponse {
 /// Default bound on a full request/reply round trip. Deliberately longer than
 /// `MachineSettings::request_timeout`'s default (60s): a `Run` that dispatches
 /// inline (see `Daemon::handle`) must have room to finish before this gives up.
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// `daemon_running` only needs to know whether something answers `Ping`; it
 /// shouldn't itself hang for a minute against a wedged daemon.
@@ -1598,6 +2126,14 @@ mod tests {
                 cwd: None,
                 keep_pane: None,
                 keep_pane_from: None,
+                remove_worktree: None,
+                remove_worktree_from: None,
+                load: None,
+                load_from: None,
+                fetch: Default::default(),
+                start_prompt: None,
+                workdir: None,
+                workdir_bundles: Vec::new(),
                 rounds: Default::default(),
             },
             machine: None,
@@ -1768,11 +2304,23 @@ mod tests {
                 after: 7,
                 limit: 50,
                 task: Some(3),
+                machine: None,
             },
             IpcRequest::TaskClaim {
                 machine: "laptop".into(),
                 free_slots: 2,
                 flock_work: true,
+                herdr_version: None,
+                pastor_version: None,
+                workdir_sets: false,
+            },
+            IpcRequest::TaskClaim {
+                machine: "laptop".into(),
+                free_slots: 2,
+                flock_work: true,
+                herdr_version: None,
+                pastor_version: Some("0.10.0".into()),
+                workdir_sets: true,
             },
             IpcRequest::TaskReport {
                 machine: "laptop".into(),
@@ -1782,6 +2330,8 @@ mod tests {
                 detail: Some("agent asked: go on?".into()),
                 limit: None,
                 trusted: None,
+                checkout: None,
+                workdir_skipped: Vec::new(),
             },
             IpcRequest::TaskReport {
                 machine: "laptop".into(),
@@ -1791,6 +2341,22 @@ mod tests {
                 detail: None,
                 limit: None,
                 trusted: Some(vec!["Down".into(), "Enter".into()]),
+                checkout: None,
+                workdir_skipped: Vec::new(),
+            },
+            IpcRequest::TaskReport {
+                machine: "laptop".into(),
+                id: 4,
+                state: crate::task::TaskState::Running,
+                pane: Some("p1".into()),
+                detail: None,
+                limit: None,
+                trusted: None,
+                checkout: None,
+                workdir_skipped: vec![crate::task::WorkdirSkip {
+                    id: "repo-notes".into(),
+                    why: "shared folder (/srv/app)".into(),
+                }],
             },
             IpcRequest::PullTrust {
                 machine: "laptop".into(),
@@ -1828,6 +2394,7 @@ mod tests {
                 after: 0,
                 limit: 10,
                 task: None,
+                machine: None,
             },
             IpcRequest::FileGet {
                 file: "flock".into(),
@@ -1839,6 +2406,10 @@ mod tests {
             },
             IpcRequest::FlockDescribe { name: "f".into() },
             IpcRequest::MachineDescribe { name: "m".into() },
+            IpcRequest::MachineCheck {
+                name: "m".into(),
+                provisioner: None,
+            },
             IpcRequest::Queue {
                 flock: Some("work".into()),
                 machine: None,
@@ -1911,6 +2482,10 @@ mod tests {
             IpcRequest::FlockSetDefault { name: "f".into() },
             IpcRequest::MachineAdd {
                 machine: crate::config::flock::MachineConfig {
+                    reserved: 0,
+                    provisioner: None,
+                    bundles: Vec::new(),
+                    bundle_apply: None,
                     pull: false,
                     description: None,
                     name: "m".into(),
@@ -1922,6 +2497,7 @@ mod tests {
                     job_slots: 1,
                     burst: 1,
                     tags: vec![],
+                    loads: vec![],
                     flock: None,
                     agent: None,
                     agent_args: None,
@@ -1933,9 +2509,14 @@ mod tests {
                     min_disk: None,
                     min_memory: None,
                     unknown_room: None,
+                    pins: Default::default(),
+                    env: Default::default(),
                 },
             },
-            IpcRequest::MachineRemove { name: "m".into() },
+            IpcRequest::MachineRemove {
+                name: "m".into(),
+                dry_run: false,
+            },
             IpcRequest::MachineMove {
                 name: "m".into(),
                 flock: "f".into(),
@@ -1980,6 +2561,28 @@ mod tests {
             IpcRequest::LimitClear {
                 account: "me".into(),
                 model: None,
+            },
+            IpcRequest::AgentSignedIn {
+                machine: "m".into(),
+                agent: "claude".into(),
+            },
+            IpcRequest::MachineCordon {
+                name: "m".into(),
+                reason: None,
+            },
+            IpcRequest::MachineUncordon { name: "m".into() },
+            IpcRequest::LoginStart {
+                machine: "m".into(),
+                agent: "claude".into(),
+            },
+            IpcRequest::LoginCode {
+                machine: "m".into(),
+                agent: "claude".into(),
+                code: "c".into(),
+            },
+            IpcRequest::LoginCancel {
+                machine: "m".into(),
+                agent: "claude".into(),
             },
             IpcRequest::OrchestratorRun { name: "o".into() },
             IpcRequest::OrchestratorStart { name: "o".into() },
@@ -2289,9 +2892,121 @@ mod tests {
                 "keep_pane",
             ),
             (
+                run(serde_json::json!({"spec": {"agent": "claude", "remove_worktree": true}})),
+                REMOVE_WORKTREE_PROTOCOL,
+                "removing a failed task's worktree",
+            ),
+            (
+                submit(serde_json::json!({"remove_worktree": false})),
+                REMOVE_WORKTREE_PROTOCOL,
+                "remove_worktree",
+            ),
+            (
+                req(serde_json::json!({"op": "machine_remove", "name": "m", "dry_run": true})),
+                MACHINE_CLEANUP_PROTOCOL,
+                "machine remove --dry-run",
+            ),
+            (
+                req(serde_json::json!({
+                    "op": "bootstrap_report", "machine": "m",
+                    "result": {"ok": true, "isolation": "none", "steps": [],
+                               "machine_key": null, "agent_key": null, "host_key": null,
+                               "herdr_version": null, "pastor_version": null}
+                })),
+                BOOTSTRAP_PROTOCOL,
+                "bootstrap reports",
+            ),
+            (
+                req(serde_json::json!({
+                    "op": "artifact_locate", "name": "pastor", "version": "0.10.0", "target": "t"
+                })),
+                ARTIFACT_PROTOCOL,
+                "artifact lookups",
+            ),
+            (
+                req(serde_json::json!({"op": "task_sweep", "machine": null, "yes": false})),
+                SWEEP_PROTOCOL,
+                "task sweep",
+            ),
+            (
+                req(serde_json::json!({"op": "join_list"})),
+                JOIN_TOKEN_PROTOCOL,
+                "join tokens",
+            ),
+            (
+                run(serde_json::json!({"spec": {"agent": "claude", "fetch": {"skip": true}}})),
+                NO_FETCH_PROTOCOL,
+                "fetching a worktree's base",
+            ),
+            (
+                submit(serde_json::json!({"no_fetch": false})),
+                NO_FETCH_PROTOCOL,
+                "no_fetch",
+            ),
+            (
+                run(serde_json::json!({"spec": {"agent": "claude", "load": "rust"}})),
+                LOAD_PROTOCOL,
+                "a task's load",
+            ),
+            (
+                req(serde_json::json!({"op": "workdir_list"})),
+                WORKDIR_PROTOCOL,
+                "workdir sets through the head",
+            ),
+            (
+                req(
+                    serde_json::json!({"op": "workdir_place", "machine": "m", "dir": "/w", "set": {}}),
+                ),
+                WORKDIR_PROTOCOL,
+                "workdir sets through the head",
+            ),
+            (
+                req(serde_json::json!({"op": "workdir_remove", "machine": "m", "dir": "/w"})),
+                WORKDIR_PROTOCOL,
+                "workdir sets through the head",
+            ),
+            (
+                req(serde_json::json!({"op": "workdir_check", "machine": "m", "dir": "/w"})),
+                WORKDIR_PROTOCOL,
+                "workdir sets through the head",
+            ),
+            (
+                req(serde_json::json!({"op": "workdir_report", "machine": "m", "reports": []})),
+                WORKDIR_REPORT_PROTOCOL,
+                "workdir reports",
+            ),
+            (
+                run(
+                    serde_json::json!({"spec": {"agent": "claude", "workdir": {"set": {"id": "s"}}}}),
+                ),
+                WORKDIR_TASK_PROTOCOL,
+                "a task's workdir set",
+            ),
+            (
+                run(
+                    serde_json::json!({"spec": {"agent": "claude", "workdir_bundles": [{"id": "b"}]}}),
+                ),
+                WORKDIR_BUNDLES_PROTOCOL,
+                "stored workdir bundles",
+            ),
+            (
+                req(
+                    serde_json::json!({"op": "workdir_place", "machine": "m", "dir": "/w", "bundle": "b", "kind": "claude"}),
+                ),
+                WORKDIR_BUNDLES_PROTOCOL,
+                "stored workdir bundles",
+            ),
+            (
                 req(serde_json::json!({"op": "task_claim", "machine": "m", "free_slots": 1})),
                 PULL_PROTOCOL,
                 "pull machines",
+            ),
+            (
+                req(
+                    serde_json::json!({"op": "task_claim", "machine": "m", "free_slots": 1, "workdir_sets": true}),
+                ),
+                WORKDIR_PULL_PROTOCOL,
+                "workdir sets on pull machines",
             ),
             (
                 req(
@@ -2299,6 +3014,13 @@ mod tests {
                 ),
                 PULL_PROTOCOL,
                 "pull machines",
+            ),
+            (
+                req(
+                    serde_json::json!({"op": "task_report", "machine": "m", "id": 1, "state": "running", "workdir_skipped": [{"id": "b", "why": "shared folder"}]}),
+                ),
+                WORKDIR_PULL_PROTOCOL,
+                "workdir sets on pull machines",
             ),
             (
                 req(serde_json::json!({"op": "pull_trust", "machine": "m"})),
@@ -2391,6 +3113,7 @@ mod tests {
             FALLBACK_PROTOCOL,
             KEEP_PANE_PROTOCOL,
             PULL_TRUST_PROTOCOL,
+            REMOVE_WORKTREE_PROTOCOL,
         ] {
             assert!(covered.contains(&p), "no request needs protocol {p}");
         }

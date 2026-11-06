@@ -104,10 +104,27 @@ enum Command {
         #[command(subcommand)]
         cmd: pastor::setup::SetupCmd,
     },
+    /// Set this machine up for a flock, as the login user: keys, client.toml, services, harnesses
+    Bootstrap(pastor::bootstrap::Args),
+    /// The fleet as a whole: pastor updates
+    Fleet {
+        #[command(subcommand)]
+        cmd: pastor::fleet_update::FleetCmd,
+    },
     /// Install, link, list and try out connectors
     Connector {
         #[command(subcommand)]
         cmd: pastor::connector::cli::ConnectorCmd,
+    },
+    /// Bundles of skills, settings, MCP servers and instructions for agents' homes
+    Bundle {
+        #[command(subcommand)]
+        cmd: pastor::bundle::cli::BundleCmd,
+    },
+    /// Sets of files placed in an agent's working directory before it starts
+    Workdir {
+        #[command(subcommand)]
+        cmd: pastor::bundle::workdir_cli::WorkdirCmd,
     },
     /// Permission profiles: named tool allow and deny lists, built in and from pastor.toml
     Profile {
@@ -119,17 +136,37 @@ enum Command {
         #[command(subcommand)]
         cmd: pastor::limit_cli::LimitCmd,
     },
+    /// Agents on machines: check that one is signed in
+    Agent {
+        #[command(subcommand)]
+        cmd: pastor::agent_cli::AgentCmd,
+    },
+    /// Sign an agent in on a machine: open its login in a pane there, show the URL and code, and clear its signed-out mark once it passes
+    Login(pastor::login_cli::LoginArgs),
     /// The repos whose folder-trust prompt pastor answers on each machine
     Trust {
         #[command(subcommand)]
         cmd: pastor::trust_cli::TrustCmd,
     },
+    /// Join a head with a one-time token as a pull machine, or make and list the tokens on the head
+    Join(pastor::join::JoinCli),
     /// Pass request lines from stdin to this machine's head; for a remote CLI over ssh
     Bridge(BridgeArgs),
+    /// Talk to a Claude session's inbox socket on this machine
+    Inbox {
+        #[command(subcommand)]
+        cmd: pastor::inbox::InboxCmd,
+    },
     /// Which head this CLI uses: this machine's, or one on another machine over ssh
     Head {
         #[command(subcommand)]
         cmd: pastor::head::HeadCmd,
+    },
+    /// Take from this host what pastor put there for itself: its marked authorized_keys lines and its own key files in the state directory, nothing else
+    Leave {
+        /// Change nothing: list what would go
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -143,13 +180,23 @@ struct ServeArgs {
 }
 
 #[derive(Args, Debug)]
+#[command(group(clap::ArgGroup::new("bridge_mode").args(["agent", "shepherd"])))]
 struct BridgeArgs {
     /// Pass on only what an agent on --machine may ask: its machine's tasks
     #[arg(long, requires = "machine")]
     agent: bool,
-    /// The machine whose agents this bridge serves, as flock.toml names it
-    #[arg(long, requires = "agent")]
+    /// Pass on only what the shepherd of pull machine --machine may ask: its own claims, reports, trust, jobs and events
+    #[arg(long, requires_all = ["machine", "generation"])]
+    shepherd: bool,
+    /// The machine this bridge serves (needs --agent or --shepherd), as flock.toml names it
+    #[arg(long, requires = "bridge_mode")]
     machine: Option<String>,
+    /// The enrollment of --machine this shepherd's key belongs to; every request is refused once the head moves past it (needs --shepherd)
+    #[arg(long = "gen", value_name = "N", requires = "shepherd")]
+    generation: Option<i64>,
+    /// Take one join request for join token ID, and nothing else: the way in for a machine that joins with it
+    #[arg(long, value_name = "ID", conflicts_with_all = ["agent", "shepherd", "machine"])]
+    join: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -297,6 +344,11 @@ struct RunArgs {
     /// Only a machine with this tag takes the task; repeat for more, and it needs them all
     #[arg(long = "tag")]
     tags: Vec<String>,
+    /// The kind of work the task is (`rust`, `light`): only a machine that
+    /// takes this load in flock.toml places it (default: its agent's
+    /// `load`, else its repo's under `[repos]`, else none)
+    #[arg(long, value_name = "LOAD", value_parser = parse_load)]
+    load: Option<String>,
     /// Mark the task stale once it has run this long (30m, 2h; default:
     /// the flock's, else `[defaults] timeout`)
     #[arg(long)]
@@ -313,6 +365,23 @@ struct RunArgs {
     /// else `[defaults] keep_pane`, else no)
     #[arg(long)]
     keep_pane: bool,
+    /// Remove the task's worktree once it ends, failed or stale too, not
+    /// only done, as its pane closes; its branch stays, and a dirty
+    /// checkout is kept with a note (default: the flock's
+    /// `remove_worktree`, else `[defaults] remove_worktree`, else no)
+    #[arg(long)]
+    remove_worktree: bool,
+    /// Do not fetch the repo's remote before the task's worktree is made
+    /// (default: fetch it; a fetch that fails warns, and the worktree is
+    /// made from the repo as it is)
+    #[arg(long)]
+    no_fetch: bool,
+    /// A workdir set to place in the agent's folder before each start: a
+    /// JSON or TOML file, a directory with a pastor-workdir.toml, or '-'
+    /// for stdin. Its profile must be the task's, or none (it takes the
+    /// task's); a failed place fails the start (workdir_failed)
+    #[arg(long, value_name = "SET")]
+    workdir_set: Option<String>,
     /// Where the agent's pane goes: repo (under the repo it works on), own
     /// (its own workspace), pastor (the `pastor` workspace) or
     /// pane:<workspace> (default: the flock's, else `[defaults] place`,
@@ -406,6 +475,8 @@ enum TaskCmd {
     Close(pastor::task_cli::CloseArgs),
     /// Delete old finished tasks; their items stay seen
     Prune(pastor::task_cli::PruneArgs),
+    /// List the worktrees pastor kept for tasks that ended, and with --yes remove those with nothing in them to lose
+    Sweep(pastor::task_cli::SweepArgs),
     /// Type text or press keys in a live task's agent, to answer what it is waiting on
     Send(pastor::task_cli::SendArgs),
     /// Mark a task done, its pane to close after close_done_after; an agent may end its own
@@ -453,6 +524,26 @@ enum MachineCmd {
         /// Also save it in herdr's sidebar (runs `herdr machine add`)
         #[arg(long, conflicts_with_all = ["local", "command"])]
         herdr: bool,
+        /// The public key its agents reach the head with (a .pub file, or - for stdin): its marked line goes in this host's authorized_keys, run on the head
+        #[arg(long, value_name = "FILE")]
+        agent_key: Option<String>,
+        /// Change nothing: say what would be added, and the authorized_keys line with --agent-key
+        #[arg(long)]
+        dry_run: bool,
+        /// Set the machine up over ssh from the head, as its login user, after adding it: pin its host key, copy pastor and herdr, run pastor bootstrap there (needs a running head and head_address)
+        #[arg(long, requires = "ssh", conflicts_with_all = ["agent_key", "dry_run", "herdr"])]
+        bootstrap: bool,
+        /// With --bootstrap: the host key the machine must offer, as a SHA256: fingerprint or an ssh-ed25519 key; unset, the key is trusted the first time it is seen
+        #[arg(long, value_name = "KEY", requires = "bootstrap")]
+        host_key: Option<String>,
+    },
+    /// Set an ssh machine up from the head, as its login user, or finish a setup that stopped; pins its host key on first use and never replaces it
+    Bootstrap {
+        /// The machine, as flock.toml names it
+        name: String,
+        /// The host key the machine must offer, as a SHA256: fingerprint or an ssh-ed25519 key
+        #[arg(long, value_name = "KEY")]
+        host_key: Option<String>,
     },
     /// Remove a machine from flock.toml; tasks already on it keep their rows
     Remove {
@@ -461,6 +552,9 @@ enum MachineCmd {
         /// Also remove herdr's saved machine with this label
         #[arg(long)]
         herdr: bool,
+        /// Change nothing: list what would go (its flock.toml entry, its marked authorized_keys lines, its known_hosts entry, its bootstrap state)
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Take a machine out of every flock and put it in this one; tasks already on it stay there
     Move {
@@ -468,6 +562,19 @@ enum MachineCmd {
         name: String,
         /// The flock it moves to
         flock: String,
+    },
+    /// Take no new task on a machine until it is uncordoned; the tasks it runs go on
+    Cordon {
+        /// The machine, as flock.toml names it
+        name: String,
+        /// Why, one line; `machine list` and `machine describe` show it
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
+    },
+    /// Let a cordoned machine take tasks again, and place what waited for it
+    Uncordon {
+        /// The machine, as flock.toml names it
+        name: String,
     },
     /// A line about the head, then each machine: host, flock, channel, herdr, agents
     List {
@@ -489,18 +596,55 @@ enum MachineCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Run a machine's provisioner's checks there and say what it is missing for the agents that can land on it; changes nothing, and exits 1 if a check failed
+    Check {
+        /// The machine, as flock.toml names it
+        name: String,
+        /// Use this provisioner instead of the machine's own or the first that fits it
+        #[arg(long, value_name = "ID")]
+        provisioner: Option<String>,
+        /// Print as a JSON object, {machine, provisioner, version, agents, rows}
+        #[arg(long)]
+        json: bool,
+    },
+    /// Install or update each harness the machine's flock pins, and herdr when pastor.toml pins it, to the pinned version, as the machine's user; exits 1 if one could not be
+    Install {
+        /// The machine, as flock.toml names it
+        name: String,
+        /// Only the harness this agent runs
+        #[arg(long, value_name = "AGENT", conflicts_with = "kind")]
+        agent: Option<String>,
+        /// Only this kind of harness, such as claude, or herdr
+        #[arg(long, value_name = "KIND")]
+        kind: Option<String>,
+        /// Say what would change, and change nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Print as a JSON object, {machine, dry_run, rows}
+        #[arg(long)]
+        json: bool,
+    },
     /// Open the full herdr UI on a machine
     Open {
         /// The machine, as flock.toml names it
         name: String,
     },
-    /// Print the authorized_keys line that lets a machine's agents reach this head
+    /// Print the authorized_keys line that lets a machine's agents reach this head; with --write, put it there on its marked line
     AuthorizedKey {
         /// The machine, as flock.toml names it
         name: String,
         /// The public key of the machine's user: a .pub file, or - for stdin
         #[arg(long, value_name = "FILE")]
         key: String,
+        /// The line for the machine's shepherd instead of its agents': `bridge --shepherd`, for a pull machine's own key
+        #[arg(long)]
+        shepherd: bool,
+        /// Write the machine's marked line in this host's authorized_keys, replacing the one it had; run on the head
+        #[arg(long)]
+        write: bool,
+        /// With --write: print the line and the file, and change nothing
+        #[arg(long, requires = "write")]
+        dry_run: bool,
     },
 }
 
@@ -545,7 +689,7 @@ enum FlockCmd {
         flock: String,
         /// The machine, as flock.toml names it
         machine: String,
-        /// At most this many of the flock's tasks on the machine (default: its max_agents, or its number there already)
+        /// At most this many of the flock's tasks on the machine; 0 drains it (default: its max_agents, or its number there already)
         #[arg(long, value_name = "N")]
         max: Option<u32>,
     },
@@ -630,6 +774,18 @@ fn main() {
     if let Command::Bridge(args) = &command {
         bridge(&paths, args);
     }
+    // Also plumbing: it talks to Claude's socket, not to the head.
+    if let Command::Inbox { cmd } = command {
+        inbox(cmd);
+    }
+    // A machine joining a head has none of its own yet: it reads no head's
+    // config, and the token it reads must not meet a thread or a child first.
+    if let Command::Join(pastor::join::JoinCli {
+        cmd: None, join, ..
+    }) = &command
+    {
+        join_machine(&paths, join);
+    }
     if let Some(legacy) = pastor::config::legacy_macos_dir() {
         match pastor::config::migrate_legacy_dir(&legacy, &paths) {
             Ok(Some(note)) => eprintln!("{note}"),
@@ -673,11 +829,16 @@ fn main() {
                 ),
             );
         }
+        if let Some(why) = done_reaches_out(&command, head_from_flag(remote.as_ref())) {
+            fail(
+                "agent_refused",
+                &format!("{task} is a task, and `pastor task done` from its pane {why}"),
+            );
+        }
         if !head_decides(&paths, &command, remote.is_some())
             && changes_fleet(&command)
             && !ends_own_task(&command, task)
             && !orchestrator_may(&command)
-            && !agents_change_fleet(&paths)
         {
             fail(
                 "agent_refused",
@@ -696,7 +857,7 @@ fn main() {
                 ),
             );
         }
-        if changes_fleet(&command) && !orchestrator_may(&command) && !agents_change_fleet(&paths) {
+        if changes_fleet(&command) && !orchestrator_may(&command) {
             fail("agent_refused", &pastor::daemon::script_refusal(o));
         }
     }
@@ -768,22 +929,95 @@ fn main() {
             Command::Events(args) => pastor::events::cli(&client, args).await,
             Command::Watch(args) => pastor::watch::cli(&client, args).await,
             Command::Setup { cmd } => pastor::setup::cli(&paths, cmd),
+            Command::Fleet { cmd } => pastor::fleet_update::cli(&paths, cmd),
+            Command::Bootstrap(args) => {
+                pastor::bootstrap::cli(&paths, &args, head_flag.as_deref()).await
+            }
             Command::Connector { cmd } => pastor::connector::cli::run(&paths, cmd, head).await,
-            Command::Profile { cmd } => pastor::profile_cli::run(&head_config(&client).await?, cmd),
+            Command::Bundle { cmd } => pastor::bundle::cli::run(&paths, cmd).await,
+            Command::Workdir { cmd } if !cmd.is_local() => {
+                pastor::bundle::workdir_cli::run_head(&client, cmd).await
+            }
+            Command::Workdir { cmd } => {
+                let prepared = pastor::bundle::workdir_cli::prepare(cmd)?;
+                // A set that names a profile needs pastor.toml as the head
+                // reads it, and the machine's own profile from the flock.
+                let rules = match prepared.profile() {
+                    None => None,
+                    Some(_) => {
+                        let config = head_config(&client).await?;
+                        let own = match prepared.machine() {
+                            Some(machine) => pastor::profile_cli::own_profile(
+                                &config,
+                                &head_flock(&client).await?,
+                                machine,
+                            )?,
+                            None => None,
+                        };
+                        Some(pastor::bundle::workdir_cli::Rules { config, own })
+                    }
+                };
+                let Some(done) = pastor::bundle::workdir_cli::run(&paths, prepared, rules)? else {
+                    return Ok(());
+                };
+                // A remote head cannot reach this machine if it is a pull or
+                // command machine: tell it what was done. A task's pane does
+                // not: its bridge allows no report (an orchestrator's script is
+                // the only task that may place at all).
+                if client.head.is_some() && client.caller.task.is_none() {
+                    pastor::bundle::workdir_cli::report_to_head(&paths, &client, &done).await;
+                }
+                done.print()
+            }
+            Command::Profile { cmd } => {
+                let flock = if pastor::profile_cli::needs_flock(&cmd) {
+                    Some(head_flock(&client).await?)
+                } else {
+                    None
+                };
+                pastor::profile_cli::run(&head_config(&client).await?, flock.as_ref(), cmd)
+            }
             Command::Trust { cmd } => pastor::trust_cli::run(&client, cmd, head).await,
+            Command::Join(pastor::join::JoinCli { cmd: Some(cmd), .. }) => {
+                pastor::join::run(&client, cmd).await
+            }
             Command::Limit { cmd } => pastor::limit_cli::run(&client, cmd, head).await,
+            Command::Agent { cmd } => pastor::agent_cli::run(&client, cmd, head).await,
+            Command::Login(args) => pastor::login_cli::run(&client, args, head).await,
             Command::Queue(args) => pastor::queue_cli::run(&client, args, head).await,
             Command::Status(args) => status(&client, args, head).await,
-            Command::Bridge(_) => unreachable!("handled before the runtime"),
+            Command::Bridge(_)
+            | Command::Inbox { .. }
+            | Command::Join(pastor::join::JoinCli { cmd: None, .. }) => {
+                unreachable!("handled before the runtime")
+            }
             Command::Head { cmd } => pastor::head::run(&paths, cmd, remote.as_ref()).await,
+            Command::Leave { dry_run } => leave(&paths, dry_run),
         }
     });
     if let Err(err) = result {
-        if let Some(e) = err.downcast_ref::<pastor::cli::CliError>() {
-            fail(&e.code, &e.message);
+        match err.downcast::<pastor::cli::CliError>() {
+            Ok(e) => {
+                let e =
+                    pastor::cli::in_task_pane(e, client.caller.task.as_deref(), remote.is_some());
+                fail(&e.code, &e.message);
+            }
+            Err(err) => fail("runtime_error", &format!("{err:#}")),
         }
-        fail("runtime_error", &format!("{err:#}"));
     }
+}
+
+/// `pastor leave`: this host stops being part of a fleet. What it removes is
+/// only what pastor marked or made (`leave::leave`); each thing is said.
+fn leave(paths: &Paths, dry_run: bool) -> anyhow::Result<()> {
+    let said = pastor::leave::leave(paths, dry_run)?;
+    if said.is_empty() {
+        println!("nothing of pastor's to remove");
+    }
+    for line in said {
+        println!("{line}");
+    }
+    Ok(())
 }
 
 /// The log a background `pastor serve --foreground` was started with
@@ -890,9 +1124,23 @@ fn bridge(paths: &Paths, args: &BridgeArgs) -> ! {
     let socket = paths.socket_file();
     let input = tokio::io::BufReader::new(tokio::io::stdin());
     let result = rt.block_on(async {
-        match (args.agent, &args.machine) {
-            (true, Some(machine)) => {
+        if let Some(id) = &args.join {
+            return pastor::join::bridge(&socket, id, input, tokio::io::stdout()).await;
+        }
+        match (args.agent, args.shepherd, &args.machine, args.generation) {
+            (true, _, Some(machine), _) => {
                 pastor::bridge::run_agent(&socket, machine, input, tokio::io::stdout()).await
+            }
+            (_, true, Some(machine), Some(generation)) => {
+                pastor::bridge::run_shepherd(
+                    &socket,
+                    &pastor::artifacts::cache_root(paths),
+                    machine,
+                    generation,
+                    input,
+                    tokio::io::stdout(),
+                )
+                .await
             }
             _ => pastor::bridge::run(&socket, input, tokio::io::stdout()).await,
         }
@@ -906,6 +1154,29 @@ fn bridge(paths: &Paths, args: &BridgeArgs) -> ! {
     };
     println!("{}", serde_json::json!({"code": code, "message": message}));
     std::process::exit(1)
+}
+
+/// `pastor inbox`. A send exits 1 itself unless the message was accepted.
+fn inbox(cmd: pastor::inbox::InboxCmd) -> ! {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    match rt.block_on(pastor::inbox::run(cmd)) {
+        Ok(()) => std::process::exit(0),
+        Err(err) => match err.downcast::<CliError>() {
+            Ok(e) => fail(&e.code, &e.message),
+            Err(err) => fail("runtime_error", &format!("{err:#}")),
+        },
+    }
+}
+
+/// `pastor join` with a token, on the machine that joins.
+fn join_machine(paths: &Paths, args: &pastor::join::JoinArgs) -> ! {
+    match pastor::bootstrap::pull::cli(paths, args) {
+        Ok(()) => std::process::exit(0),
+        Err(err) => match err.downcast::<CliError>() {
+            Ok(e) => fail(&e.code, &e.message),
+            Err(err) => fail("runtime_error", &format!("{err:#}")),
+        },
+    }
 }
 
 fn fail(code: &str, message: &str) -> ! {
@@ -1029,11 +1300,16 @@ fn head_use(command: &Command) -> Option<bool> {
         },
         Command::Machine { cmd } => match cmd {
             MachineCmd::List { flock, .. } => Some(flock.is_some()),
-            MachineCmd::Describe { .. } => Some(false),
+            MachineCmd::Describe { .. } | MachineCmd::Check { .. } => Some(false),
+            // A cordon is the head's own record; flock.toml is not read.
+            MachineCmd::Cordon { .. } | MachineCmd::Uncordon { .. } => Some(false),
             // Open execs herdr on the machine; the head has no part in it.
             MachineCmd::Open { .. } => None,
             // Reads flock.toml and prints a line; it edits no file.
             MachineCmd::AuthorizedKey { .. } => None,
+            // Reads flock.toml, pastor.toml and the artifact cache here and
+            // goes to the machine itself, as `bundle apply` does.
+            MachineCmd::Install { .. } => None,
             _ => Some(true),
         },
         Command::Flock { cmd } => match cmd {
@@ -1092,6 +1368,20 @@ fn remote_route(command: &Command) -> RemoteRoute {
         Command::Config {
             cmd: ConfigCmd::Edit { local: true },
         } => RemoteRoute::Here,
+        // Run by the head on the machine it applies to.
+        Command::Bundle {
+            cmd:
+                pastor::bundle::cli::BundleCmd::Apply { local: Some(_), .. }
+                | pastor::bundle::cli::BundleCmd::Adopt { local: Some(_), .. },
+        } => RemoteRoute::Here,
+        // The cache and the ssh pins are the head's.
+        Command::Fleet { .. } => RemoteRoute::Unsupported(
+            "it copies from the head's artifact cache over the head's ssh, and updates the head itself last",
+        ),
+        // The bundles dir and its versions are the head's files.
+        Command::Bundle { .. } => RemoteRoute::Unsupported(
+            "bundles are kept in the head's config dir, and it would read and change this machine's",
+        ),
         // Watch asks the head for its events, tasks and jobs; its connectors
         // are this machine's.
         Command::Task { .. }
@@ -1101,7 +1391,10 @@ fn remote_route(command: &Command) -> RemoteRoute {
         | Command::Machine { .. }
         | Command::Flock { .. }
         | Command::Trust { .. }
+        | Command::Join(_)
         | Command::Limit { .. }
+        | Command::Agent { .. }
+        | Command::Login(_)
         | Command::Profile { .. }
         | Command::Config { .. }
         | Command::Events(_)
@@ -1112,9 +1405,15 @@ fn remote_route(command: &Command) -> RemoteRoute {
         | Command::Orchestrator { .. } => RemoteRoute::Head,
         Command::Completions { .. }
         | Command::Setup { .. }
+        | Command::Bootstrap(_)
+        | Command::Leave { .. }
         | Command::Head { .. }
         | Command::Bridge(_)
-        | Command::Connector { .. } => RemoteRoute::Here,
+        | Command::Inbox { .. }
+        | Command::Connector { .. }
+        // It writes in a directory on this machine, or asks the head itself
+        // for one on another (`workdir_cli::run_head`).
+        | Command::Workdir { .. } => RemoteRoute::Here,
         // Stop and status act on this machine's serve, head or headless.
         Command::Serve(ServeArgs { cmd: Some(_), .. }) => RemoteRoute::Here,
         Command::Serve(_) => RemoteRoute::Serve,
@@ -1122,9 +1421,8 @@ fn remote_route(command: &Command) -> RemoteRoute {
 }
 
 /// Whether a remote head, not this machine, judges whether the task
-/// calling may run `command`: the head refuses what its own
-/// `agents_change_fleet` and the task's role forbid, and this machine's
-/// pastor.toml and store have no say in it. A job whose file is here is
+/// calling may run `command`: the head refuses what the task's role
+/// forbids, and this machine's store has no say in it. A job whose file is here is
 /// not the head's: `job()` runs and edits it here, so the guard here
 /// applies.
 fn head_decides(paths: &Paths, command: &Command, remote: bool) -> bool {
@@ -1193,16 +1491,25 @@ fn changes_fleet(command: &Command) -> bool {
                 | TaskCmd::Priority(_)
                 | TaskCmd::Close(_)
                 | TaskCmd::Prune(_)
+                | TaskCmd::Sweep(_)
                 | TaskCmd::Send(_)
                 | TaskCmd::Done(_)
                 // herdr's agent terminal types into any task's pane.
                 | TaskCmd::Attach { .. }
         ),
-        // Reading the fleet is fine: list and describe change nothing. Open
-        // counts: herdr's full UI drives every pane and agent on the machine.
-        Command::Machine { cmd } => {
-            !matches!(cmd, MachineCmd::List { .. } | MachineCmd::Describe { .. })
-        }
+        // Reading the fleet is fine: list, describe and check change
+        // nothing (check runs a provisioner's checks, never its fixes), nor
+        // does an install's dry run. Open counts: herdr's full UI drives
+        // every pane and agent on the machine.
+        Command::Machine { cmd } => !matches!(
+            cmd,
+            MachineCmd::List { .. }
+                | MachineCmd::Describe { .. }
+                | MachineCmd::Check { .. }
+                | MachineCmd::Install { dry_run: true, .. }
+                | MachineCmd::Add { dry_run: true, .. }
+                | MachineCmd::Remove { dry_run: true, .. }
+        ),
         Command::Flock { cmd } => !matches!(
             cmd,
             FlockCmd::List { .. }
@@ -1214,7 +1521,6 @@ fn changes_fleet(command: &Command) -> bool {
         Command::Tick(_) => true,
         Command::Job { cmd } => !matches!(cmd, JobCmd::List { .. } | JobCmd::Describe { .. }),
         Command::Orchestrator { cmd } => pastor::orchestrator_cli::changes_fleet(cmd),
-        // pastor.toml holds agents_change_fleet itself.
         Command::Config { .. } => true,
         // Install, link, uninstall and unlink edit the catalog and reload the
         // head's jobs, restarting its stream connectors.
@@ -1229,10 +1535,30 @@ fn changes_fleet(command: &Command) -> bool {
             cmd: Some(pastor::serve_cli::ServeCmd::Status { .. }),
             ..
         }) => false,
-        Command::Serve(_) | Command::Setup { .. } => true,
+        Command::Serve(_)
+        | Command::Setup { .. }
+        | Command::Bootstrap(_)
+        | Command::Fleet { .. } => true,
+        // Add and remove change what the flocks' machines get, and apply
+        // and adopt write it into their homes; a dry run writes nothing.
+        Command::Bundle { cmd } => !matches!(
+            cmd,
+            pastor::bundle::cli::BundleCmd::List { .. }
+                | pastor::bundle::cli::BundleCmd::Show { .. }
+                | pastor::bundle::cli::BundleCmd::Apply { dry_run: true, .. }
+                | pastor::bundle::cli::BundleCmd::Adopt { dry_run: true, .. }
+        ),
+        // An agent may say what a set would change, never place one: it
+        // could hand itself files another agent will start with.
+        Command::Workdir { cmd } => cmd.writes(),
         Command::Trust { cmd } => pastor::trust_cli::changes_fleet(cmd),
+        Command::Join(j) => j.cmd.as_ref().is_some_and(pastor::join::changes_fleet),
         Command::Limit { cmd } => pastor::limit_cli::changes_fleet(cmd),
+        Command::Agent { cmd } => pastor::agent_cli::changes_fleet(cmd),
+        Command::Login(args) => pastor::login_cli::changes_fleet(args),
         Command::Queue(a) => pastor::queue_cli::changes_fleet(a),
+        // Leaving takes a host's keys away; a dry run only lists them.
+        Command::Leave { dry_run } => !dry_run,
         _ => false,
     }
 }
@@ -1265,15 +1591,38 @@ fn orchestrator_may(command: &Command) -> bool {
 }
 
 /// Whether `command` is `task done` for `task`, the task the caller runs
-/// in: the one change an agent may make without `agents_change_fleet`.
+/// in: the one change an agent may make.
 fn ends_own_task(command: &Command, task: &str) -> bool {
     matches!(command, Command::Task { cmd: TaskCmd::Done(a) } if a.ends(task))
 }
 
-/// `agents_change_fleet` in pastor.toml. A file that does not load counts
-/// as off: the refusal is the safe side.
-fn agents_change_fleet(paths: &Paths) -> bool {
-    PastorConfig::load(&paths.config_file()).is_ok_and(|c| c.agents_change_fleet)
+/// Whether the head in use was named by the `--head` flag, rather than by
+/// `PASTOR_HEAD` or client.toml.
+fn head_from_flag(remote: Option<&pastor::head::RemoteHead>) -> bool {
+    remote.is_some_and(|r| r.source == pastor::head::HeadSource::Flag)
+}
+
+/// What `task done` would reach beyond the caller's own task, if it is one:
+/// another head (the `--head` flag; the head `PASTOR_HEAD` or client.toml
+/// names is the task's own, how it reaches its head from another machine) or
+/// a file read into the summary (`--summary-file`, in any form, `-` for the
+/// standard input too: whatever a command redirects into it is not the agent's
+/// own text). A task ends itself with the summary as `--summary` text, so it
+/// cannot go past its deny rules or to another head through the command it is
+/// allowed to run.
+fn done_reaches_out(command: &Command, head_flag: bool) -> Option<&'static str> {
+    let Command::Task {
+        cmd: TaskCmd::Done(a),
+    } = command
+    else {
+        return None;
+    };
+    if head_flag {
+        return Some("takes no --head: it ends the task on its own head");
+    }
+    a.summary_file
+        .is_some()
+        .then_some("takes the summary as --summary text, not --summary-file")
 }
 
 /// The role of `task`, read straight from the database for this local guard,
@@ -1310,7 +1659,17 @@ fn flocks_declared(paths: &Paths) -> bool {
 /// (`FLOCK_TIMEOUT_PLACE_PROTOCOL`), a share and a max
 /// (`FLOCK_SHARE_PROTOCOL`). The newest one the file uses wins.
 fn flock_file_need(paths: &Paths) -> Option<(u32, &'static str)> {
-    if flock_keep_pane_declared(paths) {
+    if flock_loads_declared(paths) {
+        Some((
+            pastor::ipc::LOAD_PROTOCOL,
+            "predates loads, and would silently drop flock.toml on reload, keeping its old flocks",
+        ))
+    } else if flock_remove_worktree_declared(paths) {
+        Some((
+            pastor::ipc::REMOVE_WORKTREE_PROTOCOL,
+            "predates a flock's remove_worktree, and would silently drop flock.toml on reload, keeping its old flocks",
+        ))
+    } else if flock_keep_pane_declared(paths) {
         Some((
             pastor::ipc::KEEP_PANE_PROTOCOL,
             "predates a flock's keep_pane, and would silently drop flock.toml on reload, keeping its old flocks",
@@ -1333,6 +1692,16 @@ fn flock_file_need(paths: &Paths) -> Option<(u32, &'static str)> {
     } else {
         None
     }
+}
+
+/// Whether flock.toml gives any flock or machine `loads`, a field an older
+/// head's `FlockEntry` and `MachineConfig` do not know (see
+/// `LOAD_PROTOCOL`).
+fn flock_loads_declared(paths: &Paths) -> bool {
+    Flock::load(&paths.flock_file()).is_ok_and(|f| {
+        f.flocks.iter().any(|e| !e.loads.is_empty())
+            || f.machines.iter().any(|m| !m.loads.is_empty())
+    })
 }
 
 /// Whether flock.toml gives any flock a share and a max on a machine
@@ -1362,6 +1731,13 @@ fn multi_flock_declared(paths: &Paths) -> bool {
 /// head's `FlockEntry` does not know (see `KEEP_PANE_PROTOCOL`).
 fn flock_keep_pane_declared(paths: &Paths) -> bool {
     Flock::load(&paths.flock_file()).is_ok_and(|f| f.flocks.iter().any(|e| e.keep_pane.is_some()))
+}
+
+/// Whether flock.toml sets `remove_worktree` on any flock, a field an
+/// older head's `FlockEntry` does not know (see `REMOVE_WORKTREE_PROTOCOL`).
+fn flock_remove_worktree_declared(paths: &Paths) -> bool {
+    Flock::load(&paths.flock_file())
+        .is_ok_and(|f| f.flocks.iter().any(|e| e.remove_worktree.is_some()))
 }
 
 /// Whether flock.toml gives any flock its own `timeout` or `place`, the
@@ -1495,6 +1871,11 @@ fn agent_choice(a: &RunArgs) -> AgentChoice {
 /// What `pastor task run`'s flags ask for, with pastor.toml's `[defaults]` filling
 /// in what they leave out. The agent in it is only what a head from before
 /// flock agents would run: a current head resolves it again, with the flock.
+/// `--load`, as `task::check_load` takes it.
+fn parse_load(s: &str) -> Result<String, String> {
+    pastor::task::check_load(s).map(|()| s.to_string())
+}
+
 fn run_spec(a: &RunArgs, config: &PastorConfig) -> anyhow::Result<DispatchSpec> {
     let timeout = a
         .timeout
@@ -1515,6 +1896,9 @@ fn run_spec(a: &RunArgs, config: &PastorConfig) -> anyhow::Result<DispatchSpec> 
         branch: a.branch.clone(),
         machine: a.machine.clone(),
         tags: a.tags.clone(),
+        // Only the ask: the head fills in the agent's or the repo's.
+        load: a.load.clone(),
+        load_from: None,
         timeout_secs: timeout.as_secs(),
         checkout: None,
         reopen: None,
@@ -1534,7 +1918,29 @@ fn run_spec(a: &RunArgs, config: &PastorConfig) -> anyhow::Result<DispatchSpec> 
         // Only the ask, like `label`.
         keep_pane: a.keep_pane.then_some(true),
         keep_pane_from: None,
+        remove_worktree: a.remove_worktree.then_some(true),
+        remove_worktree_from: None,
+        fetch: pastor::task::FetchNote {
+            skip: a.no_fetch,
+            warning: None,
+        },
         rounds: Default::default(),
+        start_prompt: None,
+        workdir: match a.workdir_set.as_deref() {
+            Some("-") if a.prompt_file.as_deref() == Some("-") => {
+                return Err(pastor::cli::CliError::err(
+                    "usage_error",
+                    "--prompt-file and --workdir-set cannot both read stdin",
+                ));
+            }
+            Some(src) => Some(Box::new(pastor::task::TaskWorkdir {
+                set: pastor::bundle::workdir::Set::load(src)?.to_doc(),
+                placed_in: None,
+                render: None,
+            })),
+            None => None,
+        },
+        workdir_bundles: Vec::new(),
     })
 }
 
@@ -1647,6 +2053,7 @@ async fn probe_machine(
     // there, rather than probing whatever herdr runs here.
     if m.pull {
         return Ok(pastor::cli::MachineRow {
+            cordon: None,
             now: Vec::new(),
             name: m.name.clone(),
             host: "pull".into(),
@@ -1663,10 +2070,14 @@ async fn probe_machine(
             max_agents: m.max_agents,
             job_slots: m.job_slots,
             burst: m.burst,
+            reserved: m.reserved,
             tags: m.tags.clone(),
             orphans: vec![],
             profile: own_profile(config, f, m),
             description: pastor::config::clean_description(m.description.as_deref()),
+            no_head_address: false,
+            harness: vec![],
+            room: None,
         });
     }
     let ep = Endpoint::from_machine(m, paths);
@@ -1693,6 +2104,7 @@ async fn probe_machine(
     let (pastor_version, pastor_read_at) = version_read(asked);
     let (channel, herdr_version, protocol, live, error) = probe_fields(ping, agent_count);
     Ok(pastor::cli::MachineRow {
+        cordon: None,
         now: Vec::new(),
         name: m.name.clone(),
         host: ep.host(),
@@ -1709,10 +2121,14 @@ async fn probe_machine(
         max_agents: m.max_agents,
         job_slots: m.job_slots,
         burst: m.burst,
+        reserved: m.reserved,
         tags: m.tags.clone(),
         orphans,
         profile: own_profile(config, f, m),
         description: pastor::config::clean_description(m.description.as_deref()),
+        no_head_address: pastor::daemon::is_cut_off(config.head_address.as_deref(), m),
+        harness: vec![],
+        room: None,
     })
 }
 
@@ -1820,14 +2236,27 @@ async fn machine_list(
         }
         let descriptions: Vec<Option<String>> =
             rows.iter().map(|m| m.description.clone()).collect();
+        // `--wide` adds each machine's room, before DESCRIPTION.
+        let mut header = pastor::cli::MACHINE_HEADER.to_vec();
+        let mut table_rows = pastor::cli::machine_rows(&rows);
+        if wide {
+            header.push("RESERVED");
+            header.push("DISK");
+            header.push("MEM");
+            for (row, m) in table_rows.iter_mut().zip(&rows) {
+                row.push(if m.reserved == 0 {
+                    "-".to_string()
+                } else {
+                    m.reserved.to_string()
+                });
+                let (disk, mem) = pastor::cli::room_cells(m.room.as_ref());
+                row.push(disk);
+                row.push(mem);
+            }
+        }
         println!(
             "{}",
-            pastor::cli::list_table(
-                &pastor::cli::MACHINE_HEADER,
-                &pastor::cli::machine_rows(&rows),
-                wide,
-                &descriptions,
-            )
+            pastor::cli::list_table(&header, &table_rows, wide, &descriptions)
         );
     }
     Ok(())
@@ -2074,15 +2503,23 @@ async fn task(client: &pastor::ipc::Client, cmd: TaskCmd, head: Head) -> anyhow:
                 };
                 (t, all)
             };
-            match (json, all) {
-                (true, Some(all)) => {
-                    let mut v = t.to_json();
-                    v["summaries"] = serde_json::to_value(&all)?;
-                    println!("{}", serde_json::to_string_pretty(&v)?);
+            // The head's config, not this machine's, when it is another's.
+            let env = match (head_config(client).await, head_flock(client).await) {
+                (Ok(config), Ok(flock)) => pastor::cli::task_env(&config, &flock, &t),
+                _ => Default::default(),
+            };
+            let summaries = all.as_deref().unwrap_or(t.summary.as_slice());
+            if json {
+                let mut v = t.to_json();
+                if all.is_some() {
+                    v["summaries"] = serde_json::to_value(summaries)?;
                 }
-                (true, None) => print_task(&t, true)?,
-                (false, Some(all)) => println!("{}", pastor::cli::task_detail_with(&t, &all)),
-                (false, None) => println!("{}", pastor::cli::task_detail(&t)),
+                if let Some(env) = pastor::cli::env_json(&env) {
+                    v["env"] = env;
+                }
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                println!("{}", pastor::cli::task_detail_env(&t, summaries, &env));
             }
         }
         TaskCmd::Read { task, lines } => {
@@ -2104,6 +2541,7 @@ async fn task(client: &pastor::ipc::Client, cmd: TaskCmd, head: Head) -> anyhow:
         TaskCmd::Priority(a) => pastor::task_cli::priority(client, a).await?,
         TaskCmd::Close(a) => pastor::task_cli::close(client, a).await?,
         TaskCmd::Prune(a) => pastor::task_cli::prune(client, a, head).await?,
+        TaskCmd::Sweep(a) => pastor::task_cli::sweep(client, a).await?,
         TaskCmd::Send(a) => pastor::task_cli::send(client, a).await?,
         TaskCmd::Done(a) => pastor::task_cli::done(client, a).await?,
     }
@@ -2127,8 +2565,40 @@ async fn machine(client: &pastor::ipc::Client, cmd: MachineCmd, head: Head) -> a
             flock,
             description,
             herdr,
+            agent_key,
+            dry_run,
+            bootstrap,
+            host_key,
         } => {
+            // Before anything changes: the key must read, and make a line.
+            let agent_key = agent_key.as_deref().map(read_public_key).transpose()?;
+            if agent_key.is_some() && client.head.is_some() {
+                fail(
+                    "agent_key_needs_the_head",
+                    "--agent-key writes this host's authorized_keys: run machine add on the head",
+                );
+            }
+            let key_line = agent_key
+                .as_deref()
+                .map(|k| write_agent_key(&name, k, true))
+                .transpose()?;
+            if dry_run {
+                if Flock::load(&path)?.get(&name).is_some() {
+                    fail("machine_exists", &format!("{name} is already in the flock"));
+                }
+                println!("would add machine {name} to flock.toml");
+                if let Some(line) = key_line {
+                    println!("{line}");
+                }
+                return Ok(());
+            }
             let m = MachineConfig {
+                reserved: 0,
+                provisioner: None,
+                bundles: Vec::new(),
+                bundle_apply: None,
+                pins: Default::default(),
+                env: Default::default(),
                 pull: false,
                 description: pastor::config::clean_description(description.as_deref()),
                 name: name.clone(),
@@ -2140,6 +2610,7 @@ async fn machine(client: &pastor::ipc::Client, cmd: MachineCmd, head: Head) -> a
                 job_slots,
                 burst,
                 tags,
+                loads: vec![],
                 flock,
                 agent: None,
                 agent_args: None,
@@ -2152,6 +2623,15 @@ async fn machine(client: &pastor::ipc::Client, cmd: MachineCmd, head: Head) -> a
                 min_memory: None,
                 unknown_room: None,
             };
+            if bootstrap {
+                if m.ssh.is_none() {
+                    fail(
+                        "usage_error",
+                        "--bootstrap sets a machine up over ssh: give it an ssh target",
+                    );
+                }
+                return bootstrap_machine(client, head, &name, Some(m), host_key).await;
+            }
             // With a head the reload line comes with its answer, before the
             // herdr lines; without one it follows them.
             let reload = if head.is_live() {
@@ -2188,11 +2668,21 @@ async fn machine(client: &pastor::ipc::Client, cmd: MachineCmd, head: Head) -> a
                 ),
                 _ => {}
             }
+            if let Some(key) = &agent_key {
+                println!("{}", write_agent_key(&name, key, false)?);
+            }
             if let Some(reload) = reload {
                 println!("{reload}");
             }
         }
-        MachineCmd::Remove { name, herdr } => {
+        MachineCmd::Bootstrap { name, host_key } => {
+            bootstrap_machine(client, head, &name, None, host_key).await?;
+        }
+        MachineCmd::Remove {
+            name,
+            herdr,
+            dry_run,
+        } => {
             // Only for the herdr hint below, read before the machine goes,
             // from the head's file; a file that does not load gives no hint.
             let target = if herdr {
@@ -2206,11 +2696,64 @@ async fn machine(client: &pastor::ipc::Client, cmd: MachineCmd, head: Head) -> a
             if head.is_live() {
                 println!(
                     "{}",
-                    ask_text(client, IpcRequest::MachineRemove { name: name.clone() }).await?
+                    ask_text(
+                        client,
+                        IpcRequest::MachineRemove {
+                            name: name.clone(),
+                            dry_run
+                        }
+                    )
+                    .await?
                 );
+                if dry_run {
+                    return Ok(());
+                }
             } else {
+                // What the head would keep for the machine, read before its
+                // entry goes: the host its known_hosts line is under.
+                let host = Flock::load(&path)?
+                    .get(&name)
+                    .and_then(|m| m.ssh.clone())
+                    .and_then(|t| pastor::leave::host_of(&t).map(str::to_string));
+                let known = Flock::load(&path)?.get(&name).is_some();
+                let store = paths
+                    .db_file()
+                    .exists()
+                    .then(|| Store::open(&paths.db_file()))
+                    .transpose()?;
+                if dry_run {
+                    if !known {
+                        fail("unknown_machine", &format!("no machine {name}"));
+                    }
+                    let said = pastor::leave::machine_cleanup(
+                        paths,
+                        store.as_ref(),
+                        &name,
+                        host.as_deref(),
+                        true,
+                    )?;
+                    println!(
+                        "{}",
+                        std::iter::once(format!("would remove {name} from flock.toml"))
+                            .chain(said)
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    );
+                    return Ok(());
+                }
                 let _lock = offline_fleet_lock(paths)?;
                 let done = fleet_edit::remove_machine(&path, &name).map_err(edit_error)?;
+                let said = pastor::leave::machine_cleanup(
+                    paths,
+                    store.as_ref(),
+                    &name,
+                    host.as_deref(),
+                    false,
+                )?;
+                let done = std::iter::once(done)
+                    .chain(said)
+                    .collect::<Vec<_>>()
+                    .join("; ");
                 println!("{done}; {}", reload_running_head(paths, head).await);
             }
             if herdr {
@@ -2254,12 +2797,56 @@ async fn machine(client: &pastor::ipc::Client, cmd: MachineCmd, head: Head) -> a
                 println!("{done}; {}", reload_running_head(paths, head).await);
             }
         }
+        MachineCmd::Cordon { name, reason } => {
+            println!(
+                "{}",
+                ask_text(client, IpcRequest::MachineCordon { name, reason }).await?
+            );
+        }
+        MachineCmd::Uncordon { name } => {
+            println!(
+                "{}",
+                ask_text(client, IpcRequest::MachineUncordon { name }).await?
+            );
+        }
         MachineCmd::List { flock, wide, json } => {
             machine_list(client, flock.as_deref(), wide, json, head).await?
         }
         MachineCmd::Describe { name, json } => machine_describe(client, &name, json, head).await?,
+        MachineCmd::Check {
+            name,
+            provisioner,
+            json,
+        } => machine_check(client, &name, provisioner, json, head).await?,
+        MachineCmd::Install {
+            name,
+            agent,
+            kind,
+            dry_run,
+            json,
+        } => {
+            let only = match (agent, kind) {
+                (Some(a), _) => pastor::harness_install::Only::Agent(a),
+                (None, Some(k)) => pastor::harness_install::Only::Kind(k),
+                (None, None) => pastor::harness_install::Only::All,
+            };
+            pastor::harness_install::cli(paths, &name, only, dry_run, json).await?
+        }
         MachineCmd::Open { name } => open(client, &name).await?,
-        MachineCmd::AuthorizedKey { name, key } => authorized_key(&path, &name, &key)?,
+        MachineCmd::AuthorizedKey {
+            name,
+            key,
+            shepherd: true,
+            write,
+            dry_run,
+        } => shepherd_key(paths, &name, &key, write, dry_run)?,
+        MachineCmd::AuthorizedKey {
+            name,
+            key,
+            write,
+            dry_run,
+            ..
+        } => authorized_key(&path, &name, &key, write, dry_run)?,
     }
     Ok(())
 }
@@ -2637,9 +3224,8 @@ fn attach_remote_command(session: &str, agent: &str) -> String {
 const TASK_PAUSED: &str = "task_paused";
 
 /// Why `task attach` refuses `t`: a paused task's session resumes on its
-/// own when a slot frees, and a second `claude --resume` of it in a pane of
-/// attach's would put two agents on one conversation. `None` for any
-/// other state.
+/// own when a slot frees, and a second resume of it in a pane of attach's
+/// would put two agents on one conversation. `None` for any other state.
 fn paused_attach_refusal(t: &Task) -> Option<String> {
     (t.state == TaskState::Paused).then(|| {
         let by = t
@@ -2657,9 +3243,8 @@ fn paused_attach_refusal(t: &Task) -> Option<String> {
 }
 
 /// Why `task attach` refuses `t` when it waits for a usage limit to
-/// reset: its session resumes on its own then, and a second `claude
-/// --resume` would put two agents on one conversation. `None` for any
-/// other state.
+/// reset: its session resumes on its own then, and a second resume
+/// would put two agents on one conversation. `None` for any other state.
 fn waiting_attach_refusal(t: &Task) -> Option<String> {
     (t.state == TaskState::Waiting).then(|| {
         format!(
@@ -2703,10 +3288,11 @@ async fn attach(client: &pastor::ipc::Client, task: &str) -> anyhow::Result<()> 
         client.head.as_ref(),
     );
     let m = &m;
-    // Its pane is gone: a Claude task's own session opens again in a new
-    // pane, and the task stays as it is.
+    // Its pane is gone: the task's own recorded session opens again in a
+    // new pane, and the task stays as it is.
     if !t.state.occupies_pane() {
-        let agents = head_config(client).await?.agents;
+        let config = head_config(client).await?;
+        let agents = config.agents.clone();
         if let Some(why) = pastor::reopen::why_not(&t, &agents) {
             fail(
                 "no_agent",
@@ -2724,7 +3310,21 @@ async fn attach(client: &pastor::ipc::Client, task: &str) -> anyhow::Result<()> 
             );
         }
         let ep = Endpoint::from_machine(m, paths);
-        agent = pastor::reopen::reopen(&ep, &t, &agents)
+        // The layers a dispatch of the task gave its pane.
+        let under = pastor::cli::dispatch_env(&config, &f, &t);
+        let workdirs = pastor::bundle::workdir_task::ClientGate { client };
+        let mut t = t.clone();
+        if m.pull {
+            let left = pastor::reopen::leave_stored_out(&mut t, &machine);
+            if !left.is_empty() {
+                eprintln!(
+                    "{}: not placed: {} ({machine} is a pull machine, where a reopen places no stored workdir bundles)",
+                    t.display_id(),
+                    left.join(", ")
+                );
+            }
+        }
+        agent = pastor::reopen::reopen(&ep, &t, &agents, &under, Some(&workdirs))
             .await
             .unwrap_or_else(|e| fail(e.code, &e.message));
         if agent != Task::agent_name_for(t.id) {
@@ -2757,23 +3357,139 @@ async fn attach(client: &pastor::ipc::Client, task: &str) -> anyhow::Result<()> 
 
 /// `pastor machine authorized-key`: prints the line, and never edits
 /// `authorized_keys` or any other file.
-fn authorized_key(flock: &std::path::Path, machine: &str, key: &str) -> anyhow::Result<()> {
+fn authorized_key(
+    flock: &std::path::Path,
+    machine: &str,
+    key: &str,
+    write: bool,
+    dry_run: bool,
+) -> anyhow::Result<()> {
     if Flock::load(flock)?.get(machine).is_none() {
         fail("unknown_machine", machine);
     }
-    let key = if key == "-" {
+    let key = read_public_key(key)?;
+    let pastor = std::env::current_exe()?;
+    if !write {
+        println!(
+            "{}",
+            pastor::bridge::authorized_key_line(&pastor, machine, &key)?
+        );
+        return Ok(());
+    }
+    println!("{}", write_agent_key(machine, &key, dry_run)?);
+    Ok(())
+}
+
+/// `pastor machine authorized-key --shepherd`: the line that lets a pull
+/// machine's own key in only to run `bridge --shepherd --machine <name>
+/// --gen <n>`, `n` the machine's enrollment (`shepherd_generation`); printed,
+/// or with `write` put on the machine's marked line of this host's
+/// `authorized_keys` (`PASTOR_AUTHORIZED_KEYS` for tests). With `dry_run` it
+/// only says what would be written, and records no enrollment.
+fn shepherd_key(
+    paths: &Paths,
+    machine: &str,
+    key: &str,
+    write: bool,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    use pastor::authkeys::{Marker, default_file, line, upsert};
+    match Flock::load(&paths.flock_file())?.get(machine) {
+        None => fail("unknown_machine", machine),
+        Some(m) if !m.pull => fail(
+            "not_pull_machine",
+            &format!(
+                "{machine} is not a pull machine: the head reaches it, and it runs no shepherd"
+            ),
+        ),
+        Some(_) => {}
+    }
+    let key = read_public_key(key)?;
+    let pastor = std::env::current_exe()?;
+    let marker = Marker::Machine(machine.to_string());
+    let generation = shepherd_generation(paths, machine, !dry_run)?;
+    let args = format!("bridge --shepherd --machine {machine} --gen {generation}");
+    let file = default_file();
+    if !write {
+        println!("{}", line(&pastor, &args, &key, &marker)?);
+    } else if dry_run {
+        let line = line(&pastor, &args, &key, &marker)?;
+        println!("would write to {}:\n{line}", file.display());
+    } else if upsert(&file, &marker, &pastor, &args, &key)? {
+        println!("wrote {machine}'s shepherd key line to {}", file.display());
+    } else {
+        println!(
+            "{machine}'s shepherd key line is already in {}",
+            file.display()
+        );
+    }
+    Ok(())
+}
+
+/// The enrollment of `machine` its shepherd's key line carries: its
+/// `machine_state` row's generation. A machine with none yet, such as a pull
+/// machine moving over from the plain bridge, gets a row at generation 0,
+/// the one it has until a join enrolls it again, unless `record` is false.
+/// Its bootstrap reads `ok`, as no row did: the machine already runs tasks,
+/// and a pending one would hold it back from dispatch.
+fn shepherd_generation(paths: &Paths, machine: &str, record: bool) -> anyhow::Result<i64> {
+    use pastor::store::{BootstrapState, MachineState};
+    let store = Store::open(&paths.db_file())?;
+    if let Some(state) = store.machine_state(machine)? {
+        return Ok(state.generation);
+    }
+    if record {
+        store.put_machine_state(&MachineState {
+            machine: machine.to_string(),
+            bootstrap: BootstrapState::Ok,
+            isolation: None,
+            failed_step: None,
+            why: None,
+            host_key: None,
+            herdr_version: None,
+            pastor_version: None,
+            generation: 0,
+            updated_at: chrono::Utc::now(),
+        })?;
+    }
+    Ok(0)
+}
+
+/// The public key `--key` names: a file, or `-` for stdin.
+fn read_public_key(key: &str) -> anyhow::Result<String> {
+    Ok(if key == "-" {
         std::io::read_to_string(std::io::stdin())?
     } else {
         std::fs::read_to_string(key).map_err(|e| {
             pastor::cli::CliError::err("invalid_key", format!("cannot read {key}: {e}"))
         })?
-    };
+    })
+}
+
+/// Put `machine`'s agent key on its marked line of this host's
+/// `authorized_keys` (`PASTOR_AUTHORIZED_KEYS` for tests), locked to
+/// `pastor bridge --agent --machine <machine>`. The same key again changes
+/// nothing; a new key replaces the line. With `dry_run` it only says what
+/// would be written. Returns the sentence to print.
+fn write_agent_key(machine: &str, key: &str, dry_run: bool) -> anyhow::Result<String> {
+    use pastor::authkeys::{Marker, default_file, line, upsert};
     let pastor = std::env::current_exe()?;
-    println!(
-        "{}",
-        pastor::bridge::authorized_key_line(&pastor, machine, &key)?
-    );
-    Ok(())
+    let marker = Marker::Agent(machine.to_string());
+    let args = format!("bridge --agent --machine {machine}");
+    let file = default_file();
+    if dry_run {
+        let line = line(&pastor, &args, key, &marker)?;
+        return Ok(format!("would write to {}:\n{line}", file.display()));
+    }
+    let changed = upsert(&file, &marker, &pastor, &args, key)?;
+    Ok(if changed {
+        format!("wrote {machine}'s agent key line to {}", file.display())
+    } else {
+        format!(
+            "{machine}'s agent key line is already in {}",
+            file.display()
+        )
+    })
 }
 
 async fn open(client: &pastor::ipc::Client, machine: &str) -> anyhow::Result<()> {
@@ -3073,17 +3789,14 @@ async fn local_job(client: &pastor::ipc::Client, cmd: JobCmd) -> anyhow::Result<
 
 /// `toggle`'s own guard: `job enable|disable` reaches this machine's serve
 /// with no head to ask about the caller's role (the shepherd keeps no task
-/// store, `shepherd.rs`), so a task caller is refused unless
-/// `agents_change_fleet` is on, orchestrator or not.
+/// store, `shepherd.rs`), so a task caller is refused, orchestrator or not.
 async fn local_toggle(
     client: &pastor::ipc::Client,
     name: &str,
     enabled: bool,
 ) -> anyhow::Result<()> {
     let paths = &client.paths;
-    if let Some(task) = &client.caller.task
-        && !agents_change_fleet(paths)
-    {
+    if let Some(task) = &client.caller.task {
         return Err(CliError::err(
             "agent_refused",
             format!(
@@ -3296,6 +4009,7 @@ async fn machine_describe(
     paths.ensure()?;
     let store = Store::open(&paths.db_file())?;
     let config = PastorConfig::load(&paths.config_file())?;
+    let harnesses = pastor::harness_manifest::Harnesses::load(paths)?;
     let row = probe_machine(m, &f, &config, paths, &store).await?;
     let tasks = store.list_tasks(&pastor::describe::machine_tasks(name))?;
     let d = pastor::describe::MachineDescription {
@@ -3306,8 +4020,154 @@ async fn machine_describe(
         agents_by_kind: m.agents.clone(),
         tasks,
         recent_errors: pastor::describe::machine_errors(events_log(paths), name),
+        workdirs: pastor::bundle::workdir_keep::describe(
+            paths,
+            name,
+            pastor::bundle::keep::reach(paths.clone())(m).is_some(),
+        ),
+        // With no head nothing has read the homes; the plan and the last
+        // apply say what they can.
+        config: pastor::bundle::keep::describe(
+            paths,
+            &f,
+            &pastor::machine_check::Config {
+                defaults: &config.defaults,
+                agents: &config.agents,
+                models: &config.models,
+                profiles: &config.profiles,
+                harnesses: &harnesses,
+                herdr_pin: None,
+                head_address: None,
+            },
+            m,
+            None,
+        ),
+        signed_out: pastor::describe::signed_out_on(store.limits()?, name),
+        bootstrap: store.machine_state(name)?,
     };
     print_description(&d, json, pastor::describe::machine_text)
+}
+
+/// `machine add --bootstrap` (with `machine`, the entry to add) and `machine
+/// bootstrap NAME`: the running head sets the machine up over ssh
+/// (`bootstrap::push`). What it did is printed step by step, and a failed
+/// step is the command's error, with what to do about it.
+async fn bootstrap_machine(
+    client: &pastor::ipc::Client,
+    head: Head,
+    name: &str,
+    machine: Option<MachineConfig>,
+    host_key: Option<String>,
+) -> anyhow::Result<()> {
+    if !head.is_live() {
+        fail(
+            "no_head",
+            "bootstrapping a machine runs on the head: start pastor serve, and set head_address in pastor.toml",
+        );
+    }
+    let req = IpcRequest::MachineBootstrap {
+        name: name.to_string(),
+        machine,
+        host_key,
+    };
+    let got = pastor::ipc::request_head_with_timeout(client, &req, BOOTSTRAP_WAIT).await;
+    let IpcResponse::Bootstrapped(outcome) = pastor::cli::reply(got)? else {
+        anyhow::bail!("the head answered a bootstrap with something else");
+    };
+    print!("{}", pastor::bootstrap::human(&outcome));
+    match pastor::bootstrap::error(&outcome) {
+        Some(err) => Err(err),
+        None => {
+            println!("{name} is bootstrapped");
+            Ok(())
+        }
+    }
+}
+
+/// How long the CLI waits for a push bootstrap.
+const BOOTSTRAP_WAIT: std::time::Duration = std::time::Duration::from_secs(35 * 60);
+
+/// `machine check`: the head runs it when one runs, and raises
+/// `machine.check_failed` for each failed row; else it runs here, with
+/// flock.toml and pastor.toml as they are. Exits 1 when a row failed.
+async fn machine_check(
+    client: &pastor::ipc::Client,
+    name: &str,
+    provisioner: Option<String>,
+    json: bool,
+    head: Head,
+) -> anyhow::Result<()> {
+    let paths = &client.paths;
+    let report = if head.is_live() {
+        let req = IpcRequest::MachineCheck {
+            name: name.to_string(),
+            provisioner,
+        };
+        let got =
+            pastor::ipc::request_head_with_timeout(client, &req, pastor::machine_check::WAIT).await;
+        match pastor::cli::reply(got)? {
+            IpcResponse::MachineChecked(report) => report,
+            resp => return Err(unexpected(resp)),
+        }
+    } else {
+        let f = Flock::load(&paths.flock_file())?;
+        let Some(m) = f.get(name) else {
+            fail(
+                "unknown_machine",
+                &format!("no machine {name} in the flock"),
+            );
+        };
+        let config = PastorConfig::load(&paths.config_file())?;
+        let catalog = pastor::provision::Catalog::load(paths)?;
+        let harnesses = pastor::harness_manifest::Harnesses::load(paths)?;
+        let shell = Arc::new(
+            pastor::provision::run::MachineShell::new(m, paths)
+                .map_err(|e| CliError::err(e.code(), e))?,
+        );
+        let parts = pastor::machine_check::Config {
+            defaults: &config.defaults,
+            agents: &config.agents,
+            models: &config.models,
+            profiles: &config.profiles,
+            harnesses: &harnesses,
+            herdr_pin: config
+                .artifacts
+                .herdr
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty()),
+            head_address: config.head_address.as_deref(),
+        };
+        let running = pastor::machine_check::running_herdr(m, paths).await;
+        let mut report = pastor::machine_check::check(
+            shell.clone(),
+            m,
+            &f,
+            &parts,
+            &catalog,
+            provisioner.as_deref(),
+            running.as_deref(),
+            Some(Arc::new(pastor::herdr::transport::Endpoint::from_machine(
+                m, paths,
+            ))),
+        )
+        .await?;
+        report
+            .rows
+            .extend(pastor::bundle::keep::check_rows(paths, &f, &parts, m, shell).await);
+        let inbox = pastor::machine_check::inbox_rows(m, &f, &parts, paths, &report.rows).await;
+        report.rows.extend(inbox);
+        report
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", report.text());
+    }
+    if !report.ok() {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// `flock describe`: the head's description when one runs, else one built
@@ -3349,7 +4209,6 @@ async fn toggle(
     // (`orchestrator_may`), whose role only the head knows.
     if !head.is_live()
         && let Some(task) = &client.caller.task
-        && !agents_change_fleet(paths)
     {
         return Err(CliError::err(
             "agent_refused",
@@ -3391,6 +4250,60 @@ mod tests {
             } => *a,
             other => panic!("{other:?}"),
         }
+    }
+
+    /// `task done` from a task's pane ends the task on its own head with the
+    /// summary as `--summary` text: not through a `--head` flag, not read
+    /// from a file or from stdin. The head `PASTOR_HEAD` names is no flag:
+    /// it is how a task on another machine reaches its own head.
+    #[test]
+    fn a_task_ends_itself_without_reaching_out() {
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
+        let plain = parse(&["pastor", "task", "done", "--summary", "done: x"]);
+        assert_eq!(done_reaches_out(&plain, false), None);
+        let current = parse(&[
+            "pastor",
+            "task",
+            "done",
+            "--current",
+            "--summary",
+            "done: x",
+        ]);
+        assert_eq!(done_reaches_out(&current, false), None);
+        for file in ["-", "notes.txt"] {
+            let cmd = parse(&[
+                "pastor",
+                "task",
+                "done",
+                "--current",
+                "--summary-file",
+                file,
+            ]);
+            assert!(done_reaches_out(&cmd, false).is_some(), "{file}");
+        }
+        assert!(done_reaches_out(&plain, true).is_some());
+        // A head the pane's own env names is no `--head`.
+        let paths = Paths::new("/c", "/s");
+        let file = || {
+            Some(pastor::head::HeadSetting {
+                ssh: "user@head".into(),
+                pastor: None,
+            })
+        };
+        for (flag, env, file, from_flag) in [
+            (Some("user@head"), None, None, true),
+            (Some("user@head"), Some("user@head"), file(), true),
+            (None, Some("user@head"), None, false),
+            (None, None, file(), false),
+        ] {
+            let head = pastor::head::resolve(&paths, flag, env, file);
+            assert_eq!(head_from_flag(head.as_ref()), from_flag, "{flag:?} {env:?}");
+            let may = done_reaches_out(&plain, head_from_flag(head.as_ref())).is_none();
+            assert_eq!(may, !from_flag);
+        }
+        assert!(!head_from_flag(None));
+        let other = parse(&["pastor", "task", "list"]);
+        assert_eq!(done_reaches_out(&other, true), None);
     }
 
     /// `task run --role orchestrator` is what no task may send; from a
@@ -3996,6 +4909,31 @@ mod tests {
         assert_eq!(tags, vec!["t".to_string()]);
     }
 
+    /// The shepherd bridge takes no argument that names an artifact: the
+    /// request is a line on stdin, so a name never shows in `ps`.
+    #[test]
+    fn the_shepherd_bridge_takes_no_artifact_in_argv() {
+        let base = [
+            "pastor",
+            "bridge",
+            "--shepherd",
+            "--machine",
+            "m",
+            "--gen",
+            "1",
+        ];
+        assert!(Cli::try_parse_from(base).is_ok());
+        for extra in [
+            &["pastor"][..],
+            &["--artifact", "pastor"][..],
+            &["--fetch", "pastor"][..],
+        ] {
+            let mut args = base.to_vec();
+            args.extend_from_slice(extra);
+            assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
+        }
+    }
+
     #[test]
     fn herdr_flag_needs_an_ssh_machine() {
         fn err(args: &[&str]) -> clap::Error {
@@ -4588,8 +5526,10 @@ mod tests {
 
     /// Loads a whole-file example as the file its content shows: a flock
     /// file (`[[machine]]` or `[[flock]]`), a job (`[connector]` with
-    /// `use`), an orchestrator (`kind`), a connector manifest (`id`), a
-    /// client.toml (`[head]`), or else pastor.toml.
+    /// `use`), an orchestrator (`kind`), a bundle manifest (`id` and what a
+    /// bundle carries), a provisioner manifest (`id` and `[[check]]`), a
+    /// connector manifest (`id`), a client.toml (`[head]`), or else
+    /// pastor.toml.
     fn load_example(text: &str) -> Result<(), String> {
         use pastor::connector::Catalog;
         use serde_json::Value;
@@ -4637,9 +5577,35 @@ mod tests {
                 pastor::orchestrator::Loaded::Invalid { error, .. } => return Err(error),
             }
         } else if let Some(id) = table.get("id").and_then(|i| i.as_str()) {
-            let dir = paths.connectors_dir().join(id);
-            write(&dir.join(pastor::connector::manifest::MANIFEST_FILE));
-            pastor::connector::load_manifest(&dir, Some(id))?;
+            // Every manifest starts with an `id`; only a provisioner has
+            // checks, and only a bundle carries skills, files and the rest.
+            // A bundle's files are not in the example, so its text alone
+            // is checked.
+            let bundle_keys = [
+                "skill",
+                "file",
+                "instructions",
+                "settings",
+                "mcp",
+                "plugin",
+                "require",
+            ];
+            if table.contains_key("paths") {
+                // A harness manifest, loaded from the config dir as one.
+                let file = paths.harnesses_dir().join(format!("{id}.toml"));
+                write(&file);
+                pastor::harness_manifest::load_file(&file).map_err(err)?;
+            } else if bundle_keys.iter().any(|k| table.contains_key(*k)) {
+                pastor::bundle::Manifest::parse(text)?;
+            } else if table.contains_key("check") {
+                let dir = paths.provisioners_dir().join(id);
+                write(&dir.join(pastor::provision::MANIFEST_FILE));
+                pastor::provision::load_manifest(&dir, Some(id))?;
+            } else {
+                let dir = paths.connectors_dir().join(id);
+                write(&dir.join(pastor::connector::manifest::MANIFEST_FILE));
+                pastor::connector::load_manifest(&dir, Some(id))?;
+            }
         } else if table.contains_key("head") {
             let path = pastor::head::client_file(&paths);
             write(&path);
@@ -4870,10 +5836,19 @@ mod tests {
         for words in spans(&between("Local on purpose, as with no head set:", "\n\n")) {
             assert_eq!(route(&words), RemoteRoute::Here, "{words}");
         }
-        let refused = between("Only one command is refused with a remote head:", "\n\n");
+        let refused = between(
+            "These commands are refused with a remote head:",
+            ". The first",
+        );
         let refused = spans(&refused);
         assert_eq!(refused[0], "machine authorized-key");
-        assert!(matches!(route(&refused[0]), RemoteRoute::Unsupported(_)));
+        assert_eq!(refused.len(), 6, "{refused:?}");
+        for words in &refused {
+            assert!(
+                matches!(route(words), RemoteRoute::Unsupported(_)),
+                "{words}"
+            );
+        }
     }
 
     /// A job whose file is here runs and is edited here, not by the remote
@@ -4916,9 +5891,10 @@ mod tests {
     fn sample_command(words: &str) -> Command {
         let extra: &[&str] = match words {
             "task run" | "task describe" | "task read" | "task attach" | "task retry"
-            | "task close" | "task done" | "job run" | "machine open" => &["x"],
+            | "task close" | "task done" | "job run" | "machine open" | "machine check" => &["x"],
             "flock add" | "flock remove" | "flock describe" | "machine remove"
             | "machine describe" | "profile describe" => &["x"],
+            "bundle add" | "bundle show" | "bundle remove" => &["x"],
             "machine add" => &["x", "--local"],
             "machine authorized-key" => &["x", "--key", "-"],
             "flock default" => &["show"],
@@ -4930,6 +5906,14 @@ mod tests {
             "setup" => &["systemd"],
             "head" => &["show"],
             "connector" | "orchestrator" => &["list"],
+            "workdir" => &["remove", "--local", "/x"],
+            "inbox" => &[
+                "send",
+                "--session",
+                "2a191324-a7b9-431f-85b4-9a1773eeea24",
+                "--mode",
+                "prompting",
+            ],
             _ => &[],
         };
         let argv = std::iter::once("pastor")
@@ -4976,7 +5960,24 @@ mod tests {
             names.push(name);
         }
         names.sort();
-        assert_eq!(names, ["connector", "dispatch", "pastor", "spec"]);
+        assert_eq!(names, ["connector", "dispatch", "pastor", "review", "spec"]);
+    }
+
+    /// Orchestrators are out of scope for `pastor:dispatch` and
+    /// `pastor:review`: dispatch only runs a plan interactively, and review
+    /// starts its one fix task the same way dispatch starts any other task.
+    /// Neither skill may tell an agent to write, read or name an
+    /// orchestrator file.
+    #[test]
+    fn dispatch_and_review_never_mention_orchestrators() {
+        for name in ["dispatch", "review"] {
+            let path = skills_dir().join(name).join("SKILL.md");
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                !text.to_lowercase().contains("orchestrator"),
+                "{path:?} mentions an orchestrator"
+            );
+        }
     }
 
     /// The repository installs as a Claude Code plugin named `pastor`, which
@@ -5085,7 +6086,12 @@ mod tests {
                     cmd = sub;
                     rest = &rest[1..];
                 }
-                None if cmd.has_subcommands() && !word.starts_with('-') => {
+                // A command whose own arguments stand in for its
+                // subcommands (`login <machine> <agent>`) takes a word too.
+                None if cmd.has_subcommands()
+                    && !cmd.is_args_conflicts_with_subcommands_set()
+                    && !word.starts_with('-') =>
+                {
                     return Err(format!(
                         "`{word}` is not a subcommand of `{}`",
                         cmd.get_name()
@@ -5106,8 +6112,10 @@ mod tests {
             if name == "help" || name == "version" {
                 continue;
             }
+            // A global flag, such as --head, goes after any subcommand.
             let arg = cmd
                 .get_arguments()
+                .chain(root.get_arguments().filter(|a| a.is_global_set()))
                 .find(|a| a.get_long() == Some(name))
                 .ok_or_else(|| format!("`{}` has no --{name}", cmd.get_name()))?;
             if !inline && arg.get_action().takes_values() {

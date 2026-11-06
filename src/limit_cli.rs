@@ -24,13 +24,13 @@ pub fn not_exhausted(account: &str, model: Option<&str>) -> String {
 
 #[derive(Subcommand, Debug)]
 pub enum LimitCmd {
-    /// Every exhausted account: its model, when it is tried again, what ran out, who saw it
+    /// Every exhausted account and signed-out agent: its model, when it is tried again, what ran out, who saw it
     List {
         /// Print as a JSON array
         #[arg(long)]
         json: bool,
     },
-    /// Forget an account's limit, so queued and waiting tasks start on it on the next pass
+    /// Forget an account's limit or signed-out mark, so queued and waiting tasks start on it on the next pass
     Clear {
         /// The account, as `limit list` shows it: an agent's `account`, or `<machine>/<agent>`
         account: String,
@@ -112,7 +112,12 @@ fn print_list(list: &[AccountLimit], json: bool) -> anyhow::Result<()> {
                 vec![
                     l.account.clone(),
                     l.model.clone().unwrap_or_else(|| "-".into()),
-                    local_time(l.retry_at, now),
+                    // No time clears a signed-out row; a sign-in does.
+                    if l.signed_out {
+                        "sign-in".into()
+                    } else {
+                        local_time(l.retry_at, now)
+                    },
                     l.what(),
                     seen,
                     age(l.seen_at),

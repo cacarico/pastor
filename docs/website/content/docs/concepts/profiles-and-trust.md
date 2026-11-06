@@ -96,8 +96,8 @@ answer it.
 pastor sets `PASTOR_TASK` in every agent's pane. From there, the agent may
 read everything and end its own task with `pastor task done`. Every command
 that changes something is refused with `agent_refused`: running or closing
-tasks, editing machines, flocks, jobs or config, `serve`, and the rest.
-`agents_change_fleet = true` in `pastor.toml` turns the refusal off.
+tasks, editing machines, flocks, jobs or config, `serve`, and the rest. No
+setting turns the refusal off.
 
 An [orchestrator](../orchestrators/) may also run, retry, send to and close
 tasks, and enable and disable jobs. Only a person starts one.

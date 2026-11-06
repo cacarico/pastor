@@ -92,6 +92,7 @@ Set exactly one of `ssh`, `local`, `pull` and `command`. Unknown keys in a
 | `label` | unset | the workspace name template for its tasks |
 | `summary` | unset | `ask`, `require` or `off` for its tasks |
 | `keep_pane` | unset | `true` keeps its tasks' panes once they end, until `pastor task close` |
+| `remove_worktree` | unset | `true` removes its tasks' worktrees when they fail or go stale too, not only when done |
 | `description` | unset | one line on what it is for, for `pastor flock list --wide` |
 
 Unknown keys in a `[[flock]]` are refused. Each key applies when the task or
@@ -104,9 +105,14 @@ A machine's number in `machines` is one of two forms:
 |---|---|
 | `desk = 2` | at most 2 of this flock's live tasks on `desk` |
 | `desk = { share = 2, max = 4 }` | up to 2 as usual; from 2 up to 4 only while no task of a flock under its share waits there |
+| `desk = 0` | in the flock, but none of its tasks starts on `desk`: drains it |
 
-A number is at least 1, and `max` is never below `share`. Job slots and
-burst never take a machine past a flock's number.
+A number is a whole number, 0 or more, and `max` is never below `share`; a
+share of 0 goes only with a max of 0. 0 (`desk = 0`, or
+`{ share = 0, max = 0 }`) keeps the machine in the flock with no slots, to
+drain it: the flock's tasks running there finish, and none starts there,
+`--now` included; one pinned there waits with `flock work has 0 slots on
+desk`. Job slots and burst never take a machine past a flock's number.
 
 ## what the commands write
 

@@ -1,0 +1,13 @@
+#! question: no
+#! shell: yes
+#! trust: no
+● Bash(make check)
+  ⎿  Running in the background (↓ to manage)
+
+✢ Slithering… (46s · ↓ 3.1k tokens · thought for 7s)
+  ⎿  Tip: Use /btw to ask a quick side question without interrupting Claude's current work
+
+──────────────────────────────────────────────────────────────────────────────
+❯ 
+──────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on · 1 shell · esc to interrupt · ↓ to manage

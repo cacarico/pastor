@@ -3,7 +3,7 @@
 # still called pastor.
 [package]
 name = "pastor-cli"
-version = "0.10.0-rc.1"
+version = "0.10.0-rc.2"
 edition = "2024"
 # Let chains (stable since 1.88) are used throughout; raising this is a
 # minor bump, see CONTRIBUTING.md.
@@ -99,6 +99,7 @@ tokio = { version = "1.53.1", features = [
 ] }
 toml = "1.1.6"
 toml_edit = "0.25.15"
+sha2 = "0.10.9"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 

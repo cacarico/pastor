@@ -247,7 +247,10 @@ mod tests {
         let err = lock_fleet(&paths, Duration::from_millis(100)).unwrap_err();
         assert_eq!(err.downcast_ref::<CliError>().unwrap().code, "fleet_locked");
         drop(held);
-        lock_fleet(&paths, Duration::ZERO).unwrap();
+        // A child forked by another test (sh, git, the test binary) can hold
+        // a copy of `held`'s descriptor until it execs, so a zero wait here
+        // races it; give it room to clear, as production callers already do.
+        lock_fleet(&paths, Duration::from_secs(5)).unwrap();
     }
 
     const FILE: &str = "[[flock]]\nname = \"home\"\ndefault = true\n\n[[flock]]\nname = \"work\"\n\n[[machine]]\nname = \"desk\"\nlocal = true\nmax_agents = 3\nflock = \"work\"  # the old way\n";

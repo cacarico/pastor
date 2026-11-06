@@ -1,7 +1,7 @@
 # Developer entry points. Every target maps to one cargo command so the
 # Makefile stays the single list of "what you can run here".
 
-.PHONY: help build release check changelog changelog-check fmt lint test test-machine test-ssh portability coverage coverage-check coverage-run leaks smoke smoke-profiles smoke-rc mutants mutants-diff install install-completions completions cli-reference demo site site-serve links clean
+.PHONY: help build release check changelog changelog-check fmt lint test test-machine test-ssh test-bootstrap test-bootstrap-clean portability coverage coverage-check coverage-run leaks smoke smoke-profiles smoke-rc mutants mutants-diff install install-completions completions cli-reference demo site site-serve links clean
 
 help: ## list targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{ printf "  %-14s %s\n", $$1, $$2 }'
@@ -46,6 +46,25 @@ test-machine: ## the machine actor tests on their own
 # see tests/real_ssh.rs. Needs OpenSSH's server (sshd) and ssh-keygen.
 test-ssh: ## the CLI against a head over a real ssh, through a throwaway sshd
 	cargo test --features fake-herdr --test real_ssh -- --ignored
+
+# Push bootstrap against Debian, Fedora and Arch containers (systemd as PID 1,
+# sshd, a login user with no sudo): rootless podman only, since the containers
+# start with --systemd=always. Needs ssh, ssh-keygen, ssh-keyscan and a static
+# linux-x86_64 herdr (PASTOR_TEST_HERDR_BIN, else the herdr on the PATH); the
+# pastor in the containers is this build, which needs a glibc no newer than
+# the images' (PASTOR_TEST_PASTOR_BIN names another). Not part of `make
+# check`. The images and containers are removed after, pass or fail.
+test-bootstrap: ## end-to-end push bootstrap in debian, fedora and arch containers, and a debian machine joining by token
+	@status=0; \
+	PASTOR_E2E_REQUIRE=1 cargo test --features fake-herdr --test bootstrap_e2e -- --ignored --test-threads 1 || status=$$?; \
+	$(MAKE) --no-print-directory test-bootstrap-clean; \
+	exit $$status
+
+test-bootstrap-clean: ## remove the labeled images and containers the bootstrap tests made
+	@if command -v podman >/dev/null 2>&1; then \
+		podman ps -aq --filter label=pastor-bootstrap-test | xargs -r podman rm -f -v >/dev/null; \
+		podman images -q --filter label=pastor-bootstrap-test | sort -u | xargs -r podman rmi -f >/dev/null; \
+	fi
 
 # The release builds are static musl binaries and FreeBSD builds from source,
 # so code that only compiles against glibc on x86_64 has to fail before the
@@ -197,11 +216,20 @@ demo: build ## record the README gifs with vhs against a demo head
 # ship in the release tarball, so `make check` fails when they are stale.
 # `pastor completions <shell>` prints the same thing at runtime for shells
 # not listed here.
+#
+# The binary comes from `cargo run`, which finds it wherever CARGO_TARGET_DIR
+# puts it. Each script is written beside its file and moved into place only
+# when the CLI succeeded and printed something, so a failed run leaves the
+# checked-in copy as it was. PASTOR_CMD names another command to run.
+PASTOR_CMD ?= cargo run -q --bin pastor --
 completions: ## regenerate contrib/completions/pastor.{bash,fish} from the CLI
-	cargo build -q
 	mkdir -p contrib/completions
-	target/debug/pastor completions bash > contrib/completions/pastor.bash
-	target/debug/pastor completions fish > contrib/completions/pastor.fish
+	@set -e; for shell in bash fish; do \
+	  out=contrib/completions/pastor.$$shell; \
+	  $(PASTOR_CMD) completions $$shell > $$out.tmp || { rm -f $$out.tmp; exit 1; }; \
+	  test -s $$out.tmp || { rm -f $$out.tmp; echo "make completions: the CLI printed no $$shell script; $$out is unchanged" >&2; exit 1; }; \
+	  mv $$out.tmp $$out; \
+	done
 
 # Rendered from the clap definitions like the completions; the page's prose
 # above the generated marker is kept. `make check` fails when it is stale.

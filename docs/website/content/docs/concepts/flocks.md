@@ -113,6 +113,7 @@ pastor flock list --wide                  # machines, live agents, queued tasks,
 pastor flock describe sandbox
 pastor flock add lab server-1 --description "Test rigs"  # server-1 joins it
 pastor flock join lab desk --max 2        # desk runs at most 2 of lab's tasks
+pastor flock join lab desk --max 0        # drain: lab's tasks there finish, none starts
 pastor flock leave lab desk               # out of lab; out of its last flock, back in the default
 pastor flock default set lab              # new tasks and jobs go to lab
 pastor flock edit                         # saved only once valid

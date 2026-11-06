@@ -54,8 +54,8 @@ pub const QUEUE_HEADER: [&str; 7] = [
 pub const WAITING_FOR_MODEL: &str = "waiting for a machine";
 
 /// How a queued task's error starts while every model it may run is on an
-/// exhausted account: `waiting: claude-personal exhausted until 03:00
-/// (5-hour limit, seen by t-412)`; cleared once it starts.
+/// exhausted account: `waiting: claude-alt exhausted until 03:00
+/// (5-hour limit, seen by t-12)`; cleared once it starts.
 pub const WAITING_FOR_ACCOUNT: &str = "waiting";
 
 /// Whether `error` is a note dispatch left on a queued task about why it
@@ -179,6 +179,9 @@ fn why_waiting(
         return match views.iter_mut().find(|v| v.name == m) {
             None => format!("{by}machine {m} is not in the flock"),
             Some(v) if !v.healthy => format!("{by}machine {m} is not connected"),
+            // A cordoned machine resumes nothing (`Fleet::resume_paused`), so
+            // the task holds no slot there in the simulation either.
+            Some(v) if v.floor.cordoned => format!("{by}machine {m} is cordoned"),
             Some(v) if v.has_room(claim) => {
                 v.live += 1;
                 v.live_jobs += usize::from(task.from_job());
@@ -201,7 +204,8 @@ fn why_waiting(
         return format!("{next}: {m} has room");
     }
     let tags = &task.spec.tags;
-    let has_tags = |v: &MachineView| tags.iter().all(|t| v.tags.contains(t));
+    let has_tags = |v: &MachineView| v.has_tags(&task.spec);
+    let load = task.spec.load.as_deref().unwrap_or_default();
     // The flock at its number on `v`, or past its share while another
     // waits, as `dispatch_queued` notes it.
     let at_number = |v: &MachineView| flock_held(v, flock);
@@ -217,9 +221,26 @@ fn why_waiting(
                 )
             }
             Some(v) if !v.healthy => format!("machine {pinned} is not connected"),
+            Some(v) if task.spec.workdir.is_some() && !v.workdir_sets => {
+                format!(
+                    "machine {pinned}'s pastor does not place workdir sets: upgrade pastor there"
+                )
+            }
             Some(v) if !has_tags(v) => format!("machine {pinned} lacks tags {}", tags.join(", ")),
-            Some(v) if v.has_room(claim) && at_number(v).is_some() => {
+            Some(v) if !v.takes_load(&task.spec) => {
+                format!("machine {pinned} does not take load {load}")
+            }
+            Some(v)
+                if (v.has_room(claim) || v.seat(flock).is_some_and(|s| s.drained()))
+                    && at_number(v).is_some() =>
+            {
                 at_number(v).expect("checked")
+            }
+            Some(v) if v.has_room(claim) && v.floor_held(flock).is_some() => {
+                format!(
+                    "{WAITING_FOR_MODEL}: {}",
+                    v.floor_held(flock).expect("checked")
+                )
             }
             Some(v) => format!("machine {pinned} is full ({}/{})", v.live, v.max_agents),
         };
@@ -235,9 +256,30 @@ fn why_waiting(
         )
     } else if !mine.iter().any(|v| v.healthy && has_tags(v)) {
         format!("no machine in flock {flock} has tags {}", tags.join(", "))
+    } else if task.spec.workdir.is_some() && !mine.iter().any(|v| v.healthy && v.workdir_sets) {
+        format!(
+            "no connected machine in flock {flock} places workdir sets: a pull machine does once its pastor is upgraded"
+        )
+    } else if !mine.iter().any(|v| v.healthy && v.suits(&task.spec)) {
+        format!("no connected machine in flock {flock} takes load {load}")
     } else if let Some(why) = mine
         .iter()
-        .filter(|v| v.healthy && has_tags(v) && v.has_room(claim))
+        .filter(|v| {
+            v.healthy
+                && !v.pull
+                && v.suits(&task.spec)
+                && v.has_room(claim)
+                && v.flock_may_take(flock)
+                && accepts(task, &v.name)
+        })
+        .find_map(|v| v.floor_held(flock))
+    {
+        // A machine that would take it but for its room floor, as
+        // `dispatch_queued` notes it.
+        format!("{WAITING_FOR_MODEL}: {why}")
+    } else if let Some(why) = mine
+        .iter()
+        .filter(|v| v.healthy && v.suits(&task.spec) && v.has_room(claim))
         .find_map(|v| at_number(v))
     {
         why
@@ -318,10 +360,12 @@ mod tests {
             job_slots: 0,
             burst: 0,
             tags: vec![],
+            loads: vec![],
             live,
             live_jobs: 0,
             healthy,
             pull: false,
+            workdir_sets: true,
             flocks: vec![crate::dispatch::FlockSeat {
                 name: flock.into(),
                 share: None,
@@ -329,6 +373,7 @@ mod tests {
                 live,
             }],
             waiting_under_share: vec![],
+            floor: Default::default(),
         }
     }
 
@@ -390,6 +435,22 @@ mod tests {
         assert_eq!(whys(vec![paused], &free), ["next pass: resumes on b"]);
     }
 
+    /// A paused task on a cordoned machine does not resume there, says so,
+    /// and leaves the machine's slot to the task behind it.
+    #[test]
+    fn a_paused_task_on_a_cordoned_machine_waits_and_takes_no_slot() {
+        let mut paused = task(3, Some("default"), None);
+        paused.state = TaskState::Paused;
+        paused.machine = Some("b".into());
+        paused.pause.paused_for = Some(9);
+        let mut cordoned = view("b", "default", 0, 2, true);
+        cordoned.floor.cordoned = true;
+        let behind = task(4, Some("default"), Some("b"));
+        let got = whys(vec![paused, behind], &[cordoned]);
+        assert_eq!(got[0], "paused for t-9; machine b is cordoned");
+        assert_eq!(got[1], "waiting for a machine: b is cordoned");
+    }
+
     /// Each reason a flock or a pinned machine takes nothing is named.
     #[test]
     fn why_names_what_keeps_a_task_waiting() {
@@ -425,6 +486,77 @@ mod tests {
                 "no machine in flock lab has tags gpu",
                 "waiting for a machine: no agent runs gpt",
                 "machine b is not connected",
+            ]
+        );
+    }
+
+    /// A task whose load no connected machine of its flock takes says so,
+    /// and so does one pinned to a machine that does not take it; one that
+    /// finds a taker goes there.
+    #[test]
+    fn why_names_a_load_nothing_takes() {
+        let rust = MachineView {
+            loads: vec!["rust".into()],
+            ..view("b", "default", 0, 2, true)
+        };
+        let views = [view("a", "default", 0, 2, true), rust];
+        let load = |id: i64, machine: Option<&str>, load: &str| {
+            let mut t = task(id, None, machine);
+            t.spec.load = Some(load.into());
+            t
+        };
+        assert_eq!(
+            whys(
+                vec![
+                    load(1, None, "light"),
+                    load(2, Some("a"), "rust"),
+                    load(3, None, "rust"),
+                ],
+                &views
+            ),
+            [
+                "no connected machine in flock default takes load light",
+                "machine a does not take load rust",
+                "next pass: b has room",
+            ]
+        );
+    }
+
+    /// A task with a workdir set waits for a machine that places it: one
+    /// pinned to a pull machine whose pastor does not place sets says to
+    /// upgrade it, and a loose one in a flock with no such machine says so.
+    #[test]
+    fn a_task_with_a_set_names_the_machine_that_cannot_place_it() {
+        let with_set = |id: i64, machine: Option<&str>| {
+            let mut t = task(id, None, machine);
+            t.spec.workdir = Some(Box::new(crate::task::TaskWorkdir {
+                set: serde_json::json!({"id": "s", "kind": "claude"}),
+                placed_in: None,
+                render: None,
+            }));
+            t
+        };
+        let laptop = |sets: bool| MachineView {
+            pull: true,
+            workdir_sets: sets,
+            ..view("laptop", "default", 0, 1, true)
+        };
+        assert_eq!(
+            whys(vec![with_set(1, Some("laptop"))], &[laptop(false)]),
+            ["machine laptop's pastor does not place workdir sets: upgrade pastor there"]
+        );
+        assert_eq!(
+            whys(vec![with_set(1, Some("laptop"))], &[laptop(true)]),
+            ["next claim: laptop has room"]
+        );
+        let bridged = MachineView {
+            workdir_sets: false,
+            ..view("a", "default", 0, 2, true)
+        };
+        assert_eq!(
+            whys(vec![with_set(2, None)], &[bridged, laptop(false)]),
+            [
+                "no connected machine in flock default places workdir sets: a pull machine does once its pastor is upgraded"
             ]
         );
     }
@@ -508,6 +640,86 @@ mod tests {
                 "flock work is at 2 of 2 on desk",
                 "next pass: desk has room",
             ]
+        );
+    }
+
+    /// A task pinned to a machine where its flock has 0 slots waits with
+    /// that as the reason, even once the machine is full.
+    #[test]
+    fn a_flock_at_0_on_the_pinned_machine_says_so() {
+        let seat = |name: &str, max: u32, live: usize| crate::dispatch::FlockSeat {
+            name: name.into(),
+            share: Some(max),
+            max: Some(max),
+            live,
+        };
+        let open = [MachineView {
+            flocks: vec![seat("default", 3, 0), seat("work", 0, 1)],
+            ..view("desk", "default", 1, 4, true)
+        }];
+        let full = [MachineView {
+            flocks: vec![seat("default", 3, 3), seat("work", 0, 1)],
+            ..view("desk", "default", 4, 4, true)
+        }];
+        let drained =
+            "flock work has 0 slots on desk: it starts no new tasks there (1 still running)";
+        assert_eq!(
+            whys(
+                vec![
+                    task(1, Some("work"), Some("desk")),
+                    task(2, Some("work"), None)
+                ],
+                &open
+            ),
+            [drained, drained]
+        );
+        assert_eq!(
+            whys(vec![task(1, Some("work"), Some("desk"))], &full),
+            [drained]
+        );
+    }
+
+    /// A machine under its room floor is not where a task goes next, and
+    /// the task says why as dispatch notes it, loose or pinned; one unread
+    /// with its flock holding an unread room says that; another machine
+    /// with room still takes the next task.
+    #[test]
+    fn a_machine_under_its_floor_says_so() {
+        let short = MachineView {
+            floor: crate::dispatch::FloorView {
+                short: Some("a has 1.0 GB free under /tmp".into()),
+                ..Default::default()
+            },
+            ..view("a", "default", 0, 2, true)
+        };
+        assert_eq!(
+            whys(
+                vec![task(1, None, None), task(2, None, Some("a"))],
+                std::slice::from_ref(&short)
+            ),
+            [
+                "waiting for a machine: a has 1.0 GB free under /tmp",
+                "waiting for a machine: a has 1.0 GB free under /tmp",
+            ]
+        );
+        let unread = MachineView {
+            floor: crate::dispatch::FloorView {
+                unread: true,
+                hold_unread: vec!["default".into()],
+                ..Default::default()
+            },
+            ..view("a", "default", 0, 2, true)
+        };
+        assert_eq!(
+            whys(vec![task(3, None, None)], &[unread]),
+            ["waiting for a machine: a's room cannot be read"]
+        );
+        assert_eq!(
+            whys(
+                vec![task(4, None, None)],
+                &[short, view("b", "default", 1, 2, true)]
+            ),
+            ["next pass: b has room"]
         );
     }
 

@@ -74,7 +74,7 @@ fn an_unresponsive_head_is_a_hard_error_on_every_head_path() {
 
 /// A sandbox that blocks the connect to pastor.sock makes it fail with
 /// EPERM or EACCES. That is the caller being blocked, not a sick head:
-/// `head_unresponsive` there sent agents into retry loops (t-1051). A socket
+/// `head_unresponsive` there sent agents into retry loops. A socket
 /// the caller may not write gives the same EACCES.
 #[test]
 fn a_denied_socket_connect_is_not_an_unresponsive_head() {

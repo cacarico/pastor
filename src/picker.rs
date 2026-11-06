@@ -30,7 +30,7 @@ pub struct Found {
 /// its prose above an option list is set off by a blank line). A list in a
 /// message has no cursor, so it is not one.
 pub fn at_bottom(text: &str) -> Option<Found> {
-    let text = text.replace('\u{a0}', " ");
+    let text = mend_hints(&text.replace('\u{a0}', " "));
     // Empty lines stay, as "", so a plain-option block has its bounds; a
     // rule or the edge of a box bounds it the same way.
     let lines: Vec<&str> = text
@@ -188,12 +188,43 @@ pub fn is_box_edge(line: &str) -> bool {
             .all(|c| matches!(c, '─' | '╭' | '╮' | '╰' | '╯' | '┌' | '┐' | '└' | '┘'))
 }
 
-/// A line of key hints under a picker: `Enter to confirm · Esc to cancel`.
+/// A line of key hints under a picker: `Enter to confirm · Esc to cancel`,
+/// or the end of Claude's autocompact hints, `... · esc not now`.
 pub fn is_key_hint(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
-    ["to confirm", "to cancel", "to select", "to navigate"]
-        .iter()
-        .any(|h| lower.contains(h))
+    [
+        "to confirm",
+        "to cancel",
+        "to select",
+        "to navigate",
+        "↑/↓ choose",
+        "esc not now",
+    ]
+    .iter()
+    .any(|h| lower.contains(h))
+}
+
+/// `text` with a line of hints that a narrow pane wrapped inside `esc not
+/// now` joined back into one, so `is_key_hint` and the readers see
+/// the hint whole, and the second half is not taken for an option.
+pub fn mend_hints(text: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let rest = line.trim().to_ascii_lowercase();
+        let wrapped = |prev: &str, head: &str, tail: &str| {
+            rest == tail && prev.trim_end().to_ascii_lowercase().ends_with(head)
+        };
+        match out.last_mut() {
+            Some(prev)
+                if wrapped(prev, "· esc", "not now") || wrapped(prev, "· esc not", "now") =>
+            {
+                prev.push(' ');
+                prev.push_str(line.trim());
+            }
+            _ => out.push(line.to_string()),
+        }
+    }
+    out.join("\n")
 }
 
 /// An option of a picker: `❯ 1. Stop and wait for limit to reset` or
@@ -254,6 +285,42 @@ mod tests {
         let f = at_bottom(screen).unwrap();
         assert_eq!(f.picker.options, ["Yes", "No, keep default"]);
         assert_eq!(f.above, ["Make auto mode your default?"]);
+    }
+
+    /// Claude's autocompact offer, as captured: its hints say `enter confirm
+    /// · esc not now`, and a narrow pane wraps them after `esc`.
+    const AUTOCOMPACT: &str = "───────────\n We recommend compacting earlier\n\n   Each message re-sends the whole conversation.\n\n   Want to autocompact at 400k tokens instead?\n\n   ❯ Autocompact at ‹ 400k › tokens\n     Keep 600k tokens\n\n   ↑/↓ choose · ←/→ change size · enter confirm · esc not now\n";
+
+    #[test]
+    fn the_autocompact_offer_is_a_picker_wrapped_or_not() {
+        // The 61-column hint line, wrapped at each width a pane can give it.
+        let wrapped = [
+            AUTOCOMPACT.to_string(),
+            AUTOCOMPACT.replace("esc not now", "esc\n   not now"),
+            AUTOCOMPACT.replace("esc not now", "esc not\n   now"),
+            AUTOCOMPACT.replace("enter confirm ·", "enter confirm\n   ·"),
+        ];
+        for screen in wrapped.iter().map(String::as_str) {
+            let f = at_bottom(screen).unwrap();
+            assert_eq!(
+                f.picker.options,
+                ["Autocompact at ‹ 400k › tokens", "Keep 600k tokens"]
+            );
+            assert_eq!(f.picker.selected, 0);
+            assert_eq!(f.picker.keys_to("Keep").unwrap(), ["Down", "Enter"]);
+        }
+    }
+
+    /// A bare `Not now` option is an option, not the end of a hint.
+    #[test]
+    fn a_not_now_option_is_not_mended_into_a_hint() {
+        let screen =
+            "Update now?\n\n\u{276f} Yes\n  Not now\n\nEnter to confirm \u{b7} Esc to cancel\n";
+        assert_eq!(mend_hints(screen), screen.trim_end_matches('\n'));
+        assert_eq!(
+            at_bottom(screen).unwrap().picker.options,
+            ["Yes", "Not now"]
+        );
     }
 
     #[test]

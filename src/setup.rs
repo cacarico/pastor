@@ -1,5 +1,6 @@
 //! `pastor setup systemd|launchd [--herdr]`: install the shipped user unit
-//! (or, on macOS, LaunchAgent; see [`launchd`]), apply the
+//! (or, on macOS, LaunchAgent; see [`launchd`]), settle the head's
+//! `head_address` (see [`head_address`]), apply the
 //! requested systemd action, and check what a unit needs to outlive a login (lingering) and
 //! what pastor requires of its own files (config and state dirs 0700,
 //! socket and connector `.env` files 0600).
@@ -14,6 +15,7 @@ use anyhow::Context;
 
 use crate::config::{Paths, create_private_dir};
 
+mod head_address;
 mod launchd;
 
 const PASTOR_UNIT: &str = include_str!("../contrib/systemd/pastor.service");
@@ -107,6 +109,7 @@ pub fn cli(paths: &Paths, cmd: SetupCmd) -> anyhow::Result<()> {
                 action: Action::from_flags(enable, start, now, stop),
             };
             ask(&install.plan(), yes)?;
+            settle_head_address(unit, paths, yes)?;
             let report = install.run(&SystemRunner, paths)?;
             print!("{report}");
         }
@@ -133,9 +136,30 @@ pub fn cli(paths: &Paths, cmd: SetupCmd) -> anyhow::Result<()> {
                 action: Action::from_flags(enable, start, now, stop),
             };
             ask(&install.plan(), yes)?;
+            settle_head_address(unit, paths, yes)?;
             let report = install.run(&SystemRunner, paths)?;
             print!("{report}");
         }
+    }
+    Ok(())
+}
+
+/// For the head's unit, before it starts: `head_address::settle`, asking at
+/// a terminal unless `--yes`, and print what it settled. herdr's unit goes
+/// on flock machines, which have no head_address of their own.
+fn settle_head_address(unit: Unit, paths: &Paths, yes: bool) -> anyhow::Result<()> {
+    if unit != Unit::Pastor {
+        return Ok(());
+    }
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let mut out = std::io::stdout();
+    let ask = (!yes && stdin.is_terminal()).then_some((
+        &mut input as &mut dyn std::io::BufRead,
+        &mut out as &mut dyn std::io::Write,
+    ));
+    if let Some(line) = head_address::settle(paths, ask, head_address::from_this_host())? {
+        println!("{line}");
     }
     Ok(())
 }
@@ -912,13 +936,20 @@ mod tests {
             "UMask=0077",
             "LockPersonality=yes",
             "RestrictRealtime=yes",
-            "OOMPolicy=continue",
         ] {
             assert!(
                 PASTOR_UNIT.lines().any(|l| l == line),
                 "pastor lacks {line}"
             );
             assert!(!HERDR_UNIT.contains(line), "herdr has {line}");
+        }
+        // Both units survive a child killed for memory: an agent's build
+        // must not take the whole unit (and every other agent) down with it.
+        for (name, unit) in [("pastor", PASTOR_UNIT), ("herdr", HERDR_UNIT)] {
+            assert!(
+                unit.lines().any(|l| l == "OOMPolicy=continue"),
+                "{name} lacks OOMPolicy=continue"
+            );
         }
         assert!(HERDR_UNIT.contains("ExecStart=%h/.local/bin/herdr server"));
     }

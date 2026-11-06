@@ -281,7 +281,7 @@ fn another_kind_reads_no_limit() {
             ["claude", "agy", "opencode"].contains(&f.kind.as_str()),
             "{name}"
         );
-        for kind in ["claude", "agy", "opencode", "codex", "claude-personal"] {
+        for kind in ["claude", "agy", "opencode", "codex", "claude-alt"] {
             if kind == f.kind {
                 continue;
             }

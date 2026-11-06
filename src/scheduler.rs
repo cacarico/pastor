@@ -839,6 +839,12 @@ impl Scheduler {
         events: broadcast::Sender<PastorEvent>,
     ) -> Scheduler {
         fleet.set_config(config);
+        match crate::harness_manifest::Harnesses::load(&paths) {
+            Ok(h) => fleet.set_harnesses(Arc::new(h)),
+            Err(err) => {
+                tracing::error!(%err, "the harness manifests do not load; the built-in ones are used")
+            }
+        }
         Scheduler {
             paths,
             defaults: config.defaults.clone(),
@@ -927,7 +933,14 @@ impl Scheduler {
         store: Arc<Store>,
     ) -> anyhow::Result<Scheduler> {
         let flock = Flock::load(&paths.flock_file())?;
-        flock.check_config(&config.models, &config.agents, &config.profiles)?;
+        flock.check_config(
+            &config.models,
+            &config.agents,
+            &config.profiles,
+            &crate::provision::Catalog::load(&paths)?,
+        )?;
+        flock.check_bundles(&crate::bundle::Catalog::load(&paths)?)?;
+        crate::harness_manifest::Harnesses::load(&paths)?;
         let fleet = Arc::new(Fleet::new(Vec::new(), store.clone()).with_flock(flock));
         let (events, _) = broadcast::channel(1);
         Ok(Scheduler {
@@ -1135,7 +1148,7 @@ impl Scheduler {
     /// fleet did (often nothing).
     pub async fn reload_config(&mut self, force: bool) -> Option<FlockDiff> {
         let files = [self.paths.config_file(), self.paths.flock_file()];
-        let fp = ConfigFingerprint(file_fingerprint(&files));
+        let fp = ConfigFingerprint::sample(&self.paths);
         if !force && self.config_fingerprint.as_ref() == Some(&fp) {
             if !self.fleet.any_shutting_down() {
                 return None;
@@ -1181,12 +1194,15 @@ impl Scheduler {
             self.fleet.flock()
         } else {
             match Flock::load_existing(&files[1]).and_then(|f| {
+                let provisioners = crate::provision::Catalog::load(&self.paths)?;
                 f.check_config(
                     &self.config.models,
                     &self.config.agents,
                     &self.config.profiles,
-                )
-                .map(|()| f)
+                    &provisioners,
+                )?;
+                f.check_bundles(&crate::bundle::Catalog::load(&self.paths)?)
+                    .map(|()| f)
             }) {
                 Ok(f) => f,
                 Err(err) if is_not_found(&err) => {
@@ -1202,6 +1218,12 @@ impl Scheduler {
                 }
             }
         };
+        match crate::harness_manifest::Harnesses::load(&self.paths) {
+            Ok(h) => self.fleet.set_harnesses(Arc::new(h)),
+            Err(err) => {
+                tracing::error!(%err, "the harness manifests do not load; the previous ones stay in use")
+            }
+        }
         let diff = self.fleet.apply_config(&self.config, &flock).await;
         self.report(&diff, &flock);
         Some(diff)
@@ -1218,6 +1240,10 @@ impl Scheduler {
             shutting_down = ?diff.shutting_down,
             "flock reloaded"
         );
+        // A headless serve's flock is the head's business.
+        if !self.headless {
+            crate::daemon::warn_cut_off_from_head(&self.config, &flock.machines);
+        }
         // A `shutting_down` name is also absent from `flock` (its actor just
         // has not stopped yet), so its tasks match `tasks_on_removed_machines`
         // too: without this arm a machine whose actor is wedged never gets
@@ -1351,6 +1377,12 @@ impl Scheduler {
             .check_pull_lost(self.config.pull_lost_after_duration())
             .await;
         self.warn_long_queued(now);
+        crate::join::sweep(
+            &self.store,
+            &crate::authkeys::default_file(),
+            &self.events,
+            now,
+        );
     }
 
     /// `pastor job run`: now, regardless of schedule and `enabled`.
@@ -1663,11 +1695,16 @@ impl Scheduler {
     }
 }
 
-/// (path, mtime, size) of `pastor.toml` and `flock.toml`: what
-/// `Scheduler::reload_config` compares to decide whether either changed.
-/// The jobs directory has its own check (`fingerprint`). Like that one, it
-/// follows symlinks, so a config file linked from a dotfiles repo is seen
-/// when its target changes. A missing file is `(path, None, 0)`.
+/// (path, mtime, size) of `pastor.toml`, `flock.toml` and every copied
+/// provisioner's manifest: what `Scheduler::reload_config` compares to
+/// decide whether any of them changed. A copied manifest feeds
+/// `Flock::check_config`, so adding, removing or editing one must also
+/// invalidate this, not just the two config files, or fixing a manifest a
+/// rejected flock edit named stays invisible until something else changes
+/// on disk (Copilot 4281285763). The jobs directory has its own check
+/// (`fingerprint`). Like that one, it follows symlinks, so a config file
+/// linked from a dotfiles repo is seen when its target changes. A missing
+/// file is `(path, None, 0)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigFingerprint(Vec<(PathBuf, Option<SystemTime>, u64)>);
 
@@ -1675,8 +1712,53 @@ impl ConfigFingerprint {
     /// Take it before reading the files, so an edit that lands after the
     /// read still differs from it.
     pub fn sample(paths: &Paths) -> ConfigFingerprint {
-        ConfigFingerprint(file_fingerprint(&[paths.config_file(), paths.flock_file()]))
+        let mut fp = file_fingerprint(&[paths.config_file(), paths.flock_file()]);
+        fp.extend(provisioner_fingerprint(&paths.provisioners_dir()));
+        fp.extend(harness_fingerprint(&paths.harnesses_dir()));
+        ConfigFingerprint(fp)
     }
+}
+
+/// (path, mtime, size) of every copied provisioner's manifest, one level
+/// under `dir`: a directory added, removed or whose manifest was edited
+/// changes this. Entries starting with `.` and plain files are skipped, the
+/// same rule `provision::Catalog::load` uses, and a missing directory is no
+/// entries.
+fn provisioner_fingerprint(dir: &std::path::Path) -> Vec<(PathBuf, Option<SystemTime>, u64)> {
+    let mut manifests = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_dotted = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with('.'));
+            if is_dotted || !std::fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(true) {
+                continue;
+            }
+            manifests.push(path.join(crate::provision::manifest::MANIFEST_FILE));
+        }
+    }
+    manifests.sort();
+    file_fingerprint(&manifests)
+}
+
+/// (path, mtime, size) of every manifest file in the harnesses dir: a file
+/// added, removed or edited changes this. The same files
+/// `harness_manifest::Harnesses::load` reads.
+fn harness_fingerprint(dir: &std::path::Path) -> Vec<(PathBuf, Option<SystemTime>, u64)> {
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if path.extension().is_some_and(|x| x == "toml") && !name.starts_with('.') {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    file_fingerprint(&files)
 }
 
 /// Whether `err` (from `PastorConfig::load_existing` or `Flock::load_existing`)
@@ -1709,28 +1791,54 @@ fn retime(tick: &mut tokio::time::Interval, period: Duration) {
     }
 }
 
+/// (path, mtime, size) of every file under the jobs directory: the job
+/// files, and the workdir sets they name, which are read with them and may
+/// sit in a subdirectory. Names starting with a dot (a `.git`, an editor's
+/// swap file) are left out, and so is anything past `FINGERPRINT_FILES`
+/// files or `FINGERPRINT_DEPTH` directories down.
 fn fingerprint(dir: &std::path::Path) -> Vec<(PathBuf, Option<SystemTime>, u64)> {
     let mut out = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-                continue;
-            }
-            // `std::fs::metadata` follows symlinks (unlike `DirEntry::metadata`,
-            // which reads the link itself on Unix); a job file managed as a
-            // symlink into a dotfiles repo must fingerprint the target, or an
-            // edit to the target is never noticed.
-            let md = std::fs::metadata(&path).ok();
-            out.push((
-                path,
-                md.as_ref().and_then(|m| m.modified().ok()),
-                md.map(|m| m.len()).unwrap_or(0),
-            ));
-        }
-    }
+    fingerprint_into(dir, 0, &mut out);
     out.sort();
     out
+}
+
+const FINGERPRINT_FILES: usize = 10_000;
+const FINGERPRINT_DEPTH: usize = 8;
+
+fn fingerprint_into(
+    dir: &std::path::Path,
+    depth: usize,
+    out: &mut Vec<(PathBuf, Option<SystemTime>, u64)>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if out.len() >= FINGERPRINT_FILES {
+            return;
+        }
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        // `std::fs::metadata` follows symlinks (unlike `DirEntry::metadata`,
+        // which reads the link itself on Unix); a job file managed as a
+        // symlink into a dotfiles repo must fingerprint the target, or an
+        // edit to the target is never noticed.
+        let md = std::fs::metadata(&path).ok();
+        if md.as_ref().is_some_and(|m| m.is_dir()) {
+            if depth < FINGERPRINT_DEPTH {
+                fingerprint_into(&path, depth + 1, out);
+            }
+            continue;
+        }
+        out.push((
+            path,
+            md.as_ref().and_then(|m| m.modified().ok()),
+            md.map(|m| m.len()).unwrap_or(0),
+        ));
+    }
 }
 
 #[cfg(all(test, feature = "fake-herdr"))]
@@ -1872,6 +1980,7 @@ mod tests {
             max_tasks_per_run: 5,
             backfill: Duration::from_secs(600),
             summary: None,
+            workdir_set: None,
             spec: DispatchSpec {
                 now: false,
                 agent: "claude".into(),
@@ -1894,6 +2003,14 @@ mod tests {
                 cwd: None,
                 keep_pane: None,
                 keep_pane_from: None,
+                remove_worktree: None,
+                remove_worktree_from: None,
+                load: None,
+                load_from: None,
+                fetch: Default::default(),
+                start_prompt: None,
+                workdir: None,
+                workdir_bundles: Vec::new(),
                 rounds: Default::default(),
             },
             agent: Default::default(),
@@ -2554,10 +2671,10 @@ mod tests {
 
         // Literal text keeps its freedom, `..` included.
         let mut j = job("j");
-        j.spec.repo = Some("~/ghq/{{ item.owner }}/{{ item.repo }}".into());
+        j.spec.repo = Some("~/src/{{ item.owner }}/{{ item.repo }}".into());
         j.spec.branch = Some("pastor/{{ task.id }}".into());
         let (_, spec) = render_task(&j, &item, 7).unwrap();
-        assert_eq!(spec.repo.as_deref(), Some("~/ghq/cacarico/pastor"));
+        assert_eq!(spec.repo.as_deref(), Some("~/src/cacarico/pastor"));
         assert_eq!(spec.branch.as_deref(), Some("pastor/t-7"));
         j.spec.repo = Some("/srv/../work/{{ item.repo }}".into());
         let (_, spec) = render_task(&j, &item, 7).unwrap();
@@ -2978,6 +3095,32 @@ mod tests {
         assert!(
             s.fleet.get("a").is_some(),
             "the startup flock must survive the first pass"
+        );
+    }
+
+    /// A harness manifest added to the config dir reaches the fleet at the
+    /// next pass without a restart; one that stops loading keeps the
+    /// previous manifests.
+    #[tokio::test]
+    async fn a_harness_manifest_is_picked_up_by_a_reload() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (mut s, _tmp) = managed_scheduler(&store);
+        s.reload_config(false).await;
+        assert!(s.fleet.harnesses().get("tool").is_none());
+        let dir = s.paths.harnesses_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("tool.toml"),
+            "id = \"tool\"\n[paths]\nhome = \"~/.tool\"\n",
+        )
+        .unwrap();
+        assert!(s.reload_config(false).await.is_some(), "the edit is seen");
+        assert!(s.fleet.harnesses().get("tool").is_some());
+        std::fs::write(dir.join("tool.toml"), "id = \"tool\"\n").unwrap();
+        s.reload_config(false).await;
+        assert!(
+            s.fleet.harnesses().get("tool").is_some(),
+            "the previous manifests stay"
         );
     }
 
@@ -3775,6 +3918,50 @@ mod tests {
             s.statuses(Utc::now())[0].schedule.as_deref(),
             Some("every 10m")
         );
+    }
+
+    /// A job's workdir set is read with the job, so an edit to the set file
+    /// is picked up as an edit to the job file is, and so is a set written
+    /// after the job that names it.
+    #[tokio::test]
+    async fn reload_sees_an_edit_to_a_job_s_workdir_set() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (mut s, tmp) = scheduler_with(&store);
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        let set = |content: &str| {
+            serde_json::json!({"id": "reviewer", "kind": "claude", "files": [
+                {"path": ".claude/agents/checker.md", "content": content}]})
+            .to_string()
+        };
+        let sets = paths.jobs_dir().join("sets");
+        // `[dispatch]` is CLOCK_JOB's last table.
+        let job = format!("{CLOCK_JOB}workdir_set = \"sets/reviewer.json\"\n");
+        write_job(&paths, "a", &job);
+        assert!(s.reload());
+        assert!(s.entries["a"].job.is_none(), "no set yet: invalid");
+
+        std::fs::create_dir_all(&sets).unwrap();
+        std::fs::write(sets.join("reviewer.json"), set("one\n")).unwrap();
+        assert!(s.reload(), "the set appeared");
+        let content = |s: &Scheduler| {
+            s.entries["a"]
+                .job
+                .as_ref()
+                .unwrap()
+                .spec
+                .workdir
+                .as_ref()
+                .unwrap()
+                .set["files"][0]["content"]
+                .clone()
+        };
+        assert_eq!(content(&s), "one\n");
+
+        std::thread::sleep(Duration::from_millis(20)); // mtime granularity
+        std::fs::write(sets.join("reviewer.json"), set("two, longer\n")).unwrap();
+        assert!(s.reload(), "the set changed");
+        assert_eq!(content(&s), "two, longer\n");
+        assert!(!s.reload(), "nothing changed since");
     }
 
     #[tokio::test]

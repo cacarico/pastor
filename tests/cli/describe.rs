@@ -176,6 +176,27 @@ fn descriptions_show_in_lists_describe_and_json_without_a_head() {
 
     let wide = ok(o.cmd(&["machine", "list", "--wide"]));
     assert!(wide.contains("The desk one"), "{wide}");
+    // The room columns come before DESCRIPTION; a probe reads no room, so
+    // they are dashes.
+    let header: Vec<&str> = wide
+        .lines()
+        .find(|l| l.starts_with("NAME"))
+        .expect("a header")
+        .split_whitespace()
+        .collect();
+    assert_eq!(
+        header[header.len() - 4..],
+        ["RESERVED", "DISK", "MEM", "DESCRIPTION"],
+        "{wide}"
+    );
+    let row: Vec<&str> = wide
+        .lines()
+        .find(|l| l.starts_with("pi-1"))
+        .expect("a row")
+        .split_whitespace()
+        .collect();
+    assert_eq!(row[row.len() - 6..row.len() - 3], ["-", "-", "-"], "{wide}");
+    assert!(!ok(o.cmd(&["machine", "list"])).contains("DISK"));
     let ms: serde_json::Value =
         serde_json::from_str(&ok(o.cmd(&["machine", "list", "--json"]))).unwrap();
     assert_eq!(ms["machines"][0]["description"], "The desk one");

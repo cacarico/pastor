@@ -90,6 +90,66 @@ pub fn instructions_content(files: &[String]) -> String {
 /// `MachineDenyKeys::Conflict` names.
 pub const OPENCODE_PERMISSIONS_CONFLICT: &str = "opencode_permissions_conflict";
 
+/// One line of `CONFIG_CHECK_COMMAND`'s output: a managed file with a
+/// permission-shaped key at the top level, or one pastor could not read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigCheckHit {
+    /// `file` has `key` (`"permission"` or `"tools"`): a grep, not a parse,
+    /// so a key inside a comment or a string counts too, the safe side.
+    Key { file: String, key: String },
+    /// `file` is there but pastor could not read it, or for the macOS
+    /// preferences `plutil` could not convert it: a false yes refuses the
+    /// task with the reason; a false no would run it under rules nobody
+    /// checked.
+    Unreadable { file: String },
+}
+
+impl std::fmt::Display for ConfigCheckHit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigCheckHit::Key { file, key } => write!(f, "{file} ({key})"),
+            ConfigCheckHit::Unreadable { file } => write!(f, "{file} (unreadable)"),
+        }
+    }
+}
+
+/// `CONFIG_CHECK_COMMAND`'s output into the hits it found, in the order it
+/// printed them: a non-blank line is `<file>\t<key>` with `key` being
+/// `"permission"` or `"tools"`, or `unreadable\t<file>` for a file that
+/// exists and pastor could not read. A line with no tab, or a tab but
+/// neither shape, such as a shell startup message like `session\tready`
+/// mixed into the probe's stdout, is ignored rather than mistaken for a
+/// hit.
+pub fn parse_config_check(output: &str) -> Vec<ConfigCheckHit> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (a, b) = line.split_once('\t')?;
+            if a == "unreadable" {
+                Some(ConfigCheckHit::Unreadable {
+                    file: b.to_string(),
+                })
+            } else if b == "permission" || b == "tools" {
+                Some(ConfigCheckHit::Key {
+                    file: a.to_string(),
+                    key: b.to_string(),
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// `hits` as one clause for the `opencode_permissions_conflict` message,
+/// naming every file and key found.
+pub fn describe_config_check_hits(hits: &[ConfigCheckHit]) -> String {
+    hits.iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// opencode permissions a profile always allows: the agent's own to-do list,
 /// which touches nothing outside it.
 const ALWAYS_ALLOWED: [&str; 2] = ["todoread", "todowrite"];
@@ -242,23 +302,33 @@ pub fn permission_json(
     format!("{{{}}}", entries.join(","))
 }
 
-/// The shell command that answers `yes` when the managed opencode config
-/// sets permission rules, `no` otherwise: the managed dir (`/etc/opencode`,
-/// on macOS `/Library/Application Support/opencode`, or opencode's own
+/// The shell command that names every hit in the managed opencode config,
+/// one `<file>\t<key>` line per hit (`key` is `"permission"` or `"tools"`),
+/// `unreadable\t<file>` for a file that is there but pastor could not read,
+/// and nothing when it is clean: the managed dir (`/etc/opencode`, on macOS
+/// `/Library/Application Support/opencode`, or opencode's own
 /// `OPENCODE_TEST_MANAGED_CONFIG_DIR`)'s `opencode.json` and
 /// `opencode.jsonc`, and on macOS the MDM preferences opencode merges last,
 /// `ai.opencode.managed.plist` under `/Library/Managed Preferences/<user>`
 /// and `/Library/Managed Preferences` (`PASTOR_TEST_MANAGED_PREFERENCES_DIR`
 /// points the tests elsewhere), read as JSON through `plutil`; one `plutil`
-/// cannot read counts as a yes. Any `"permission"` key counts, top level or
-/// under an agent, and a `"tools"` one, which opencode turns into rules;
-/// one in a comment too: a false yes refuses a task with the reason, a
-/// false no would run it under rules nobody chose. These two sources are
+/// cannot convert is named as unreadable, the same as a file pastor cannot
+/// read. Any `"permission"` key counts, top level or under an agent, and a
+/// `"tools"` one, which opencode turns into rules; one in a comment too: a
+/// grep, not a JSONC parser, so a stray key is still named, the safe side.
+/// `[ -r "$f" ]` passes for a readable directory too, so each grep's own
+/// exit status is checked rather than trusted: no match (1) is clean, but
+/// anything else (2, such as `grep: Is a directory`) marks the file
+/// unreadable instead of being read the same as no match. A hit refuses the
+/// task with the reason, naming the file and key (`parse_config_check`);
+/// nothing found runs it. These two sources are
 /// merged after `OPENCODE_CONFIG_CONTENT`, so pastor cannot neutralise them
 /// the way it does the global config and `~/.opencode`
 /// (`CONFIG_READ_COMMAND`); the project's config is off for a profiled task
-/// (`DISABLE_PROJECT_CONFIG_ENV`) and is not read by either command.
-pub const CONFIG_CHECK_COMMAND: &str = r#"o="$(uname -s)"; m="$OPENCODE_TEST_MANAGED_CONFIG_DIR"; if [ -z "$m" ]; then if [ "$o" = Darwin ]; then m="/Library/Application Support/opencode"; else m=/etc/opencode; fi; fi; k='"(permission|tools)"[[:space:]]*:'; r=no; if cat "$m/opencode.json" "$m/opencode.jsonc" 2>/dev/null | grep -Eq "$k"; then r=yes; fi; if [ "$o" = Darwin ]; then p="${PASTOR_TEST_MANAGED_PREFERENCES_DIR:-/Library/Managed Preferences}"; for f in "$p/$(id -un)/ai.opencode.managed.plist" "$p/ai.opencode.managed.plist"; do if [ -e "$f" ]; then if j="$(plutil -convert json -o - "$f" 2>/dev/null)"; then if printf '%s' "$j" | grep -Eq "$k"; then r=yes; fi; else r=yes; fi; fi; done; fi; printf '%s' "$r""#;
+/// (`DISABLE_PROJECT_CONFIG_ENV`) and is not read by either command. Always
+/// exits 0, hits or none, so a shell that ran at all is never mistaken for
+/// one that could not be reached.
+pub const CONFIG_CHECK_COMMAND: &str = r#"o="$(uname -s)"; m="$OPENCODE_TEST_MANAGED_CONFIG_DIR"; if [ -z "$m" ]; then if [ "$o" = Darwin ]; then m="/Library/Application Support/opencode"; else m=/etc/opencode; fi; fi; for f in "$m/opencode.json" "$m/opencode.jsonc"; do if [ -e "$f" ]; then if [ -r "$f" ]; then u=0; if grep -Eq '"permission"[[:space:]]*:' "$f" 2>/dev/null; then printf '%s\tpermission\n' "$f"; elif [ $? -gt 1 ]; then u=1; fi; if grep -Eq '"tools"[[:space:]]*:' "$f" 2>/dev/null; then printf '%s\ttools\n' "$f"; elif [ $? -gt 1 ]; then u=1; fi; if [ "$u" = 1 ]; then printf 'unreadable\t%s\n' "$f"; fi; else printf 'unreadable\t%s\n' "$f"; fi; fi; done; if [ "$o" = Darwin ]; then p="${PASTOR_TEST_MANAGED_PREFERENCES_DIR:-/Library/Managed Preferences}"; for f in "$p/$(id -un)/ai.opencode.managed.plist" "$p/ai.opencode.managed.plist"; do if [ -e "$f" ]; then if j="$(plutil -convert json -o - "$f" 2>/dev/null)"; then if printf '%s' "$j" | grep -Eq '"permission"[[:space:]]*:'; then printf '%s\tpermission\n' "$f"; fi; if printf '%s' "$j" | grep -Eq '"tools"[[:space:]]*:'; then printf '%s\ttools\n' "$f"; fi; else printf 'unreadable\t%s\n' "$f"; fi; fi; done; fi; exit 0"#;
 
 /// The most of the machine's own opencode config `CONFIG_READ_COMMAND`
 /// prints, in bytes, all files together. A probe's output is capped on the
@@ -806,7 +876,7 @@ mod tests {
             r#"{"webfetch": "allow", "read": {"*.env": "allow"}}"#,
             r#"{"*": "allow"}"#,
             r#"{"*": "ask", "read": "allow"}"#,
-            r#"{"external_directory": {"~/ghq/**": "allow"}, "doom_loop": "allow"}"#,
+            r#"{"external_directory": {"~/src/**": "allow"}, "doom_loop": "allow"}"#,
         ];
         for name in ["review", "develop", crate::config::profile::UNRESTRICTED] {
             let profile = profiles.resolve(name).unwrap();
@@ -817,7 +887,7 @@ mod tests {
                 let rules = opencode_rules(machine, &pastor);
                 let why = format!("{name} on {machine}: {pastor}");
                 for key in &keys {
-                    for call in ["x", "git push origin", "~/ghq/pastor/README.md", "a.env"] {
+                    for call in ["x", "git push origin", "~/src/pastor/README.md", "a.env"] {
                         assert_eq!(evaluate(&rules, key, call), "deny", "{key} {call} {why}");
                     }
                 }
@@ -1048,7 +1118,7 @@ mod tests {
     /// Runs the check command with `home` as `HOME` and `managed` as
     /// opencode's managed config directory, and its managed preferences
     /// under `managed/prefs`.
-    fn check(home: &std::path::Path, managed: &std::path::Path) -> String {
+    fn check(home: &std::path::Path, managed: &std::path::Path) -> Vec<ConfigCheckHit> {
         check_with_path(home, managed, &std::env::var("PATH").unwrap())
     }
 
@@ -1069,7 +1139,11 @@ mod tests {
         String::from_utf8(out.stdout).unwrap()
     }
 
-    fn check_with_path(home: &std::path::Path, managed: &std::path::Path, path: &str) -> String {
+    fn check_with_path(
+        home: &std::path::Path,
+        managed: &std::path::Path,
+        path: &str,
+    ) -> Vec<ConfigCheckHit> {
         let out = std::process::Command::new("sh")
             .args(["-c", CONFIG_CHECK_COMMAND])
             .env("HOME", home)
@@ -1079,12 +1153,14 @@ mod tests {
             .env("PASTOR_TEST_MANAGED_PREFERENCES_DIR", managed.join("prefs"))
             .output()
             .unwrap();
-        String::from_utf8(out.stdout).unwrap()
+        assert!(out.status.success(), "{out:?}");
+        parse_config_check(&String::from_utf8(out.stdout).unwrap())
     }
 
     /// On macOS the MDM preferences count, the user's and the machine's,
-    /// read through `plutil`; one it cannot read is a yes. A stub `uname`
-    /// says Darwin, and a stub `plutil` prints the file as its JSON.
+    /// read through `plutil`; one it cannot convert is named unreadable. A
+    /// stub `uname` says Darwin, and a stub `plutil` prints the file as its
+    /// JSON.
     #[test]
     fn the_config_check_command_reads_managed_preferences_on_macos() {
         use std::os::unix::fs::PermissionsExt;
@@ -1118,22 +1194,36 @@ mod tests {
         .unwrap();
         let mine = prefs.join(user.trim());
         std::fs::create_dir_all(&mine).unwrap();
-        assert_eq!(run(), "no");
+        assert_eq!(run(), vec![]);
         let plist = prefs.join("ai.opencode.managed.plist");
         std::fs::write(&plist, r#"{"model":"x"}"#).unwrap();
-        assert_eq!(run(), "no");
+        assert_eq!(run(), vec![]);
         std::fs::write(&plist, r#"{"permission":{"edit":"deny"}}"#).unwrap();
-        assert_eq!(run(), "yes");
+        assert_eq!(
+            run(),
+            vec![ConfigCheckHit::Key {
+                file: plist.display().to_string(),
+                key: "permission".into(),
+            }]
+        );
         std::fs::remove_file(&plist).unwrap();
-        std::fs::write(
-            mine.join("ai.opencode.managed.plist"),
-            r#"{"tools":{"bash":false}}"#,
-        )
-        .unwrap();
-        assert_eq!(run(), "yes");
-        std::fs::write(mine.join("ai.opencode.managed.plist"), "broken").unwrap();
+        let mine_plist = mine.join("ai.opencode.managed.plist");
+        std::fs::write(&mine_plist, r#"{"tools":{"bash":false}}"#).unwrap();
+        assert_eq!(
+            run(),
+            vec![ConfigCheckHit::Key {
+                file: mine_plist.display().to_string(),
+                key: "tools".into(),
+            }]
+        );
+        std::fs::write(&mine_plist, "broken").unwrap();
         stub("plutil", r#"exit 1"#);
-        assert_eq!(run(), "yes");
+        assert_eq!(
+            run(),
+            vec![ConfigCheckHit::Unreadable {
+                file: mine_plist.display().to_string(),
+            }]
+        );
     }
 
     /// opencode also reads `~/.opencode`, whatever `XDG_CONFIG_HOME` says.
@@ -1161,12 +1251,145 @@ mod tests {
     fn the_config_check_command_reads_the_managed_dir() {
         let home = tempfile::tempdir().unwrap();
         let managed = tempfile::tempdir().unwrap();
+        let file = managed.path().join("opencode.jsonc");
         std::fs::write(
-            managed.path().join("opencode.jsonc"),
+            &file,
             "// managed\n{ \"permission\": { \"edit\": \"deny\" } }",
         )
         .unwrap();
-        assert_eq!(check(home.path(), managed.path()), "yes");
+        assert_eq!(
+            check(home.path(), managed.path()),
+            vec![ConfigCheckHit::Key {
+                file: file.display().to_string(),
+                key: "permission".into(),
+            }]
+        );
+    }
+
+    /// A managed config file pastor cannot read is named unreadable, never
+    /// silently skipped as a clean config (`2>/dev/null` used to swallow
+    /// the failure). Skipped as root, which ignores file permissions.
+    #[test]
+    fn the_config_check_command_names_an_unreadable_managed_file() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let managed = tempfile::tempdir().unwrap();
+        let file = managed.path().join("opencode.json");
+        std::fs::write(&file, r#"{"permission": {"bash": "allow"}}"#).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let hits = check(home.path(), managed.path());
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            hits,
+            vec![ConfigCheckHit::Unreadable {
+                file: file.display().to_string(),
+            }]
+        );
+    }
+
+    /// A readable directory at the config path passes `[ -r "$f" ]`, so
+    /// grep's own exit status is what must catch it: it errors (`Is a
+    /// directory`, exit 2) rather than finding no match (exit 1), and that
+    /// is named unreadable, never read as a clean config.
+    #[test]
+    fn the_config_check_command_names_a_directory_as_unreadable() {
+        let home = tempfile::tempdir().unwrap();
+        let managed = tempfile::tempdir().unwrap();
+        let dir = managed.path().join("opencode.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(
+            check(home.path(), managed.path()),
+            vec![ConfigCheckHit::Unreadable {
+                file: dir.display().to_string(),
+            }]
+        );
+    }
+
+    /// `parse_config_check` on a clean answer (no output at all) finds
+    /// nothing.
+    #[test]
+    fn parse_config_check_reads_a_clean_answer_as_no_hits() {
+        assert_eq!(parse_config_check(""), vec![]);
+    }
+
+    /// One `<file>\t<key>` line is one hit.
+    #[test]
+    fn parse_config_check_reads_one_hit() {
+        assert_eq!(
+            parse_config_check("/etc/opencode/opencode.json\tpermission\n"),
+            vec![ConfigCheckHit::Key {
+                file: "/etc/opencode/opencode.json".into(),
+                key: "permission".into(),
+            }]
+        );
+    }
+
+    /// Two lines are two hits, in the order printed, from the same file or
+    /// different ones.
+    #[test]
+    fn parse_config_check_reads_two_hits() {
+        assert_eq!(
+            parse_config_check(
+                "/etc/opencode/opencode.json\tpermission\n/etc/opencode/opencode.json\ttools\n"
+            ),
+            vec![
+                ConfigCheckHit::Key {
+                    file: "/etc/opencode/opencode.json".into(),
+                    key: "permission".into(),
+                },
+                ConfigCheckHit::Key {
+                    file: "/etc/opencode/opencode.json".into(),
+                    key: "tools".into(),
+                },
+            ]
+        );
+    }
+
+    /// `unreadable\t<file>` is an unreadable hit, not a key named
+    /// "unreadable".
+    #[test]
+    fn parse_config_check_reads_an_unreadable_hit() {
+        assert_eq!(
+            parse_config_check("unreadable\t/etc/opencode/opencode.json\n"),
+            vec![ConfigCheckHit::Unreadable {
+                file: "/etc/opencode/opencode.json".into(),
+            }]
+        );
+    }
+
+    /// A line with no tab is junk, not a hit: ignored rather than mistaken
+    /// for one, while the real hits around it still come through.
+    #[test]
+    fn parse_config_check_ignores_junk_lines() {
+        assert_eq!(
+            parse_config_check(
+                "welcome to the machine\n/etc/opencode/opencode.json\tpermission\nnoise\n"
+            ),
+            vec![ConfigCheckHit::Key {
+                file: "/etc/opencode/opencode.json".into(),
+                key: "permission".into(),
+            }]
+        );
+    }
+
+    /// A tab-separated line whose second field is not `"permission"` or
+    /// `"tools"`, such as a shell startup message like `session\tready`
+    /// landing in the probe's stdout alongside the command's own output, is
+    /// not mistaken for a hit; the real hits around it still come through.
+    #[test]
+    fn parse_config_check_ignores_non_key_tab_lines() {
+        assert_eq!(
+            parse_config_check(
+                "session\tready\n/etc/opencode/opencode.json\tpermission\nmode\tinteractive\n"
+            ),
+            vec![ConfigCheckHit::Key {
+                file: "/etc/opencode/opencode.json".into(),
+                key: "permission".into(),
+            }]
+        );
     }
 
     /// opencode turns a legacy `tools` block into permission rules, so one

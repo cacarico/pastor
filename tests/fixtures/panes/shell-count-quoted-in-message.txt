@@ -1,0 +1,12 @@
+#! question: no
+#! shell: no
+#! trust: no
+● The hook ran 1 shell · and 2 shells · in the last run; both ended.
+  Pushed the branch.
+
+✻ Worked for 2m 03s
+
+──────────────────────────────────────────────────────────────────────────────
+❯ 
+──────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on · ↓ to manage

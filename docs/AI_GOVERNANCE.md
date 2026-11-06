@@ -22,8 +22,7 @@ fix it before you open the pull request.
 
 pastor starts an agent as the user in that machine's `ssh = "user@host"`, or
 the head's own user for a machine it runs locally, and it does decide part of
-what they may do: an agent it started cannot change the fleet unless you set
-`agents_change_fleet`, a task runs under the permission profile and the
+what they may do: an agent it started cannot change the fleet, a task runs under the permission profile and the
 `allow` and `deny` lists you give it, and no task can start an orchestrator.
 What it cannot decide is what that user can reach: files, keys, tokens and
 the network. [Trust model](manual.md#trust-model) in the manual has the

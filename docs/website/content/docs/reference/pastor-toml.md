@@ -51,13 +51,13 @@ load, and the error names the key.
 | `close_done_after` | `"5s"` | a done task's pane closes after this, so its machine slot frees; `"15m"` leaves time for `pastor task attach` to show its last screen; `"never"` keeps it |
 | `close_failed_after` | `"5s"` | a failed or stale task's pane, or an orphan's, closes after this once its agent has stopped; the task stays failed and retryable, its worktree kept; `"never"` keeps them |
 | `pull_lost_after` | `"10m"` | a pull machine that has not claimed or reported for this long counts as lost, and its starting and running tasks go stale |
-| `agents_change_fleet` | `false` | `true` lets agents pastor started run, retry, send to and close tasks, run jobs, and edit machines, flocks and jobs |
 | `max_orchestrators` | `1` | how many orchestrator agents run at once; each still takes a slot on the head's machine under its `max_agents` |
 | `head_address` | unset | the ssh destination other machines reach the head by; agents on other machines get it as `PASTOR_HEAD` |
 
-No duration here may be zero. `agents_change_fleet` guards against an agent
-acting on its own; it is not a security boundary, since the agent runs as
-your user. See [profiles and trust](../../concepts/profiles-and-trust/).
+No duration here may be zero. The guard that keeps agents pastor started from
+changing the fleet stops an agent acting on its own; it is not a security
+boundary, since the agent runs as your user. See [profiles and
+trust](../../concepts/profiles-and-trust/).
 
 ## defaults
 
@@ -83,6 +83,7 @@ see the [`task run` flags](../cli/#task) and
 | `label` | unset | the task's workspace name template; unset is `"{{ flock }}/{{ task.id }}"` |
 | `summary` | unset | `ask`, `require` or `off`; unset is `ask` |
 | `keep_pane` | unset | `true` keeps a task's pane once it ends, until `pastor task close`; unset is no |
+| `remove_worktree` | unset | `true` removes a task's worktree when it fails or goes stale too, not only when done; its branch stays; unset is no |
 
 `allow` and `deny` add up across layers instead of replacing each other:
 `[defaults]`, then the flock, then the task or job. A pattern denied in any

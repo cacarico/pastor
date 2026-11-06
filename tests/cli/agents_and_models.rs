@@ -23,9 +23,19 @@ fn agent_args_reach_herdr_from_the_flags_or_the_defaults() {
     let start = env.agent_start_params("t-1");
     // A claude agent starts on a session of its own, after its args, and
     // the task records it.
-    let session = start["args"][3].as_str().unwrap().to_string();
-    assert_eq!(start["args"][2], "--session-id", "{start}");
-    assert_eq!(without_session(&start["args"]), want, "{start}");
+    // Between them, the one tool every Claude task is allowed.
+    let session = start["args"][5].as_str().unwrap().to_string();
+    assert_eq!(start["args"][4], "--session-id", "{start}");
+    assert_eq!(
+        without_session(&start["args"]),
+        serde_json::json!([
+            "--model",
+            "claude-opus-5-5",
+            "--allowedTools",
+            "Bash(pastor task done:*)"
+        ]),
+        "{start}"
+    );
     assert_eq!(start["kind"], "claude");
 
     let out = env.cmd(&["task", "describe", "t-1"]);
@@ -58,7 +68,12 @@ fn agent_args_reach_herdr_from_the_flags_or_the_defaults() {
     let start = env.agent_start_params("t-2");
     assert_eq!(
         without_session(&start["args"]),
-        serde_json::json!(["--model", "claude-sonnet-5"]),
+        serde_json::json!([
+            "--model",
+            "claude-sonnet-5",
+            "--allowedTools",
+            "Bash(pastor task done:*)"
+        ]),
         "{start}"
     );
 
@@ -90,6 +105,8 @@ fn agent_args_reach_herdr_from_the_flags_or_the_defaults() {
         serde_json::json!([
             "--model",
             "claude-haiku-4-5",
+            "--allowedTools",
+            "Bash(pastor task done:*)",
             "--disallowedTools",
             "WebFetch"
         ]),
@@ -108,7 +125,7 @@ fn agent_args_reach_herdr_from_the_flags_or_the_defaults() {
     assert!(text.contains("deny:       WebFetch\n"), "{text}");
 }
 
-/// `[agents.claude-personal] kind = "claude"` with an env: herdr starts a
+/// `[agents.claude-alt] kind = "claude"` with an env: herdr starts a
 /// claude in a workspace created with that env, and the task keeps the name.
 #[test]
 fn an_agent_definition_reaches_herdr_as_its_kind_and_env() {
@@ -116,11 +133,11 @@ fn an_agent_definition_reaches_herdr_as_its_kind_and_env() {
     std::fs::write(
         env.config.join("pastor.toml"),
         "tick = \"1s\"\nsettle = \"1s\"\nreconcile_every = \"1s\"\n\
-         [agents.claude-personal]\nkind = \"claude\"\n\
-         env = { CLAUDE_CONFIG_DIR = \"/srv/claude-personal\" }\n",
+         [agents.claude-alt]\nkind = \"claude\"\n\
+         env = { CLAUDE_CONFIG_DIR = \"/srv/claude-alt\" }\n",
     )
     .unwrap();
-    let out = env.cmd(&["task", "run", "hi", "--agent", "claude-personal", "--json"]);
+    let out = env.cmd(&["task", "run", "hi", "--agent", "claude-alt", "--json"]);
     assert!(
         out.status.success(),
         "{}",
@@ -138,7 +155,7 @@ fn an_agent_definition_reaches_herdr_as_its_kind_and_env() {
         ws["params"]["env"],
         serde_json::json!({
             "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN": "1",
-            "CLAUDE_CONFIG_DIR": "/srv/claude-personal",
+            "CLAUDE_CONFIG_DIR": "/srv/claude-alt",
             "PASTOR_TASK": "t-1",
         }),
         "its env, and the claude kind's classic renderer: {ws}"
@@ -146,7 +163,7 @@ fn an_agent_definition_reaches_herdr_as_its_kind_and_env() {
     let out = env.cmd(&["task", "describe", "t-1"]);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(
-        text.contains("agent:      claude-personal (from task run)\n"),
+        text.contains("agent:      claude-alt (from task run)\n"),
         "{text}"
     );
 }
@@ -175,7 +192,13 @@ fn a_named_model_reaches_herdr_and_bad_ones_are_refused() {
     let start = env.agent_start_params("t-1");
     assert_eq!(
         without_session(&start["args"]),
-        serde_json::json!(["--model", "claude-sonnet-5", "-v"]),
+        serde_json::json!([
+            "--model",
+            "claude-sonnet-5",
+            "-v",
+            "--allowedTools",
+            "Bash(pastor task done:*)"
+        ]),
         "{start}"
     );
     let out = env.cmd(&["task", "describe", "t-1"]);
@@ -275,6 +298,8 @@ fn a_profile_reaches_herdr_and_bad_ones_are_refused() {
             "dontAsk",
             "--allowedTools",
             "Bash(make:*)",
+            "--allowedTools",
+            "Bash(pastor task done:*)",
             "--disallowedTools",
             "WebFetch"
         ]),
@@ -370,6 +395,202 @@ fn the_profile_smoke_script_passes_tasks_that_end_done() {
         assert_eq!(got["profile"], "review", "{got}");
         assert_eq!(got["spec"]["agent"], agent, "{got}");
     }
+}
+
+/// `profile render` prints what a task under the profile gets: the args
+/// herdr is asked to start the agent with. Claude only: an agy task under a
+/// profile cannot start here, since the fake machine shows no agy rules to
+/// check; agy's flags are compared with a launch and its settings with the
+/// provisioner's in `profile_render`'s tests.
+#[test]
+fn profile_render_equals_what_a_launched_task_gets() {
+    let env = start();
+    std::fs::write(
+        env.config.join("pastor.toml"),
+        "tick = \"1s\"\nsettle = \"1s\"\nreconcile_every = \"1s\"\n\
+         [profiles.ci]\nallow = [\"Bash(make:*)\", \"mcp__board__post\"]\ndeny = [\"WebFetch\"]\n",
+    )
+    .unwrap();
+    for (i, kind) in ["claude"].into_iter().enumerate() {
+        let rendered = env.json(&["profile", "render", "ci", "--kind", kind, "--json"]);
+        assert_eq!(rendered["kind"], kind, "{rendered}");
+        let t = env.json(&[
+            "task",
+            "run",
+            "hi",
+            "--agent",
+            kind,
+            "--profile",
+            "ci",
+            "--json",
+        ]);
+        assert_eq!(t["profile"], "ci", "{t}");
+        let start = env.agent_start_params(&format!("t-{}", i + 1));
+        let mut args = start["args"].as_array().unwrap().clone();
+        if kind == "claude" {
+            args = without_session(&start["args"]).as_array().unwrap().clone();
+        }
+        assert_eq!(
+            serde_json::Value::Array(args),
+            rendered["flags"],
+            "{kind}: {start}"
+        );
+    }
+}
+
+/// `profile render` names the profile it renders, lists the patterns a kind
+/// cannot carry with why, takes the machine's own profile with `--machine`
+/// and applies its `unrestricted` rule, and refuses a kind it does not know
+/// and a missing name.
+#[test]
+fn profile_render_lists_what_a_kind_cannot_carry_and_resolves_the_machine() {
+    let (_tmp, config, state) = completion_config();
+    std::fs::write(
+        config.join("pastor.toml"),
+        "[profiles.ci]\nextends = \"review\"\nallow = [\"mcp__board__post\"]\n\
+         [profiles.globdeny]\nextends = \"review\"\ndeny = [\"Glob\"]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        config.join("flock.toml"),
+        "[[machine]]\nname = \"here\"\nlocal = true\nprofile = \"ci\"\n\
+         [[machine]]\nname = \"dev\"\nssh = \"user@dev\"\nprofile = \"develop\"\n",
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .env("PASTOR_DATA_DIR", state.join("data"))
+            .output()
+            .unwrap()
+    };
+    let out = run(&["profile", "render", "ci", "--kind", "agy", "--json"]);
+    assert!(out.status.success(), "{out:?}");
+    let agy: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        agy["flags"],
+        serde_json::json!(["--dangerously-skip-permissions", "--mode", "accept-edits"])
+    );
+    assert!(
+        agy["settings"]["permissions"]["allow"]
+            .as_array()
+            .unwrap()
+            .contains(&"mcp(board/post)".into()),
+        "{agy}"
+    );
+    assert_eq!(
+        agy["unsupported"],
+        serde_json::json!([
+            {"pattern": "Glob", "why": "agy has no rule for it"},
+            {"pattern": "Grep", "why": "agy has no rule for it"},
+        ]),
+        "{agy}"
+    );
+
+    // The machine's own profile is the default, and the text form says it.
+    let out = run(&["profile", "render", "--kind", "claude", "--machine", "here"]);
+    assert!(out.status.success(), "{out:?}");
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.starts_with("profile: ci\nkind: claude\n"), "{text}");
+    assert!(
+        text.contains("flags: --permission-mode dontAsk --allowedTools Read"),
+        "{text}"
+    );
+    assert!(text.contains("unsupported: -\n"), "{text}");
+
+    // The kinds that come later are refused by name.
+    for kind in ["opencode", "codex"] {
+        let out = run(&["profile", "render", "ci", "--kind", kind]);
+        assert_eq!(out.status.code(), Some(1), "{kind}: {out:?}");
+        let (code, message) = last_error(&out);
+        assert_eq!(code, "render_kind_unsupported", "{kind}");
+        assert!(
+            message.contains(&format!("does not support {kind} yet")),
+            "{message}"
+        );
+    }
+
+    // agy refuses a deny it has no rule for, as a task under it is refused,
+    // and its rules are per machine: a profile the machine's own does not
+    // cover is refused, one it does is not.
+    let out = run(&["profile", "render", "globdeny", "--kind", "agy"]);
+    assert_eq!(last_error(&out).0, "agy_deny_unsupported", "{out:?}");
+    let out = run(&[
+        "profile",
+        "render",
+        "review",
+        "--kind",
+        "agy",
+        "--machine",
+        "dev",
+    ]);
+    assert_eq!(last_error(&out).0, "agy_profile_mismatch", "{out:?}");
+    let out = run(&[
+        "profile",
+        "render",
+        "develop",
+        "--kind",
+        "agy",
+        "--machine",
+        "dev",
+    ]);
+    assert!(out.status.success(), "{out:?}");
+    let out = run(&[
+        "profile",
+        "render",
+        "review",
+        "--kind",
+        "claude",
+        "--machine",
+        "dev",
+    ]);
+    assert!(out.status.success(), "{out:?}");
+
+    for (args, code) in [
+        (
+            &[
+                "profile",
+                "render",
+                "unrestricted",
+                "--kind",
+                "claude",
+                "--machine",
+                "here",
+            ][..],
+            "profile_not_allowed",
+        ),
+        (
+            &[
+                "profile",
+                "render",
+                "ci",
+                "--kind",
+                "claude",
+                "--machine",
+                "nope",
+            ],
+            "unknown_machine",
+        ),
+        (&["profile", "render", "--kind", "claude"], "no_profile"),
+        (
+            &["profile", "render", "nope", "--kind", "claude"],
+            "unknown_profile",
+        ),
+    ] {
+        let out = run(args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {out:?}");
+        assert_eq!(last_error(&out).0, code, "{args:?}");
+    }
+    // An unrestricted render is fine with no machine.
+    assert!(
+        run(&["profile", "render", "unrestricted", "--kind", "claude"])
+            .status
+            .success()
+    );
+    let out = run(&["profile", "render", "ci", "--kind", "gemini"]);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
 }
 
 /// `pastor profile list|describe` read pastor.toml with no head: the

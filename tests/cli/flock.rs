@@ -733,10 +733,14 @@ fn flock_join_and_leave_edit_membership() {
         error_code(&run(&["flock", "join", "home", "nope"])),
         "unknown_machine"
     );
-    assert_eq!(
-        error_code(&run(&["flock", "join", "home", "desk", "--max", "0"])),
-        "config_error"
-    );
+    // 0 keeps desk in home with no slots, to drain it; a negative number
+    // is a usage error.
+    ok(run(&["flock", "join", "home", "desk", "--max", "0"]));
+    let table = ok(run(&["flock", "list"]));
+    assert!(table.contains("desk -/0, lab -/2"), "{table}");
+    let negative = run(&["flock", "join", "home", "desk", "--max", "-1"]);
+    assert_eq!(negative.status.code(), Some(2));
+    ok(run(&["flock", "join", "home", "desk", "--max", "3"]));
 
     let out = ok(run(&["machine", "move", "lab", "work"]));
     assert!(out.starts_with("moved lab to flock work (work:2)"), "{out}");

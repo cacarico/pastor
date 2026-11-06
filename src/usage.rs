@@ -67,7 +67,7 @@ END {
 /// `CLAUDE_CONFIG_DIR` to `config_dir` (as written in `pastor.toml`, `~`
 /// and all), or `~/.claude` without it, as a shell word the machine's shell
 /// expands.
-fn config_dir_word(config_dir: Option<&str>) -> String {
+pub(crate) fn config_dir_word(config_dir: Option<&str>) -> String {
     match config_dir {
         None => "\"$HOME\"/.claude".into(),
         Some("~") => "\"$HOME\"".into(),
@@ -195,7 +195,7 @@ mod tests {
     #[test]
     fn the_command_looks_in_the_agents_config_dir() {
         let home = tempfile::tempdir().unwrap();
-        let project = home.path().join(".claude-personal/projects/p");
+        let project = home.path().join(".claude-alt/projects/p");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(
             project.join(format!("{SESSION}.jsonl")),
@@ -209,8 +209,8 @@ mod tests {
             None
         );
         for dir in [
-            "~/.claude-personal".to_string(),
-            home.path().join(".claude-personal").display().to_string(),
+            "~/.claude-alt".to_string(),
+            home.path().join(".claude-alt").display().to_string(),
         ] {
             let out = run(home.path(), Some(&dir));
             let u = parse_usage(&String::from_utf8_lossy(&out.stdout), Utc::now())

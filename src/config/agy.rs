@@ -12,6 +12,8 @@
 //! list cannot be passed: under the flag everything not denied runs,
 //! shell writes included, and the manual says so.
 
+use serde::{Deserialize, Serialize};
+
 /// The herdr agent kind this applies to.
 pub const KIND: &str = "agy";
 
@@ -114,6 +116,135 @@ pub fn required_rule(pattern: &str) -> Option<String> {
             }
         }
     })
+}
+
+/// The agy rule every profiled agy task is allowed, whatever its profile:
+/// `pastor task done`, as `config::TASK_DONE_ALLOW` is for Claude. The
+/// provisioner writes it into the settings' allow list.
+pub const TASK_DONE_RULE: &str = "command(pastor task done)";
+
+/// A Claude Code pattern as the agy rule an allow of it writes. `required_rule`
+/// reads a pattern at least as broadly as Claude does, which is the safe side
+/// of a deny and the wrong one of an allow; so a `Bash(x)` with no `:*`, exact
+/// in Claude and a prefix in agy, is `None` here: agy has no exact match, and
+/// an allow it cannot state is left out rather than widened.
+pub fn allow_rule(pattern: &str) -> Option<String> {
+    if let Some((tool, rest)) = pattern.split_once('(')
+        && tool == "Bash"
+    {
+        let words = rest.strip_suffix(')').unwrap_or(rest);
+        if words != "*" && !words.ends_with(":*") {
+            return None;
+        }
+    }
+    required_rule(pattern)
+}
+
+/// The agy rules an allow list writes, in its order, once each. Patterns
+/// agy has no rule for, or none that states them exactly (`allow_rule`), are
+/// left out.
+pub fn allow_rules(allow: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for rule in allow.iter().filter_map(|p| allow_rule(p)) {
+        if !out.contains(&rule) {
+            out.push(rule);
+        }
+    }
+    out
+}
+
+/// What a profile sets in agy's settings besides its two rule lists: the
+/// `[profiles.<name>.agy]` table. A key left out keeps the default below, or
+/// leaves the setting as the file has it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Options {
+    /// `toolPermission`: `always-proceed` approves every tool `ask`, which a
+    /// profiled launch asks for anyway; `request-review` asks. Written
+    /// always; unset it is `always-proceed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_permission: Option<String>,
+    /// `agentMode`: `accept-edits` skips the diff review before a file
+    /// write, as a profiled launch does; `request-review` and `auto` are
+    /// agy's others. Written always; unset it is `accept-edits`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_mode: Option<String>,
+    /// `allowNonWorkspaceAccess`: whether a tool may reach outside the
+    /// workspace. Written only when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_non_workspace_access: Option<bool>,
+    /// `queuedMessages`: `queue` holds a message sent to a busy agent until
+    /// its turn ends, `send-immediately` interrupts it. Written only when
+    /// set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_messages: Option<String>,
+}
+
+/// The values `Options` takes for each of its words.
+pub const TOOL_PERMISSIONS: [&str; 2] = ["always-proceed", "request-review"];
+pub const AGENT_MODES: [&str; 3] = ["accept-edits", "request-review", "auto"];
+pub const QUEUED_MESSAGES: [&str; 2] = ["queue", "send-immediately"];
+
+impl Options {
+    pub fn is_empty(&self) -> bool {
+        *self == Options::default()
+    }
+
+    /// These options with every key `base` sets and these do not.
+    pub fn over(&self, base: &Options) -> Options {
+        Options {
+            tool_permission: self
+                .tool_permission
+                .clone()
+                .or(base.tool_permission.clone()),
+            agent_mode: self.agent_mode.clone().or(base.agent_mode.clone()),
+            allow_non_workspace_access: self
+                .allow_non_workspace_access
+                .or(base.allow_non_workspace_access),
+            queued_messages: self
+                .queued_messages
+                .clone()
+                .or(base.queued_messages.clone()),
+        }
+    }
+
+    /// The load-time check: each word is one agy knows. `key` names the
+    /// table in the error.
+    pub fn check(&self, key: &str) -> Result<(), String> {
+        for (name, value, allowed) in [
+            (
+                "tool_permission",
+                &self.tool_permission,
+                &TOOL_PERMISSIONS[..],
+            ),
+            ("agent_mode", &self.agent_mode, &AGENT_MODES[..]),
+            (
+                "queued_messages",
+                &self.queued_messages,
+                &QUEUED_MESSAGES[..],
+            ),
+        ] {
+            if let Some(v) = value
+                && !allowed.contains(&v.as_str())
+            {
+                return Err(format!(
+                    "{key}.{name}: {v:?} is not one of {}",
+                    allowed.join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A machine's own permission profile as agy's settings take it: the lists
+/// in Claude Code's patterns and the profile's `Options`. What the agy
+/// provisioner writes into agy's settings before a profiled launch.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Policy {
+    pub allow: Vec<String>,
+    pub deny: Vec<String>,
+    pub options: Options,
 }
 
 /// A rule's action and target: `command(git push)` is `("command", "git
@@ -227,6 +358,34 @@ pub fn not_denied_by(task_deny: &[String], own_deny: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Why a task under `profile` cannot run on a machine whose own profile is
+/// `own`, with `own_deny` its deny list: agy's rules are per machine, so every
+/// pattern the task denies must be denied by the machine's own profile
+/// (`AGY_PROFILE_MISMATCH`). `None` when it can. The check `Daemon::settle`
+/// makes for a task and `profile render --machine` makes for a render.
+pub fn profile_mismatch(
+    task_deny: &[String],
+    profile: &str,
+    own: &str,
+    own_deny: &[String],
+    machine: Option<&str>,
+) -> Option<super::AgentRefusal> {
+    let uncovered = not_denied_by(task_deny, own_deny);
+    if uncovered.is_empty() {
+        return None;
+    }
+    Some(super::AgentRefusal {
+        code: AGY_PROFILE_MISMATCH,
+        message: format!(
+            "profile {profile} denies {} and the own profile of machine {} ({own}) does not; \
+             agy's rules are per machine, so run the task under that machine's profile \
+             or on a machine whose own profile is {profile}",
+            uncovered.join(", "),
+            machine.unwrap_or("-"),
+        ),
+    })
+}
+
 /// The marker line before each file the probe prints, and the last line.
 const MARKER: &str = "==== ";
 const END: &str = "end";
@@ -293,6 +452,63 @@ pub fn fake_output(denies: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An allow is the deny translation where agy states the pattern as
+    /// Claude does, and nothing where it would state more: a `Bash(x)` with
+    /// no `:*` is exact in Claude and a prefix in agy.
+    #[test]
+    fn an_allow_is_stated_exactly_or_not_at_all() {
+        for (pattern, rule) in [
+            ("Bash", Some("command(*)")),
+            ("Bash(*)", Some("command(*)")),
+            ("Bash(git log:*)", Some("command(git log)")),
+            ("Bash(git log)", None),
+            ("Edit", Some("write_file(*)")),
+            ("Read(~/.ssh/*)", Some("read_file(~/.ssh)")),
+            (
+                "WebFetch(domain:example.org)",
+                Some("read_url(example.org)"),
+            ),
+            ("mcp__srv__tool", Some("mcp(srv/tool)")),
+            ("Glob", None),
+            ("Bash(a*b:*)", None),
+        ] {
+            assert_eq!(allow_rule(pattern).as_deref(), rule, "{pattern}");
+        }
+        let allow: Vec<String> = ["Edit", "Write", "Glob", "Bash(git log)", "Bash"]
+            .map(String::from)
+            .into();
+        assert_eq!(allow_rules(&allow), ["write_file(*)", "command(*)"]);
+    }
+
+    /// `over` keeps a key these set and takes the rest from the base.
+    #[test]
+    fn options_layer_and_check_their_words() {
+        let far = Options {
+            tool_permission: Some("request-review".into()),
+            queued_messages: Some("queue".into()),
+            ..Default::default()
+        };
+        let near = Options {
+            tool_permission: Some("always-proceed".into()),
+            allow_non_workspace_access: Some(false),
+            ..Default::default()
+        };
+        let both = near.over(&far);
+        assert_eq!(both.tool_permission.as_deref(), Some("always-proceed"));
+        assert_eq!(both.queued_messages.as_deref(), Some("queue"));
+        assert_eq!(both.allow_non_workspace_access, Some(false));
+        assert!(Options::default().is_empty());
+        assert!(!both.is_empty());
+        both.check("a").unwrap();
+        let bad = Options {
+            agent_mode: Some("yolo".into()),
+            ..Default::default()
+        };
+        let err = bad.check("profiles.a.agy").unwrap_err();
+        assert!(err.contains("profiles.a.agy.agent_mode"), "{err}");
+        assert!(err.contains("accept-edits"), "{err}");
+    }
 
     /// Each row of the spec's translation table, and the shapes agy
     /// cannot take.

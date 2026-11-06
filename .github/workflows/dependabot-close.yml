@@ -1,0 +1,33 @@
+# Closes the pull requests Dependabot opens here. .github/dependabot.yml is
+# the same file in the private copy pastor is published from (publish.sh
+# pushes its main as it is), so both repos get the same version updates.
+# They are merged in the private copy and arrive here with the next sync; the
+# public one is closed with a note.
+#
+# pull_request_target runs this file as it is on main, never the pull
+# request's, and the job never checks the pull request's code out: it only
+# asks the API to comment and close, with a token that can do nothing else.
+# The token can write because the base branch is main, not a branch
+# Dependabot made. The private copy skips the job, so its own Dependabot
+# pull requests stay. tests/dependabot_close.rs pins all of this down.
+name: dependabot-close
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  close:
+    if: github.repository == 'cacarico/pastor' && github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: >-
+          gh pr close "$PR_URL" --comment "This update is merged in the
+          private repository pastor is published from, and arrives here
+          with the next sync. Closing."

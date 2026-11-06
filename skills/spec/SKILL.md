@@ -10,7 +10,7 @@ Plan work so that pastor can run it, one task after another, on machines where n
 
 **REQUIRED BACKGROUND:** the `pastor` skill (or `pastor --skill`). This skill does not repeat the CLI.
 
-**REQUIRED SUB-SKILLS:** `superpowers:brainstorming` for the design, `superpowers:writing-plans` for the task breakdown. This skill adds what an unwatched agent needs on top of them.
+**Builds on:** a brainstorming skill for the design and a plan-writing skill for the task breakdown (any will do). This skill adds what an unwatched agent needs on top of them.
 
 ## Why this is different from a normal plan
 
@@ -26,16 +26,16 @@ So every task in the plan must:
 
 Follow these in order. Create a todo for each.
 
-1. **Design.** If the user has no approved spec, run `superpowers:brainstorming` unchanged, approval gate included. Add nothing until the design is approved. This is the only step where you ask the user things; ask here what the tasks cannot, including the repo path on the target machines (`--repo` is a path there, not here) and the command that checks the repo (`make check`, `cargo test`, ...), unless the repo says.
+1. **Design.** If the user has no approved spec, run your brainstorming skill unchanged, approval gate included. Add nothing until the design is approved. This is the only step where you ask the user things; ask here what the tasks cannot, including the repo path on the target machines (`--repo` is a path there, not here) and the command that checks the repo (`make check`, `cargo test`, ...), unless the repo says.
 2. **Read the fleet.** `pastor machine list --json` and `pastor flock list --json`: flocks, tags, `max_agents`, which machines are `connected` or `polling`. With no head, the probe answer is enough. Never start `pastor serve` or install services.
 3. **Name the plan.** `<name>` is short kebab case. The plan branch is `pastor/<name>`. Files, all on that branch:
-   - `docs/superpowers/plans/YYYY-MM-DD-<name>.md`: the plan
-   - `docs/superpowers/plans/YYYY-MM-DD-<name>.ledger.md`: the ledger
-   - `docs/superpowers/plans/YYYY-MM-DD-<name>/task-N.md`: one prompt file per task
-4. **Write the plan** with `superpowers:writing-plans` as the base and the additions in [plan-format.md](plan-format.md): a Pastor header, and a Dispatch block per task. Tasks run in series on the plan branch; each depends on the one before.
+   - `docs/plans/YYYY-MM-DD-<name>.md`: the plan
+   - `docs/plans/YYYY-MM-DD-<name>.ledger.md`: the ledger
+   - `docs/plans/YYYY-MM-DD-<name>/task-N.md`: one prompt file per task
+4. **Write the plan** with your plan-writing skill as the base and the additions in [plan-format.md](plan-format.md): a Pastor header, and a Dispatch block per task. Tasks run in series on the plan branch; each depends on the one before.
 5. **Pick a model per task** from the table below, with a one-line reason in the Dispatch block.
 6. **Write one prompt file per task** from the template in [plan-format.md](plan-format.md). The Dispatch command runs it with `pastor task run --prompt-file`, so quotes, backticks and `$` need no escaping.
-7. **Self-review.** Everything writing-plans checks, plus the unattended checks below. Fix what fails before going on.
+7. **Self-review.** Everything your plan-writing skill checks, plus the unattended checks below. Fix what fails before going on.
 8. **Commit and push the plan branch**: plan, empty ledger (header only) and prompt files, one commit, `git push origin HEAD:pastor/<name>`. Do not push the default branch.
 9. **Hand off.** Show the user the plan path, the branch, and the first task's Dispatch command. Stop. The user reviews the plan and starts the first task; each next task starts only once the ledger on the plan branch says the one before is `complete`. Tell the user not to push the plan branch while a task may still push it: the `ran as t-M` ledger line goes in between tasks.
 

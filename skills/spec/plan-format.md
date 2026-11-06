@@ -1,6 +1,6 @@
 # Plan format for pastor
 
-A pastor plan is a `superpowers:writing-plans` plan with two additions: a Pastor header after the plan's own header, and a Dispatch block at the end of every task. The steps, file lists and code stay as writing-plans writes them; the agent follows them.
+A pastor plan is an ordinary implementation plan, as a plan-writing skill writes one, with two additions: a Pastor header after the plan's own header, and a Dispatch block at the end of every task. The steps, file lists and code stay as the plan's author wrote them; the agent follows them.
 
 ## Pastor header
 
@@ -8,12 +8,12 @@ A pastor plan is a `superpowers:writing-plans` plan with two additions: a Pastor
 ## Pastor
 
 - Plan branch: `pastor/<name>` (the plan, the ledger and the prompt files live here)
-- Ledger: `docs/superpowers/plans/YYYY-MM-DD-<name>.ledger.md`
+- Ledger: `docs/plans/YYYY-MM-DD-<name>.ledger.md`
 - Repo on the machines: `~/work/app`
 - Check: `make check`
 - Order: series. Start task N+1 only when the ledger has `Task N: complete`.
 - Dispatch: do not push the plan branch while a task may push it. Record `Task N: ran as t-M on <machine>` after the task's own ledger line, before starting the next.
-- Before merging: drop `docs/superpowers/plans/YYYY-MM-DD-<name>*` from the branch unless the repo keeps its plans.
+- Before merging: drop `docs/plans/YYYY-MM-DD-<name>*` from the branch unless the repo keeps its plans.
 ```
 
 A plan whose tasks fan out uses `Order: waves` instead, with the wave list under it:
@@ -54,7 +54,7 @@ A task in a plan with `Order: waves` gives `wave: W` instead of `depends on:`, n
 followed by the command, in a `bash` block of its own:
 
 ```bash
-pastor task run --prompt-file docs/superpowers/plans/YYYY-MM-DD-<name>/task-2.md \
+pastor task run --prompt-file docs/plans/YYYY-MM-DD-<name>/task-2.md \
   --flock default --repo '~/work/app' --worktree --branch pastor/<name>-2 \
   --model sonnet --timeout 45m --json
 ```
@@ -71,19 +71,19 @@ Rules for the command:
 
 ## Prompt file
 
-One per task, `docs/superpowers/plans/YYYY-MM-DD-<name>/task-N.md`. Plain text; it is sent to the agent as is. Fill in the angle brackets:
+One per task, `docs/plans/YYYY-MM-DD-<name>/task-N.md`. Plain text; it is sent to the agent as is. Fill in the angle brackets:
 
 ```text
 You are running unattended as task <N> of the plan <name>. Nobody will answer questions.
 
 You are in a fresh git worktree of <repo description>. Run `git fetch origin` and `git reset --hard origin/pastor/<name>` first.
 
-Read docs/superpowers/plans/<date>-<name>.md: the Global Constraints and Task <N> only. Do Task <N>'s steps in order, test first. Run `<check>` and keep it green; never commit while it fails. Commit as the steps say, with conventional commit messages whose body says why.
+Read docs/plans/<date>-<name>.md: the Global Constraints and Task <N> only. Do Task <N>'s steps in order, test first. Run `<check>` and keep it green; never commit while it fails. Commit as the steps say, with conventional commit messages whose body says why.
 
 When the task is done: tick Task <N>'s boxes in the plan and commit that. Then record it in the ledger and push, in this order:
 
 1. `git fetch origin` and `git rebase origin/pastor/<name>`, so the ledger you append to is the latest one.
-2. Append the line `Task <N>: complete (<first>..<last>, <check>: pass)` to docs/superpowers/plans/<date>-<name>.ledger.md and commit it.
+2. Append the line `Task <N>: complete (<first>..<last>, <check>: pass)` to docs/plans/<date>-<name>.ledger.md and commit it.
 3. `git push origin HEAD:pastor/<name>`. If it is rejected as not a fast-forward, do steps 1 and 3 once more.
 
 If the rebase stops on a conflict in the ledger, keep both sides' lines: the ledger is append-only, so the lines already on the branch come first and yours after them. Then `git add` the ledger and `git rebase --continue`. If it stops on a conflict in any other file, or the second push is rejected too, run `git rebase --abort` if a rebase is in progress, push nothing, and print PUSH FAILED instead of DONE.
@@ -106,9 +106,9 @@ You are running unattended as task <N> of wave <W> in the plan <name>. Nobody wi
 
 You are in a fresh git worktree of <repo description>. Run `git fetch origin` and `git reset --hard origin/pastor/<name>` first: that is the plan branch as wave <W> started, since no task in this wave pushes it before the wave is merged.
 
-Read docs/superpowers/plans/<date>-<name>.md: the Global Constraints and Task <N> only. Do Task <N>'s steps in order, test first. Run `<check>` and keep it green; never commit while it fails. Commit as the steps say, with conventional commit messages whose body says why.
+Read docs/plans/<date>-<name>.md: the Global Constraints and Task <N> only. Do Task <N>'s steps in order, test first. Run `<check>` and keep it green; never commit while it fails. Commit as the steps say, with conventional commit messages whose body says why.
 
-When the task is done: tick Task <N>'s boxes in the plan and commit that. Then append the line `Task <N>: complete (<first>..<last>, <check>: pass)` to docs/superpowers/plans/<date>-<name>.ledger.md, commit it, and `git push origin HEAD:pastor/<name>-task-<N>`.
+When the task is done: tick Task <N>'s boxes in the plan and commit that. Then append the line `Task <N>: complete (<first>..<last>, <check>: pass)` to docs/plans/<date>-<name>.ledger.md, commit it, and `git push origin HEAD:pastor/<name>-task-<N>`.
 
 If something is missing or a step cannot be done as written, do not guess past it: record `Task <N>: blocked: <why>` in the ledger the same way (append, commit, push), and stop.
 
@@ -135,7 +135,7 @@ Its prompt file is `task-M<W>.md` next to the others, and its Dispatch block nam
 ```
 
 ```bash
-pastor task run --prompt-file docs/superpowers/plans/YYYY-MM-DD-<name>/task-M1.md \
+pastor task run --prompt-file docs/plans/YYYY-MM-DD-<name>/task-M1.md \
   --flock default --repo '~/work/app' --worktree --branch pastor/<name>-m1 \
   --model sonnet --timeout 30m --json
 ```
@@ -147,7 +147,7 @@ You are running unattended as the merge task of wave <W> in the plan <name>. Nob
 
 You are in a fresh git worktree of <repo description>. Run `git fetch origin` and `git reset --hard origin/pastor/<name>` first.
 
-The wave's tasks are <list>. Each pushed its own branch, `origin/pastor/<name>-task-<N>`, and wrote its ledger line there. The ledger is docs/superpowers/plans/<date>-<name>.ledger.md.
+The wave's tasks are <list>. Each pushed its own branch, `origin/pastor/<name>-task-<N>`, and wrote its ledger line there. The ledger is docs/plans/<date>-<name>.ledger.md.
 
 To record a `blocked` line below, do this, in this order: nothing has been merged yet, or you have just reset back to `origin/pastor/<name>`, so there are no merge commits on HEAD to lose.
 
@@ -159,7 +159,7 @@ If that rebase stops on a conflict in the ledger, keep both sides' lines: the li
 
 Then:
 
-1. For each task <N> of the wave, in plan order, check that `origin/pastor/<name>-task-<N>` exists and that its ledger (`git show origin/pastor/<name>-task-<N>:docs/superpowers/plans/<date>-<name>.ledger.md`) has a `Task <N>: complete` line. If a branch is missing, or its ledger has no `complete` line for its task, record `Wave <W>: blocked: Task <N> <why>` and stop. Merge nothing.
+1. For each task <N> of the wave, in plan order, check that `origin/pastor/<name>-task-<N>` exists and that its ledger (`git show origin/pastor/<name>-task-<N>:docs/plans/<date>-<name>.ledger.md`) has a `Task <N>: complete` line. If a branch is missing, or its ledger has no `complete` line for its task, record `Wave <W>: blocked: Task <N> <why>` and stop. Merge nothing.
 2. For each task <N> in plan order, `git merge --no-ff origin/pastor/<name>-task-<N>`. If the merge stops on a conflict in the ledger only, keep both sides' lines, the plan branch's first and the task's after them, then `git add` the ledger and `git commit --no-edit`. If it stops on a conflict in any other file, run `git merge --abort`, go back with `git reset --hard origin/pastor/<name>`, record `Wave <W>: blocked: conflict in <paths> between Task <A> and Task <B>` (the task being merged and the earlier one that touched those paths) and stop. Do not resolve a conflict in any file but the ledger.
 3. Run `<check>` on the merged result. If it fails, go back with `git reset --hard origin/pastor/<name>`, record `Wave <W>: blocked: <check> fails after merge` and stop. Do not fix it.
 4. Append the line `Wave <W>: merged (Tasks <list>, <check>: pass)` to the ledger and commit it on top of the merge commits from step 2. Then `git push origin HEAD:pastor/<name>`. Do not rebase here, unlike a `blocked` line: HEAD now carries the wave's `--no-ff` merge commits, and `git rebase` drops merge commits and cherry-picks their contents instead, which would destroy them and likely conflict. If this push is rejected as not a fast-forward, stop and print PUSH FAILED instead of DONE: something else pushed the plan branch while this merge task ran, which should not happen, and a person needs to look before anything merges on top of it.

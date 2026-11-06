@@ -1,0 +1,125 @@
+# The built-in provisioner for a Mac that runs agents under herdr. Checks
+# exit 0 when the machine passes. A missing package (git, gh) is reported
+# for whoever runs the machine to install; only pastor and the agents' CLIs
+# have a fix, which runs as the user pastor logs in as.
+id = "macos"
+name = "macOS"
+version = "0.2.0"
+description = "A Mac with git, herdr, pastor and the agents' CLIs"
+
+[platform]
+os = "darwin"
+
+[[check]]
+id = "git"
+description = "git is installed"
+command = ["sh", "-c", "command -v git || { echo git is not on the PATH; exit 1; }"]
+
+[[check]]
+id = "herdr"
+description = "herdr is on the PATH of a non-interactive shell, where pastor's bridge runs it"
+command = ["sh", "-c", "command -v herdr || { echo herdr is not on the PATH; exit 1; }"]
+
+[[check]]
+id = "pastor"
+description = "pastor is installed, for `pastor task done` from an agent"
+command = ["sh", "-c", "command -v pastor || { echo pastor is not on the PATH; exit 1; }"]
+fix = ["sh", "-c", "curl -fsSL https://cacari.co/pastor/install.sh | sh"]
+timeout = "10m"
+
+[[check]]
+id = "gh"
+description = "gh is installed"
+command = ["sh", "-c", "command -v gh || { echo gh is not on the PATH; exit 1; }"]
+account = "github"
+
+[[check]]
+id = "gh-login"
+description = "gh is logged in to github.com"
+command = ["gh", "auth", "status", "--hostname", "github.com"]
+needs = ["gh"]
+account = "github"
+
+# One install and one login check per agent kind. Each runs once for every
+# agent of its kind that can land on the machine, with that agent's env, so
+# two Claude accounts are two login rows; a kind no agent there uses has no
+# row. The same eight checks are in every built-in.
+
+[[check]]
+id = "claude"
+description = "claude is installed"
+command = ["sh", "-c", "command -v claude || { echo claude is not on the PATH; exit 1; }"]
+fix = ["sh", "-c", "curl -fsSL https://claude.ai/install.sh | bash"]
+agent = "claude"
+timeout = "10m"
+
+[[check]]
+id = "claude-login"
+description = "claude is logged in, to the account its CLAUDE_CONFIG_DIR holds"
+command = ["claude", "auth", "status", "--text"]
+needs = ["claude"]
+agent = "claude"
+
+[[check]]
+id = "codex"
+description = "codex is installed"
+command = ["sh", "-c", "command -v codex || { echo codex is not on the PATH; exit 1; }"]
+agent = "codex"
+
+[[check]]
+id = "codex-login"
+description = "codex is logged in"
+command = ["codex", "login", "status"]
+needs = ["codex"]
+agent = "codex"
+
+[[check]]
+id = "opencode"
+description = "opencode is installed"
+command = ["sh", "-c", "command -v opencode || { echo opencode is not on the PATH; exit 1; }"]
+agent = "opencode"
+
+# opencode has no login status of its own: `auth list` exits 0 with or
+# without credentials. Older releases end the list with "N credentials" and,
+# when a provider's key is in the env, "N environment variable(s)"; newer
+# ones print "No authenticated integrations" for none. The output goes to a
+# file in the run directory, which the run removes.
+[[check]]
+id = "opencode-login"
+description = "opencode has a provider's credentials, stored or in its env"
+command = ["sh", "-c", """
+opencode auth list >auth-list 2>&1 || { tail -n 1 auth-list; exit 2; }
+if grep -Eq "No authenticated integrations|(^|[^0-9])0 credentials" auth-list &&
+  ! grep -q "environment variable" auth-list; then
+  echo "opencode has no provider credentials"
+  exit 1
+fi
+grep -E "[0-9]+ (credentials|environment variable)" auth-list | tail -n 1
+exit 0
+"""]
+needs = ["opencode"]
+agent = "opencode"
+
+[[check]]
+id = "agy"
+description = "agy is installed"
+command = ["sh", "-c", "command -v agy || { echo agy is not on the PATH; exit 1; }"]
+agent = "agy"
+
+# agy has no login status either; listing its models needs a signed-in
+# account, and says so when there is none. Any other failure, such as no
+# network, is an error rather than a missing login.
+[[check]]
+id = "agy-login"
+description = "agy is signed in"
+command = ["sh", "-c", """
+agy models >agy-models 2>&1 && { echo "signed in"; exit 0; }
+if grep -qi "sign in" agy-models; then
+  grep -i "sign in" agy-models | head -n 1
+  exit 1
+fi
+grep -v "^Fetching" agy-models | head -n 1
+exit 2
+"""]
+needs = ["agy"]
+agent = "agy"

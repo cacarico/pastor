@@ -62,12 +62,21 @@ A task's state change is `task.` and the new state.
 | `task.failed` | it failed | |
 | `task.stale` | its timeout passed, or its pull machine was lost | |
 | `task.closed` | its pane was closed | |
+| `task.fetch_failed` | fetching the remote before the task's worktree failed; the worktree was made from the repo as it is | `repo`, `why` |
+| `task.processes_killed` | what its agent left running was ended after its pane closed | `pane`, `count` (ended), `processes` (each `pid`, `name`, `found` as `tree`, `group` or `cwd`, `forced` when it did not end on `TERM`, and `ended`, false when it could not be signalled) |
 | `task.input` | someone ran `pastor task send`, or pastor answered Claude's limit picker with "Stop and wait" | `keys`, `text_len`, `trust` with `--trust`, `limit_picker` from the picker, `rate_retry` from a short-limit retry; never the text |
 | `task.trusted` | the head answered a folder-trust prompt from saved trust | `keys` |
 | `job.failed` | a job run failed | |
 | `connector.finish_failed` | a connector's finish command failed | `connector`, `reason` |
 | `machine.lost` | a machine stopped answering; once per outage | |
 | `machine.connected` | a lost machine answers again | |
+| `machine.check_failed` | a row of `pastor machine check` failed, on a head; one event per row | `check`, `agent`, `status` (`fail` or `error`), `first_line`, `reason`, `provisioner` |
+| `machine.bootstrapped` | a bootstrap report for a machine said it is ok | `isolation`, `missing` |
+| `machine.bootstrap_failed` | a bootstrap report for a machine said a step failed | `step`, `why` |
+| `bundle.applied` | bundles were applied to a machine, by the head or by `pastor bundle apply` | `bundles` (id to hash), `added`, `updated`, `removed` |
+| `bundle.failed` | an apply to a machine failed | `error` |
+| `bundle.drift` | a harness home that was `ok` or `stale` has something pastor wrote changed by hand | `home`, `agents`, `items` |
+| `bundle.conflict` | a home came to a conflict, or an apply left `conflict` or `linked` rows | `items` |
 | `agent.exhausted` | the head recorded an account (or one model of it) as out of usage | `account`, `model`, `agent`, `until`, `retry_at`, `hard`, `no_credit`, `what`, `line` |
 | `agent.reset` | an exhausted account can be used again | `account`, `model`, `agent`, `retry_at`, `by` (`time` or `hand`) |
 
@@ -112,8 +121,8 @@ Orchestrator events all carry `orchestrator`, its name, in `detail`. See
 | `detail` | more, on the types that carry it; absent otherwise |
 | `summary` | on `task.done` and `task.failed`: how the round ended, with `round`, `outcome`, `text`, `source` (`agent` or `pane`) and `at` |
 
-`outcome` is `done`, `partial`, `blocked`, `nothing to do`, `unknown` or
-`no summary`. See [how it ended](../../concepts/tasks/#how-it-ended).
+`outcome` is `done`, `partial`, `blocked`, `nothing to do`, `unknown`,
+`no summary` or `no head` (the agent could not reach the head to send one). See [how it ended](../../concepts/tasks/#how-it-ended).
 
 Fields may be added; none are renamed or removed. A line that does not
 parse is skipped.

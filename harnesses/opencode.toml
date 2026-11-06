@@ -1,0 +1,12 @@
+# opencode: where it keeps what a bundle places. Its version, login and
+# install are not described here yet.
+
+id = "opencode"
+name = "opencode"
+
+[paths]
+home_env = "OPENCODE_CONFIG_DIR"
+home = "~/.config/opencode"
+instructions = "AGENTS.md"
+# Its login, outside the home; pastor never reads it, nor writes over it.
+secrets = ["~/.local/share/opencode/auth.json"]

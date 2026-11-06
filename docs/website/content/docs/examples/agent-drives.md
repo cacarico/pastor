@@ -34,6 +34,23 @@ skill scaffolds one, asks at most whether it polls or streams and which
 secrets it needs, and tests the result with `pastor connector try` and
 `pastor tick --dry-run` before anyone installs it for real.
 
+## run and review a plan
+
+A `pastor:spec` plan runs itself one task at a time, but something still
+has to start each task and notice when it stops. `pastor:dispatch` does
+that: it starts the plan's next task, waits for it with no tight loop, and
+handles a folder-trust prompt, a finished task's outcome, a failed task
+with a known cause and a stale one by fixed rules — anything else goes to
+you. Once the plan says `COMPLETE`, `pastor:review` takes it from there: it
+runs the repo's own check, reviews the diff, sends back at most one fix
+task for what it finds, and opens the pull request. Both start agents on
+your flock, so neither runs on its own — ask for them by name:
+
+```text
+/pastor:dispatch docs/plans/2026-09-26-nested-herdr.md
+/pastor:review pastor/nested-herdr
+```
+
 ## read with JSON
 
 Tables are for people. Every `list` and `describe` takes `--json`, and so do
@@ -66,8 +83,7 @@ treats commands from there as that task's.
 | | install or link connectors, start or set up a head |
 
 A refused command fails with `agent_refused`, and the message lists what is
-off limits. `agents_change_fleet = true` in `pastor.toml` lifts the rule.
-It guards against an agent's mistakes, not against a determined one: the
+off limits. It guards against an agent's mistakes, not against a determined one: the
 agent runs as your user. See [profiles and trust](../../concepts/profiles-and-trust/#agents-and-the-flock).
 
 ## an orchestrator agent
@@ -110,7 +126,7 @@ And the agent of `t-12` itself, which pastor started, as it finishes:
 
 ```text
 ⏺ Bash(pastor task run "Also bump the lockfile" --repo '~/src/app')
-  ⎿  Error: {"code":"agent_refused","message":"t-12 is an agent pastor started, and agents may not change the fleet (run, send to, attach to, ...); set agents_change_fleet = true in pastor.toml to allow it"}
+  ⎿  Error: {"code":"agent_refused","message":"t-12 is an agent pastor started, and agents may not change the fleet (run, send to, attach to, ...)"}
 
 ⏺ Bash(pastor task done --summary "done: fixed the 3 review comments on PR #42 and pushed")
   ⎿  ID    STATE  PRIORITY  MACHINE   FLOCK    AGENT   MODEL   JOB  AGE  NOTE

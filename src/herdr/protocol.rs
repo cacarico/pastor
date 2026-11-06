@@ -83,6 +83,29 @@ impl AgentStatus {
     }
 }
 
+/// Whether an agent's own session (`AgentInfo::agent_session`) is resumed
+/// by an id on its command line or by a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentSessionRefKind {
+    Id,
+    Path,
+}
+
+/// Where an agent's own session lives, as its hook last reported it to
+/// herdr (agy's reports `conversationId`; herdr itself resumes with `agy
+/// --conversation <id>`). `agent` names which agent kind reported it, so
+/// pastor only trusts `value` for a task of that same kind; `source` is
+/// herdr's own label for the hook. Absent when no such hook is installed
+/// on the machine, or before it has reported anything yet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSessionInfo {
+    pub agent: String,
+    pub kind: AgentSessionRefKind,
+    pub source: String,
+    pub value: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentInfo {
     pub pane_id: String,
@@ -93,6 +116,10 @@ pub struct AgentInfo {
     #[serde(default)]
     pub agent: Option<String>,
     pub agent_status: AgentStatus,
+    /// The agent's own session, as its hook reported it. See
+    /// `AgentSessionInfo`.
+    #[serde(default)]
+    pub agent_session: Option<AgentSessionInfo>,
     /// Not in herdr 0.9.1 (protocol 22); newer herdr sets it to the
     /// `state_change_seq` of an idle transition that completed work.
     #[serde(default)]
@@ -217,6 +244,20 @@ pub struct ReadBody {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaneRead {
     pub read: ReadBody,
+}
+
+/// `pane.process_info`'s reply (herdr 0.9.5): the pane's shell and what
+/// runs in the foreground of its terminal. Only the shell is read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneProcessInfo {
+    pub process_info: ProcessInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessInfo {
+    pub pane_id: String,
+    #[serde(default)]
+    pub shell_pid: Option<u32>,
 }
 
 pub fn subscription_agent_status(pane_id: &str) -> Value {

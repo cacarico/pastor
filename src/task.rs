@@ -194,6 +194,16 @@ pub struct DispatchSpec {
     pub machine: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// The kind of work the task is (`rust`, `light`): only a machine that
+    /// takes it places the task (`dispatch::MachineView::suits`). Before
+    /// the task is queued, what `task run --load` asked for; once queued,
+    /// that, else its agent's `load`, else its repo's (`config::resolve_load`).
+    /// `None` places it as any task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load: Option<String>,
+    /// Where `load` came from, labelled like `AgentSource::agent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_from: Option<String>,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
     /// The worktree this task works in, recorded by dispatch once herdr
@@ -263,10 +273,123 @@ pub struct DispatchSpec {
     /// Where `keep_pane` came from, labelled like `AgentSource::agent`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_pane_from: Option<String>,
+    /// Whether auto-close removes the task's worktree once it ends done,
+    /// failed or stale, not only done: its branch stays. Settled like
+    /// `keep_pane` (`Defaults::resolve_remove_worktree`); `None` when no
+    /// layer set it, which is no.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remove_worktree: Option<bool>,
+    /// Where `remove_worktree` came from, labelled like `AgentSource::agent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remove_worktree_from: Option<String>,
     /// The agents and models the task ran before this one, each round ended
     /// by a usage limit, and the limit it waits on now, if it does.
     #[serde(default, skip_serializing_if = "Rounds::is_empty")]
     pub rounds: Rounds,
+    /// Fetching the base of the task's worktree: asked to skip, and what
+    /// went wrong.
+    #[serde(default, skip_serializing_if = "FetchNote::is_default")]
+    pub fetch: FetchNote,
+    /// What the task's latest start gives its agent, when that is not the
+    /// task's own prompt (`prompt_to_send`): a resume after a pause or a
+    /// usage limit, a limit handover, a model switch. A prompt held while
+    /// the agent sits at a startup dialog (`Task::prompt_pending`), or sent
+    /// again when not taken, is this one (`pending_prompt`); the session
+    /// already ran the task's own. Each start sets it afresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_prompt: Option<String>,
+    /// The workdir set placed in the agent's folder before each start
+    /// (`task run --workdir-set`, a job's `[dispatch] workdir_set`), and
+    /// where it went. `None`: the task places none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<Box<TaskWorkdir>>,
+    /// The stored workdir bundles (`target = "workdir"`) placed in the
+    /// agent's folder before each start, before `workdir`. Before the task
+    /// is queued, what its job named; once queued, its flock's
+    /// `workdir_bundles` and then those, each once, with where each came
+    /// from. Each start places the newest version kept of each.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workdir_bundles: Vec<WorkdirBundle>,
+}
+
+/// A stored workdir bundle a task places (`DispatchSpec::workdir_bundles`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkdirBundle {
+    pub id: String,
+    /// Who named it, labelled like `load_from` (`flock ops`, `job nightly`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// Why the last start left it out (a machine pastor places no sets on,
+    /// an agent kind it places none for), or that the bundle had nothing
+    /// for the agent's kind. `None` once a start placed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<String>,
+    /// The set the head built for the agent's kind, from the newest version
+    /// kept, when a pull machine that places sets claimed the task
+    /// (`workdir_task::for_claim`): that machine places it as it is, at
+    /// each start of that claim. Only in the claim reply; never on the
+    /// head's row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set: Option<serde_json::Value>,
+}
+
+impl WorkdirBundle {
+    pub fn named(id: &str) -> WorkdirBundle {
+        WorkdirBundle {
+            id: id.to_string(),
+            from: None,
+            skipped: None,
+            set: None,
+        }
+    }
+}
+
+/// A stored workdir bundle a pull machine left out of a task's start, and
+/// why (`TaskReport::workdir_skipped`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkdirSkip {
+    pub id: String,
+    pub why: String,
+}
+
+/// A task's workdir set (`DispatchSpec::workdir`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskWorkdir {
+    /// The set's document (`Set::to_doc`), as given and checked when the
+    /// task was queued. A set that names no profile takes the task's at
+    /// each start (`workdir_task::settle`).
+    pub set: serde_json::Value,
+    /// The folder dispatch last placed it in, so the task's cleanup knows
+    /// where it went. `None` until the first start places it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placed_in: Option<String>,
+    /// The profile the set names, as the head rendered it for the machine
+    /// when a pull machine claimed the task (`workdir_task::for_claim`): that
+    /// machine cannot read the head's pastor.toml. Only in the claim reply;
+    /// never on the head's row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render: Option<Box<crate::profile_render::Render>>,
+}
+
+/// A worktree task's fetch of its base ref (`DispatchSpec::fetch`). Before
+/// pastor makes the worktree it fetches the remote the repo's branch tracks,
+/// so the base is not stale, unless `skip` says not to. A fetch that fails
+/// does not fail the task: the worktree is made from what the repo has, and
+/// `warning` says why it could not be fetched.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchNote {
+    /// `--no-fetch`, or a job's `no_fetch`: do not fetch.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip: bool,
+    /// Why the fetch failed, set at dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+impl FetchNote {
+    pub fn is_default(&self) -> bool {
+        self == &FetchNote::default()
+    }
 }
 
 /// A task's rounds on other models (`DispatchSpec::rounds`): those that
@@ -305,7 +428,7 @@ impl std::fmt::Display for AgentRound {
     }
 }
 
-/// `claude-personal (sonnet)`, or the agent alone when it runs no model.
+/// `claude-alt (sonnet)`, or the agent alone when it runs no model.
 pub fn agent_and_model(agent: &str, model: Option<&str>) -> String {
     match model {
         Some(m) => format!("{agent} ({m})"),
@@ -478,7 +601,7 @@ pub enum SummaryMode {
 
 /// The paragraph pastor adds to a task's prompt when it sends it, unless
 /// the task's `summary` is `off`. Not stored in the task's prompt.
-pub const SUMMARY_ASK: &str = "When you finish, run `pastor task done --summary-file -` with a short summary on stdin: first line `done`, `partial`, `blocked` or `nothing to do`; then up to five short lines: what changed, where (branch, PR, files or notes), what is left.";
+pub const SUMMARY_ASK: &str = "When you finish, run `pastor task done --current --summary '<summary>'`, the summary a short text in single quotes (write a single quote inside it as `'\\''`): first line `done`, `partial`, `blocked` or `nothing to do`; then up to five short lines: what changed, where (branch, PR, files or notes), what is left. It pushes your branch if you have one, saves the summary and prints DONE, so there is nothing left to do by hand.";
 
 /// Added after `SUMMARY_ASK` for a task whose `summary` is `require`.
 pub const SUMMARY_REQUIRE: &str = "pastor fails this task if you stop without one.";
@@ -671,7 +794,7 @@ pub struct AgentSource {
 }
 
 /// Which of its fallback models a task started on, and why not on those
-/// before it: `fallback 2 of 2; claude-personal exhausted until 03:00`.
+/// before it: `fallback 2 of 2; claude-alt exhausted until 03:00`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FallbackUse {
     /// Its place in the task's fallback list, from 1.
@@ -715,9 +838,24 @@ impl DispatchSpec {
         self.agent_source.as_ref()?.profile.as_deref()
     }
 
+    /// The folder the agent's trust dialog asks about, which saved trust
+    /// (`Store::trust_repo`) is kept for: the `repo`, else for a task with
+    /// none the folder dispatch started it in (`cwd`, `~/pastor-tasks` made
+    /// absolute). `None` for a task from before `cwd` was recorded.
+    pub fn trust_dir(&self) -> Option<&str> {
+        self.repo.as_deref().or(self.cwd.as_deref())
+    }
+
     /// Whether auto-close leaves the task's pane alone (`keep_pane`).
     pub fn keeps_pane(&self) -> bool {
         self.keep_pane == Some(true)
+    }
+
+    /// Whether auto-close removes the task's worktree whatever state it
+    /// ends in (`remove_worktree`). A task that keeps its pane keeps its
+    /// worktree too.
+    pub fn removes_worktree(&self) -> bool {
+        self.worktree && self.remove_worktree == Some(true) && !self.keeps_pane()
     }
 }
 
@@ -730,8 +868,10 @@ pub const SUMMARY_MAX: usize = 2000;
 
 /// How a round of a task ended, from the first line of its summary
 /// (`Outcome::parse`). `NoSummary` is a round that ended with none, whose
-/// row holds the pane's last lines instead; `Unknown` is a summary whose
-/// first line names none of the others.
+/// row holds the pane's last lines instead; `NoHead` is the same on a
+/// machine whose agents cannot reach the head (`MachineSettings::
+/// cut_off_from_head`), where no summary could arrive; `Unknown` is a
+/// summary whose first line names none of the others.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Outcome {
     #[serde(rename = "done")]
@@ -744,6 +884,8 @@ pub enum Outcome {
     NothingToDo,
     #[serde(rename = "no summary")]
     NoSummary,
+    #[serde(rename = "no head")]
+    NoHead,
     #[serde(rename = "unknown")]
     Unknown,
 }
@@ -765,6 +907,7 @@ impl Outcome {
             Outcome::Blocked => "blocked",
             Outcome::NothingToDo => "nothing to do",
             Outcome::NoSummary => "no summary",
+            Outcome::NoHead => "no head",
             Outcome::Unknown => "unknown",
         }
     }
@@ -795,6 +938,7 @@ impl std::str::FromStr for Outcome {
             "blocked" => Outcome::Blocked,
             "nothing to do" => Outcome::NothingToDo,
             "no summary" => Outcome::NoSummary,
+            "no head" => Outcome::NoHead,
             "unknown" => Outcome::Unknown,
             other => return Err(format!("unknown outcome {other:?}")),
         })
@@ -961,6 +1105,27 @@ pub struct Task {
 /// The code of `--preempt` (or a job's `preempt`) on a task below critical.
 pub const PREEMPT_NEEDS_CRITICAL: &str = "preempt_needs_critical";
 
+/// The code of a task whose load no machine of its flock takes.
+pub const LOAD_NOT_TAKEN: &str = "load_not_taken";
+
+/// The code of a load name that is not one (`check_load`).
+pub const INVALID_LOAD: &str = "invalid_load";
+
+/// A load's name, as a task, an agent, a repo, a flock or a machine gives
+/// it: a letter or digit, then letters, digits, `-` and `_`.
+pub fn check_load(name: &str) -> Result<(), String> {
+    let mut chars = name.chars();
+    let ok = chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "load {name:?} is not a load name: a letter or digit, then letters, digits, '-' and '_'"
+        ))
+    }
+}
+
 /// How long a task that resumed after a pause is safe from another: long
 /// enough for it to get back into its work before a second critical task
 /// takes its slot again.
@@ -977,7 +1142,23 @@ pub fn prompt_to_send(task: &Task) -> String {
     }
 }
 
+/// The prompt a held or resent delivery sends (`Task::prompt_pending`): the
+/// one the task's latest start meant (`DispatchSpec::start_prompt`), else
+/// its own.
+pub fn pending_prompt(task: &Task) -> String {
+    task.spec
+        .start_prompt
+        .clone()
+        .unwrap_or_else(|| prompt_to_send(task))
+}
+
 pub const RESUME_PROMPT: &str = "pastor paused this session for a critical task and has now resumed it; carry on where you left off.";
+
+/// What a task's agent is told before pastor moves the task to another
+/// machine (`MachineHandle::save_work`): the pane stays behind, so anything
+/// not pushed stays with it. The agent must not end the task, or the move
+/// would find it done.
+pub const MOVE_SAVE_PROMPT: &str = "pastor is moving this task to another machine. Commit every change on your branch as one commit with the message `wip: moving to another machine`, push the branch, then stop and wait. Do not end the task.";
 
 /// What a waiting task's agent is told once its session is open again: it
 /// stopped on a usage limit, which has reset.
@@ -1041,11 +1222,11 @@ pub fn why_not_pausable(task: &Task, kind: &str, now: DateTime<Utc>) -> Option<&
     if task.priority != Priority::Low {
         return Some("only a low task can be paused");
     }
-    if kind != "claude" {
-        return Some("only a Claude task can be paused");
+    if resume_flag(kind).is_none() {
+        return Some("only a Claude or agy task can be paused");
     }
     if task.spec.session_id.is_none() {
-        return Some("it recorded no Claude session to resume");
+        return Some("it recorded no session to resume");
     }
     if task.ended {
         return Some("its agent said it is finished");
@@ -1062,8 +1243,9 @@ pub fn why_not_pausable(task: &Task, kind: &str, now: DateTime<Utc>) -> Option<&
 
 impl Task {
     /// May a critical task with `preempt` pause this one? A running `low`
-    /// task of an agent of kind `kind` that is `claude`, with a recorded
-    /// session to resume, not ended, and not resumed within `RESUME_GRACE`.
+    /// task of an agent of kind `kind` that has a resume flag (`claude` or
+    /// `agy`, see `resume_flag`), with a recorded session to resume, not
+    /// ended, and not resumed within `RESUME_GRACE`.
     pub fn pausable(&self, kind: &str, now: DateTime<Utc>) -> bool {
         why_not_pausable(self, kind, now).is_none()
     }
@@ -1148,8 +1330,7 @@ impl Task {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskRole {
-    /// Reads, and `task done` for its own task; everything else is refused
-    /// unless `agents_change_fleet` is on.
+    /// Reads, and `task done` for its own task; everything else is refused.
     #[default]
     Agent,
     /// Also runs, retries, types into and closes tasks and enables and
@@ -1215,6 +1396,60 @@ pub fn picks_session(args: &[String]) -> bool {
         let flag = a.split_once('=').map_or(a.as_str(), |(f, _)| f);
         CLAUDE_SESSION_FLAGS.contains(&flag)
     })
+}
+
+/// The flag that resumes a recorded session, by agent kind: `claude
+/// --resume <id>`, `agy --conversation <id>` (`agy --help`). Claude chooses
+/// its own id up front (`new_session_id`, `--session-id`); agy has no such
+/// flag, so pastor only ever resumes one it read back from herdr (see
+/// `AgentSessionInfo`). `None` for a kind pastor does not resume: such a
+/// task restarts fresh instead, as it always has.
+pub fn resume_flag(kind: &str) -> Option<&'static str> {
+    match kind {
+        "claude" => Some("--resume"),
+        "agy" => Some("--conversation"),
+        _ => None,
+    }
+}
+
+/// Is `s` safe to hand a machine's agent as a `--conversation` (or other
+/// non-Claude resume) argument: printable ASCII with no whitespace or shell
+/// metacharacters, and within a sane length. Unlike Claude's own ids
+/// (`is_session_id`), pastor did not choose this one, so its exact shape is
+/// not known; this only guards against something unsafe going into a
+/// command line on another machine.
+pub fn is_safe_session_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 200
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+}
+
+/// Is `id` something `kind`'s agent can be resumed on: Claude's strict UUID
+/// shape for `claude`, else the more general `is_safe_session_token`.
+pub fn is_resumable_session(kind: &str, id: &str) -> bool {
+    if kind == "claude" {
+        is_session_id(id)
+    } else {
+        is_safe_session_token(id)
+    }
+}
+
+/// The session `agent`'s hook reported to herdr, when pastor can resume a
+/// `kind` task on it: a kind with a resume flag (`resume_flag`) other than
+/// `claude`, whose session instead comes from the `--session-id` pastor
+/// chose. The report must name that same kind (`agent_session.agent`), be
+/// an id, not a path, and be safe to hand the machine
+/// (`is_resumable_session`). `agent.list` and `agent.prompt` both carry it.
+pub fn reported_session<'a>(kind: &str, agent: &'a crate::herdr::AgentInfo) -> Option<&'a str> {
+    if kind == "claude" || resume_flag(kind).is_none() {
+        return None;
+    }
+    let info = agent.agent_session.as_ref()?;
+    (info.agent == kind
+        && info.kind == crate::herdr::AgentSessionRefKind::Id
+        && is_resumable_session(kind, &info.value))
+    .then_some(info.value.as_str())
 }
 
 /// A new random (version 4) UUID for `claude --session-id`, from the
@@ -1299,11 +1534,26 @@ fn completed_since_prompt(
     if task.prompt_pending {
         return false;
     }
-    let baseline = task.last_completion_seq.unwrap_or(0);
+    let active = task.activity_seen || task.last_completion_seq.is_none();
+    completed_past(
+        task.last_completion_seq.unwrap_or(0),
+        active,
+        state_change_seq,
+        completion_seq,
+    )
+}
+
+/// The rule of `completed_since_prompt` for an agent idle (or done) now,
+/// given a prompt at sequence `baseline` and whether it was `active` since.
+pub(crate) fn completed_past(
+    baseline: u64,
+    active: bool,
+    state_change_seq: Option<u64>,
+    completion_seq: Option<u64>,
+) -> bool {
     if let Some(seq) = completion_seq {
         return seq > baseline;
     }
-    let active = task.activity_seen || task.last_completion_seq.is_none();
     active && state_change_seq.is_some_and(|seq| seq > baseline)
 }
 
@@ -1311,6 +1561,53 @@ fn completed_since_prompt(
 /// older releases) in the first column, and indents the rest of the message
 /// by two spaces.
 pub(crate) const MESSAGE_MARKERS: [char; 2] = ['●', '⏺'];
+
+/// How much of a prompt, whitespace aside, `shows_prompt` looks for.
+const PROMPT_START: usize = 40;
+
+/// Box borders a TUI draws down the left of a wrapped message (opencode's
+/// `┃`), which land between the pieces of a wrapped prompt.
+const GUTTERS: [char; 4] = ['│', '┃', '▎', '▌'];
+
+/// Does `pane` show that the agent took `prompt`? An agent that took it
+/// shows it as the first message of its turn, wrapped to the pane, so
+/// whitespace and box borders (`GUTTERS`) are ignored on both sides and only
+/// the first `PROMPT_START` characters are looked for. Claude shows a long pasted prompt as a
+/// `[Pasted text` placeholder instead, and an agent that has answered has
+/// taken something: either counts. A fresh session after a dialog shows
+/// none of them. An empty prompt is always shown.
+pub fn shows_prompt(pane: &str, prompt: &str) -> bool {
+    if pane.contains("[Pasted text") || pane.lines().any(|l| l.starts_with(MESSAGE_MARKERS)) {
+        return true;
+    }
+    prompt_text_in(pane, prompt)
+}
+
+/// Is the start of `prompt`, whitespace and box borders aside, in `pane`?
+/// An empty prompt is always in it.
+fn prompt_text_in(pane: &str, prompt: &str) -> bool {
+    let kept = |c: &char| !c.is_whitespace() && !GUTTERS.contains(c);
+    let start: String = prompt.chars().filter(kept).take(PROMPT_START).collect();
+    let pane: String = pane.chars().filter(kept).collect();
+    pane.contains(&start)
+}
+
+/// Does `pane` show `prompt` sitting in an agent's input box, typed and not
+/// submitted? Codex takes a prompt as a bracketed paste and reads the Enter
+/// that follows as a newline in it, so the text stays in the input: whole
+/// when it is short, as a `[Pasted Content N chars]` placeholder when it is
+/// long. Only meaningful for an agent that has not worked since the prompt
+/// went in; a submitted prompt is echoed in the same way.
+///
+/// A prompt with nothing in it is never "in" an input box: an empty box is
+/// no reason to press Enter.
+pub fn prompt_unsent_in_input(pane: &str, prompt: &str) -> bool {
+    pane.to_ascii_lowercase().contains("[pasted content")
+        || (!prompt
+            .chars()
+            .all(|c| c.is_whitespace() || GUTTERS.contains(&c))
+            && prompt_text_in(pane, prompt))
+}
 
 /// The question an agent's last message ends with, if it ends with one.
 /// herdr reports an agent that stopped to ask the same way as one that
@@ -1349,31 +1646,217 @@ pub fn trailing_question(pane: &str) -> Option<String> {
         .then_some(last)
 }
 
+/// The word an agent prints as the last line of its last message to say it is
+/// finished, when it did not run `pastor task done`.
+pub const DONE_WORD: &str = "DONE";
+
+/// Whether a line is a turn the user took: the prompt mark and text after it.
+/// The empty input box (`❯` and a no-break space) is not.
+fn user_turn(line: &str) -> bool {
+    let line = line.trim_start();
+    ["❯", ">"].iter().any(|mark| {
+        line.strip_prefix(mark)
+            .is_some_and(|t| !t.trim().is_empty())
+    })
+}
+
+/// Whether a message's first line is a tool call (`Bash(make check)`), whose
+/// output is not the agent's words.
+fn tool_call(first: &str) -> bool {
+    let Some((name, rest)) = first.trim().split_once('(') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | ':' | '-'))
+        && rest.ends_with(')')
+}
+
+/// The last message of a Claude pane, as `trailing_question` finds it: the
+/// block from the last message marker to the first line that is neither
+/// blank nor indented, with the indent taken off. `None` for a pane with no
+/// marker; for a block that is a tool call (its name and arguments may wrap,
+/// or hold spaces as an MCP tool's do, so a call is also a first line with
+/// its output right under it); and for one that ends at a turn the user took
+/// after it: nothing new was said since, and the words above are an earlier
+/// round's. A tool's output (`⎿` and what continues it, indented further than
+/// the agent's words) is left out; the agent's words after it start after a
+/// blank line, at the message's own indent.
+fn claude_last_message(pane: &str) -> Option<Vec<String>> {
+    let lines: Vec<&str> = pane.lines().collect();
+    let start = lines.iter().rposition(|l| l.starts_with(MESSAGE_MARKERS))?;
+    let mut out: Vec<String> = Vec::new();
+    // In a tool's output, and whether a blank line has gone by since.
+    let (mut output, mut blank) = (false, false);
+    let (mut seen_blank, mut attached) = (false, false);
+    for (i, line) in lines[start..].iter().enumerate() {
+        let text = if i == 0 {
+            line.trim_start_matches(MESSAGE_MARKERS)
+        } else if line.trim().is_empty() {
+            blank = true;
+            seen_blank = true;
+            ""
+        } else if let Some(rest) = line.strip_prefix("  ") {
+            if output && blank && !rest.starts_with(' ') {
+                output = false;
+            }
+            blank = false;
+            rest
+        } else if user_turn(line) {
+            return None;
+        } else {
+            break;
+        };
+        let text = text.trim();
+        if text.starts_with('⎿') {
+            output = true;
+            attached |= !seen_blank;
+        }
+        if !output {
+            out.push(text.to_string());
+        }
+    }
+    if attached || tool_call(out.first()?) {
+        return None;
+    }
+    Some(out)
+}
+
+/// The lines of an agy pane above its input (the box `╭`, or a bare `>`
+/// prompt between horizontal rules): what it said last. agy draws no marker for its messages, only the
+/// input and a status line under them, so a pane with neither has no message
+/// to read.
+fn agy_last_message(pane: &str) -> Option<Vec<String>> {
+    let lines: Vec<&str> = pane.lines().collect();
+    let input = lines.iter().rposition(|l| {
+        let l = l.trim_start();
+        l.starts_with('╭') || l == ">" || l.starts_with("> ")
+    })?;
+    let mut message: Vec<String> = lines[..input]
+        .iter()
+        .map(|l| l.trim().to_string())
+        .collect();
+    // agy draws its input between two horizontal rules; the one above is not
+    // part of what it said.
+    while message.last().is_some_and(|l| l.is_empty() || is_rule(l)) {
+        message.pop();
+    }
+    Some(message)
+}
+
+/// A line of nothing but box-drawing horizontals: the rule agy draws above
+/// and below its input.
+fn is_rule(line: &str) -> bool {
+    line.chars().count() >= 3 && line.chars().all(|c| matches!(c, '─' | '━' | '═'))
+}
+
+/// What an agent's last message says when it ends with `DONE` alone on its
+/// last line (`DONE_WORD`): the message, which is kept as the task's summary.
+/// `claude` reads the last message block of a Claude pane (the one
+/// `trailing_question` reads), anything else is agy. A `DONE` in the middle
+/// of a message, one with other words on its line, and a message that stops on
+/// a question, do not count; only an explicit last line ends a task.
+pub fn trailing_done(pane: &str, claude: bool) -> Option<String> {
+    let message = if claude {
+        claude_last_message(pane)?
+    } else {
+        agy_last_message(pane)?
+    };
+    let last = message.iter().rposition(|l| !l.is_empty())?;
+    if message[last] != DONE_WORD {
+        return None;
+    }
+    // The message above the word; agy's is the last paragraphs before it.
+    let body: Vec<&str> = message[..last].iter().map(String::as_str).collect();
+    let from = if claude {
+        0
+    } else {
+        body.len().saturating_sub(DONE_SUMMARY_LINES)
+    };
+    let text = body[from..].join("\n");
+    let text = text.trim();
+    Some(if text.is_empty() {
+        DONE_WORD.to_string()
+    } else {
+        format!("{text}\n{DONE_WORD}")
+    })
+}
+
+/// How many lines above `DONE` an agy pane gives the summary: its messages
+/// have no marker to tell where one begins.
+const DONE_SUMMARY_LINES: usize = 20;
+
 /// Whether the agent's footer says a background shell it started is still
 /// running. Claude Code can end its turn with a command (`make check`) left
-/// running in the background, draws "1 shell still running" in its footer,
-/// and takes the turn up again when the shell ends; herdr reads it as idle
-/// all the while. Only the lines after the last input prompt (`❯`) are the
-/// footer, so a message that quotes the phrase does not count; a pane with
-/// no prompt is read whole.
+/// running in the background, draws "1 shell still running" in its footer
+/// (or, from 2.1.3xx, a bare `· 1 shell ·` segment), and takes the turn up
+/// again when the shell ends; herdr reads it as idle
+/// all the while. Two places count, so a message that quotes the phrase
+/// does not: the lines after the last input prompt (`❯`; a pane with no
+/// prompt is read whole), and what Claude draws after its last message (the
+/// turn summary, the input box, a dialog in its place). The second matters
+/// when a dialog sits under the summary: its menu cursor is also `❯`. The
+/// pane wraps the phrase and its count, so line breaks are read as spaces.
 pub fn background_shell_running(pane: &str) -> bool {
     let lines: Vec<&str> = pane.lines().collect();
     let start = lines
         .iter()
         .rposition(|l| l.trim_start_matches(['\u{a0}', ' ']).starts_with('❯'))
         .map_or(0, |i| i + 1);
-    lines[start..].iter().any(|line| {
-        let line = line.replace('\u{a0}', " ");
-        ["shell still running", "shells still running"]
+    says_shell_running(&lines[start..])
+        || after_last_message(&lines).is_some_and(says_shell_running)
+}
+
+/// The lines after the last message of an agent that draws a message marker
+/// (`MESSAGE_MARKERS`): from the first line after the marker's line that
+/// starts in the first column (the message's own lines are indented, or
+/// blank). `None` with no marker, or nothing after the message.
+fn after_last_message<'a>(lines: &'a [&'a str]) -> Option<&'a [&'a str]> {
+    let start = lines.iter().rposition(|l| l.starts_with(MESSAGE_MARKERS))?;
+    let end = (start + 1..lines.len()).find(|&i| {
+        let line = lines[i];
+        !line.is_empty() && !line.starts_with([' ', '\u{a0}', '\t'])
+    })?;
+    Some(&lines[end..])
+}
+
+/// Do `lines`, read as one run of words, say `N shell(s) still running`,
+/// or hold `N shell(s)` as a footer segment of its own, between `·`s or a
+/// `·` and the line's end? A line is read alone too, as a segment last on
+/// its line would run into the next line's text in the run.
+fn says_shell_running(lines: &[&str]) -> bool {
+    let text = lines
+        .iter()
+        .flat_map(|l| l.split_whitespace())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let count = |seg: &str| {
+        let words: Vec<&str> = seg.split_whitespace().collect();
+        matches!(
+            words.as_slice(),
+            [n, "shell" | "shells"]
+                if n.bytes().all(|b| b.is_ascii_digit()) && n.bytes().any(|b| b != b'0')
+        )
+    };
+    // A segment needs a `·` beside it: a line that only says `1 shell` is
+    // someone's text.
+    let segment = lines
+        .iter()
+        .copied()
+        .chain([text.as_str()])
+        .filter(|l| l.contains('·'))
+        .any(|l| l.split('·').any(count));
+    segment
+        || ["shell still running", "shells still running"]
             .iter()
             .any(|phrase| {
-                line.match_indices(phrase).any(|(at, _)| {
-                    line[..at]
+                text.match_indices(phrase).any(|(at, _)| {
+                    text[..at]
                         .trim_end()
                         .ends_with(|c: char| c.is_ascii_digit())
                 })
             })
-    })
 }
 
 /// What agy draws when it stops for a person, idle to herdr: a tool it wants
@@ -1516,6 +1999,47 @@ pub fn next_state(task: &Task, observed: &Observed) -> Option<TaskState> {
 pub(crate) mod tests {
     use super::*;
 
+    /// The prompt shows wrapped and indented as the agent draws it, inside a
+    /// box border too, as a pasted-text placeholder, or by an answer to it;
+    /// an empty input or part of the prompt further in does not show it.
+    #[test]
+    fn shows_prompt_reads_the_start_of_a_wrapped_prompt() {
+        let prompt = "Fix the flaky test in the store module and say what was wrong with it.";
+        let pane = "> Fix the flaky test in the store\n  module and say what was wrong with it.\n\n  ? for shortcuts\n";
+        assert!(shows_prompt(pane, prompt));
+        let boxed = "  \u{2503}  Fix the flaky test in the\n  \u{2503}  store module and say what\n  \u{2503}  was wrong with it.\n";
+        assert!(shows_prompt(boxed, prompt));
+        assert!(!shows_prompt("> \n\n  ? for shortcuts\n", prompt));
+        assert!(!shows_prompt("  Fix the flaky", prompt));
+        assert!(shows_prompt("> [Pasted text #1 +12 lines]\n", prompt));
+    }
+
+    /// Codex leaves a prompt it was pasted in its input: whole, or as a
+    /// placeholder when long. An empty input, or Claude's placeholder, is not
+    /// that.
+    #[test]
+    fn a_prompt_in_the_input_box_is_unsent() {
+        let prompt = "Review the branch and report what you find in the diff";
+        assert!(prompt_unsent_in_input(
+            "› [Pasted Content 3000 chars]\n",
+            prompt
+        ));
+        assert!(prompt_unsent_in_input(
+            "› Review the branch and report\n  what you find in the diff\n",
+            prompt
+        ));
+        assert!(!prompt_unsent_in_input("› \n  ⏎ send\n", prompt));
+        // An empty prompt is shown everywhere, but is nowhere unsent.
+        assert!(!prompt_unsent_in_input("› \n  ⏎ send\n", ""));
+        assert!(!prompt_unsent_in_input("› \n  ⏎ send\n", "   "));
+        assert!(!prompt_unsent_in_input(
+            "> [Pasted text #1 +12 lines]\n",
+            prompt
+        ));
+        assert!(shows_prompt("\u{25cf} On it.\n", prompt));
+        assert!(shows_prompt("anything", ""));
+    }
+
     /// A checkout recorded before `already_open` existed is pastor's own,
     /// and one that is pastor's own writes nothing new.
     #[test]
@@ -1559,31 +2083,31 @@ pub(crate) mod tests {
     #[test]
     fn a_label_renders_every_placeholder() {
         let mut t = task(TaskState::Queued, None);
-        t.id = 285;
+        t.id = 85;
         t.flock = Some("personal".into());
         t.machine = Some("pi-1".into());
         t.job = "board".into();
         t.item = serde_json::json!({"key": "card-9"});
-        assert_eq!(render_label(None, &t).unwrap(), "personal/t-285");
+        assert_eq!(render_label(None, &t).unwrap(), "personal/t-85");
         let one = |template: &str, t: &Task| render_label(Some(template), t).unwrap();
-        assert_eq!(one("{{ task.id }}", &t), "t-285");
+        assert_eq!(one("{{ task.id }}", &t), "t-85");
         assert_eq!(one("{{ flock }}", &t), "personal");
         assert_eq!(one("{{ machine }}", &t), "pi-1");
         assert_eq!(one("{{ job }}", &t), "board");
         assert_eq!(one("{{ item.key }}", &t), "card-9");
         assert_eq!(
             one("{{job}}:{{ item.key }} ({{ task.id }})", &t),
-            "board:card-9 (t-285)"
+            "board:card-9 (t-85)"
         );
 
         // `task run` has no job and no item.
         t.job = "run".into();
         t.item = Value::Null;
-        assert_eq!(one("{{ job }}/{{ task.id }}", &t), "t-285");
+        assert_eq!(one("{{ job }}/{{ task.id }}", &t), "t-85");
         assert_eq!(one("{{ item.key }}-x", &t), "-x");
         // A task from before flocks has none.
         t.flock = None;
-        assert_eq!(render_label(None, &t).unwrap(), "t-285");
+        assert_eq!(render_label(None, &t).unwrap(), "t-85");
     }
 
     /// A label herdr would show badly, or not at all, is refused with the
@@ -1664,6 +2188,14 @@ pub(crate) mod tests {
                 cwd: None,
                 keep_pane: None,
                 keep_pane_from: None,
+                remove_worktree: None,
+                remove_worktree_from: None,
+                load: None,
+                load_from: None,
+                fetch: Default::default(),
+                start_prompt: None,
+                workdir: None,
+                workdir_bundles: Vec::new(),
                 rounds: Default::default(),
             },
             machine: Some("pi-1".into()),
@@ -2242,6 +2774,162 @@ pub(crate) mod tests {
         )
     }
 
+    /// A Claude message whose last line is `DONE` alone ends the task, with
+    /// the message as its summary; the word anywhere else, with other words,
+    /// in an earlier message, or followed by a question, does not.
+    #[test]
+    fn a_claude_message_ending_in_done_says_it_is_finished() {
+        let done = claude_pane("● Pushed the branch and opened the PR.\n\n  DONE");
+        assert_eq!(
+            trailing_done(&done, true).as_deref(),
+            Some("Pushed the branch and opened the PR.\nDONE")
+        );
+        // Paragraphs and indented lines stay as they were written.
+        let long = claude_pane("● Tests pass.\n\n  - 3 files changed\n  - PR 42\n\n  DONE");
+        assert_eq!(
+            trailing_done(&long, true).as_deref(),
+            Some("Tests pass.\n\n- 3 files changed\n- PR 42\nDONE")
+        );
+        // Only the word and nothing before it.
+        assert_eq!(
+            trailing_done(&claude_pane("● DONE"), true).as_deref(),
+            Some("DONE")
+        );
+        for not in [
+            "● DONE\n\n  Anything else you want?",
+            "● All DONE",
+            "● DONE.",
+            "● done",
+            "● DONE\n\n  but the tests fail",
+            "● Is it DONE?",
+            "● Two ways to do it.\n\n  Should I keep DONE?",
+        ] {
+            assert_eq!(trailing_done(&claude_pane(not), true), None, "{not}");
+        }
+        // An earlier message that said it does not count for a later one.
+        let later = "● DONE\n\n❯ one more thing\n\n● Working on it.\n\n❯\n";
+        assert_eq!(trailing_done(later, true), None);
+        // No marker, no message.
+        assert_eq!(trailing_done("DONE\n", true), None);
+    }
+
+    /// A turn that draws no message of its own (interrupted, or ended by an
+    /// API error) leaves the last round's `DONE` above the user's turn: not
+    /// this round's word.
+    #[test]
+    fn a_done_from_an_earlier_turn_is_not_this_turns() {
+        for after in [
+            "❯ commit and push\n  ⎿  Interrupted · What should Claude do instead?",
+            "❯ commit and push\n  ⎿  API Error: 500 internal error",
+            "❯ commit and push",
+        ] {
+            let pane = format!(
+                "● Opened the PR.\n\n  DONE\n\n{after}\n\n\
+                 ─────────────────────────\n❯\u{a0}\n─────────────────────────\n"
+            );
+            assert_eq!(trailing_done(&pane, true), None, "{after}");
+        }
+        // The same words with nothing after them are said.
+        let said = "● Opened the PR.\n\n  DONE\n\n─────────────────\n❯\u{a0}\n──────────────\n";
+        assert_eq!(
+            trailing_done(said, true).as_deref(),
+            Some("Opened the PR.\nDONE")
+        );
+    }
+
+    /// A tool call and what it printed are not the agent's words.
+    #[test]
+    fn tool_output_is_not_a_message() {
+        let call = "● Bash(./report.sh)\n  ⎿  checking\n     all good\n     DONE\n\n❯\u{a0}\n";
+        assert_eq!(trailing_done(call, true), None);
+        let bare_call = "● Bash(./report.sh)\n\n  DONE\n\n❯\u{a0}\n";
+        assert_eq!(trailing_done(bare_call, true), None);
+        // A call that wraps, one with a name of several words (an MCP tool's),
+        // and output with a blank line in it and `DONE` after.
+        for pane in [
+            "● Bash(cd ../x && ./report.sh --format text\n      --out y)\n  ⎿  checking\n\n     DONE\n\n❯\u{a0}\n",
+            "● github - get_pr (MCP)(owner: \"a\", number: 1)\n  ⎿  {\"state\": \"open\"}\n\n     DONE\n\n❯\u{a0}\n",
+        ] {
+            assert_eq!(trailing_done(pane, true), None, "{pane}");
+        }
+        // The agent's words after the call are a block of their own.
+        let after = "● Bash(./report.sh)\n  ⎿  ok\n\n● Ran the check.\n\n  DONE\n\n❯\u{a0}\n";
+        assert_eq!(
+            trailing_done(after, true).as_deref(),
+            Some("Ran the check.\nDONE")
+        );
+    }
+
+    /// agy draws no marker: its message is what sits above its input.
+    #[test]
+    fn an_agy_pane_ending_in_done_says_it_is_finished() {
+        let pane = |bottom: &str| agy_pane(bottom);
+        assert_eq!(
+            trailing_done(&pane("Opened the PR.\nDONE"), false).as_deref(),
+            Some("I ran the review and wrote the notes.\n\nOpened the PR.\nDONE")
+        );
+        let bare = "  Pushed it.\n  DONE\n\n  > \n ~/src/repo  gemini-3-pro\n";
+        assert_eq!(
+            trailing_done(bare, false).as_deref(),
+            Some("Pushed it.\nDONE")
+        );
+        for not in [
+            "DONE\nbut it fails",
+            "Requesting permission for:\n  run_command make\n  1. Allow  2. Deny",
+            "Is it DONE?",
+        ] {
+            assert_eq!(trailing_done(&pane(not), false), None, "{not}");
+        }
+        // A turn the user took after the word is not finished by it.
+        for after in ["> commit and push", "> commit and push\n  API Error: 500"] {
+            let stale = agy_pane(&format!("Opened the PR.\nDONE\n\n  {after}"));
+            assert_eq!(trailing_done(&stale, false), None, "{after}");
+        }
+        // No input drawn, no message to read.
+        assert_eq!(trailing_done("DONE\n", false), None);
+        // The summary is cut to the lines just above the word.
+        let long = format!("{}\nDONE", ["line"; 60].join("\n"));
+        let said = trailing_done(&agy_pane(&long), false).unwrap();
+        assert_eq!(said.lines().count(), DONE_SUMMARY_LINES + 1);
+    }
+
+    /// agy 1.4.12 draws its input as a bare `>` between two horizontal rules,
+    /// not a `╭` box. These panes are what it drew (the header and the
+    /// account line cut): a finished turn ends in `DONE` above the rule; a
+    /// turn interrupted after it, and one that failed, leave the user's turn
+    /// and a line of their own between the old `DONE` and the input.
+    #[test]
+    fn agy_drawing_its_input_between_rules_is_read() {
+        let rule = "─".repeat(40);
+        let pane = |above: &str| {
+            format!(
+                "> Say the word hello in one short sentence. Then put the word DONE alone on the last line of your reply.\n\n\
+                 ▸ Thought for 1s\n\n  Hello!\n\n  DONE\n\n{above}{rule}\n>\n{rule}\n\
+                 ? for shortcuts                                   accept-edits · Gemini 3.8 Flash · low\n"
+            )
+        };
+        // The turn ended on DONE.
+        let said = trailing_done(&pane(""), false).unwrap();
+        assert!(said.ends_with("Hello!\nDONE"), "{said}");
+        // The user took another turn and interrupted it.
+        let interrupted = pane(
+            "> commit and push\n\n▸ Thought for 1s\n  The user wants to commit and push. We need context\n\n  \
+             ⎿  Interrupted · What should Antigravity CLI do instead?\n",
+        );
+        assert_eq!(trailing_done(&interrupted, false), None);
+        // The turn failed.
+        let failed = pane(
+            "> commit and push\n\n⚠ failed to construct executor: unknown model key MODEL_PLACEHOLDER_M320: model not found\n\
+             Error ID: 50c5ec3d-3ed9-47bd-a1fc-bb511816d692-5\n\n",
+        );
+        assert_eq!(trailing_done(&failed, false), None);
+        // The rules alone do not make a turn done.
+        assert_eq!(
+            trailing_done(&pane("").replace("DONE", "Done."), false),
+            None
+        );
+    }
+
     #[test]
     fn a_last_message_that_asks_is_a_question() {
         let pane = claude_pane(
@@ -2283,6 +2971,13 @@ pub(crate) mod tests {
             .replace("auto mode on", "auto mode on · 2 shells still running");
         assert!(background_shell_running(&pane));
         assert!(background_shell_running("1 shell still running\n"));
+        // Claude 2.1.3xx draws a bare count as a footer segment.
+        let pane = claude_pane("● Waiting on make check.")
+            .replace("auto mode on", "auto mode on · 1 shell · ↓ to manage");
+        assert!(background_shell_running(&pane));
+        // Last on its line, a hint line under it.
+        let pane = claude_pane("● Waiting.").replace("← for agents", "← for agents · 2 shells");
+        assert!(background_shell_running(&pane));
     }
 
     #[test]
@@ -2294,6 +2989,16 @@ pub(crate) mod tests {
         let pane = claude_pane("● It said 1 shell still running, now ended.");
         assert!(!background_shell_running(&pane));
         assert!(!background_shell_running("fake output\n"));
+        // A count that is not a segment of its own, or not of shells.
+        let pane = claude_pane("● Done.").replace("auto mode on", "auto mode on · ran 1 shell");
+        assert!(!background_shell_running(&pane));
+        let pane = claude_pane("● Done.").replace("auto mode on", "auto mode on · 1 shells2");
+        assert!(!background_shell_running(&pane));
+        // No shells, and a count with no `·` beside it.
+        let pane = claude_pane("● Done.").replace("auto mode on", "auto mode on · 0 shells");
+        assert!(!background_shell_running(&pane));
+        assert!(!background_shell_running("● Done.\n\n❯\n  1 shell\n"));
+        assert!(!background_shell_running("build output\n2 shells\n"));
     }
 
     /// agy's pane when it stops on a permission prompt, and when it ends a
@@ -2390,6 +3095,7 @@ pub(crate) mod tests {
             Outcome::Blocked,
             Outcome::NothingToDo,
             Outcome::NoSummary,
+            Outcome::NoHead,
             Outcome::Unknown,
         ] {
             assert_eq!(o.as_str().parse::<Outcome>().unwrap(), o);
@@ -2442,7 +3148,8 @@ pub(crate) mod tests {
         let mut t = task(TaskState::Queued, None);
         t.prompt = "fix it\n".into();
         assert_eq!(prompt_to_send(&t), format!("fix it\n\n{SUMMARY_ASK}"));
-        assert!(SUMMARY_ASK.contains("pastor task done --summary-file -"));
+        assert!(SUMMARY_ASK.contains("pastor task done --current --summary"));
+        assert!(!SUMMARY_ASK.contains("--summary-file"));
         t.spec.summary = SummaryMode::Require;
         let sent = prompt_to_send(&t);
         assert!(

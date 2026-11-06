@@ -92,14 +92,16 @@ An agent says how its work went as it finishes. The first line of its
 summary is the outcome: `done`, `partial`, `blocked` or `nothing to do`.
 
 ```sh
-pastor task done --summary "done: pushed pastor/t-12, PR #42"
-pastor task done --summary-file notes.md  # - reads stdin
+pastor task done --summary 'done: pushed pastor/t-12, PR #42'
+pastor task done --summary-file notes.md  # - reads stdin; not from a task's pane
 ```
 
 pastor asks for it: each prompt it sends ends with a line asking the agent
-to run `pastor task done --summary-file -`. Each round of a task (the
+to run `pastor task done --current --summary '<summary>'`, the summary a short text in single quotes. Each round of a task (the
 prompt, or a `task send` that reopened it) keeps one summary. A round that
-ends without one keeps the last lines of the pane instead.
+ends without one keeps the last lines of the pane instead, as `no summary`,
+or as `no head` on an `ssh` machine whose agents cannot reach the head
+(the head has no `head_address`).
 `pastor task describe` shows the last round's, `--all-summaries` every
 round's. The same summary reaches `task list --wide`, the `task.done` and
 `task.failed` events, `pastor watch` and a connector's finish command.
@@ -124,6 +126,10 @@ own. A task run with `--keep-pane` (or `keep_pane = true` in its job, flock or
 `[defaults]`) keeps its pane and worktree whatever it ends in, until `pastor
 task close`, so you can go on talking to its agent; while it is done it holds
 no slot.
+A task run with `--remove-worktree` (or `remove_worktree = true` in its job,
+flock or `[defaults]`) loses its worktree whatever it ends in, failed and
+stale too, once its agent stops; its branch stays for the retry, and a dirty
+checkout is kept with a note.
 
 ```sh
 pastor task close t-12 --remove-worktree  # close it now, worktree too

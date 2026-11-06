@@ -481,10 +481,12 @@ fn shipped_completions_match_the_cli() {
         let out = pastor().args(["completions", shell]).output().unwrap();
         assert!(out.status.success());
         let fresh = String::from_utf8(out.stdout).unwrap();
+        assert!(!fresh.is_empty(), "the CLI printed no {shell} completions");
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("contrib/completions")
             .join(format!("pastor.{shell}"));
         let shipped = std::fs::read_to_string(&path).unwrap();
+        assert!(!shipped.is_empty(), "{} is empty", path.display());
         assert!(
             shipped == fresh,
             "{} is stale: run make completions",

@@ -5,7 +5,7 @@ use tokio::time::Instant;
 
 use crate::config::Agents;
 use crate::herdr::{
-    AgentInfo, AgentStatus, CallError, Connector, ConnectorExt, Created, HerdrError,
+    AgentInfo, AgentStatus, CallError, Connector, ConnectorExt, Created, Fetched, HerdrError,
 };
 pub use crate::machine::FlockSeat;
 use crate::task::{Checkout, DispatchSpec, Place, Priority, Reopen, Task, TaskState, render_label};
@@ -32,6 +32,9 @@ pub struct MachineView {
     /// How far past `max_agents` a critical task may go.
     pub burst: u32,
     pub tags: Vec<String>,
+    /// The loads the machine takes, its own and its flocks'
+    /// (`Flock::loads_of`), as the flock file stands now.
+    pub loads: Vec<String>,
     /// Every pane-owning task and orphan on the machine.
     pub live: usize,
     /// How many of `live` come from a job (`Task::from_job`).
@@ -45,6 +48,10 @@ pub struct MachineView {
     /// serve's own setting (`takes_flock_work`), which the head does not
     /// know.
     pub pull: bool,
+    /// The head can place a task's workdir set there: a push machine it
+    /// reaches with a shell (`workdir_task::takes_sets`). A task with a set
+    /// goes nowhere else.
+    pub workdir_sets: bool,
     /// The flocks the machine is in now, each with its number and how many
     /// of its live tasks run here.
     pub flocks: Vec<FlockSeat>,
@@ -52,6 +59,78 @@ pub struct MachineView {
     /// this machine could take. A flock past its share here takes a slot
     /// only while this is empty (`MachineView::flock_may_take`).
     pub waiting_under_share: Vec<String>,
+    /// Where the machine stands against its room floor.
+    pub floor: FloorView,
+}
+
+/// A machine against its room floor (`config::Floor`), as dispatch reads
+/// it. The default is no floor: never short, nothing unread.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FloorView {
+    /// The first floor the machine is under, worded for the queue:
+    /// `sauron has 1.2 GB free under /tmp`. Disk under `$HOME`, then
+    /// `/tmp`, then memory (`floor_against`).
+    pub short: Option<String>,
+    /// Its floor is on, but a side of it cannot be read: no numbers yet, a
+    /// probe that failed before any answered, no memory on macOS.
+    pub unread: bool,
+    /// The machine's flocks whose `unknown_room` there is `no_room`
+    /// (`config::resolve_unknown_room`): an unread side holds their tasks.
+    pub hold_unread: Vec<String>,
+    /// The last `machine check` the head ran of it found that its agents
+    /// cannot reach the head (`MachineStatus::reach`): a task placed there
+    /// could not even say it is done.
+    pub unreachable: bool,
+    /// An operator cordoned it (`pastor machine cordon`): it takes no new
+    /// task, whatever the claim, and `--now` is no way past that.
+    pub cordoned: bool,
+}
+
+/// Where a machine named `name` with `room` (in KiB, as the probe reads
+/// it) stands against `floor` (in bytes): the first side it is under, and
+/// whether a side that is on cannot be read. No floor is never short.
+pub fn floor_against(
+    name: &str,
+    room: Option<&crate::machine::Room>,
+    floor: Option<crate::config::Floor>,
+) -> (Option<String>, bool) {
+    let Some(floor) = floor else {
+        return (None, false);
+    };
+    let bytes = |kib: Option<u64>| kib.map(|k| k.saturating_mul(1024));
+    let room = room.cloned().unwrap_or_default();
+    let sides = [
+        (floor.disk, bytes(room.home_free), "free under $HOME"),
+        (floor.disk, bytes(room.tmp_free), "free under /tmp"),
+        (floor.memory, bytes(room.mem_free), "of memory free"),
+    ];
+    let mut short = None;
+    let mut unread = false;
+    for (min, free, what) in sides {
+        let Some(min) = min else { continue };
+        match free {
+            None => unread = true,
+            Some(free) if free < min && short.is_none() => {
+                short = Some(format!("{name} has {} {what}", size_label(free)));
+            }
+            Some(_) => {}
+        }
+    }
+    (short, unread)
+}
+
+/// `bytes` as the queue says a size: `1.2 GB`, `512 MB`, `64 KB`, in
+/// powers of 1024 like the floor's own sizes.
+fn size_label(bytes: u64) -> String {
+    const K: f64 = 1024.0;
+    let b = bytes as f64;
+    if b >= K * K * K {
+        format!("{:.1} GB", b / (K * K * K))
+    } else if b >= K * K {
+        format!("{:.0} MB", b / (K * K))
+    } else {
+        format!("{:.0} KB", b / K)
+    }
 }
 
 /// What a task may take on a machine: a job slot if it comes from a job,
@@ -81,6 +160,23 @@ impl MachineView {
         self.seat(flock).is_some()
     }
 
+    /// Does the machine have every tag `spec` needs, take its load, and
+    /// its workdir set if it has one? A task with no load goes to a machine
+    /// whatever loads it takes.
+    pub fn suits(&self, spec: &DispatchSpec) -> bool {
+        self.has_tags(spec)
+            && self.takes_load(spec)
+            && (spec.workdir.is_none() || self.workdir_sets)
+    }
+
+    pub fn has_tags(&self, spec: &DispatchSpec) -> bool {
+        spec.tags.iter().all(|t| self.tags.contains(t))
+    }
+
+    pub fn takes_load(&self, spec: &DispatchSpec) -> bool {
+        spec.load.as_ref().is_none_or(|l| self.loads.contains(l))
+    }
+
     /// May a task of `flock` take a slot here, as far as the flock's number
     /// goes? Under its share, yes; from its share up to its max, only while
     /// no flock under its share here has a task waiting; at its max, no.
@@ -88,6 +184,24 @@ impl MachineView {
         self.seat(flock).is_some_and(|s| {
             s.has_room() && (s.under_share() || self.waiting_under_share.is_empty())
         })
+    }
+
+    /// Why its room floor keeps a task of `flock` off this machine, as the
+    /// waiting note says it: it cannot reach the head, under its floor, or a side of it unread while
+    /// `flock`'s `unknown_room` here is `no_room`. `None` when the floor
+    /// lets it take one.
+    pub fn floor_held(&self, flock: &str) -> Option<String> {
+        if self.floor.cordoned {
+            return Some(format!("{} is cordoned", self.name));
+        }
+        if self.floor.unreachable {
+            return Some(format!("{} cannot reach the head", self.name));
+        }
+        if let Some(short) = &self.floor.short {
+            return Some(short.clone());
+        }
+        (self.floor.unread && self.floor.hold_unread.iter().any(|f| f == flock))
+            .then(|| format!("{}'s room cannot be read", self.name))
     }
 
     /// Count one more live task of `flock` here, as a dispatch would.
@@ -116,10 +230,12 @@ impl MachineView {
 }
 
 /// Only machines in `flock`, the task's, qualify. Of those the pinned machine
-/// wins. Otherwise: healthy, has every required tag, has room for `claim`
+/// wins. Otherwise: healthy, has every required tag and takes its load
+/// (`MachineView::suits`), has room for `claim`
 /// (`MachineView::has_room`) with `flock` under its number there, and past
 /// its share only while no flock under its share waits there
-/// (`MachineView::flock_may_take`), fewest live tasks. Ties keep flock order.
+/// (`MachineView::flock_may_take`), not held by its room floor
+/// (`MachineView::floor_held`), fewest live tasks. Ties keep flock order.
 pub fn pick_machine(
     machines: &[MachineView],
     flock: &str,
@@ -142,7 +258,8 @@ pub fn pick_machine_where(
         m.healthy
             && m.has_room(claim)
             && m.flock_may_take(flock)
-            && spec.tags.iter().all(|t| m.tags.contains(t))
+            && m.floor_held(flock).is_none()
+            && m.suits(spec)
             && accepts(&m.name)
     };
     if let Some(pinned) = &spec.machine {
@@ -160,10 +277,12 @@ pub fn pick_machine_where(
 }
 
 /// Where a `task run --now` task (`DispatchSpec::now`) goes: its pinned
-/// machine, if it is healthy, is still in the task's flock, has the task's
-/// tags and `accepts` it, however many tasks it runs. `max_agents`, job
-/// slots, burst and the flock's number there are not looked at: the person
-/// who pinned it chose to run past them, but not to run in another flock.
+/// machine, if it is healthy, is not cordoned, is still in the task's
+/// flock, has the task's tags and `accepts` it, however many tasks it runs.
+/// `max_agents`, job slots, burst, the flock's number and the room floor
+/// there are not looked at: the person who pinned it chose to run past
+/// them, but not to run in another flock, nor in a flock at 0 there, which
+/// is draining the machine, nor on a machine an operator cordoned.
 /// `queue_run_as` checked membership before the row was inserted, under a
 /// lock it releases before placement, so it is checked again here in case a
 /// flock edit moved the machine in between.
@@ -179,8 +298,9 @@ pub fn now_machine(
         .find(|m| &m.name == pinned)
         .filter(|m| {
             m.healthy
-                && m.in_flock(flock)
-                && spec.tags.iter().all(|t| m.tags.contains(t))
+                && !m.floor.cordoned
+                && m.seat(flock).is_some_and(|s| !s.drained())
+                && m.suits(spec)
                 && accepts(&m.name)
         })
         .map(|m| m.name.clone())
@@ -190,7 +310,8 @@ pub fn now_machine(
 /// a machine where `flock` is past its share and under its max, the other
 /// flocks under their share there that have a task in `later` the machine
 /// could take (queued, not pinned elsewhere, with its tags, room for its
-/// claim, one `accepts`). `later` is the queue behind the task being
+/// claim, not held by the machine's room floor, one `accepts`). `later` is
+/// the queue behind the task being
 /// placed: those tasks still get their turn in this pass, while one ahead
 /// of it already had its turn and did not take the machine. Elsewhere the
 /// list is left empty, since it only matters past a share.
@@ -217,8 +338,9 @@ pub fn mark_waiting_under_share(
                 || waiting.iter().any(|w| w == theirs)
                 || !v.seat(theirs).is_some_and(FlockSeat::under_share)
                 || t.spec.machine.as_ref().is_some_and(|m| *m != v.name)
-                || !t.spec.tags.iter().all(|tag| v.tags.contains(tag))
+                || !v.suits(&t.spec)
                 || !v.has_room(Claim::of(t))
+                || v.floor_held(theirs).is_some()
                 || !accepts(t, &v.name)
             {
                 continue;
@@ -235,6 +357,12 @@ pub fn mark_waiting_under_share(
 pub fn flock_held(v: &MachineView, flock: &str) -> Option<String> {
     let seat = v.seat(flock)?;
     let max = seat.max?;
+    if seat.drained() {
+        return Some(format!(
+            "flock {flock} has 0 slots on {}: it starts no new tasks there ({} still running)",
+            v.name, seat.live
+        ));
+    }
     if !seat.has_room() {
         let of = seat.number_label().unwrap_or_else(|| max.to_string());
         return Some(format!(
@@ -274,10 +402,10 @@ pub enum DispatchError {
     /// never came up, the agent exited. The task failed; the machine is fine.
     #[error("{0}")]
     Task(String),
-    /// The agent exited before it took its prompt. `tail` is the end of its
-    /// pane as it was then, empty when it could not be read: an agent can
-    /// die at its start on a usage limit, and only its pane says so
-    /// (`limit::limit_in`).
+    /// The agent exited before it took its prompt, or sits at its login
+    /// screen. `tail` is the end of its pane as it was then, empty when it
+    /// could not be read: an agent can die at its start on a usage limit,
+    /// and only its pane says so (`limit::limit_in`).
     #[error("{message}")]
     Exited { message: String, tail: String },
 }
@@ -334,12 +462,40 @@ pub async fn dispatch(
 }
 
 /// What a machine's provisioners make sure of before a launch there
-/// (`provision`): the machine's own permission profile's deny list, which
-/// the agy provisioner writes into agy's settings for an agy task under a
-/// profile. The default asks for nothing.
+/// (`provision`): the machine's own permission profile, which the agy
+/// provisioner writes into agy's settings for an agy task under a profile.
+/// The default asks for nothing.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Provision<'a> {
-    pub own_deny: &'a [String],
+    pub own: Option<&'a crate::config::agy::Policy>,
+    /// The keys of the trust pastor has saved for the machine
+    /// (`Store::trusted_repos`): before the agent starts, a Claude or agy
+    /// task whose folder is among them gets it written into the harness's
+    /// store (`trust_write`).
+    pub trusted: &'a [String],
+    /// How long after that write the store is read again; none by default.
+    pub trust_recheck: Duration,
+    /// The harness versions the machine's flock pins, and the manifests of
+    /// those harnesses: an agent of a kind pinned to a version gets the env
+    /// its manifest says keeps it from updating itself
+    /// (`Manifest::update_env`), so the pin holds.
+    pub pins: Option<&'a crate::harness::Pins>,
+    pub harnesses: Option<&'a crate::harness_manifest::Harnesses>,
+    /// The env layers under an agent's own on this machine (`[defaults]`,
+    /// the task's flock, the machine): every agent's pane gets them, the
+    /// agent's `[agents]` env over them key by key.
+    pub env: Option<&'a crate::config::EnvLayers>,
+    /// The startup dialogs pastor has already answered for the task
+    /// (`Store::answered`): its prompt is not held for them again
+    /// (`Agents::startup_markers`).
+    pub answered: &'a [String],
+    /// What places a task's workdir set in its folder before the agent
+    /// starts (`workdir_task::Gate`); none on a machine that places none.
+    pub workdirs: Option<&'a crate::bundle::workdir_task::GateHandle>,
+    /// How long the place of a task's workdir set may take; `None` is no
+    /// bound. Its own time, so a slow place fails the task `workdir_failed`
+    /// rather than reading as a herdr that stopped answering.
+    pub workdir_wait: Option<std::time::Duration>,
 }
 
 /// `dispatch` on a machine whose provisioners want `provision`.
@@ -406,6 +562,7 @@ async fn start(
     task.error = None;
     task.prompt_pending = false;
     task.activity_seen = false;
+    task.spec.start_prompt = None;
 
     let result = dispatch_steps(
         conn,
@@ -451,6 +608,8 @@ async fn dispatch_steps(
     resume: bool,
     provision: Provision<'_>,
 ) -> Result<DispatchOutcome, DispatchError> {
+    // Each dispatch says afresh what its fetch found.
+    task.spec.fetch.warning = None;
     let spec = task.spec.clone();
     // A waiting task goes on after a usage limit (`TaskState::Waiting`): with
     // its session when it has one, else from its prompt again, in the same
@@ -470,12 +629,12 @@ async fn dispatch_steps(
     });
     // agy reads its permission rules only from its settings on the machine,
     // and can write back a copy from before pastor's edit at any time, so
-    // the agy provisioner makes them deny what the machine's own profile
-    // denies before every launch, not once. First, so what checks those
-    // rules next reads them as written.
+    // the agy provisioner makes them say what the machine's own profile says
+    // before every launch, not once. First, so what checks those rules next
+    // reads them as written.
     if agents.agy_profile(&spec) {
         let machine = task.machine.as_deref().unwrap_or("this machine");
-        crate::provision::agy::reconcile(conn, provision.own_deny, machine)
+        crate::provision::agy::reconcile(conn, provision.own, machine)
             .await
             .map_err(|e| match e {
                 crate::provision::agy::ReconcileError::Transport(e) => CallError::from(e).into(),
@@ -487,8 +646,12 @@ async fn dispatch_steps(
     // Before anything is made on the machine: a task whose agent cannot take
     // its tool lists (an `[agents]` edit since it was queued) leaves nothing
     // behind.
+    let under = provision
+        .env
+        .map(|layers| layers.merged(task.flock.as_deref()))
+        .unwrap_or_default();
     let mut launch = agents
-        .launch(&spec)
+        .launch_over(&spec, &under)
         .map_err(|e| DispatchError::Task(e.message))?;
     // opencode merges `OPENCODE_PERMISSION` over its own config's rules. Its
     // managed config, and on macOS its managed preferences, are merged after
@@ -496,17 +659,19 @@ async fn dispatch_steps(
     // and the task refuses rather than run under both. A machine that cannot
     // tell (a `command` one) goes ahead.
     if agents.opencode_profile(&spec) {
-        if conn
+        if let Some(hits) = conn
             .opencode_permission_rules()
             .await
             .map_err(CallError::from)?
-            == Some(true)
+            && !hits.is_empty()
         {
             return Err(DispatchError::Task(format!(
-                "{}: the opencode config on {} has permission rules of its own, which opencode would \
-                 merge with profile {}'s; move them out of its opencode config, or run without a profile",
+                "{}: the opencode config on {} has permission rules of its own ({}), which \
+                 opencode would merge with profile {}'s; move them out of its opencode config, \
+                 or run without a profile",
                 crate::config::opencode::OPENCODE_PERMISSIONS_CONFLICT,
                 task.machine.as_deref().unwrap_or("this machine"),
+                crate::config::opencode::describe_config_check_hits(&hits),
                 spec.profile().unwrap_or_default(),
             )));
         }
@@ -583,20 +748,32 @@ async fn dispatch_steps(
         }
     }
     // A Claude agent starts on a session pastor names, so `task attach` can
-    // resume it once the pane is gone; last, after the tool flags. The task
-    // records it only once `agent.start` succeeds (`finish_dispatch`): a
-    // task that failed before then never had that conversation to resume.
-    // A paused task goes back to the session it recorded instead.
+    // resume it once the pane is gone; last, after the tool flags. An agy
+    // agent has no such flag, but is resumed the same way once pastor has
+    // read its conversation id back from herdr (`Actor::capture_agent_session`).
+    // The task records it only once `agent.start` succeeds
+    // (`finish_dispatch`): a task that failed before then never had that
+    // conversation to resume. A paused task goes back to the session it
+    // recorded instead, by whichever flag its kind resumes on
+    // (`task::resume_flag`); a kind with none, or a task with no session
+    // recorded for it (an agy task on a machine with no hook installed),
+    // falls back to starting fresh.
     let mut session = None;
     if resume && !restart {
+        let flag = crate::task::resume_flag(&launch.kind).ok_or_else(|| {
+            DispatchError::Task(format!(
+                "{name}: a {} agent cannot resume a session",
+                launch.kind
+            ))
+        })?;
         let id = spec
             .session_id
             .clone()
-            .filter(|id| crate::task::is_session_id(id))
+            .filter(|id| crate::task::is_resumable_session(&launch.kind, id))
             .ok_or_else(|| {
-                DispatchError::Task(format!("{name} has no Claude session recorded to resume"))
+                DispatchError::Task(format!("{name} has no session recorded to resume"))
             })?;
-        launch.args.extend(["--resume".to_string(), id.clone()]);
+        launch.args.extend([flag.to_string(), id.clone()]);
         session = Some(id);
     } else {
         task.spec.session_id = None;
@@ -618,6 +795,16 @@ async fn dispatch_steps(
             *value =
                 expand_home(conn, &format!("env {key}"), value, task.machine.as_deref()).await?;
         }
+    }
+    // A harness its machine pins to a version must not update itself; over
+    // the `[agents]` env, so the pin holds.
+    if let (Some(pins), Some(harnesses)) = (provision.pins, provision.harnesses)
+        && pins
+            .get(&launch.kind)
+            .is_some_and(|pin| pin != crate::harness::LATEST)
+        && let Some(m) = harnesses.get(&launch.kind)
+    {
+        env.extend(m.update_env.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
     // The mark the head refuses fleet changes by (`ipc::TASK_ENV`). Last,
     // so an `[agents]` env cannot clear it.
@@ -681,8 +868,16 @@ async fn dispatch_steps(
             {
                 // Its workspace goes in a moment, so its label is the
                 // agent's name, never the template.
-                let (created, branch) =
-                    open_worktree(conn, &spec, repo, name, name, resume).await?;
+                let (created, branch) = open_worktree(
+                    conn,
+                    &spec,
+                    repo,
+                    name,
+                    name,
+                    resume,
+                    &mut task.spec.fetch.warning,
+                )
+                .await?;
                 task.spec.checkout = find_checkout(conn, repo, branch, &created).await?;
                 worktree = Some(created);
             }
@@ -706,7 +901,16 @@ async fn dispatch_steps(
         }
         (None, Some(repo)) if spec.worktree => {
             let label = workspace_label(task, name);
-            let (created, branch) = open_worktree(conn, &spec, repo, name, &label, resume).await?;
+            let (created, branch) = open_worktree(
+                conn,
+                &spec,
+                repo,
+                name,
+                &label,
+                resume,
+                &mut task.spec.fetch.warning,
+            )
+            .await?;
             // `worktree.open` answering `already_open` means the checkout
             // was already in a workspace another task opened: that
             // workspace's label is unchanged by this task, so its own
@@ -745,6 +949,34 @@ async fn dispatch_steps(
             created.root_pane.pane_id
         }
     };
+    // A folder pastor already trusts is trusted in the harness's own store
+    // before the agent can ask about it.
+    let folder = task
+        .spec
+        .checkout
+        .as_ref()
+        .map(|c| c.path.clone())
+        .or_else(|| dir.clone());
+    crate::trust_write::before_start(
+        conn,
+        provision.trusted,
+        provision.trust_recheck,
+        task,
+        &launch,
+        folder.as_deref(),
+    )
+    .await;
+    // The task's workdir set, in the folder the agent starts in, after the
+    // trust (agy loads a folder's hooks only once it is trusted) and before
+    // the agent, which reads it as it starts.
+    place_workdir(
+        task,
+        &launch.kind,
+        folder.as_deref(),
+        provision.workdirs,
+        provision.workdir_wait,
+    )
+    .await?;
     // A resumed session already has the line asking for a summary.
     let to = crate::task::agent_and_model(&task.spec.agent, task.model());
     let prompt = if let Some((from, tail)) = moved.as_ref().filter(|_| restart) {
@@ -768,6 +1000,9 @@ async fn dispatch_steps(
     } else {
         crate::task::prompt_to_send(task)
     };
+    // Kept for a delivery held at a startup dialog, or sent again: it must
+    // be this prompt, not the task's own a resumed session already ran.
+    task.spec.start_prompt = (prompt != crate::task::prompt_to_send(task)).then(|| prompt.clone());
     finish_dispatch(FinishDispatch {
         conn,
         task,
@@ -777,9 +1012,131 @@ async fn dispatch_steps(
         pane_id: &pane_id,
         prompt: &prompt,
         agents,
+        answered: provision.answered,
         ready_timeout,
     })
     .await
+}
+
+/// Place `task`'s stored workdir bundles, then its own workdir set, in
+/// `folder` through `gate`, the set with the task's profile in it when it
+/// names none, and record where. Fails the start (`workdir_failed`) when
+/// one cannot be placed: the agent would start without what it gives.
+///
+/// A stored bundle never decides where a task runs, so on a machine that
+/// places no sets, and for a kind of agent pastor places none for, the
+/// bundles are skipped instead, with why on each (the actor raises
+/// `workdir.skipped`). A bundle with nothing for the agent's kind places
+/// nothing.
+async fn place_workdir(
+    task: &mut Task,
+    kind: &str,
+    folder: Option<&str>,
+    gate: Option<&crate::bundle::workdir_task::GateHandle>,
+    wait: Option<std::time::Duration>,
+) -> Result<(), DispatchError> {
+    use crate::bundle::workdir_push::WORKDIR_FAILED;
+    use crate::bundle::workdir_task::Placing;
+    let stored = !task.spec.workdir_bundles.is_empty();
+    if task.spec.workdir.is_none() && !stored {
+        return Ok(());
+    }
+    let machine = task.machine.clone().unwrap_or_default();
+    let fail = |why: String| DispatchError::Task(format!("{WORKDIR_FAILED}: {why}"));
+    let own = match task.spec.workdir.as_deref() {
+        Some(w) => Some(
+            crate::bundle::workdir_task::settle(&w.set, kind, task.spec.profile())
+                .map_err(|r| fail(format!("{} ({})", r.message, r.code)))?,
+        ),
+        None => None,
+    };
+    let gate = gate.and_then(|g| g.0.clone());
+    // Every task places a stored bundle under the bundle's own id, so in a
+    // folder tasks share each start would replace the last one's version,
+    // taking out files another agent there still reads. Only a checkout
+    // pastor opened for this task is its own.
+    let own_folder = task
+        .spec
+        .checkout
+        .as_ref()
+        .is_some_and(|c| !c.already_open && folder == Some(c.path.as_str()));
+    let skip = match &gate {
+        _ if !stored => None,
+        None => Some(format!(
+            "{machine} does not place workdir sets: pastor places them only on push machines"
+        )),
+        Some(_) if !crate::bundle::workdir_stored::places(kind) => Some(format!(
+            "pastor places no workdir sets for {kind} agents yet"
+        )),
+        Some(_) if !own_folder => Some(crate::bundle::workdir_task::shared_folder(
+            folder.unwrap_or("none"),
+        )),
+        Some(_) => None,
+    };
+    if let Some(why) = &skip {
+        for b in &mut task.spec.workdir_bundles {
+            b.skipped = Some(why.clone());
+        }
+    }
+    let Some(gate) = gate else {
+        if own.is_none() {
+            return Ok(());
+        }
+        return Err(fail(format!(
+            "{machine} does not place workdir sets: pastor places a task's set on push machines, and on pull machines whose pastor places them"
+        )));
+    };
+    let mut all: Vec<Placing> = Vec::new();
+    // A set the head built when a pull machine claimed the task is for the
+    // kind it was claimed for; an agent of another kind leaves it out.
+    let built_for = |b: &crate::task::WorkdirBundle| {
+        b.set
+            .as_ref()
+            .and_then(|d| d.get("kind"))
+            .and_then(|k| k.as_str())
+            .map(str::to_string)
+    };
+    if skip.is_none() {
+        for b in &task.spec.workdir_bundles {
+            match (&b.set, built_for(b)) {
+                (Some(doc), Some(k)) if k == kind => all.push(Placing::Set(doc.clone())),
+                (Some(_), _) => {}
+                (None, _) => all.push(Placing::Bundle {
+                    id: b.id.clone(),
+                    kind: kind.to_string(),
+                    flock: task.flock.clone(),
+                }),
+            }
+        }
+    }
+    let render = task.spec.workdir.as_deref().and_then(|w| w.render.clone());
+    all.extend(own.map(|set| match render {
+        Some(render) => Placing::Rendered { set, render },
+        None => Placing::Set(set),
+    }));
+    if all.is_empty() {
+        return Ok(());
+    }
+    let Some(folder) = folder else {
+        return Err(fail("the task has no folder to place its set in".into()));
+    };
+    crate::bundle::workdir_task::place_within(gate, &machine, folder, all, wait)
+        .await
+        .map_err(DispatchError::Task)?;
+    if skip.is_none() {
+        for b in &mut task.spec.workdir_bundles {
+            b.skipped = match built_for(b) {
+                Some(k) if k != kind => Some(format!(
+                    "its set was built for {k} agents when the task was claimed, and its agent is {kind}"
+                )),
+                _ => None,
+            };
+        }
+    }
+    if let Some(w) = task.spec.workdir.as_mut() {
+        w.placed_in = Some(folder.to_string());
+    }
+    Ok(())
 }
 
 /// `finish_dispatch`'s arguments, grouped.
@@ -792,6 +1149,7 @@ struct FinishDispatch<'a> {
     pane_id: &'a str,
     prompt: &'a str,
     agents: &'a Agents,
+    answered: &'a [String],
     ready_timeout: Duration,
 }
 
@@ -806,6 +1164,7 @@ async fn finish_dispatch(ask: FinishDispatch<'_>) -> Result<DispatchOutcome, Dis
         pane_id,
         prompt,
         agents,
+        answered,
         ready_timeout,
     } = ask;
     // herdr's `agent.start` returns as soon as it has launched the agent in the
@@ -815,15 +1174,33 @@ async fn finish_dispatch(ask: FinishDispatch<'_>) -> Result<DispatchOutcome, Dis
     start_agent(conn, name, &launch.kind, &launch.args, pane_id).await?;
     task.spec.session_id = session;
 
-    let hold = agents.startup_markers(&task.spec.agent);
-    let (outcome, prompted) =
-        prompt_when_ready(conn, task, name, prompt, &hold, ready_timeout).await?;
+    let screens = Screens {
+        hold: agents.startup_markers(&task.spec.agent, answered),
+        login: agents.login_markers(&task.spec.agent),
+        kind: launch.kind.clone(),
+    };
+    let inbox = Inbox::of(agents, &task.spec);
+    let (outcome, prompted) = prompt_when_ready(
+        conn,
+        task,
+        name,
+        prompt,
+        &screens,
+        inbox.as_ref(),
+        ready_timeout,
+    )
+    .await?;
     // The baseline a completion must move past, and whether the agent was
     // already at work when the prompt went in; see
     // `task::completed_since_prompt`.
-    if let Some(agent) = prompted {
+    if let Some(Prompted { agent, activity }) = prompted {
         task.last_completion_seq = Some(agent.state_change_seq);
-        task.activity_seen = agent.agent_status.is_activity();
+        task.activity_seen = activity;
+        // An agy conversation id its hook already reported, the same as
+        // `Actor::capture_agent_session` reads from `agent.list`.
+        if let Some(session) = crate::task::reported_session(&launch.kind, &agent) {
+            task.spec.session_id = Some(session.to_string());
+        }
     }
     Ok(outcome)
 }
@@ -963,9 +1340,26 @@ pub(crate) fn same_dir(a: &str, b: &str) -> bool {
     trim(a) == trim(b)
 }
 
+/// Fetch the remote `repo`'s base comes from before a worktree is made off
+/// it (`Connector::fetch_base`). Whatever goes wrong is a warning to put on
+/// the task, never an error: the worktree is made from what the repo has.
+/// `None` when it was fetched, there was no remote, or the machine cannot
+/// be asked.
+async fn fetch_base(conn: &dyn Connector, repo: &str) -> Option<String> {
+    let why = match conn.fetch_base(repo).await {
+        Ok(None | Some(Fetched::Done(_) | Fetched::NoRemote)) => return None,
+        Ok(Some(Fetched::Failed(remote, why))) => format!("could not fetch {remote}: {why}"),
+        Err(err) => format!("could not fetch: {}", err.message),
+    };
+    tracing::warn!(%repo, %why, "fetch before a worktree: going on from the repo as it is");
+    Some(format!("{why}; the worktree was made from {repo} as it is"))
+}
+
 /// The workspace of a worktree task, labelled `label`, and the branch it is
 /// on: the checkout a retry may reopen (`reopenable`), or else a new
-/// worktree on the task's branch, `pastor/<name>` by default.
+/// worktree on the task's branch, `pastor/<name>` by default, made after
+/// the repo's remote is fetched unless the task said `--no-fetch`; a fetch
+/// that failed leaves its reason in `fetch_warning`.
 async fn open_worktree(
     conn: &dyn Connector,
     spec: &DispatchSpec,
@@ -973,6 +1367,7 @@ async fn open_worktree(
     name: &str,
     label: &str,
     resume: bool,
+    fetch_warning: &mut Option<String>,
 ) -> Result<(Created, String), DispatchError> {
     // A paused task's own checkout, kept when it was paused: only it will
     // do, since Claude files the session under that directory.
@@ -992,10 +1387,20 @@ async fn open_worktree(
         let created = conn.worktree_open(repo, &reopen.branch, label).await?;
         return Ok((created, reopen.branch.clone()));
     }
+    if let Some(reopen) = restorable(conn, spec, repo).await? {
+        let created = conn.worktree_open(repo, &reopen.branch, label).await?;
+        return Ok((created, reopen.branch.clone()));
+    }
     let branch = spec
         .branch
         .clone()
         .unwrap_or_else(|| format!("pastor/{name}"));
+    // A new worktree is the one place the base matters; a retry of the same
+    // task attempts it afresh.
+    *fetch_warning = None;
+    if !spec.fetch.skip {
+        *fetch_warning = fetch_base(conn, repo).await;
+    }
     Ok((conn.worktree_create(repo, &branch, label).await?, branch))
 }
 
@@ -1034,6 +1439,38 @@ async fn reopenable<'a>(
             || Some(a.workspace_id.as_str()) == workspace
     });
     Ok((!in_use).then_some(reopen))
+}
+
+/// A retry of a task that asked for its worktree to go
+/// (`DispatchSpec::removes_worktree`), whose checkout auto-close removed
+/// while its branch stayed: the checkout is put back on that branch at its
+/// old path (`Connector::restore_worktree`), so the retry goes on from the
+/// failed task's commits rather than from a fresh `pastor/t-<id>`. `None`,
+/// a new branch, when no checkout of the branch is gone to put back, the
+/// branch is gone too, or the machine cannot tell.
+async fn restorable<'a>(
+    conn: &dyn Connector,
+    spec: &'a DispatchSpec,
+    repo: &str,
+) -> Result<Option<&'a Reopen>, DispatchError> {
+    let Some(reopen) = spec.reopen.as_ref().filter(|_| spec.removes_worktree()) else {
+        return Ok(None);
+    };
+    // Still checked out somewhere (reopenable found it in use, or moved):
+    // git would refuse a second checkout of the branch.
+    if conn
+        .worktree_list(repo)
+        .await?
+        .iter()
+        .any(|w| same_dir(&w.path, &reopen.path) || w.branch.as_deref() == Some(&reopen.branch))
+    {
+        return Ok(None);
+    }
+    let restored = conn
+        .restore_worktree(repo, &reopen.path, &reopen.branch)
+        .await
+        .map_err(CallError::from)?;
+    Ok((restored == Some(true)).then_some(reopen))
 }
 
 /// The checkout herdr just made or reopened for this task, recorded so that
@@ -1108,9 +1545,9 @@ async fn start_agent(
 pub const NO_REPO_DIR: &str = "pastor-tasks";
 
 /// Where a task with no repo starts: herdr opens a pane with no `cwd`
-/// wherever its focused pane is, which can be anyone's checkout (t-284 opened
+/// wherever its focused pane is, which can be anyone's checkout (one such task opened
 /// in a work repo). Not the home itself either: Claude Code never saves
-/// folder trust for the home, so it asked at every start (t-358). So
+/// folder trust for the home, so it asked at every start. So
 /// `~/pastor-tasks`, made when missing, where Claude asks once per machine.
 /// A folder that cannot be made falls back to the home; a machine that
 /// cannot tell its home leaves it to herdr, as before.
@@ -1204,6 +1641,89 @@ async fn check_repo_exists(
     }
 }
 
+/// What sending a task's prompts through its Claude session's inbox socket
+/// takes (`Connector::inbox_send`): its agent delivers that way
+/// (`Agents::delivery`) and pastor knows its session.
+pub(crate) struct Inbox {
+    config_dir: Option<String>,
+    session: String,
+    mode: crate::inbox::Mode,
+}
+
+impl Inbox {
+    /// `None` when `spec`'s prompts are typed.
+    pub(crate) fn of(agents: &Agents, spec: &DispatchSpec) -> Option<Inbox> {
+        if agents.delivery(&spec.agent) != crate::config::Delivery::Socket {
+            return None;
+        }
+        let session = spec
+            .session_id
+            .clone()
+            .filter(|s| crate::task::is_session_id(s))?;
+        // Under a profile Claude starts with `dontAsk`, which prompts; only
+        // its own args can make it bypass.
+        let mode = if crate::config::claude_bypasses(&spec.agent_args) {
+            crate::inbox::Mode::Bypass
+        } else {
+            crate::inbox::Mode::Prompting
+        };
+        Some(Inbox {
+            config_dir: crate::usage::config_dir(agents, &spec.agent).map(str::to_string),
+            session,
+            mode,
+        })
+    }
+
+    /// Send `text` to the session; whether it took it. Anything else is
+    /// logged with the task, and the caller types the text instead.
+    pub(crate) async fn send(&self, conn: &dyn Connector, task: &str, text: &str) -> bool {
+        let sent = conn
+            .inbox_send(self.config_dir.as_deref(), &self.session, self.mode, text)
+            .await;
+        match sent {
+            Ok(Some(out)) if out.accepted() => {
+                tracing::info!(task, "prompt sent through the inbox socket");
+                true
+            }
+            Ok(Some(out)) => {
+                tracing::info!(task, result = out.result, detail = ?out.detail, "the inbox socket did not take the prompt; typing it");
+                false
+            }
+            Ok(None) => {
+                tracing::info!(
+                    task,
+                    "no inbox socket send on this machine; typing the prompt"
+                );
+                false
+            }
+            Err(err) => {
+                tracing::warn!(task, %err, "inbox socket send failed; typing the prompt");
+                false
+            }
+        }
+    }
+}
+
+/// The agent as a prompt went in, and whether it was at work by then. A
+/// prompt typed with `agent.prompt` has the reply, which is newer than the
+/// prompt; one sent through the socket has the `agent.list` read just
+/// before, and no work since it is seen yet.
+struct Prompted {
+    agent: AgentInfo,
+    activity: bool,
+}
+
+/// What `prompt_when_ready` reads a starting agent's pane for.
+struct Screens {
+    /// Startup questions herdr reads idle and ready
+    /// (`Agents::startup_markers`).
+    hold: Vec<String>,
+    /// The agent's login screen (`Agents::login_markers`).
+    login: Vec<String>,
+    /// The agent's kind, for `limit::signed_out_in`.
+    kind: String,
+}
+
 /// Poll `agent.list` until the agent herdr just started is up, then prompt it.
 ///
 /// herdr answers `agent_not_ready` both while a managed agent is still launching
@@ -1215,16 +1735,22 @@ async fn check_repo_exists(
 /// that with `agent_blocked`, not `agent_not_ready`, and dispatch returns
 /// `Blocked` without prompting or waiting. So is an agent whose pane shows
 /// one of `hold` (`Agents::startup_markers`): a startup question herdr reads
-/// idle and ready (Codex's folder trust), which a prompt would answer and
-/// be lost in.
+/// idle and ready (Codex's folder trust, any of agy's, Claude's before herdr
+/// has noticed it), which a prompt would answer and be lost in. With `inbox`, a ready agent is sent the prompt through its
+/// session's socket first, and typed only when that does not take it. An
+/// agent at its login screen, blocked or ready (`limit::signed_out_in`), is
+/// `DispatchError::Exited` with that screen as its tail: it is signed out,
+/// and the machine holds the task as it holds one on a usage limit.
 async fn prompt_when_ready(
     conn: &dyn Connector,
     task: &Task,
     name: &str,
     prompt: &str,
-    hold: &[String],
+    screens: &Screens,
+    inbox: Option<&Inbox>,
     ready_timeout: Duration,
-) -> Result<(DispatchOutcome, Option<AgentInfo>), DispatchError> {
+) -> Result<(DispatchOutcome, Option<Prompted>), DispatchError> {
+    let hold = &screens.hold;
     let machine = task.machine.as_deref().unwrap_or("that machine");
     let deadline = Instant::now() + ready_timeout;
     loop {
@@ -1240,6 +1766,21 @@ async fn prompt_when_ready(
             )
             .await);
         };
+        let ready = agent.agent_status == AgentStatus::Blocked
+            || (!agent.launch_pending
+                && (agent.interactive_ready || agent.agent_status == AgentStatus::Working));
+        if ready && !screens.login.is_empty() {
+            // A pane that cannot be read is taken as signed in.
+            let screen = conn.agent_read(name, 100).await.unwrap_or_default();
+            if crate::limit::signed_out_in(&screens.kind, &screen, &screens.login).is_some() {
+                return Err(DispatchError::Exited {
+                    message: format!(
+                        "agent {name} is signed out on {machine}: it showed its login screen"
+                    ),
+                    tail: screen,
+                });
+            }
+        }
         if agent.agent_status == AgentStatus::Blocked {
             // Waiting for a human, usually on the agent's own startup question
             // (Claude's folder trust dialog). herdr checks `blocked` before
@@ -1266,10 +1807,23 @@ async fn prompt_when_ready(
                     return Ok((DispatchOutcome::Blocked, None));
                 }
             }
+            if let Some(inbox) = inbox
+                && inbox.send(conn, &task.display_id(), prompt).await
+            {
+                let agent = agent.clone();
+                let prompted = Prompted {
+                    agent,
+                    activity: false,
+                };
+                return Ok((DispatchOutcome::Running, Some(prompted)));
+            }
             match conn.agent_prompt(name, prompt).await {
                 // The reply carries the agent's `state_change_seq` and status
                 // as the prompt went in.
-                Ok(agent) => return Ok((DispatchOutcome::Running, Some(agent))),
+                Ok(agent) => {
+                    let activity = agent.agent_status.is_activity();
+                    return Ok((DispatchOutcome::Running, Some(Prompted { agent, activity })));
+                }
                 // The agent is up and waiting for a human, not for us. herdr
                 // did not send the prompt; the machine sends it after the block.
                 Err(err) if err.code() == Some("agent_blocked") => {
@@ -1326,6 +1880,7 @@ mod tests {
     use crate::herdr::fake::{FakeHerdr, StartBehaviour};
     use crate::task::WorkspaceLabel;
     use serde_json::Value;
+    use std::sync::Arc;
 
     /// Generous next to every `ready_after` these tests use, so only the test
     /// that means to hit the bound does.
@@ -1338,12 +1893,15 @@ mod tests {
             job_slots: 0,
             burst: 0,
             tags: tags.iter().map(|s| s.to_string()).collect(),
+            loads: vec![],
             live,
             live_jobs: 0,
             healthy,
             pull: false,
+            workdir_sets: true,
             flocks: vec![seat("default", None, live)],
             waiting_under_share: vec![],
+            floor: Default::default(),
         }
     }
 
@@ -1499,6 +2057,36 @@ mod tests {
         );
     }
 
+    /// A later task of a flock the room floor holds off never joins
+    /// `waiting_under_share`: mixed `unknown_room` policies (`work`'s room
+    /// counts as room here, `home`'s does not) must not leave both flocks
+    /// queued across passes when the machine's room is simply unread.
+    #[test]
+    fn mark_waiting_under_share_excludes_a_floor_held_later_task() {
+        let work = |live: usize| FlockSeat::new("work", Some(FlockNumber::split(1, 3)), live);
+        let desk = |work_live: usize, home_live: usize| MachineView {
+            flocks: vec![work(work_live), seat("home", Some(2), home_live)],
+            floor: FloorView {
+                short: None,
+                unread: true,
+                hold_unread: vec!["home".to_string()],
+                unreachable: false,
+                cordoned: false,
+            },
+            ..mv("desk", 10, work_live + home_live, &[], true)
+        };
+        let home_task = Task {
+            flock: Some("home".into()),
+            ..task(spec())
+        };
+        let mut views = vec![desk(1, 1)];
+        mark_waiting_under_share(&mut views, "work", &[home_task], "default", &|_, _| true);
+        assert!(
+            views[0].waiting_under_share.is_empty(),
+            "home's unread room holds it off, so it never waits under work's share"
+        );
+    }
+
     /// `flock_held` clears a seat under its share on its own, whatever
     /// `waiting_under_share` says: that list only matters to a seat past
     /// its share (`mark_waiting_under_share` never fills it otherwise, but
@@ -1514,6 +2102,49 @@ mod tests {
             flock_held(&v, "work"),
             None,
             "under its share holds nothing off"
+        );
+    }
+
+    /// A flock at 0 on a machine starts nothing there, pinned, `--now` or
+    /// not, however idle the machine; the reason says it has no slots, even
+    /// with the machine full; the flock's other machines and other flocks
+    /// still take tasks.
+    #[test]
+    fn a_flock_at_0_starts_nothing_on_the_machine() {
+        let drained = MachineView {
+            flocks: vec![seat("work", Some(0), 1), seat("home", Some(2), 0)],
+            ..mv("desk", 4, 1, &[], true)
+        };
+        let lab = MachineView {
+            flocks: vec![seat("work", Some(2), 1)],
+            ..mv("lab", 2, 1, &[], true)
+        };
+        let ms = vec![drained.clone(), lab];
+        let pinned = DispatchSpec {
+            machine: Some("desk".into()),
+            ..spec()
+        };
+        assert_eq!(
+            pick_machine(&ms[..1], "work", &spec(), Claim::default()),
+            None
+        );
+        assert_eq!(pick_machine(&ms, "work", &pinned, Claim::default()), None);
+        assert_eq!(
+            pick_machine(&ms, "work", &spec(), Claim::default()).as_deref(),
+            Some("lab")
+        );
+        assert_eq!(
+            pick_machine(&ms, "home", &pinned, Claim::default()).as_deref(),
+            Some("desk")
+        );
+        let now = DispatchSpec {
+            now: true,
+            ..pinned.clone()
+        };
+        assert_eq!(now_machine(&ms, "work", &now, &|_| true), None);
+        assert_eq!(
+            flock_held(&drained, "work").as_deref(),
+            Some("flock work has 0 slots on desk: it starts no new tasks there (1 still running)")
         );
     }
 
@@ -1666,6 +2297,14 @@ mod tests {
             cwd: None,
             keep_pane: None,
             keep_pane_from: None,
+            remove_worktree: None,
+            remove_worktree_from: None,
+            load: None,
+            load_from: None,
+            fetch: Default::default(),
+            start_prompt: None,
+            workdir: None,
+            workdir_bundles: Vec::new(),
             rounds: Default::default(),
         }
     }
@@ -1783,6 +2422,258 @@ mod tests {
         assert_eq!(
             pick_machine(&full, "default", &spec(), Claim::default()),
             None
+        );
+    }
+
+    /// A cordoned machine takes no task, whatever the claim, a pinned one
+    /// included, and the reason names it; unlike the room floor, `--now`
+    /// does not look past it.
+    #[test]
+    fn pick_machine_skips_a_cordoned_machine() {
+        let cordoned = MachineView {
+            job_slots: 1,
+            burst: 1,
+            floor: FloorView {
+                cordoned: true,
+                ..Default::default()
+            },
+            ..mv("a", 2, 0, &[], true)
+        };
+        for claim in [RUN, JOB, CRITICAL_RUN, CRITICAL_JOB] {
+            assert_eq!(
+                pick_machine(std::slice::from_ref(&cordoned), "default", &spec(), claim),
+                None,
+                "{claim:?}"
+            );
+        }
+        assert_eq!(
+            cordoned.floor_held("default").as_deref(),
+            Some("a is cordoned")
+        );
+        let ms = vec![cordoned.clone(), mv("b", 2, 1, &[], true)];
+        assert_eq!(
+            pick_machine(&ms, "default", &spec(), RUN).as_deref(),
+            Some("b"),
+            "the other machine, though it is busier"
+        );
+        let pinned = DispatchSpec {
+            machine: Some("a".into()),
+            ..spec()
+        };
+        assert_eq!(pick_machine(&ms, "default", &pinned, RUN), None);
+        let now = DispatchSpec {
+            now: true,
+            ..pinned
+        };
+        assert_eq!(now_machine(&ms, "default", &now, &|_| true), None);
+        // Uncordoned, it is placed again.
+        let lifted = MachineView {
+            floor: FloorView::default(),
+            ..cordoned
+        };
+        assert_eq!(
+            pick_machine(std::slice::from_ref(&lifted), "default", &spec(), RUN).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            now_machine(&[lifted], "default", &now, &|_| true).as_deref(),
+            Some("a")
+        );
+    }
+
+    /// A machine its last check found cannot reach the head is passed over
+    /// for every claim, and the reason names it; `--now` looks past it.
+    #[test]
+    fn pick_machine_skips_a_machine_that_cannot_reach_the_head() {
+        let cut_off = MachineView {
+            job_slots: 1,
+            burst: 1,
+            floor: FloorView {
+                unreachable: true,
+                ..Default::default()
+            },
+            ..mv("a", 2, 0, &[], true)
+        };
+        for claim in [RUN, JOB, CRITICAL_RUN, CRITICAL_JOB] {
+            assert_eq!(
+                pick_machine(std::slice::from_ref(&cut_off), "default", &spec(), claim),
+                None,
+                "{claim:?}"
+            );
+        }
+        assert_eq!(
+            cut_off.floor_held("default").as_deref(),
+            Some("a cannot reach the head")
+        );
+        let ms = vec![cut_off.clone(), mv("b", 2, 1, &[], true)];
+        assert_eq!(
+            pick_machine(&ms, "default", &spec(), RUN).as_deref(),
+            Some("b")
+        );
+        let pinned = DispatchSpec {
+            machine: Some("a".into()),
+            now: true,
+            ..spec()
+        };
+        assert_eq!(
+            now_machine(&ms, "default", &pinned, &|_| true).as_deref(),
+            Some("a")
+        );
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// A room as the probe reads it, in KiB.
+    fn room_kib(home: Option<u64>, tmp: Option<u64>, mem: Option<u64>) -> crate::machine::Room {
+        crate::machine::Room {
+            home_free: home,
+            tmp_free: tmp,
+            mem_free: mem,
+            ..Default::default()
+        }
+    }
+
+    fn floor(disk: Option<u64>, memory: Option<u64>) -> Option<crate::config::Floor> {
+        Some(crate::config::Floor { disk, memory })
+    }
+
+    /// The first side under its floor is named, `$HOME` before `/tmp`
+    /// before memory, with the room converted from KiB; a side that is on
+    /// and cannot be read is unread; a side that is off is never read;
+    /// with no floor nothing is short or unread, whatever the room.
+    #[test]
+    fn floor_against_names_the_first_side_short_and_what_is_unread() {
+        let kib = |gib: f64| Some((gib * 1024.0 * 1024.0) as u64);
+        let on = floor(Some(4 * GIB), Some(GIB));
+        let plenty = room_kib(kib(50.0), kib(10.0), kib(8.0));
+        assert_eq!(floor_against("m", Some(&plenty), on), (None, false));
+        assert_eq!(
+            floor_against("sauron", Some(&room_kib(kib(50.0), kib(1.2), kib(8.0))), on),
+            (Some("sauron has 1.2 GB free under /tmp".into()), false)
+        );
+        assert_eq!(
+            floor_against("m", Some(&room_kib(kib(2.0), kib(1.0), kib(0.5))), on),
+            (Some("m has 2.0 GB free under $HOME".into()), false),
+            "$HOME first"
+        );
+        assert_eq!(
+            floor_against("m", Some(&room_kib(kib(50.0), kib(10.0), kib(0.5))), on),
+            (Some("m has 512 MB of memory free".into()), false)
+        );
+        // Memory on macOS: unread while the memory floor is on, not once
+        // it is off.
+        let mac = room_kib(kib(50.0), kib(10.0), None);
+        assert_eq!(floor_against("m", Some(&mac), on), (None, true));
+        assert_eq!(
+            floor_against("m", Some(&mac), floor(Some(4 * GIB), None)),
+            (None, false)
+        );
+        // No numbers yet, or a probe that failed before any answered.
+        assert_eq!(floor_against("m", None, on), (None, true));
+        let failed = crate::machine::Room {
+            error: Some("ssh: connection reset".into()),
+            ..Default::default()
+        };
+        assert_eq!(floor_against("m", Some(&failed), on), (None, true));
+        // A failed probe over numbers last read keeps them.
+        let stale = crate::machine::Room {
+            error: Some("timed out".into()),
+            ..room_kib(kib(50.0), kib(1.0), kib(8.0))
+        };
+        assert_eq!(
+            floor_against("m", Some(&stale), on).0.as_deref(),
+            Some("m has 1.0 GB free under /tmp")
+        );
+        // Short on one side and unread on another reads both.
+        assert_eq!(
+            floor_against("m", Some(&room_kib(kib(1.0), None, kib(8.0))), on),
+            (Some("m has 1.0 GB free under $HOME".into()), true)
+        );
+        // No floor: never short.
+        let empty = room_kib(Some(0), Some(0), Some(0));
+        assert_eq!(floor_against("m", Some(&empty), None), (None, false));
+        assert_eq!(floor_against("m", None, None), (None, false));
+    }
+
+    /// A machine under its floor takes no task, whatever the claim: plain,
+    /// job slot or burst. An unread side counts as room unless the task's
+    /// flock holds it (`unknown_room = "no_room"`). `--now` looks at none
+    /// of it.
+    #[test]
+    fn pick_machine_skips_a_machine_held_by_its_floor() {
+        let short = MachineView {
+            job_slots: 1,
+            burst: 1,
+            floor: FloorView {
+                short: Some("a has 1.0 GB free under /tmp".into()),
+                ..Default::default()
+            },
+            ..mv("a", 2, 0, &[], true)
+        };
+        for claim in [RUN, JOB, CRITICAL_RUN, CRITICAL_JOB] {
+            assert_eq!(
+                pick_machine(std::slice::from_ref(&short), "default", &spec(), claim),
+                None,
+                "{claim:?}"
+            );
+        }
+        let pinned = DispatchSpec {
+            machine: Some("a".into()),
+            ..spec()
+        };
+        assert_eq!(
+            pick_machine(std::slice::from_ref(&short), "default", &pinned, RUN),
+            None
+        );
+        let ms = vec![short.clone(), mv("b", 2, 1, &[], true)];
+        assert_eq!(
+            pick_machine(&ms, "default", &spec(), RUN).as_deref(),
+            Some("b"),
+            "the busier machine with room"
+        );
+        assert_eq!(
+            short.floor_held("default").as_deref(),
+            Some("a has 1.0 GB free under /tmp")
+        );
+
+        let unread = |hold: &[&str]| MachineView {
+            floor: FloorView {
+                unread: true,
+                hold_unread: hold.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            },
+            ..mv("a", 2, 0, &[], true)
+        };
+        assert_eq!(
+            pick_machine(&[unread(&[])], "default", &spec(), RUN).as_deref(),
+            Some("a"),
+            "an unread room counts as room by default"
+        );
+        assert_eq!(
+            pick_machine(&[unread(&["default"])], "default", &spec(), RUN),
+            None
+        );
+        assert_eq!(
+            unread(&["default"]).floor_held("default").as_deref(),
+            Some("a's room cannot be read")
+        );
+        assert_eq!(
+            unread(&["work"]).floor_held("default"),
+            None,
+            "another flock's hold"
+        );
+
+        let now = DispatchSpec {
+            now: true,
+            ..pinned
+        };
+        assert_eq!(
+            now_machine(&[short], "default", &now, &|_| true).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            now_machine(&[unread(&["default"])], "default", &now, &|_| true).as_deref(),
+            Some("a")
         );
     }
 
@@ -2098,6 +2989,54 @@ mod tests {
         );
     }
 
+    /// A task with a load goes only to a machine that takes it, pinned,
+    /// loose or `--now`; one with no load goes to any machine, one that
+    /// takes loads too.
+    #[test]
+    fn pick_machine_keeps_a_load_to_the_machines_that_take_it() {
+        let takes = |name: &str, loads: &[&str]| MachineView {
+            loads: loads.iter().map(|l| l.to_string()).collect(),
+            ..mv(name, 2, 0, &[], true)
+        };
+        // `a` has fewer live tasks, so a task free to go anywhere picks it.
+        let ms = vec![
+            takes("a", &[]),
+            MachineView {
+                live: 1,
+                ..takes("b", &["rust", "light"])
+            },
+        ];
+        let load = |load: Option<&str>, machine: Option<&str>| DispatchSpec {
+            load: load.map(str::to_string),
+            machine: machine.map(str::to_string),
+            ..spec()
+        };
+        let pick = |s: &DispatchSpec| pick_machine(&ms, "default", s, Claim::default());
+        assert_eq!(pick(&load(Some("rust"), None)).as_deref(), Some("b"));
+        assert_eq!(pick(&load(Some("light"), None)).as_deref(), Some("b"));
+        assert_eq!(pick(&load(Some("gpu"), None)), None, "nothing takes it");
+        assert_eq!(
+            pick(&load(None, None)).as_deref(),
+            Some("a"),
+            "no load: fewest live, as before"
+        );
+        assert_eq!(
+            pick(&load(Some("rust"), Some("a"))),
+            None,
+            "pinned elsewhere"
+        );
+        assert_eq!(pick(&load(Some("rust"), Some("b"))).as_deref(), Some("b"));
+        let now = |machine: &str| DispatchSpec {
+            now: true,
+            ..load(Some("rust"), Some(machine))
+        };
+        assert_eq!(now_machine(&ms, "default", &now("a"), &|_| true), None);
+        assert_eq!(
+            now_machine(&ms, "default", &now("b"), &|_| true).as_deref(),
+            Some("b")
+        );
+    }
+
     #[tokio::test]
     async fn dispatch_sends_prompt_verbatim() {
         let fake = FakeHerdr::new();
@@ -2122,7 +3061,15 @@ mod tests {
         assert_eq!(start.params["kind"], "claude");
         assert_eq!(
             start.params["args"],
-            with_session(&t, serde_json::json!(["--model", "opus"]))
+            with_session(
+                &t,
+                serde_json::json!([
+                    "--model",
+                    "opus",
+                    "--allowedTools",
+                    "Bash(pastor task done:*)"
+                ])
+            )
         );
         let prompt = reqs.iter().find(|r| r.method == "agent.prompt").unwrap();
         assert_eq!(prompt.params["target"], "t-7");
@@ -2135,6 +3082,131 @@ mod tests {
             )
         );
         assert_eq!(t.prompt, "line one\n\"two\" {{ three }}", "not stored");
+    }
+
+    /// A Claude task's prompt goes through its session's inbox socket when
+    /// the session takes it, and is not typed. The baseline is the
+    /// sequence `agent.list` showed just before the send, and the agent
+    /// was not seen at work yet: its own move to working is.
+    #[tokio::test]
+    async fn a_claude_prompt_goes_through_the_inbox_socket() {
+        let fake = FakeHerdr::new();
+        fake.set_inbox_result(Some("accepted"));
+        let mut t = task(spec());
+        let out = dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        assert_eq!(out, DispatchOutcome::Running);
+        let reqs = fake.requests();
+        assert!(!reqs.iter().any(|r| r.method == "agent.prompt"), "typed");
+        let sends = fake.inbox_sends();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(
+            Some(sends[0].session.as_str()),
+            t.spec.session_id.as_deref()
+        );
+        assert_eq!(sends[0].mode, crate::inbox::Mode::Prompting);
+        assert_eq!(sends[0].config_dir, None);
+        assert_eq!(
+            sends[0].text,
+            format!(
+                "line one\n\"two\" {{{{ three }}}}\n\n{}",
+                crate::task::SUMMARY_ASK
+            )
+        );
+        let agent = &fake.agents()[0];
+        assert_eq!(agent.agent_status, AgentStatus::Working);
+        assert!(
+            t.last_completion_seq < Some(agent.state_change_seq),
+            "the baseline is from before the send: {:?} vs {}",
+            t.last_completion_seq,
+            agent.state_change_seq
+        );
+        assert!(!t.activity_seen);
+    }
+
+    /// Anything but `accepted`, and a machine that cannot send that way,
+    /// types the prompt as before.
+    #[tokio::test]
+    async fn a_socket_that_does_not_take_the_prompt_falls_back_to_typing() {
+        for result in [
+            None,
+            Some("no-session"),
+            Some("held"),
+            Some("dropped"),
+            Some("refused"),
+            Some("expired"),
+            Some("denied"),
+        ] {
+            let fake = FakeHerdr::new();
+            fake.set_inbox_result(result);
+            let mut t = task(spec());
+            let out = dispatch(&fake, &mut t, &Agents::default(), None, READY)
+                .await
+                .unwrap();
+            assert_eq!(out, DispatchOutcome::Running, "{result:?}");
+            assert_eq!(fake.inbox_sends().len(), 1, "{result:?}");
+            let reqs = fake.requests();
+            let prompt = reqs.iter().find(|r| r.method == "agent.prompt");
+            assert!(prompt.is_some(), "{result:?}: typed");
+            assert!(t.activity_seen, "{result:?}: the prompt reply was working");
+        }
+    }
+
+    /// `delivery = "type"` never tries the socket; another kind has none.
+    #[tokio::test]
+    async fn a_typed_agent_never_tries_the_socket() {
+        let fake = FakeHerdr::new();
+        fake.set_inbox_result(Some("accepted"));
+        let agents: Agents = toml::from_str("[claude]\ndelivery = \"type\"\n").unwrap();
+        let mut t = task(spec());
+        dispatch(&fake, &mut t, &agents, None, READY).await.unwrap();
+        assert!(fake.inbox_sends().is_empty());
+        assert!(fake.requests().iter().any(|r| r.method == "agent.prompt"));
+    }
+
+    /// A session launched bypassing permissions holds a message unless its
+    /// sender says bypass; the agent's own config dir is where its session
+    /// is found.
+    #[tokio::test]
+    async fn a_bypassing_session_is_sent_as_bypass_in_its_config_dir() {
+        let fake = FakeHerdr::new();
+        fake.set_inbox_result(Some("accepted"));
+        let agents: Agents =
+            toml::from_str("[claude]\nenv = { CLAUDE_CONFIG_DIR = \"~/.claude-alt\" }\n").unwrap();
+        let mut t = task(DispatchSpec {
+            agent_args: vec!["--dangerously-skip-permissions".into()],
+            ..spec()
+        });
+        dispatch(&fake, &mut t, &agents, None, READY).await.unwrap();
+        let sends = fake.inbox_sends();
+        assert_eq!(sends[0].mode, crate::inbox::Mode::Bypass);
+        assert_eq!(sends[0].config_dir.as_deref(), Some("~/.claude-alt"));
+    }
+
+    /// A blocked agent is not sent anything, socket or not: the machine
+    /// sends the prompt once the block clears.
+    #[tokio::test]
+    async fn a_blocked_agent_gets_no_socket_send() {
+        let fake = FakeHerdr::new();
+        fake.set_inbox_result(Some("accepted"));
+        fake.set_ready_after(Duration::from_millis(150));
+        let watcher = fake.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Some(a) = watcher.agents().first() {
+                    watcher.set_status(&a.pane_id, AgentStatus::Blocked);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let mut t = task(spec());
+        let out = dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        assert_eq!(out, DispatchOutcome::Blocked);
+        assert!(fake.inbox_sends().is_empty());
     }
 
     /// `summary = "off"` sends the prompt alone; `require` adds the
@@ -2279,6 +3351,8 @@ mod tests {
             serde_json::json!([
                 "--model",
                 "opus",
+                "--allowedTools",
+                "Bash(pastor task done:*)",
                 "--disallowedTools",
                 "WebFetch",
                 "--session-id",
@@ -2321,7 +3395,13 @@ mod tests {
             assert_eq!(t.spec.session_id, None, "{args:?}");
             let reqs = fake.requests();
             let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
-            assert_eq!(start.params["args"], serde_json::json!(args));
+            // Their own, then the one tool every Claude task is allowed.
+            let mut want = args.clone();
+            want.extend([
+                "--allowedTools".to_string(),
+                "Bash(pastor task done:*)".into(),
+            ]);
+            assert_eq!(start.params["args"], serde_json::json!(want));
         }
         let fake = FakeHerdr::new();
         let mut t = task(DispatchSpec {
@@ -2361,6 +3441,8 @@ mod tests {
                     "opus",
                     "--allowedTools",
                     "Bash(git:*)",
+                    "--allowedTools",
+                    "Bash(pastor task done:*)",
                     "--disallowedTools",
                     "WebFetch"
                 ])
@@ -2401,10 +3483,15 @@ mod tests {
     }
 
     fn develop_deny() -> Vec<String> {
+        develop_policy().deny
+    }
+
+    /// `develop` as a machine's own profile.
+    fn develop_policy() -> crate::config::agy::Policy {
         crate::config::profile::Profiles::default()
             .resolve("develop")
             .unwrap()
-            .deny
+            .agy_policy()
     }
 
     /// An agy task under `develop` whose deny list is `develop`'s, as
@@ -2416,16 +3503,23 @@ mod tests {
         }
     }
 
-    /// Dispatch `t` on `fake` whose machine's own profile denies `own_deny`;
-    /// the error, if any.
-    async fn dispatch_agy(fake: &FakeHerdr, t: &mut Task, own_deny: &[String]) -> Option<String> {
+    /// Dispatch `t` on `fake` whose machine's own profile is `own`; the
+    /// error, if any.
+    async fn dispatch_agy(
+        fake: &FakeHerdr,
+        t: &mut Task,
+        own: &crate::config::agy::Policy,
+    ) -> Option<String> {
         dispatch_with(
             fake,
             t,
             &Agents::default(),
             None,
             READY,
-            Provision { own_deny },
+            Provision {
+                own: Some(own),
+                ..Default::default()
+            },
         )
         .await
         .err()
@@ -2450,7 +3544,7 @@ mod tests {
             link: false,
         }));
         let mut t = task(agy_develop());
-        let err = dispatch_agy(&fake, &mut t, &develop_deny()).await;
+        let err = dispatch_agy(&fake, &mut t, &develop_policy()).await;
         assert!(
             !err.clone()
                 .unwrap_or_default()
@@ -2468,34 +3562,49 @@ mod tests {
         assert_eq!(fake.agy_writes().len(), 1);
         // Covered now: the next launch writes nothing.
         let mut t = task(agy_develop());
-        dispatch_agy(&fake, &mut t, &develop_deny()).await;
+        dispatch_agy(&fake, &mut t, &develop_policy()).await;
         assert_eq!(fake.agy_writes().len(), 1);
     }
 
-    /// The owner's file keeps its rules first and its other keys; a rule it
-    /// already covers is not added again.
+    /// The profile's lists replace the owner's `allow`, `deny` and `ask`
+    /// whole, a stale allow and a rule agy saved from an "always allow"
+    /// answer going with them; every other key keeps its value and place.
     #[tokio::test]
-    async fn the_owners_agy_settings_keep_their_rules() {
+    async fn the_machines_profile_replaces_the_owners_rules_and_keeps_their_other_keys() {
         let fake = FakeHerdr::new();
         fake.set_agy_settings(Some(crate::provision::agy::AgySettings {
             content: Some(
-                r#"{"theme":"dark","permissions":{"allow":["command(ls)"],"deny":["command(sudo)"]}}"#.into(),
+                r#"{"theme":"dark","permissions":{"allow":["command(ls)"],"deny":["command(sudo)","command(shutdown)"],"ask":["command(git push)"]},"trustedWorkspaces":["/w"]}"#.into(),
             ),
             link: false,
         }));
         let mut t = task(agy_develop());
-        dispatch_agy(&fake, &mut t, &develop_deny()).await;
+        dispatch_agy(&fake, &mut t, &develop_policy()).await;
         assert_eq!(
             agy_deny(&fake),
             serde_json::json!([
-                "command(sudo)",
                 "command(rm -rf)",
+                "command(sudo)",
                 "command(git push --force)"
             ])
         );
         let content = fake.agy_settings_now().unwrap().content.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            v["permissions"]["allow"],
+            serde_json::json!([
+                "read_file(*)",
+                "write_file(*)",
+                "command(*)",
+                "command(pastor task done)"
+            ])
+        );
+        assert_eq!(v["permissions"]["ask"], serde_json::json!([]));
+        assert_eq!(v["theme"], "dark");
+        assert_eq!(v["trustedWorkspaces"], serde_json::json!(["/w"]));
+        assert_eq!(v["toolPermission"], "always-proceed");
+        assert_eq!(v["agentMode"], "accept-edits");
         assert!(content.find("theme").unwrap() < content.find("permissions").unwrap());
-        assert!(content.contains("command(ls)"), "{content}");
     }
 
     /// A machine whose agy settings cannot be read (a `command` machine) or
@@ -2507,7 +3616,9 @@ mod tests {
             let fake = FakeHerdr::new();
             fake.set_agy_settings(settings);
             let mut t = task(agy_develop());
-            let err = dispatch_agy(&fake, &mut t, &develop_deny()).await.unwrap();
+            let err = dispatch_agy(&fake, &mut t, &develop_policy())
+                .await
+                .unwrap();
             assert!(err.contains("agy_permissions_missing"), "{err}");
             assert!(err.contains("command(sudo)"), "{err}");
             assert!(err.contains("pi-1"), "{err}");
@@ -2534,20 +3645,67 @@ mod tests {
         }))
         .await;
         assert!(err.contains("symlink"), "{err}");
-        // A symlink that already denies everything is fine as it is.
+        // A symlink that already says everything is fine as it is.
         let fake = FakeHerdr::new();
         fake.set_agy_settings(Some(crate::provision::agy::AgySettings {
-            content: Some(r#"{"permissions":{"deny":["command(*)"]}}"#.into()),
+            content: Some(
+                r#"{"permissions":{"allow":["read_file(*)","write_file(*)","command(*)","command(pastor task done)"],"deny":["command(rm -rf)","command(sudo)","command(git push --force)"]},"toolPermission":"always-proceed","agentMode":"accept-edits"}"#.into(),
+            ),
             link: true,
         }));
         let mut t = task(agy_develop());
-        let err = dispatch_agy(&fake, &mut t, &develop_deny()).await;
+        let err = dispatch_agy(&fake, &mut t, &develop_policy()).await;
         assert!(
             !err.clone()
                 .unwrap_or_default()
                 .contains("agy_permissions_missing"),
             "{err:?}"
         );
+    }
+
+    /// A profile's `[profiles.<name>.agy]` words reach the settings a
+    /// dispatch writes. A profile that denies nothing never refuses a task
+    /// over settings pastor cannot read or write (a launch under a profile
+    /// approves every ask anyway); one that denies something does.
+    #[tokio::test]
+    async fn a_profiles_agy_words_are_written_and_an_open_profile_never_refuses() {
+        let profiles: crate::config::profile::Profiles = toml::from_str(
+            "[open]\nallow = [\"Bash\"]\n[open.agy]\nqueued_messages = \"send-immediately\"\n\
+             allow_non_workspace_access = false\n",
+        )
+        .unwrap();
+        let open = profiles.resolve("open").unwrap().agy_policy();
+        let fake = FakeHerdr::new();
+        fake.set_agy_settings(Some(crate::provision::agy::AgySettings {
+            content: None,
+            link: false,
+        }));
+        let mut t = task(agy_develop());
+        dispatch_agy(&fake, &mut t, &open).await;
+        let content = fake.agy_settings_now().unwrap().content.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["queuedMessages"], "send-immediately");
+        assert_eq!(v["allowNonWorkspaceAccess"], false);
+        assert_eq!(
+            v["permissions"]["allow"],
+            serde_json::json!(["command(*)", "command(pastor task done)"])
+        );
+        assert_eq!(v["permissions"]["deny"], serde_json::json!([]));
+
+        // Settings pastor cannot read: no deny rule missing, no refusal.
+        let fake = FakeHerdr::new();
+        fake.set_agy_settings(None);
+        let mut t = task(DispatchSpec {
+            deny: vec![],
+            ..agy_under(Some("open"))
+        });
+        let err = dispatch_agy(&fake, &mut t, &open).await.unwrap_or_default();
+        assert!(!err.contains("agy_permissions_missing"), "{err}");
+        let mut t = task(agy_develop());
+        let err = dispatch_agy(&fake, &mut t, &develop_policy())
+            .await
+            .unwrap();
+        assert!(err.contains("agy_permissions_missing"), "{err}");
     }
 
     /// agy saving between pastor's read and write is read again and merged
@@ -2564,7 +3722,7 @@ mod tests {
         fake.set_agy_settings(empty());
         fake.agy_saves_before_write(Some(r#"{"model":"x"}"#));
         let mut t = task(agy_develop());
-        dispatch_agy(&fake, &mut t, &develop_deny()).await;
+        dispatch_agy(&fake, &mut t, &develop_policy()).await;
         let content = fake.agy_settings_now().unwrap().content.unwrap();
         assert!(content.contains("\"model\": \"x\""), "{content}");
         assert_eq!(agy_deny(&fake).as_array().unwrap().len(), 3);
@@ -2574,7 +3732,9 @@ mod tests {
         fake.agy_saves_before_write(Some("{}"));
         fake.agy_saves_before_write(Some(r#"{"a":1}"#));
         let mut t = task(agy_develop());
-        let err = dispatch_agy(&fake, &mut t, &develop_deny()).await.unwrap();
+        let err = dispatch_agy(&fake, &mut t, &develop_policy())
+            .await
+            .unwrap();
         assert!(err.contains("agy_permissions_missing"), "{err}");
         assert!(err.contains("kept saving"), "{err}");
     }
@@ -2586,7 +3746,7 @@ mod tests {
     /// `a_profiled_agy_task_needs_its_denies_in_the_machines_agy_settings`.)
     #[tokio::test]
     async fn the_agy_provisioner_leaves_other_tasks_alone() {
-        let own = develop_deny();
+        let own = develop_policy();
         let mut claude = agy_develop();
         claude.agent = "claude".into();
         let own_permissions: Agents = toml::from_str("[agy]\nown_permissions = true\n").unwrap();
@@ -2604,7 +3764,10 @@ mod tests {
                 &agents,
                 None,
                 READY,
-                Provision { own_deny: &own },
+                Provision {
+                    own: Some(&own),
+                    ..Default::default()
+                },
             )
             .await
             .err()
@@ -2698,7 +3861,10 @@ mod tests {
         assert_eq!(start.params["args"], serde_json::json!([]));
 
         let fake = FakeHerdr::new();
-        fake.set_opencode_permissions(Some(true));
+        fake.set_opencode_permissions(Some(vec![crate::config::opencode::ConfigCheckHit::Key {
+            file: "/etc/opencode/opencode.json".into(),
+            key: "permission".into(),
+        }]));
         let mut t = task(opencode_under(Some("review")));
         let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
@@ -2708,6 +3874,11 @@ mod tests {
             "{err}"
         );
         assert!(err.to_string().contains("pi-1"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("/etc/opencode/opencode.json (permission)"),
+            "{err}"
+        );
         assert!(!err.is_transport());
         assert_eq!(t.state, TaskState::Failed);
         assert!(fake.requests().is_empty(), "{:?}", fake.requests());
@@ -2719,7 +3890,11 @@ mod tests {
             .unwrap();
 
         let fake = FakeHerdr::new();
-        fake.set_opencode_permissions(Some(true));
+        fake.set_opencode_permissions(Some(vec![
+            crate::config::opencode::ConfigCheckHit::Unreadable {
+                file: "/etc/opencode/opencode.json".into(),
+            },
+        ]));
         let mut t = task(DispatchSpec {
             allow: vec![],
             deny: vec![],
@@ -2728,6 +3903,32 @@ mod tests {
         dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
+    }
+
+    /// A managed config file `CONFIG_CHECK_COMMAND` could not read refuses
+    /// the task the same as one with rules in it, naming the file.
+    #[tokio::test]
+    async fn a_profiled_opencode_task_refuses_an_unreadable_managed_file() {
+        let fake = FakeHerdr::new();
+        fake.set_opencode_permissions(Some(vec![
+            crate::config::opencode::ConfigCheckHit::Unreadable {
+                file: "/etc/opencode/opencode.json".into(),
+            },
+        ]));
+        let mut t = task(opencode_under(Some("review")));
+        let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("opencode_permissions_conflict"),
+            "{err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("/etc/opencode/opencode.json (unreadable)"),
+            "{err}"
+        );
+        assert_eq!(t.state, TaskState::Failed);
     }
 
     /// A machine whose own global opencode config or `~/.opencode` has
@@ -2875,20 +4076,17 @@ mod tests {
         assert!(fake.requests().is_empty(), "{:?}", fake.requests());
     }
 
-    /// `[agents.claude-personal] kind = "claude"` with an env: herdr starts
+    /// `[agents.claude-alt] kind = "claude"` with an env: herdr starts
     /// a claude, with Claude's tool flags, in a pane that has the env, `~`
     /// expanded against the machine's home, a bare `~` too.
     fn personal() -> Agents {
         let mut agents = Agents::default();
         agents.0.insert(
-            "claude-personal".into(),
+            "claude-alt".into(),
             crate::config::AgentDef {
                 kind: Some("claude".into()),
                 env: [
-                    (
-                        "CLAUDE_CONFIG_DIR".to_string(),
-                        "~/.claude-personal".to_string(),
-                    ),
+                    ("CLAUDE_CONFIG_DIR".to_string(), "~/.claude-alt".to_string()),
                     ("PLAIN".to_string(), "a~b".to_string()),
                     ("BARE".to_string(), "~".to_string()),
                 ]
@@ -2899,11 +4097,160 @@ mod tests {
         agents
     }
 
+    const CLAUDE_STORE: &str = "{\n  \"projects\": {},\n  \"userID\": \"abc\"\n}\n";
+
+    /// Dispatch `t` with `trusted` as the trust pastor holds for the machine.
+    async fn dispatch_trusting(fake: &FakeHerdr, t: &mut Task, agents: &Agents, trusted: &[&str]) {
+        let trusted: Vec<String> = trusted.iter().map(|s| s.to_string()).collect();
+        dispatch_with(
+            fake,
+            t,
+            agents,
+            None,
+            READY,
+            Provision {
+                trusted: &trusted,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A Claude task in a folder pastor trusts has it trusted in the agent
+    /// home's store before the agent starts, so the dialog never shows; one
+    /// in a folder nobody trusted, and one whose store is not there, are
+    /// left as they were.
+    #[tokio::test]
+    async fn a_trusted_folder_is_written_into_claudes_store_before_the_start() {
+        let fake = FakeHerdr::new();
+        fake.set_home_file("~/.claude.json", Some(CLAUDE_STORE));
+        let mut t = task(DispatchSpec {
+            repo: Some("/srv/app".into()),
+            ..spec()
+        });
+        dispatch_trusting(&fake, &mut t, &Agents::default(), &["/srv/app"]).await;
+        let v: serde_json::Value =
+            serde_json::from_str(&fake.home_file_now("~/.claude.json").unwrap()).unwrap();
+        assert_eq!(v["projects"]["/srv/app"]["hasTrustDialogAccepted"], true);
+        assert_eq!(v["userID"], "abc");
+        assert!(fake.requests().iter().any(|r| r.method == "agent.start"));
+        assert_eq!(fake.file_writes().len(), 1);
+
+        // Not a folder pastor trusts.
+        let fake = FakeHerdr::new();
+        fake.set_home_file("~/.claude.json", Some(CLAUDE_STORE));
+        let mut t = task(spec());
+        dispatch_trusting(&fake, &mut t, &Agents::default(), &["/srv/other"]).await;
+        assert_eq!(
+            fake.home_file_now("~/.claude.json").as_deref(),
+            Some(CLAUDE_STORE)
+        );
+        assert!(fake.file_writes().is_empty());
+
+        // A home that has never run Claude has no store to add to.
+        let fake = FakeHerdr::new();
+        let mut t = task(spec());
+        dispatch_trusting(&fake, &mut t, &Agents::default(), &["/srv/app"]).await;
+        assert_eq!(fake.home_file_now("~/.claude.json"), None);
+        assert!(fake.file_writes().is_empty());
+    }
+
+    /// The store is the one of the agent's config dir, and a task with no
+    /// repo is trusted by the folder it starts in.
+    #[tokio::test]
+    async fn the_store_follows_the_agents_home_and_a_no_repo_task_its_folder() {
+        let fake = FakeHerdr::new();
+        let store = "~/.claude-alt/.claude.json";
+        fake.set_home_file(store, Some(CLAUDE_STORE));
+        let mut t = task(DispatchSpec {
+            agent: "claude-alt".into(),
+            repo: None,
+            ..spec()
+        });
+        // The key pastor holds for such a task is its folder.
+        dispatch_trusting(&fake, &mut t, &personal(), &["/home/fake/pastor-tasks"]).await;
+        let v: serde_json::Value =
+            serde_json::from_str(&fake.home_file_now(store).unwrap()).unwrap();
+        assert_eq!(
+            v["projects"]["/home/fake/pastor-tasks"]["hasTrustDialogAccepted"], true,
+            "{v}"
+        );
+    }
+
+    /// A worktree task starts in its checkout, a folder of its own: that is
+    /// the folder written, on the strength of the trust held for its repo.
+    #[tokio::test]
+    async fn a_worktree_tasks_checkout_is_written_on_its_repos_trust() {
+        let fake = FakeHerdr::new();
+        fake.set_home_file("~/.claude.json", Some(CLAUDE_STORE));
+        let mut t = task(DispatchSpec {
+            repo: Some("/srv/app".into()),
+            worktree: true,
+            branch: Some("pastor/k1".into()),
+            ..spec()
+        });
+        dispatch_trusting(&fake, &mut t, &Agents::default(), &["/srv/app"]).await;
+        let v: serde_json::Value =
+            serde_json::from_str(&fake.home_file_now("~/.claude.json").unwrap()).unwrap();
+        let projects = v["projects"].as_object().unwrap();
+        assert_eq!(
+            projects.keys().collect::<Vec<_>>(),
+            ["/fake/worktrees/pastor-k1"],
+            "the checkout, not the repo: {v}"
+        );
+        assert_eq!(
+            v["projects"]["/fake/worktrees/pastor-k1"]["hasTrustDialogAccepted"],
+            true
+        );
+    }
+
+    /// agy's trusted workspaces are written into its settings.
+    #[tokio::test]
+    async fn a_trusted_folder_is_a_trusted_workspace_of_agy() {
+        let fake = FakeHerdr::new();
+        fake.set_home_file(
+            crate::provision::agy::SETTINGS_FILE,
+            Some("{\"agentMode\": \"accept-edits\"}\n"),
+        );
+        let mut t = task(DispatchSpec {
+            agent: "agy".into(),
+            ..spec()
+        });
+        dispatch_trusting(&fake, &mut t, &Agents::default(), &["/srv/app"]).await;
+        let v: serde_json::Value = serde_json::from_str(
+            &fake
+                .home_file_now(crate::provision::agy::SETTINGS_FILE)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["trustedWorkspaces"], serde_json::json!(["/srv/app"]));
+        assert_eq!(v["agentMode"], "accept-edits");
+    }
+
+    /// Another kind has no store here, and a write that cannot be done never
+    /// fails the task.
+    #[tokio::test]
+    async fn trust_that_cannot_be_written_does_not_fail_the_task() {
+        let fake = FakeHerdr::new();
+        fake.set_home_file("~/.claude.json", Some("{ nope"));
+        let mut t = task(spec());
+        dispatch_trusting(&fake, &mut t, &Agents::default(), &["/srv/app"]).await;
+        assert!(fake.requests().iter().any(|r| r.method == "agent.start"));
+        let fake = FakeHerdr::new();
+        let mut t = task(DispatchSpec {
+            agent: "codex".into(),
+            ..spec()
+        });
+        dispatch_trusting(&fake, &mut t, &Agents::default(), &["/srv/app"]).await;
+        assert!(fake.file_writes().is_empty());
+    }
+
     #[tokio::test]
     async fn an_agent_definition_starts_its_kind_with_its_env() {
         let fake = FakeHerdr::new();
         let mut t = task(DispatchSpec {
-            agent: "claude-personal".into(),
+            agent: "claude-alt".into(),
             deny: vec!["WebFetch".into()],
             ..spec()
         });
@@ -2919,7 +4266,7 @@ mod tests {
         let want = serde_json::json!({
             "BARE": "/home/fake",
             "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN": "1",
-            "CLAUDE_CONFIG_DIR": "/home/fake/.claude-personal",
+            "CLAUDE_CONFIG_DIR": "/home/fake/.claude-alt",
             "PASTOR_TASK": "t-7",
             "PLAIN": "a~b",
         });
@@ -2931,7 +4278,14 @@ mod tests {
             start.params["args"],
             with_session(
                 &t,
-                serde_json::json!(["--model", "opus", "--disallowedTools", "WebFetch"])
+                serde_json::json!([
+                    "--model",
+                    "opus",
+                    "--allowedTools",
+                    "Bash(pastor task done:*)",
+                    "--disallowedTools",
+                    "WebFetch"
+                ])
             )
         );
         assert_eq!(fake.pane_env(t.pane_id.as_deref().unwrap()), want);
@@ -2944,7 +4298,7 @@ mod tests {
     async fn a_worktree_agent_gets_its_env_through_a_split_pane() {
         let fake = FakeHerdr::new();
         let mut t = task(DispatchSpec {
-            agent: "claude-personal".into(),
+            agent: "claude-alt".into(),
             worktree: true,
             branch: Some("pastor/k1".into()),
             ..spec()
@@ -2967,7 +4321,7 @@ mod tests {
         assert_eq!(reqs[at("agent.start")].params["pane_id"], pane.as_str());
         assert_eq!(
             fake.pane_env(&pane)["CLAUDE_CONFIG_DIR"],
-            "/home/fake/.claude-personal"
+            "/home/fake/.claude-alt"
         );
         assert_eq!(t.workspace_id.as_deref(), Some("w1"));
 
@@ -3005,19 +4359,255 @@ mod tests {
         assert_eq!(fake.pane_env(&pane)["PASTOR_TASK"], "t-7");
     }
 
+    /// An agent of a kind its machine pins to a version gets the env its
+    /// manifest says keeps it from updating itself; one pinned to `latest`,
+    /// or not pinned, does not.
+    #[tokio::test]
+    async fn a_pinned_harness_is_kept_from_updating_itself() {
+        let harnesses = crate::harness_manifest::Harnesses::builtin();
+        for (pin, set) in [
+            (Some("2.1.310"), true),
+            (Some("latest"), false),
+            (None, false),
+        ] {
+            let pins: crate::harness::Pins = pin
+                .map(|p| ("claude".to_string(), p.to_string()))
+                .into_iter()
+                .collect();
+            let fake = FakeHerdr::new();
+            let mut t = task(spec());
+            dispatch_with(
+                &fake,
+                &mut t,
+                &Agents::default(),
+                None,
+                READY,
+                Provision {
+                    pins: Some(&pins),
+                    harnesses: Some(harnesses),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let env = fake.pane_env(t.pane_id.as_deref().unwrap());
+            assert_eq!(env.get("DISABLE_AUTOUPDATER").is_some(), set, "{pin:?}");
+        }
+    }
+
+    /// The env layers reach the pane: `[defaults]` under the task's flock's,
+    /// under the machine's, under the agent's own, key by key; another
+    /// flock's layer and a task with no flock get no flock layer; the marks
+    /// pastor sets stay last.
+    #[tokio::test]
+    async fn env_layers_reach_the_pane_under_the_agents_own() {
+        let layers = crate::config::EnvLayers {
+            defaults: [("A", "d"), ("B", "d"), ("C", "d"), ("D", "d")]
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .into(),
+            flocks: [
+                (
+                    "work".to_string(),
+                    [("B", "work"), ("C", "work"), ("D", "work")]
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .into(),
+                ),
+                (
+                    "play".to_string(),
+                    [("B", "play")]
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .into(),
+                ),
+            ]
+            .into(),
+            machine: [("C", "machine"), ("D", "machine"), ("PASTOR_TASK", "mine")]
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .into(),
+        };
+        let mut agents = personal();
+        agents
+            .0
+            .get_mut("claude-alt")
+            .unwrap()
+            .env
+            .insert("D".into(), "agent".into());
+        let pane_env = async |flock: Option<&str>| {
+            let fake = FakeHerdr::new();
+            let mut t = task(DispatchSpec {
+                agent: "claude-alt".into(),
+                ..spec()
+            });
+            t.flock = flock.map(str::to_string);
+            dispatch_with(
+                &fake,
+                &mut t,
+                &agents,
+                None,
+                READY,
+                Provision {
+                    env: Some(&layers),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            fake.pane_env(t.pane_id.as_deref().unwrap())
+        };
+        let env = pane_env(Some("work")).await;
+        assert_eq!(env["A"], "d", "defaults");
+        assert_eq!(env["B"], "work", "the flock over defaults");
+        assert_eq!(env["C"], "machine", "the machine over the flock");
+        assert_eq!(env["D"], "agent", "the agent over all");
+        assert!(
+            env["CLAUDE_CONFIG_DIR"].as_str().unwrap().starts_with('/'),
+            "its own keys stay"
+        );
+        assert_eq!(env["PASTOR_TASK"], "t-7", "the mark stays last");
+        assert_eq!(pane_env(Some("play")).await["B"], "play");
+        assert_eq!(pane_env(None).await["B"], "d", "no flock, no flock layer");
+        // Not given, nothing changes.
+        let fake = FakeHerdr::new();
+        let mut t = task(DispatchSpec {
+            agent: "claude-alt".into(),
+            ..spec()
+        });
+        dispatch(&fake, &mut t, &agents, None, READY).await.unwrap();
+        assert!(
+            fake.pane_env(t.pane_id.as_deref().unwrap())
+                .get("A")
+                .is_none()
+        );
+    }
+
+    /// A worktree task's base is fetched from its repo's remote before the
+    /// worktree is made; a task without a worktree, one that said `--no-fetch`
+    /// and one that reopens a checkout fetch nothing.
+    #[tokio::test]
+    async fn the_base_is_fetched_before_a_new_worktree_is_made() {
+        let fetched = |t: &DispatchSpec| {
+            let t = t.clone();
+            async move {
+                let fake = FakeHerdr::new();
+                let mut task = task(t);
+                dispatch(&fake, &mut task, &Agents::default(), None, READY)
+                    .await
+                    .unwrap();
+                (fake, task)
+            }
+        };
+        let (fake, t) = fetched(&DispatchSpec {
+            worktree: true,
+            repo: Some("/r/app".into()),
+            ..spec()
+        })
+        .await;
+        assert_eq!(fake.fetches(), ["/r/app"]);
+        let before = fake.fetched_after()[0];
+        let create = fake
+            .requests()
+            .iter()
+            .position(|r| r.method == "worktree.create")
+            .unwrap();
+        assert!(create >= before, "fetched first: {before} vs {create}");
+        assert_eq!(t.spec.fetch.warning, None);
+
+        for (why, s) in [
+            (
+                "--no-fetch",
+                DispatchSpec {
+                    worktree: true,
+                    repo: Some("/r/app".into()),
+                    fetch: crate::task::FetchNote {
+                        skip: true,
+                        warning: None,
+                    },
+                    ..spec()
+                },
+            ),
+            (
+                "no worktree",
+                DispatchSpec {
+                    worktree: false,
+                    repo: Some("/r/app".into()),
+                    ..spec()
+                },
+            ),
+        ] {
+            let (fake, _) = fetched(&s).await;
+            assert!(fake.fetches().is_empty(), "{why}");
+        }
+    }
+
+    /// A fetch that fails is a warning on the task, not a failure: the
+    /// worktree is made from the repo as it is, the reason is in
+    /// `fetch.warning`, and a dispatch that fetches fine clears it. A remote
+    /// that cannot be reached, a machine that cannot be asked and a repo with
+    /// no remote at all are all fine for the task.
+    #[tokio::test]
+    async fn a_failed_fetch_warns_and_the_worktree_is_made_anyway() {
+        use crate::herdr::Fetched;
+        let wt = || DispatchSpec {
+            worktree: true,
+            repo: Some("/r/app".into()),
+            ..spec()
+        };
+        let fake = FakeHerdr::new();
+        fake.set_fetch(Fetched::Failed(
+            "origin".into(),
+            "fatal: unable to access 'https://git.example/app.git'".into(),
+        ));
+        let mut t = task(wt());
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        assert_eq!(t.state, TaskState::Running);
+        let why = t.spec.fetch.warning.clone().unwrap();
+        assert!(why.contains("could not fetch origin"), "{why}");
+        assert!(why.contains("unable to access"), "{why}");
+        assert!(why.contains("made from /r/app as it is"), "{why}");
+        assert!(
+            fake.requests()
+                .iter()
+                .any(|r| r.method == "worktree.create"),
+            "the worktree was made"
+        );
+
+        // The next dispatch of the task says afresh what its fetch found.
+        let fake = FakeHerdr::new();
+        fake.set_fetch(Fetched::Done("origin".into()));
+        let mut again = task(DispatchSpec {
+            fetch: t.spec.fetch.clone(),
+            ..wt()
+        });
+        dispatch(&fake, &mut again, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        assert_eq!(again.spec.fetch.warning, None);
+
+        for answer in [Fetched::NoRemote] {
+            let fake = FakeHerdr::new();
+            fake.set_fetch(answer);
+            let mut t = task(wt());
+            dispatch(&fake, &mut t, &Agents::default(), None, READY)
+                .await
+                .unwrap();
+            assert_eq!(t.spec.fetch.warning, None);
+        }
+    }
+
     /// A head address reaches the agent as `PASTOR_HEAD`, after the
     /// `[agents]` env so config cannot clear it; without one there is none.
     #[tokio::test]
     async fn the_head_address_goes_in_the_pane_env() {
         let fake = FakeHerdr::new();
         let mut t = task(DispatchSpec {
-            agent: "claude-personal".into(),
+            agent: "claude-alt".into(),
             ..spec()
         });
         let mut agents = personal();
         agents
             .0
-            .get_mut("claude-personal")
+            .get_mut("claude-alt")
             .unwrap()
             .env
             .insert("PASTOR_HEAD".into(), "elsewhere".into());
@@ -3083,15 +4673,26 @@ mod tests {
                 path,
                 agent: "someone-else".into(),
             })),
+            // A warning the task came with, from the dispatch of the task
+            // it retries, is not this dispatch's.
+            fetch: crate::task::FetchNote {
+                skip: false,
+                warning: Some("could not fetch origin: old".into()),
+            },
             ..spec()
         });
         dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
+        assert_eq!(t.spec.fetch.warning, None);
         assert_eq!(t.spec.label.name.as_deref(), Some("seed"));
         assert_eq!(
             t.spec.label.note.as_deref(),
             Some(crate::task::JOINED_WORKSPACE)
+        );
+        assert!(
+            fake.fetches().is_empty(),
+            "a reopened checkout is not a new worktree"
         );
     }
 
@@ -3142,11 +4743,11 @@ mod tests {
     }
 
     /// herdr opens a pane with no `cwd` wherever its focused pane is, which
-    /// put t-284, a task with no repo, in someone's work checkout
-    /// (2026-09-28). A task with no repo starts in `~/pastor-tasks`, made
+    /// put a task with no repo in someone's work checkout.
+    /// A task with no repo starts in `~/pastor-tasks`, made
     /// when missing, in a workspace of its own or a pane split into a shared
     /// one: not the home itself, which Claude Code never saves trust for, so
-    /// it asked at every start (t-358). A machine that cannot tell its home
+    /// it asked at every start. A machine that cannot tell its home
     /// leaves the choice to herdr, as before.
     #[tokio::test]
     async fn a_task_with_no_repo_starts_in_pastor_tasks() {
@@ -3311,6 +4912,58 @@ mod tests {
         assert!(prompt.ends_with(crate::task::LIMIT_HANDOVER), "{prompt}");
         assert_eq!(t.waiting_until, None);
         assert!(t.spec.session_id.is_some(), "a new session to resume next");
+    }
+
+    /// An agy task resumes a wait the same way a Claude one does, but on
+    /// `--conversation`, the flag agy takes it on, and only when herdr
+    /// reported one (`task::resume_flag`); with none recorded, an agy task
+    /// gets no flag at all (agy has none to choose its own session with),
+    /// and restarts from its prompt and the handover, same as today.
+    #[tokio::test]
+    async fn an_agy_waiting_task_resumes_its_conversation_or_falls_back_to_a_restart() {
+        let started = |fake: &FakeHerdr| {
+            let reqs = fake.requests();
+            let start = reqs
+                .iter()
+                .rev()
+                .find(|r| r.method == "agent.start")
+                .unwrap();
+            start.params["args"].clone()
+        };
+        let conversation = "9f1e2d3c-4b5a-6978-8f90-123456789abc";
+        let fake = FakeHerdr::new();
+        let mut t = task(DispatchSpec {
+            agent: "agy".into(),
+            agent_args: vec![],
+            session_id: Some(conversation.into()),
+            ..spec()
+        });
+        t.waiting_until = Some(Utc::now());
+        resume(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        assert_eq!(
+            started(&fake),
+            serde_json::json!(["--conversation", conversation])
+        );
+        assert_eq!(t.spec.session_id.as_deref(), Some(conversation));
+
+        let fake = FakeHerdr::new();
+        let mut t = task(DispatchSpec {
+            agent: "agy".into(),
+            agent_args: vec![],
+            ..spec()
+        });
+        t.waiting_until = Some(Utc::now());
+        resume(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        assert_eq!(
+            started(&fake),
+            serde_json::json!([]),
+            "no flag to choose one"
+        );
+        assert_eq!(t.spec.session_id, None, "nothing for agy to resume next");
     }
 
     /// A waiting task that moved to another model: in the same session with
@@ -4121,5 +5774,507 @@ mod tests {
             .await
             .unwrap_err();
         assert!(!err.to_string().contains("nowhere to resume"), "{err}");
+    }
+
+    /// A gate that records each place, with whether herdr had started an
+    /// agent yet, and answers `answer`.
+    struct Places {
+        fake: FakeHerdr,
+        answer: Result<(), String>,
+        calls: std::sync::Mutex<Vec<(String, String, Value, bool)>>,
+    }
+
+    impl crate::bundle::workdir_task::Gate for Places {
+        /// A set's document, or for a bundle `{"bundle": id, "kind": kind,
+        /// "flock": flock}`; a bundle named `empty` has nothing to place.
+        fn place<'a>(
+            &'a self,
+            machine: &'a str,
+            dir: &'a str,
+            what: &'a crate::bundle::workdir_task::Placing,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + 'a>>
+        {
+            use crate::bundle::workdir_task::Placing;
+            let started = self
+                .fake
+                .requests()
+                .iter()
+                .any(|r| r.method == "agent.start");
+            let (seen, placed) = match what {
+                Placing::Set(set) => (set.clone(), true),
+                Placing::Rendered { set, render } => {
+                    let mut seen = set.clone();
+                    seen["rendered"] = render.profile.clone().into();
+                    (seen, true)
+                }
+                Placing::Bundle { id, kind, flock } => (
+                    serde_json::json!({"bundle": id, "kind": kind, "flock": flock}),
+                    id != "empty",
+                ),
+            };
+            self.calls
+                .lock()
+                .unwrap()
+                .push((machine.to_string(), dir.to_string(), seen, started));
+            let answer = self.answer.clone().map(|()| placed);
+            Box::pin(async move { answer })
+        }
+
+        fn forget(&self, _machine: &str, _dir: &str) {}
+    }
+
+    fn places(fake: &FakeHerdr, answer: Result<(), String>) -> Arc<Places> {
+        Arc::new(Places {
+            fake: fake.clone(),
+            answer,
+            calls: Default::default(),
+        })
+    }
+
+    fn with_set(spec: DispatchSpec) -> DispatchSpec {
+        DispatchSpec {
+            workdir: Some(Box::new(crate::task::TaskWorkdir {
+                set: serde_json::json!({"id": "reviewer", "kind": "claude", "files": [
+                    {"path": ".claude/agents/checker.md", "content": "Check.\n"}]}),
+                placed_in: None,
+                render: None,
+            })),
+            ..spec
+        }
+    }
+
+    async fn dispatch_placing(
+        fake: &FakeHerdr,
+        t: &mut Task,
+        gate: &Arc<Places>,
+        resume_it: bool,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let handle = crate::bundle::workdir_task::GateHandle(Some(
+            gate.clone() as Arc<dyn crate::bundle::workdir_task::Gate>
+        ));
+        let provision = Provision {
+            workdirs: Some(&handle),
+            ..Default::default()
+        };
+        if resume_it {
+            resume_with(fake, t, &Agents::default(), None, READY, provision).await
+        } else {
+            dispatch_with(fake, t, &Agents::default(), None, READY, provision).await
+        }
+    }
+
+    /// A task's set goes into the folder its agent starts in, before the
+    /// agent starts, and again on each start: here a dispatch, then a
+    /// resume. The place is recorded on the task.
+    #[tokio::test]
+    async fn a_tasks_workdir_set_is_placed_before_each_start() {
+        let fake = FakeHerdr::new();
+        let gate = places(&fake, Ok(()));
+        let mut t = task(with_set(spec()));
+        dispatch_placing(&fake, &mut t, &gate, false).await.unwrap();
+        {
+            let calls = gate.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            let (machine, dir, set, started) = &calls[0];
+            assert_eq!(machine, "pi-1");
+            assert_eq!(dir, "/srv/app");
+            assert_eq!(set["id"], "reviewer");
+            assert!(!started, "placed before agent.start");
+        }
+        assert_eq!(
+            t.spec.workdir.as_ref().unwrap().placed_in.as_deref(),
+            Some("/srv/app")
+        );
+        dispatch_placing(&fake, &mut t, &gate, true).await.unwrap();
+        assert_eq!(gate.calls.lock().unwrap().len(), 2, "again on the resume");
+    }
+
+    /// A set that names no profile takes the task's; a set for another kind
+    /// fails the start, as does a gate that refuses or a machine with none.
+    /// Nothing starts then.
+    #[tokio::test]
+    async fn a_workdir_set_that_cannot_be_placed_fails_the_start() {
+        let fake = FakeHerdr::new();
+        let gate = places(&fake, Ok(()));
+        let mut profiled = with_set(spec());
+        profiled.agent_source = Some(Box::new(crate::task::AgentSource {
+            profile: Some("review".into()),
+            ..Default::default()
+        }));
+        let mut t = task(profiled);
+        dispatch_placing(&fake, &mut t, &gate, false).await.unwrap();
+        assert_eq!(gate.calls.lock().unwrap()[0].2["profile"], "review");
+
+        let refused = |answer: Result<(), String>, spec: DispatchSpec| async move {
+            let fake = FakeHerdr::new();
+            let gate = places(&fake, answer);
+            let mut t = task(spec);
+            let err = dispatch_placing(&fake, &mut t, &gate, false)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert_eq!(t.state, TaskState::Failed);
+            assert!(
+                !fake.requests().iter().any(|r| r.method == "agent.start"),
+                "no agent: {err}"
+            );
+            err
+        };
+        let err = refused(Err("workdir_failed: conflict x".into()), with_set(spec())).await;
+        assert_eq!(err, "workdir_failed: conflict x");
+        let mut agy = with_set(spec());
+        agy.workdir.as_mut().unwrap().set["kind"] = "agy".into();
+        let err = refused(Ok(()), agy).await;
+        assert!(err.starts_with("workdir_failed: "), "{err}");
+        assert!(err.contains("workdir_kind_mismatch"), "{err}");
+
+        // A machine with no gate places nothing, and says so.
+        let fake = FakeHerdr::new();
+        let mut t = task(with_set(spec()));
+        let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not place workdir sets"), "{err}");
+    }
+
+    fn with_bundles(spec: DispatchSpec, ids: &[&str]) -> DispatchSpec {
+        DispatchSpec {
+            workdir_bundles: ids
+                .iter()
+                .map(|id| crate::task::WorkdirBundle::named(id))
+                .collect(),
+            ..spec
+        }
+    }
+
+    /// A worktree task's spec: its checkout is its own folder.
+    fn in_worktree(spec: DispatchSpec, branch: &str) -> DispatchSpec {
+        DispatchSpec {
+            worktree: true,
+            branch: Some(branch.into()),
+            ..spec
+        }
+    }
+
+    /// A task's stored workdir bundles go into its own worktree first, in
+    /// list order and for its agent's kind and flock, then its own set, all
+    /// before the agent starts. A bundle with nothing for the kind places
+    /// nothing and is not a skip.
+    #[tokio::test]
+    async fn a_tasks_workdir_bundles_are_placed_before_its_own_set() {
+        let fake = FakeHerdr::new();
+        let gate = places(&fake, Ok(()));
+        let mut t = task(with_bundles(
+            in_worktree(with_set(spec()), "pastor/k1"),
+            &["repo-notes", "empty"],
+        ));
+        t.flock = Some("ops".into());
+        dispatch_placing(&fake, &mut t, &gate, false).await.unwrap();
+        let calls = gate.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert_eq!(
+            calls[0].2,
+            serde_json::json!({"bundle": "repo-notes", "kind": "claude", "flock": "ops"})
+        );
+        assert_eq!(calls[1].2["bundle"], "empty");
+        assert_eq!(calls[2].2["id"], "reviewer");
+        assert!(
+            calls
+                .iter()
+                .all(|c| c.1 == "/fake/worktrees/pastor-k1" && !c.3),
+            "{calls:?}"
+        );
+        assert!(t.spec.workdir_bundles.iter().all(|b| b.skipped.is_none()));
+
+        // Bundles alone, with no set of its own.
+        let fake = FakeHerdr::new();
+        let gate = places(&fake, Ok(()));
+        let mut t = task(with_bundles(
+            in_worktree(spec(), "pastor/k2"),
+            &["repo-notes"],
+        ));
+        dispatch_placing(&fake, &mut t, &gate, false).await.unwrap();
+        assert_eq!(gate.calls.lock().unwrap().len(), 1);
+    }
+
+    /// A stored bundle that cannot be placed, such as one that clashes with
+    /// another set in the folder, fails the start like the task's own set:
+    /// nothing after it is placed, and no agent starts.
+    #[tokio::test]
+    async fn a_workdir_bundle_that_cannot_be_placed_fails_the_start() {
+        let fake = FakeHerdr::new();
+        let gate = places(
+            &fake,
+            Err("workdir_failed: workdir_conflict .claude/agents/checker.md".into()),
+        );
+        let mut t = task(with_bundles(
+            in_worktree(with_set(spec()), "pastor/k1"),
+            &["repo-notes"],
+        ));
+        let err = dispatch_placing(&fake, &mut t, &gate, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("workdir_conflict"), "{err}");
+        assert_eq!(gate.calls.lock().unwrap().len(), 1, "stopped at the first");
+        assert_eq!(t.state, TaskState::Failed);
+        assert!(!fake.requests().iter().any(|r| r.method == "agent.start"));
+    }
+
+    /// A stored bundle never decides where a task runs: on a machine that
+    /// places no sets, or for an agent kind pastor places none for, the
+    /// task starts without its bundles, each marked skipped with why.
+    #[tokio::test]
+    async fn workdir_bundles_are_skipped_where_no_set_is_placed() {
+        let fake = FakeHerdr::new();
+        let mut t = task(with_bundles(spec(), &["repo-notes"]));
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let why = t.spec.workdir_bundles[0].skipped.clone().unwrap();
+        assert!(why.contains("does not place workdir sets"), "{why}");
+        assert!(fake.requests().iter().any(|r| r.method == "agent.start"));
+
+        let fake = FakeHerdr::new();
+        let gate = places(&fake, Ok(()));
+        let mut t = task(with_bundles(
+            DispatchSpec {
+                agent: "codex".into(),
+                ..spec()
+            },
+            &["repo-notes"],
+        ));
+        dispatch_placing(&fake, &mut t, &gate, false).await.unwrap();
+        assert!(gate.calls.lock().unwrap().is_empty());
+        let why = t.spec.workdir_bundles[0].skipped.clone().unwrap();
+        assert!(why.contains("no workdir sets for codex agents"), "{why}");
+    }
+
+    /// Stored bundles go in a task's own worktree only. Every task of a
+    /// flock places a bundle under the bundle's own id, so in a folder
+    /// tasks share (a repo task with no worktree, the no-repo folder, a
+    /// checkout pastor did not open) each start would replace the last
+    /// one's version: a claude task's files would go when an agy task
+    /// started beside it. There they are skipped with why, and the task's
+    /// own set is still placed.
+    #[tokio::test]
+    async fn workdir_bundles_go_only_in_the_tasks_own_worktree() {
+        let fake = FakeHerdr::new();
+        let gate = places(&fake, Ok(()));
+        let mut claude = task(with_bundles(with_set(spec()), &["repo-notes"]));
+        let mut agy = task(with_bundles(
+            DispatchSpec {
+                agent: "agy".into(),
+                ..spec()
+            },
+            &["repo-notes"],
+        ));
+        agy.id = 8;
+        dispatch_placing(&fake, &mut claude, &gate, false)
+            .await
+            .unwrap();
+        dispatch_placing(&fake, &mut agy, &gate, false)
+            .await
+            .unwrap();
+        let calls = gate.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "only claude's own set: {calls:?}");
+        assert_eq!(calls[0].2["id"], "reviewer");
+        for t in [&claude, &agy] {
+            let why = t.spec.workdir_bundles[0].skipped.clone().unwrap();
+            assert!(why.starts_with("shared folder (/srv/app)"), "{why}");
+        }
+
+        // A task with no repo starts in the folder every such task shares.
+        let fake = FakeHerdr::new();
+        let gate = places(&fake, Ok(()));
+        let mut t = task(with_bundles(
+            DispatchSpec {
+                repo: None,
+                ..spec()
+            },
+            &["repo-notes"],
+        ));
+        dispatch_placing(&fake, &mut t, &gate, false).await.unwrap();
+        assert!(gate.calls.lock().unwrap().is_empty());
+        let why = t.spec.workdir_bundles[0].skipped.clone().unwrap();
+        assert!(why.starts_with("shared folder ("), "{why}");
+
+        // A checkout pastor did not open is someone else's folder too.
+        let fake = FakeHerdr::new();
+        let gate = places(&fake, Ok(()));
+        fake.worktree_create("/srv/app", "pastor/k1", "seed")
+            .await
+            .unwrap();
+        let path = fake
+            .worktree_list("/srv/app")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|w| w.branch.as_deref() == Some("pastor/k1"))
+            .unwrap()
+            .path;
+        let mut t = task(with_bundles(
+            DispatchSpec {
+                worktree: true,
+                reopen: Some(Box::new(Reopen {
+                    branch: "pastor/k1".into(),
+                    path: path.clone(),
+                    agent: "someone-else".into(),
+                })),
+                ..spec()
+            },
+            &["repo-notes"],
+        ));
+        dispatch_placing(&fake, &mut t, &gate, false).await.unwrap();
+        assert!(t.spec.checkout.as_ref().unwrap().already_open);
+        assert!(gate.calls.lock().unwrap().is_empty());
+        let why = t.spec.workdir_bundles[0].skipped.clone().unwrap();
+        assert!(why.starts_with(&format!("shared folder ({path})")), "{why}");
+
+        // Two worktree tasks each get the bundle in their own checkout.
+        let fake = FakeHerdr::new();
+        let gate = places(&fake, Ok(()));
+        let mut one = task(with_bundles(
+            in_worktree(spec(), "pastor/k1"),
+            &["repo-notes"],
+        ));
+        let mut two = task(with_bundles(
+            in_worktree(
+                DispatchSpec {
+                    agent: "agy".into(),
+                    ..spec()
+                },
+                "pastor/k2",
+            ),
+            &["repo-notes"],
+        ));
+        two.id = 8;
+        dispatch_placing(&fake, &mut one, &gate, false)
+            .await
+            .unwrap();
+        dispatch_placing(&fake, &mut two, &gate, false)
+            .await
+            .unwrap();
+        let dirs: Vec<String> = gate
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|c| c.1.clone())
+            .collect();
+        assert_eq!(
+            dirs,
+            ["/fake/worktrees/pastor-k1", "/fake/worktrees/pastor-k2"]
+        );
+    }
+
+    /// A task a pull machine claimed carries what the head built for it:
+    /// each stored bundle's set goes to the gate as it is, not by id, and
+    /// its own set with the head's rendering of its profile. A set built
+    /// for another kind than the agent's is left out, and says why.
+    #[tokio::test]
+    async fn a_claimed_task_places_the_sets_the_head_built() {
+        let built = |kind: &str| {
+            serde_json::json!({"id": "repo-notes", "kind": kind, "files": [
+                {"path": ".claude/agents/notes.md", "content": "Notes.\n"}]})
+        };
+        let claimed = |kind: &str| {
+            let mut spec =
+                with_bundles(in_worktree(with_set(spec()), "pastor/k1"), &["repo-notes"]);
+            spec.workdir_bundles[0].set = Some(built(kind));
+            spec.agent_source = Some(Box::new(crate::task::AgentSource {
+                profile: Some("review".into()),
+                ..Default::default()
+            }));
+            let config = crate::config::PastorConfig::default();
+            let profile = config.profiles.resolve("review").unwrap();
+            spec.workdir.as_mut().unwrap().render = Some(Box::new(
+                crate::profile_render::render(&config, &profile, "claude", None).unwrap(),
+            ));
+            spec
+        };
+        let fake = FakeHerdr::new();
+        let gate = places(&fake, Ok(()));
+        let mut t = task(claimed("claude"));
+        dispatch_placing(&fake, &mut t, &gate, false).await.unwrap();
+        let calls = gate.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[0].2, built("claude"));
+        assert_eq!(calls[1].2["id"], "reviewer");
+        assert_eq!(calls[1].2["rendered"], "review");
+        assert!(t.spec.workdir_bundles[0].skipped.is_none());
+
+        let fake = FakeHerdr::new();
+        let gate = places(&fake, Ok(()));
+        let mut t = task(claimed("agy"));
+        dispatch_placing(&fake, &mut t, &gate, false).await.unwrap();
+        let calls = gate.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "only its own set: {calls:?}");
+        let why = t.spec.workdir_bundles[0].skipped.clone().unwrap();
+        assert!(why.contains("built for agy agents"), "{why}");
+    }
+
+    /// A gate whose place never answers.
+    struct Hangs;
+
+    impl crate::bundle::workdir_task::Gate for Hangs {
+        fn place<'a>(
+            &'a self,
+            _machine: &'a str,
+            _dir: &'a str,
+            _what: &'a crate::bundle::workdir_task::Placing,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + 'a>>
+        {
+            Box::pin(std::future::pending())
+        }
+
+        fn forget(&self, _machine: &str, _dir: &str) {}
+    }
+
+    /// A place that does not answer within its own bound fails the start
+    /// `workdir_failed`, a task error and not a herdr that stopped
+    /// answering, and no agent starts.
+    #[tokio::test]
+    async fn a_place_that_does_not_answer_in_time_fails_the_start() {
+        let fake = FakeHerdr::new();
+        let handle = crate::bundle::workdir_task::GateHandle(Some(Arc::new(Hangs)));
+        let provision = Provision {
+            workdirs: Some(&handle),
+            workdir_wait: Some(Duration::from_millis(50)),
+            ..Default::default()
+        };
+        let mut t = task(with_set(spec()));
+        let err = dispatch_with(&fake, &mut t, &Agents::default(), None, READY, provision)
+            .await
+            .unwrap_err();
+        assert!(!err.is_transport(), "{err}");
+        let err = err.to_string();
+        assert!(err.starts_with("workdir_failed: "), "{err}");
+        assert!(err.contains("did not answer within"), "{err}");
+        assert_eq!(t.state, TaskState::Failed);
+        assert!(!fake.requests().iter().any(|r| r.method == "agent.start"));
+    }
+
+    /// A task with no set asks the gate nothing.
+    #[tokio::test]
+    async fn a_task_with_no_set_places_nothing() {
+        let fake = FakeHerdr::new();
+        let gate = places(&fake, Err("not asked".into()));
+        let mut t = task(spec());
+        dispatch_placing(&fake, &mut t, &gate, false).await.unwrap();
+        assert!(gate.calls.lock().unwrap().is_empty());
+    }
+
+    /// A machine the head cannot place a set on does not suit a task with
+    /// one.
+    #[test]
+    fn a_task_with_a_set_suits_only_machines_that_take_sets() {
+        let mut m = mv("a", 2, 0, &[], true);
+        let with = with_set(spec());
+        assert!(m.suits(&with));
+        m.workdir_sets = false;
+        assert!(!m.suits(&with));
+        assert!(m.suits(&spec()), "a task with none goes anywhere");
     }
 }
